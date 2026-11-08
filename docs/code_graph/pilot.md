@@ -9,7 +9,7 @@ git repo. Validated end-to-end during the FR-1 pilot on Nano's own
 
 - Linux or macOS (Windows pilot is a separate FR).
 - A git working tree.
-- Either: a Cargo toolchain (Rust 1.85 or newer) **or** a
+- Either: a Cargo toolchain (Rust 1.88 or newer) **or** a
   pre-built `heliosdb-nano` release binary on `$PATH`.
 
 ## Install

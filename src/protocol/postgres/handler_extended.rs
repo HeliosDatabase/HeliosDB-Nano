@@ -44,8 +44,52 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
                 result_schema: None,
                 cached_plan: None,
                 cached_plan_epoch: 0,
+                cached_plan_layout: crate::storage::LayoutStamp::empty(),
                 is_catalog: Some(false),
                 result_shape: Default::default(),
+            })?;
+            self.send_message(BackendMessage::ParseComplete).await?;
+            return Ok(());
+        }
+
+        // These executor utilities have custom grammar rather than a sqlparser
+        // AST. Validate using the same pure planner as text/params, before the
+        // generic syntax gate. Planning is optional at Parse (as for ordinary
+        // DDL): absent branches/targets may be created before Execute. Policy,
+        // constraints and durable effects belong exclusively to Execute.
+        if crate::EmbeddedDatabase::try_preparse_executor_ddl(&query)?.is_some()
+            || crate::sql::Parser::try_parse_alter_column_storage(&query)?.is_some()
+        {
+            let planned = self
+                .database
+                .wire_parameterized_plan_for_session(self.session_id, &query)
+                .ok();
+            let (cached_plan, cached_plan_epoch, cached_plan_layout) = match planned {
+                Some((pinned, epoch)) => (Some(pinned.plan), epoch, pinned.layout),
+                None => (None, 0, crate::storage::LayoutStamp::empty()),
+            };
+            // The grammar has no parameter positions. Preserve the client's
+            // declared vector, including unused typed parameters, as the normal
+            // Parse path does; unresolved OID0 uses its existing safe fallback.
+            let param_types = param_types
+                .into_iter()
+                .map(|oid| if oid == 0 { super::param_infer::UNKNOWN_OID } else { oid })
+                .collect();
+            self.prepared_statements.store_statement(PreparedStatement {
+                name: statement_name,
+                query,
+                param_types,
+                result_schema: None,
+                cached_plan,
+                cached_plan_epoch,
+                cached_plan_layout,
+                is_catalog: Some(false),
+                result_shape: super::prepared::ResultShapeState {
+                    described: None,
+                    stamp: self.result_schema_stamp(),
+                    scope: self.session_scope(),
+                    synthesised: false,
+                },
             })?;
             self.send_message(BackendMessage::ParseComplete).await?;
             return Ok(());
@@ -162,10 +206,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
             scope: self.session_scope(),
             synthesised: false,
         };
-        let (result_schema, cached_plan, cached_plan_epoch) = if let Some(s) = catalog_schema {
-            (Some(s), None, 0)
-        } else if let Some((schema, plan, epoch)) = self.shared_query_schema(&statement, &query) {
-            (Some(schema), Some(plan), epoch)
+        let (result_schema, cached_plan, cached_plan_epoch, cached_plan_layout) = if let Some(s) = catalog_schema {
+            (Some(s), None, 0, crate::storage::LayoutStamp::empty())
+        } else if let Some((schema, pinned, epoch)) = self.shared_query_schema(&statement, &query) {
+            (Some(schema), Some(pinned.plan), epoch, pinned.layout)
         } else {
             // KNOWN DIVERGENCE, deliberately left here (sprinter 84ac05bd69c4).
             //
@@ -199,7 +243,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
                     Self::synthesise_schema_from_ast(&statement)
                 }
             };
-            (schema, None, 0)
+            (schema, None, 0, crate::storage::LayoutStamp::empty())
         };
 
         tracing::debug!(
@@ -220,6 +264,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
             // populate `cached_plan` lazily at first Execute via R5.W2).
             cached_plan,
             cached_plan_epoch,
+            cached_plan_layout,
             is_catalog,
             result_shape,
         };
@@ -557,11 +602,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
             // arithmetic-overflow panic under overflow-checks) becomes a
             // recoverable XX000 error instead of dropping the connection.
             let results = super::handler::run_guarded(|| match self.pinned_plan_for(&statement) {
-                Some(plan) => self.database.query_params_for_session_with_plan(
+                Some(pinned) => self.database.query_params_for_session_with_plan(
                     self.session_id,
                     &statement.query,
                     &param_values,
-                    &plan,
+                    &pinned,
                 ),
                 None => self
                     .database
@@ -697,7 +742,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
             let query = &statement.query;
             let params = &param_values;
             let affected = super::handler::run_with_retry(policy, retriable, || match &pinned {
-                Some(plan) => db.execute_params_for_session_with_plan(sid, query, params, plan),
+                Some(pinned) => db.execute_params_for_session_with_plan(sid, query, params, pinned),
                 None => db.execute_params_for_session(sid, query, params),
             })
             .await?;
@@ -722,7 +767,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
     /// caller falls back to the legacy path, which either surfaces the real
     /// error or handles shapes that don't pre-plan (e.g. code-graph
     /// rewrites, SHOW BRANCHES).
-    fn pinned_plan_for(&self, statement: &PreparedStatement) -> Option<std::sync::Arc<crate::sql::LogicalPlan>> {
+    fn pinned_plan_for(&self, statement: &PreparedStatement) -> Option<crate::PinnedPlan> {
         // A pinned plan is built at Parse time against the SHARED (public) plan
         // cache with no per-session `search_path` installed, so under a
         // non-`public` session it would resolve bare names to the wrong schema.
@@ -743,17 +788,27 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
         if self.database.session_holds_temp_tables(self.session_id) {
             return None;
         }
+        // Spec R5.6: and while the layout epochs it was built under are current; a
+        // schema change of one of its tables since (a statement pinned before an
+        // `ADD COLUMN` read the new column NULL in every row after it) plans again.
+        // The statement entry checks the stamp once more, inside its read set.
         let current_epoch = self.database.wire_plan_epoch();
         if let Some(plan) = &statement.cached_plan {
-            if statement.cached_plan_epoch == current_epoch {
-                return Some(std::sync::Arc::clone(plan));
+            if statement.cached_plan_epoch == current_epoch && statement.cached_plan_layout.is_current() {
+                return Some(crate::PinnedPlan {
+                    plan: std::sync::Arc::clone(plan),
+                    layout: statement.cached_plan_layout.clone(),
+                });
             }
         }
-        let (plan, epoch) = self.database.wire_parameterized_plan(&statement.query).ok()?;
-        let _ = self
-            .prepared_statements
-            .set_cached_plan(&statement.name, std::sync::Arc::clone(&plan), epoch);
-        Some(plan)
+        let (pinned, epoch) = self.database.wire_parameterized_plan(&statement.query).ok()?;
+        let _ = self.prepared_statements.set_cached_plan(
+            &statement.name,
+            std::sync::Arc::clone(&pinned.plan),
+            epoch,
+            pinned.layout.clone(),
+        );
+        Some(pinned)
     }
 
     /// W2.3: derive the Describe result schema for a plain row-returning query
@@ -784,7 +839,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
         &self,
         statement: &sqlparser::ast::Statement,
         query: &str,
-    ) -> Option<(crate::Schema, std::sync::Arc<crate::sql::LogicalPlan>, u64)> {
+    ) -> Option<(crate::Schema, crate::PinnedPlan, u64)> {
         if !matches!(statement, sqlparser::ast::Statement::Query(_)) {
             return None;
         }
@@ -802,12 +857,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
         if self.database.session_holds_temp_tables(self.session_id) {
             return None;
         }
-        let (plan, epoch) = self.database.wire_parameterized_plan(query).ok()?;
-        let schema = (*plan.schema()).clone();
+        let (pinned, epoch) = self.database.wire_parameterized_plan(query).ok()?;
+        let schema = (*pinned.plan.schema()).clone();
         if schema.columns.is_empty() {
             return None;
         }
-        Some((schema, plan, epoch))
+        Some((schema, pinned, epoch))
     }
 
     /// Handle Describe message (extended protocol) with full implementation
@@ -1303,7 +1358,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
                         Self::expr_column_label(expr).unwrap_or_else(|| format!("column{}", i + 1))
                     }
                     SelectItem::ExprWithAlias { alias, .. } => alias.value.clone(),
-                    SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => format!("column{}", i + 1),
+                    SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {
+                        format!("column{}", i + 1)
+                    }
                 };
                 crate::Column::new(name, crate::DataType::Text)
             })

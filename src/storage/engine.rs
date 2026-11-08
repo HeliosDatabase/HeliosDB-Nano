@@ -32,11 +32,12 @@ use crate::ColumnStorageMode;
 use crate::{Config, Error, Result, Tuple, Value};
 use parking_lot::RwLock;
 use rocksdb::{
-    BlockBasedOptions, Cache, ColumnFamilyDescriptor, IteratorMode, Options, ReadOptions, WriteBatch, WriteOptions, DB,
+    BlockBasedOptions, Cache, ColumnFamilyDescriptor, Direction, IteratorMode, Options, ReadOptions, WriteBatch,
+    WriteOptions, DB,
 };
 use std::borrow::Cow;
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -46,10 +47,10 @@ use tracing::{debug, error, info, warn};
 // an ordinary `storage` module — no `#[path]`, so the write-gate funnel scan
 // sees every write it makes). It reaches the engine through `pub(crate)`
 // primitives: the decode / key helpers and `write_batch_through_gate`.
-use super::art_manager::{MergedKeysOutcome, MergedRowChange};
+use super::art_manager::{MergedKeysClaim, MergedKeysOutcome, MergedRowChange};
 use super::branch_catalog::{
-    incarnations_differ, known_incarnation, AncestorMerge, MergeAction, MergeDdlScope, MergeFailSite, MergeIntent,
-    MergeStep, MERGE_TARGET_MAIN,
+    incarnations_differ, known_incarnation, AncestorMerge, MergeAction, MergeDdlScope, MergeFailSite, MergeFkPolicy,
+    MergeIntent, MergeStep, MERGE_TARGET_MAIN,
 };
 use super::branch_freeze::{BranchFreeze, MAIN_LEVEL};
 use super::branch_view;
@@ -60,11 +61,33 @@ thread_local! {
     static KEY_BUFFER: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(256));
 }
 
+#[cfg(feature = "internal-tests")]
+thread_local! {
+    static NEXT_GENERIC_AFTER_CLAIM: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+#[cfg(feature = "internal-tests")]
+thread_local! {
+    static FAIL_NEXT_SEQUENCE_FLUSH_AFTER_APPLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static AFTER_SEQUENCE_STATE_WRITE: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+}
+
 #[derive(Clone, Copy)]
 enum RowDecodeHint<'a> {
     Full,
     Prefix(usize),
     Columns(&'a [usize]),
+}
+
+/// How a primary-key point lookup uses the row cache.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PkLookupCache {
+    /// A read: a cached row is served, a row read from storage is cached.
+    ReadAndFill,
+    /// A read that serves a cached row but caches nothing (a one-off probe).
+    ReadOnly,
+    /// A write (spec R5.4, review F1): storage only, neither served nor filled.
+    Bypass,
 }
 
 #[derive(Clone, Copy)]
@@ -89,6 +112,263 @@ fn schema_uses_column_storage(schema: &crate::Schema) -> bool {
         .columns
         .iter()
         .any(|column| column.storage_mode != ColumnStorageMode::Default)
+}
+
+/// Only current rows enter this codec, before a writer changes their sidecars.
+/// Shared caches/handles, rather than an engine capture, keep the ownership graph
+/// acyclic. The schema fast-out leaves ordinary inline rows unserialized.
+struct EngineCurrentRowHistoryCodec {
+    db: std::sync::Weak<DB>,
+    key_manager: Option<Arc<KeyManager>>,
+    dictionaries: Arc<DictionaryManager>,
+    schemas: Arc<dashmap::DashMap<String, crate::Schema>>,
+}
+
+/// Only side-storage writes allocate this state. Its locks cover the durable
+/// group, then leave before snapshot publication or a replication ACK wait.
+struct RowStorageWrite<'a> {
+    dictionary: Option<super::dictionary::DictionaryWriteGroup<'a>>,
+    columnar: Option<parking_lot::MutexGuard<'static, ()>>,
+}
+
+impl RowStorageWrite<'_> {
+    fn finish(self, db: &DB, written: bool) {
+        drop(self.columnar);
+        if let Some(dictionary) = self.dictionary {
+            dictionary.finish(db, written);
+        }
+    }
+}
+
+impl super::time_travel::CurrentRowHistoryCodec for EngineCurrentRowHistoryCodec {
+    fn dictionary_writer_lock(&self) -> parking_lot::ReentrantMutexGuard<'_, ()> {
+        self.dictionaries.writer_lock()
+    }
+
+    fn validate_staged_dictionary(&self, key: &[u8], proposed: &[u8]) -> Result<()> {
+        let db = self
+            .db
+            .upgrade()
+            .ok_or_else(|| Error::storage("row history database is closed"))?;
+        DictionaryManager::validate_staged(&db, key, proposed)?;
+        self.dictionaries.validate_cached_staged(key, proposed)
+    }
+
+    fn forget_committed_dictionaries(&self) {
+        self.dictionaries.clear_cache();
+    }
+
+    fn table_uses_side_storage(&self, table: &str) -> Result<bool> {
+        if let Some(schema) = self.schemas.get(table) {
+            return Ok(schema_uses_column_storage(schema.value()));
+        }
+        let db = self
+            .db
+            .upgrade()
+            .ok_or_else(|| Error::storage("row history database is closed"))?;
+        let key = format!("meta:table:{table}");
+        let Some(raw) = db.get(key.as_bytes())? else {
+            return Ok(false);
+        };
+        let plain = super::tde::open_ref(self.key_manager.as_deref(), key.as_bytes(), &raw)?;
+        let schema: crate::Schema = bincode::deserialize(&plain)
+            .map_err(|e| Error::storage(format!("row history schema does not decode: {e}")))?;
+        Ok(schema_uses_column_storage(&schema))
+    }
+
+    fn logical_retained_tuple(&self, table: &str, row: u64, tuple: &mut Tuple) -> Result<()> {
+        let unreadable = |why: &str| {
+            Error::history_before_layout_change(
+                table,
+                &format!("retained row version {row} has no reconstructible logical payload ({why})"),
+            )
+        };
+        // A columnar reference has no immutable payload ID, unlike a CAS hash
+        // or append-only dictionary ID. Reading today's slot would invent history.
+        if tuple.values.iter().any(|value| matches!(value, Value::ColumnarRef)) {
+            return Err(unreadable("legacy ColumnarRef"));
+        }
+        let db = self
+            .db
+            .upgrade()
+            .ok_or_else(|| Error::storage("row history database is closed"))?;
+        let schema = match self.schemas.get(table) {
+            Some(schema) => schema.value().clone(),
+            None => {
+                let key = format!("meta:table:{table}");
+                let raw = db
+                    .get(key.as_bytes())?
+                    .ok_or_else(|| unreadable("table schema is missing"))?;
+                let plain = super::tde::open_ref(self.key_manager.as_deref(), key.as_bytes(), &raw)?;
+                bincode::deserialize::<crate::Schema>(&plain)
+                    .map_err(|e| unreadable(&format!("table schema does not decode: {e}")))?
+            }
+        };
+        for (position, value) in tuple.values.iter_mut().enumerate() {
+            if !matches!(value, Value::DictRef { .. } | Value::CasRef { .. }) {
+                continue;
+            }
+            let column = schema
+                .columns
+                .get(position)
+                .ok_or_else(|| unreadable("reference outside current layout"))?;
+            *value = match &*value {
+                Value::DictRef { dict_id } => Value::String(
+                    self.dictionaries
+                        .decode(&db, table, &column.name, *dict_id)
+                        .map_err(|e| unreadable(&format!("dictionary payload is missing: {e}")))?,
+                ),
+                Value::CasRef { hash } => ContentAddressedStore::resolve(&db, hash, &column.data_type)
+                    .map_err(|e| unreadable(&format!("CAS payload is missing: {e}")))?,
+                _ => unreachable!(),
+            };
+        }
+        super::table_layout::refuse_physical_version(table, row, tuple)
+    }
+
+    fn logical_row(
+        &self,
+        table: &str,
+        row: u64,
+        plain: &[u8],
+        pending: Option<&super::time_travel::PendingHistoryRead<'_>>,
+    ) -> Result<Option<Vec<u8>>> {
+        if pending.is_none() {
+            if let Some(schema) = self.schemas.get(table) {
+                if !schema_uses_column_storage(schema.value()) {
+                    return Ok(None);
+                }
+            }
+        }
+        let db = self
+            .db
+            .upgrade()
+            .ok_or_else(|| Error::storage("row history database is closed"))?;
+        let read = |key: &[u8]| -> Result<Option<Vec<u8>>> {
+            if let Some(value) = pending.and_then(|lookup| lookup(key)) {
+                return Ok(value);
+            }
+            db.get(key)
+                .map_err(|e| Error::storage(format!("row history sidecar read failed: {e}")))
+        };
+        let schema_key = format!("meta:table:{table}");
+        // Pending catalog writes are unusual (SQL DDL has its own group), but
+        // a raw transaction must not decode its new row under the old schema.
+        let staged_schema = pending.and_then(|lookup| lookup(schema_key.as_bytes()));
+        let schema = if staged_schema.is_none() {
+            if let Some(entry) = self.schemas.get(table) {
+                if !schema_uses_column_storage(entry.value()) {
+                    return Ok(None);
+                }
+                Some(entry.value().clone())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let schema = match schema {
+            Some(schema) => schema,
+            None => {
+                let raw = match staged_schema {
+                    Some(raw) => raw,
+                    None => read(schema_key.as_bytes())?,
+                };
+                let Some(raw) = raw else {
+                    // Raw data keys without catalog metadata are supported by
+                    // Transaction. There is no valid physical reference there.
+                    return Ok(None);
+                };
+                let decoded = super::tde::open_ref(self.key_manager.as_deref(), schema_key.as_bytes(), &raw)?;
+                bincode::deserialize::<crate::Schema>(&decoded)
+                    .map_err(|e| Error::storage(format!("row history schema does not decode: {e}")))?
+            }
+        };
+        if !schema_uses_column_storage(&schema) {
+            return Ok(None);
+        }
+        let mut tuple: Tuple = bincode::deserialize(plain)
+            .map_err(|e| Error::storage(format!("row history tuple does not decode: {e}")))?;
+        let mut changed = false;
+        for (position, value) in tuple.values.iter_mut().enumerate() {
+            if !matches!(value, Value::DictRef { .. } | Value::CasRef { .. } | Value::ColumnarRef) {
+                continue;
+            }
+            let column = schema.columns.get(position).ok_or_else(|| {
+                Error::storage(format!(
+                    "current row '{table}:{row}' has a reference outside its schema"
+                ))
+            })?;
+            *value = match (&*value, column.storage_mode) {
+                (Value::DictRef { dict_id }, ColumnStorageMode::Dictionary) => {
+                    let key = format!("dict:{table}:{}", column.name);
+                    let text = match pending.and_then(|lookup| lookup(key.as_bytes())) {
+                        Some(raw) => {
+                            let raw = raw.ok_or_else(|| Error::storage("new row history dictionary was deleted"))?;
+                            let dict: super::dictionary::ColumnDictionary = bincode::deserialize(&raw)
+                                .map_err(|e| Error::storage(format!("row history dictionary does not decode: {e}")))?;
+                            dict.decode(*dict_id)
+                                .ok_or_else(|| Error::storage("new row history dictionary id is missing"))?
+                                .to_string()
+                        }
+                        None => self.dictionaries.decode(&db, table, &column.name, *dict_id)?,
+                    };
+                    Value::String(text)
+                }
+                (Value::CasRef { hash }, ColumnStorageMode::ContentAddressed) => {
+                    let mut key = Vec::from(b"cas:".as_slice());
+                    key.extend_from_slice(hash);
+                    match pending.and_then(|lookup| lookup(&key)) {
+                        Some(raw) => {
+                            let raw = raw.ok_or_else(|| Error::storage("new row history CAS payload was deleted"))?;
+                            match column.data_type {
+                                crate::DataType::Text
+                                | crate::DataType::Varchar(_)
+                                | crate::DataType::Char(_)
+                                | crate::DataType::Json
+                                | crate::DataType::Jsonb => Value::String(
+                                    String::from_utf8(raw)
+                                        .map_err(|e| Error::storage(format!("row history CAS UTF-8: {e}")))?,
+                                ),
+                                crate::DataType::Bytea => Value::Bytes(raw),
+                                _ => return Err(Error::storage("invalid row history CAS target type")),
+                            }
+                        }
+                        None => ContentAddressedStore::resolve(&db, hash, &column.data_type)?,
+                    }
+                }
+                (Value::ColumnarRef, ColumnStorageMode::Columnar) => {
+                    let (batch, _) = ColumnarStore::batch_location(row);
+                    let key = format!("col:{table}:{}:{batch}", column.name);
+                    let resolved = match pending.and_then(|lookup| lookup(key.as_bytes())) {
+                        Some(Some(raw)) => super::typed_batch::decode_column_batch(&raw)?.get(row),
+                        Some(None) => None,
+                        None => ColumnarStore::get(&db, table, &column.name, row)?,
+                    };
+                    resolved.ok_or_else(|| {
+                        Error::storage(format!(
+                            "current row history columnar value '{table}.{}:{row}' is missing",
+                            column.name
+                        ))
+                    })?
+                }
+                _ => {
+                    return Err(Error::storage(format!(
+                        "current row '{table}:{row}' has a storage reference incompatible with column '{}'",
+                        column.name
+                    )))
+                }
+            };
+            changed = true;
+        }
+        if changed {
+            Ok(Some(bincode::serialize(&tuple).map_err(|e| {
+                Error::storage(format!("logical row history does not encode: {e}"))
+            })?))
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 fn columnar_filter_predicate(predicate: &AnalyzedPredicate) -> Option<FilterPredicate> {
@@ -753,6 +1033,77 @@ fn merge_columnar_group_map(
     Ok(())
 }
 
+/// Spec R5.6: what the write funnel asks an engine about a batch that changes table
+/// layouts (`storage::layout_epochs::LayoutHook`). It holds the engine's caches, not
+/// the engine, and the store weakly: the gate outlives no engine, and a standby's
+/// handle must be free to close when its engine is gone.
+struct EngineLayoutHook {
+    db: std::sync::Weak<DB>,
+    snapshots: std::sync::Weak<super::time_travel::SnapshotManager>,
+    key_manager: Option<Arc<KeyManager>>,
+    schema_cache: Arc<dashmap::DashMap<String, crate::Schema>>,
+    missing_values_cache: Arc<dashmap::DashMap<String, Option<Arc<super::row_shape::MissingValues>>>>,
+    row_cache: Arc<super::RowCache>,
+    schema_generation: Arc<AtomicU64>,
+    write_watermarks: Arc<dashmap::DashMap<String, u64>>,
+}
+
+impl super::layout_epochs::LayoutHook for EngineLayoutHook {
+    fn index_table(&self, name: &str, value: Option<&[u8]>) -> Option<String> {
+        let key = format!("meta:index:{name}");
+        let stored;
+        let sealed: &[u8] = match value {
+            Some(value) => value,
+            None => {
+                // A delete: the definition is still in the store, before the write.
+                stored = self.db.upgrade()?.get(key.as_bytes()).ok()??;
+                &stored
+            }
+        };
+        let plain = super::tde::open_ref(self.key_manager.as_deref(), key.as_bytes(), sealed).ok()?;
+        Catalog::decode_persisted_index_definition(name, &plain).map(|definition| definition.table_name)
+    }
+
+    fn publish(&self, tables: &[String]) {
+        publish_layout_change(
+            &self.schema_generation,
+            &self.write_watermarks,
+            &self.schema_cache,
+            &self.missing_values_cache,
+            &self.row_cache,
+            tables,
+        );
+        if let Some(snapshots) = self.snapshots.upgrade() {
+            for table in tables {
+                snapshots.invalidate_table_layout(table);
+            }
+        }
+    }
+}
+
+/// Spec R5.6: drop what readers cache of `tables`' layouts, in R5 decision 11's order:
+/// the schema generation first (a fill that read the store before the change was
+/// stamped with the old one and is refused; the generation also ends every cached
+/// result), then each table's schema, missing values and cached rows (a fill that
+/// landed before the bump is removed). The committed-write watermarks go too, as on
+/// every schema change (`StorageEngine::bump_schema_generation`).
+fn publish_layout_change(
+    schema_generation: &AtomicU64,
+    write_watermarks: &dashmap::DashMap<String, u64>,
+    schema_cache: &dashmap::DashMap<String, crate::Schema>,
+    missing_values_cache: &dashmap::DashMap<String, Option<Arc<super::row_shape::MissingValues>>>,
+    row_cache: &super::RowCache,
+    tables: &[String],
+) {
+    schema_generation.fetch_add(1, Ordering::Release);
+    write_watermarks.clear();
+    for table in tables {
+        schema_cache.remove(table.as_str());
+        missing_values_cache.remove(table.as_str());
+        row_cache.invalidate_table(table);
+    }
+}
+
 /// R3.2: lexicographic shard bounds for parallel iteration of a table's
 /// `data:{table}:` keyspace. Row keys carry *unpadded* decimal row ids, so
 /// numeric ranges are not contiguous — but splitting on the first one/two id
@@ -1047,7 +1398,9 @@ fn update_groups_for_batch_kernel(
                         (Some(&code), Some(&ok)) if ok != 0 => (code as usize).min(null_slot),
                         _ => null_slot,
                     };
-                    let Some(slot) = per_code.get_mut(idx) else { continue };
+                    let Some(slot) = per_code.get_mut(idx) else {
+                        continue;
+                    };
                     let states = slot.get_or_insert_with(|| {
                         aggregates
                             .iter()
@@ -1785,6 +2138,58 @@ impl Drop for SynchronousCommitOverrideGuard {
 /// second time). That is why the disarm point is the write itself and not the
 /// end of the function — everything after the write is maintenance of a row
 /// that is already a fact.
+// Standalone vector-table writers publish row storage before their graph hook.
+// Hold the existing census through both; advance a completed row generation
+// before releasing it, including on an uncertain write error.
+struct VectorRowWrite<'a> {
+    engine: &'a StorageEngine,
+    table: &'a str,
+    _census: super::UncommittedWriteHold,
+    plan: super::vector_row::VectorRowPlan,
+    attempt: super::write_outcome::WriteAttempt,
+    published: bool,
+}
+impl VectorRowWrite<'_> {
+    fn finish(&mut self) -> Result<()> {
+        let published = self.plan.publish();
+        self.published = published.is_ok();
+        self.plan.settle(self.attempt.outcome(), self.published);
+        published.map_err(Error::applied_publication_failure)?;
+        self.engine
+            .check_table_readable(self.table)
+            .map_err(Error::applied_publication_failure)
+    }
+    fn may_undo_rejected_row(&mut self) -> bool {
+        self.plan.settle(self.attempt.outcome(), self.published)
+    }
+}
+impl Drop for VectorRowWrite<'_> {
+    fn drop(&mut self) {
+        let outcome = self.attempt.outcome();
+        self.plan.settle(outcome, self.published);
+        self.engine.row_locks.note_rows_changed(self.table);
+        if outcome != super::write_outcome::WriteOutcome::NotWritten {
+            self.engine.generic_mutation_generation.fetch_add(1, Ordering::Release);
+        }
+    }
+}
+
+/// Publish a direct non-vector change only after its ART/row-cache maintenance.
+/// A reader that started before this final data epoch cannot install its old
+/// result after the writer returns. Native-error fencing is handled separately.
+struct DirectRowCachePublication<'a> {
+    engine: &'a StorageEngine,
+    applied: bool,
+}
+
+impl Drop for DirectRowCachePublication<'_> {
+    fn drop(&mut self) {
+        if self.applied {
+            self.engine.generic_mutation_generation.fetch_add(1, Ordering::Release);
+        }
+    }
+}
+
 struct IndexClaim<'a> {
     engine: &'a StorageEngine,
     table_name: &'a str,
@@ -1794,6 +2199,22 @@ struct IndexClaim<'a> {
     /// `true` while the row is still un-written, i.e. while the claim is a
     /// phantom that has to be given back.
     pending: bool,
+    attempt: super::write_outcome::WriteAttempt,
+    _vector_write: Option<VectorRowWrite<'a>>,
+}
+
+/// One deduplicated generic mutation, read from current storage under its row
+/// lock. A delete has no new image; both images are logical values.
+struct GenericRowMutation {
+    row_id: u64,
+    old: Tuple,
+    new: Option<Tuple>,
+}
+
+struct GenericIndexCommit {
+    claim: Option<MergedKeysClaim>,
+    applied: bool,
+    settle_error: Option<String>,
 }
 
 impl<'a> IndexClaim<'a> {
@@ -1807,6 +2228,7 @@ impl<'a> IndexClaim<'a> {
         schema: &'a crate::Schema,
         tuple: &'a Tuple,
     ) -> Result<Self> {
+        let vector_write = engine.vector_row_write(table_name, [row_id]);
         engine.claim_index_entries(table_name, row_id, schema, tuple)?;
         Ok(Self {
             engine,
@@ -1815,6 +2237,8 @@ impl<'a> IndexClaim<'a> {
             schema,
             tuple,
             pending: true,
+            attempt: super::write_outcome::WriteAttempt::default(),
+            _vector_write: vector_write,
         })
     }
 
@@ -1823,13 +2247,28 @@ impl<'a> IndexClaim<'a> {
     fn row_is_durable(&mut self) {
         self.pending = false;
     }
+
+    fn finish_vector_publication(&mut self) -> Result<()> {
+        if let Some(mut publication) = self._vector_write.take() {
+            publication.finish()?;
+        }
+        Ok(())
+    }
 }
 
 impl Drop for IndexClaim<'_> {
     fn drop(&mut self) {
-        if self.pending {
+        if self.pending
+            && self._vector_write.as_mut().map_or_else(
+                || self.attempt.outcome() == super::write_outcome::WriteOutcome::NotWritten,
+                VectorRowWrite::may_undo_rejected_row,
+            )
+        {
             self.engine
                 .release_index_claim(self.table_name, self.row_id, self.schema, self.tuple);
+        }
+        if self._vector_write.is_none() && self.attempt.outcome() != super::write_outcome::WriteOutcome::NotWritten {
+            self.engine.generic_mutation_generation.fetch_add(1, Ordering::Release);
         }
     }
 }
@@ -1855,6 +2294,8 @@ struct BatchIndexClaim<'a> {
     /// short of `rows.len()` on the failure path inside `acquire`.
     claimed: usize,
     pending: bool,
+    attempt: super::write_outcome::WriteAttempt,
+    _vector_write: Option<VectorRowWrite<'a>>,
 }
 
 impl<'a> BatchIndexClaim<'a> {
@@ -1871,6 +2312,8 @@ impl<'a> BatchIndexClaim<'a> {
             rows,
             claimed: 0,
             pending: true,
+            attempt: super::write_outcome::WriteAttempt::default(),
+            _vector_write: engine.vector_row_write(table_name, rows.iter().map(|(row, _)| *row)),
         };
         for (row_id, tuple) in rows {
             // On refusal `claim` is dropped by the `?`, which releases the
@@ -1886,11 +2329,25 @@ impl<'a> BatchIndexClaim<'a> {
     fn rows_are_durable(&mut self) {
         self.pending = false;
     }
+    fn finish_vector_publication(&mut self) -> Result<()> {
+        if let Some(mut publication) = self._vector_write.take() {
+            publication.finish()?;
+        }
+        Ok(())
+    }
 }
 
 impl Drop for BatchIndexClaim<'_> {
     fn drop(&mut self) {
-        if !self.pending {
+        if self._vector_write.is_none() && self.attempt.outcome() != super::write_outcome::WriteOutcome::NotWritten {
+            self.engine.generic_mutation_generation.fetch_add(1, Ordering::Release);
+        }
+        if !self.pending
+            || self._vector_write.as_mut().map_or_else(
+                || self.attempt.outcome() != super::write_outcome::WriteOutcome::NotWritten,
+                |publication| !publication.may_undo_rejected_row(),
+            )
+        {
             return;
         }
         for (row_id, tuple) in self.rows.iter().take(self.claimed) {
@@ -2096,6 +2553,10 @@ pub struct StorageEngine {
     /// Spec R5.4 (P12): the per-row write locks and change epochs
     /// (`storage::row_locks`).
     row_locks: Arc<super::row_locks::RowLocks>,
+    /// Spec R5.6: the per-table layout epochs (`storage::layout_epochs`), which the
+    /// write gate moves on a primary and the physical applier on a standby. Not
+    /// `row_locks`'s change epochs: those count row changes, these catalog changes.
+    layout_epochs: Arc<super::layout_epochs::LayoutEpochs>,
     /// R4.3: MVCC version garbage collector (watermark + collector state).
     version_gc: Arc<super::version_gc::VersionGc>,
     /// R4.3: background version-GC thread; joined on engine drop. None
@@ -2242,6 +2703,11 @@ pub struct StorageEngine {
     /// Monotonic schema generation backing `existence_cache`; bumped by
     /// `bump_schema_generation` on every catalog-existence change.
     schema_generation: Arc<AtomicU64>,
+    /// Cold generic storage API mutations bypass EmbeddedDatabase's local
+    /// result-cache invalidation. Keep their epoch separate from schema changes,
+    /// which also refresh transaction snapshots and must never move for DML.
+    generic_mutation_generation: Arc<AtomicU64>,
+    vector_row_context: std::sync::OnceLock<Arc<super::vector_row::VectorRowContext>>,
     /// W2.5: per-table high-water timestamp of the latest committed write.
     /// An in-transaction reader whose snapshot timestamp is >= a table's
     /// watermark (and which has no own staged writes to it) can read the
@@ -2569,6 +3035,74 @@ impl StorageEngine {
         Self::open_with_mode(path, config, OpenMode::Primary)
     }
 
+    /// Explicit offline migration: retain the complete local state and WAL
+    /// history, changing only its recovery metadata in one synced write group.
+    /// Uses an existing-directory raw open so normal startup cannot redo,
+    /// backfill or clean up anything before the operator's choice is applied.
+    pub fn adopt_local_wal_state(path: impl AsRef<Path>) -> Result<super::WalAdoptionReport> {
+        let path = path.as_ref();
+        if !path.is_dir() || !path.join("CURRENT").is_file() {
+            return Err(Error::storage(format!(
+                "WAL adoption requires an existing RocksDB directory: {}",
+                path.display()
+            )));
+        }
+        Self::refuse_physical_standby_store(path)?;
+        match std::fs::symlink_metadata(path.join("NANO-PHYSICAL-REPLICA.json")) {
+            Ok(_) => return Err(Error::storage("WAL adoption refuses a physical replica directory")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+            Err(error) => return Err(Error::storage(format!("physical marker lookup failed: {error}"))),
+        }
+        if let Some(reason) = super::replication_records::promotion_open_refusal(path) {
+            return Err(Error::storage(reason));
+        }
+        if super::replication_records::fenced_record_at_open(path)
+            .map_err(Error::storage)?
+            .is_some()
+        {
+            return Err(Error::storage("WAL adoption refuses a fenced primary directory"));
+        }
+        let families = Self::existing_column_families(path)?;
+        if families.iter().any(|family| family != "default") {
+            return Err(Error::storage("WAL adoption refuses an unrecognized column family"));
+        }
+        let (mut options, families) = Self::db_options(&Config::default(), false)?;
+        options.create_if_missing(false);
+        options.create_missing_column_families(false);
+        // RocksDB's write lock refuses a live primary/receiver. No engine
+        // components, workers, encryption sentinel or cleanup are constructed.
+        let db = DB::open_cf_descriptors(&options, path, families).map_err(|error| {
+            Error::storage(format!(
+                "offline WAL adoption could not lock/open the existing directory: {error}"
+            ))
+        })?;
+        if let Some(reason) = super::replication_records::promotion_open_refusal(path) {
+            return Err(Error::storage(reason));
+        }
+        if super::replication_records::fenced_record_at_open(path)
+            .map_err(Error::storage)?
+            .is_some()
+        {
+            return Err(Error::storage("WAL adoption refuses a fenced primary directory"));
+        }
+        match std::fs::symlink_metadata(path.join("NANO-PHYSICAL-REPLICA.json")) {
+            Ok(_) => return Err(Error::storage("WAL adoption refuses a physical replica directory")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+            Err(error) => return Err(Error::storage(format!("physical marker lookup failed: {error}"))),
+        }
+        if db
+            .get(b"__nano_physical_replica_cursor_v1")
+            .map_err(|error| Error::storage(format!("physical cursor lookup failed: {error}")))?
+            .is_some()
+        {
+            return Err(Error::storage("WAL adoption refuses a physical receiver directory"));
+        }
+        super::replication_epoch::read_epoch_record(&db)
+            .map_err(|error| Error::storage(format!("WAL adoption replication identity: {error}")))?;
+        let state = super::wal_recovery::inspect(&db)?;
+        super::wal_recovery::adopt(&db, &super::WriteGate::open(), state)
+    }
+
     /// Open an EXISTING database read-only (RocksDB open-for-read-only). A
     /// second process can read while a primary holds the dir open for writing
     /// (RocksDB read-only opens take no DB lock). The read-only handle sees the
@@ -2809,6 +3343,18 @@ impl StorageEngine {
         self.gate.write(&self.db, batch, self.memory_write_options.as_ref())
     }
 
+    /// Observe a direct branch owner's native group, excluding preliminary B4
+    /// copy groups. The view settles its cache before releasing key claims.
+    #[track_caller]
+    pub(crate) fn write_batch_through_gate_observed(
+        &self,
+        batch: WriteBatch,
+        attempt: &super::write_outcome::WriteAttempt,
+    ) -> Result<()> {
+        self.gate
+            .write_observed(&self.db, batch, self.memory_write_options.as_ref(), attempt)
+    }
+
     /// Sprinter 6bc4a4040eb7 (B4): the write gate's freeze hook of this engine, on a
     /// store that accepts writes.
     pub(crate) fn branch_freeze(&self) -> Option<&Arc<BranchFreeze>> {
@@ -2876,20 +3422,44 @@ impl StorageEngine {
     /// entries, all riding the one group: spec R5.2's `ADD COLUMN` (the schema
     /// and each column's missing value).
     #[track_caller]
-    pub(crate) fn write_ddl_batch_ops(&self, operations: Vec<WalOperation>, mut batch: WriteBatch) -> Result<DdlWrite> {
+    pub(crate) fn write_ddl_batch_ops(&self, operations: Vec<WalOperation>, batch: WriteBatch) -> Result<DdlWrite> {
+        self.write_ddl_batch_ops_inner(operations, batch, None)
+    }
+
+    #[track_caller]
+    pub(crate) fn write_ddl_batch_ops_observed(
+        &self,
+        operations: Vec<WalOperation>,
+        batch: WriteBatch,
+        attempt: &super::write_outcome::WriteAttempt,
+    ) -> Result<DdlWrite> {
+        self.write_ddl_batch_ops_inner(operations, batch, Some(attempt))
+    }
+
+    #[track_caller]
+    fn write_ddl_batch_ops_inner(
+        &self,
+        operations: Vec<WalOperation>,
+        mut batch: WriteBatch,
+        attempt: Option<&super::write_outcome::WriteAttempt>,
+    ) -> Result<DdlWrite> {
         let options = self.memory_write_options.as_ref();
+        let write = |batch| match attempt {
+            Some(attempt) => self.gate.write_observed(&self.db, batch, options, attempt),
+            None => self.db_write(batch, options),
+        };
         let wal = if self.is_replaying.load(Ordering::Acquire) {
             None
         } else {
             self.wal.as_ref()
         };
         let Some(wal) = wal else {
-            self.db_write(batch, options)?;
+            write(batch)?;
             return Ok(DdlWrite { barrier: None });
         };
         let wal = wal.read();
         let staged = wal.stage(operations, &mut batch)?;
-        if let Err(error) = self.db_write(batch, options) {
+        if let Err(error) = write(batch) {
             if let Some(staged) = staged {
                 wal.abandon_staged(staged);
             }
@@ -2900,6 +3470,86 @@ impl StorageEngine {
             wal.publish_staged(staged);
         }
         Ok(DdlWrite { barrier })
+    }
+
+    /// Write an already-durable data batch with its logical operation in the
+    /// same RocksDB group. Such a batch is never part of a statement capture's
+    /// transaction, so offering its operation to that frame would split them.
+    /// The caller retains its write options and waits after its finalization.
+    fn write_direct_batch(
+        &self,
+        batch: WriteBatch,
+        operation: Option<WalOperation>,
+        options: Option<&WriteOptions>,
+    ) -> Result<Option<u64>> {
+        self.write_direct_batch_with_vector(batch, operation, options, None)
+    }
+
+    fn write_direct_batch_with_vector(
+        &self,
+        batch: WriteBatch,
+        operation: Option<WalOperation>,
+        options: Option<&WriteOptions>,
+        publication: Option<&mut VectorRowWrite<'_>>,
+    ) -> Result<Option<u64>> {
+        self.write_direct_batch_observed(batch, operation, options, publication, None)
+    }
+
+    fn write_direct_batch_observed(
+        &self,
+        mut batch: WriteBatch,
+        operation: Option<WalOperation>,
+        options: Option<&WriteOptions>,
+        mut publication: Option<&mut VectorRowWrite<'_>>,
+        attempt: Option<&super::write_outcome::WriteAttempt>,
+    ) -> Result<Option<u64>> {
+        if let Some(publication) = publication.as_deref_mut() {
+            publication.plan.write_call_started();
+        }
+        let write = |batch, options| match publication.as_deref() {
+            Some(publication) => self.gate.write_observed(&self.db, batch, options, &publication.attempt),
+            None => match attempt {
+                Some(attempt) => self.gate.write_observed(&self.db, batch, options, attempt),
+                None => self.gate.write(&self.db, batch, options),
+            },
+        };
+        let wal = self.wal.as_ref().filter(|_| !self.is_replaying.load(Ordering::Acquire));
+        let (Some(wal), Some(operation)) = (wal, operation) else {
+            write(batch, options).map_err(|e| Error::storage(format!("Direct data batch write failed: {e}")))?;
+            return Ok(None);
+        };
+        let wal = wal.read();
+        let staged = wal.stage(vec![operation], &mut batch)?;
+        if let Err(error) = write(batch, options) {
+            if let Some(staged) = staged {
+                wal.abandon_staged(staged);
+            }
+            return Err(Error::storage(format!("Direct data batch write failed: {error}")));
+        }
+        let barrier = wal.replication_barrier();
+        if let Some(staged) = staged {
+            wal.publish_staged(staged);
+        }
+        Ok(barrier)
+    }
+
+    fn wait_for_direct_replication(barrier: Option<u64>) {
+        if !super::table_locks::defer_replication_wait(barrier)
+            && !super::table_locks::defer_commit_replication_wait(barrier)
+        {
+            WriteAheadLog::wait_replicated_sequence(barrier);
+        }
+    }
+
+    /// Internal regression hook: direct data writes inside a transaction's
+    /// capture still have to publish their own history atomically.
+    #[cfg(any(test, feature = "internal-tests"))]
+    pub fn debug_with_statement_wal_capture<R>(&self, execute: impl FnOnce() -> R) -> R {
+        let _capture = self
+            .wal
+            .as_ref()
+            .map(|wal| wal.read().begin_statement_capture(u64::MAX));
+        execute()
     }
 
     /// Refuse to open a physical standby's directory in any mode but
@@ -3418,6 +4068,11 @@ impl StorageEngine {
             return Err(Error::storage("physical receiver cannot use logical recovery startup"));
         }
 
+        // Refuse unknown/ambiguous recovery metadata before any bookkeeping
+        // writes, even with logical WAL disabled. Eligibility itself writes
+        // nothing: the second key verification below must succeed first.
+        let wal_state = super::wal_recovery::validate_open(&db, writes && !mode.is_physical())?;
+
         // Re-run the key check against the writable handle. It re-verifies the
         // sentinel the preflight already checked and, on the FIRST encrypted
         // open of a database that has none, installs it. A fresh store (no
@@ -3425,11 +4080,30 @@ impl StorageEngine {
         // of snapshot recovery, WAL replay and catalog load — all of which read
         // stored values — so a key mismatch is one error at open rather than an
         // unbounded number of unreadable values afterwards.
+        let key_check_manager = key_manager.as_deref();
+        // The child-process regression crosses the actual preflight/open
+        // boundary with a valid key, then fails this real second verification.
+        // Keep the injection out of production builds and scope it to one path.
+        #[cfg(all(feature = "internal-tests", feature = "encryption"))]
+        let replaced_key_manager = (writes
+            && std::env::var_os("NANO_TEST_SECOND_KEY_CHECK_REPLACEMENT_DIR").as_deref() == Some(db_path.as_os_str()))
+        .then(KeyManager::generate_random);
+        #[cfg(all(feature = "internal-tests", feature = "encryption"))]
+        let key_check_manager = replaced_key_manager.as_ref().or(key_check_manager);
         if mode.is_physical() {
-            super::tde::verify_physical_snapshot_key(&db, key_manager.as_deref())?;
+            super::tde::verify_physical_snapshot_key(&db, key_check_manager)?;
         } else {
-            super::tde::verify_or_install_key_check(&db, key_manager.as_deref(), &gate)?;
+            super::tde::verify_or_install_key_check(&db, key_check_manager, &gate)?;
         }
+        // The raw writable handle holds the directory lock throughout both
+        // checks. Only after the key is verified may recovery metadata change;
+        // physical/read-only opens never adopt, replay or prune.
+        if writes && !mode.is_physical() {
+            super::wal_recovery::adopt(&db, &gate, wal_state)?;
+        }
+
+        let dict_manager = Arc::new(DictionaryManager::new());
+        let schema_cache = Arc::new(dashmap::DashMap::new());
 
         // Initialize snapshot manager. It builds its own `WriteBatch`es against
         // the same `Arc<DB>`, so it needs the same key manager the engine uses —
@@ -3438,10 +4112,16 @@ impl StorageEngine {
         let snapshot_manager = {
             let mut sm = SnapshotManager::new(Arc::clone(&db), Arc::clone(&gate));
             sm.set_key_manager(key_manager.clone());
+            sm.set_current_row_history_codec(Arc::new(EngineCurrentRowHistoryCodec {
+                db: Arc::downgrade(&db),
+                key_manager: key_manager.clone(),
+                dictionaries: Arc::clone(&dict_manager),
+                schemas: Arc::clone(&schema_cache),
+            }));
             // A physical image registers snapshots in memory only: a read-only
             // COMMIT on it must not write a `snapshot:` key. Spec P5.1: nor on
             // a fenced primary, whose gate refuses it.
-            if mode.is_physical() || fenced.is_some() {
+            if !writes {
                 sm.set_persistence(false);
             }
             Arc::new(sm)
@@ -3457,7 +4137,7 @@ impl StorageEngine {
         // W3.2: wire the single-copy-latest-version knob (after recovery, so the
         // durable elision sentinel is loaded and the materialize gate is armed
         // for any rows a prior session left flagged).
-        if mode.is_physical() {
+        if !writes {
             snapshot_manager.configure_elision_read_only()?;
         } else {
             snapshot_manager.configure_elision(config.storage.elide_latest_version);
@@ -3475,7 +4155,7 @@ impl StorageEngine {
 
         // Initialize branch manager
         debug!("Initializing BranchManager");
-        let branch_open = if mode.is_physical() {
+        let branch_open = if !writes {
             BranchManager::open_existing(Arc::clone(&db), Arc::clone(&gate), Arc::clone(&timestamp))
         } else {
             BranchManager::new(Arc::clone(&db), Arc::clone(&gate), Arc::clone(&timestamp))
@@ -3542,10 +4222,7 @@ impl StorageEngine {
                     info!("WAL initialized successfully");
                     Some(Arc::new(RwLock::new(wal)))
                 }
-                Err(e) => {
-                    warn!("Failed to initialize WAL: {}. Durability guarantees may be reduced.", e);
-                    None
-                }
+                Err(e) => return Err(Error::storage(format!("WAL initialization failed: {e}"))),
             }
         } else {
             debug!("WAL disabled in configuration");
@@ -3617,6 +4294,7 @@ impl StorageEngine {
         };
 
         let row_counters = Arc::new(dashmap::DashMap::new());
+        gate.install_counter_values(Arc::clone(&row_counters));
 
         // R4.3: MVCC version GC (watermark recovery + optional background
         // collector). Retention parse errors fail the open: a misread
@@ -3650,6 +4328,7 @@ impl StorageEngine {
         // `__vidx:` keys its applier writes and never write them, from the
         // first registration on (hydration included).
         let vector_indexes = VectorIndexManager::new();
+        vector_indexes.set_persistent_key_manager(key_manager.clone());
         if matches!(mode, OpenMode::PhysicalStandby { .. }) {
             vector_indexes.set_persistent_policy(super::vector_index::PersistentPolicy::ReplicaMemoryOnly);
         }
@@ -3662,7 +4341,6 @@ impl StorageEngine {
             config.storage.statement_timeout_ms.or(config.storage.query_timeout_ms),
             Arc::clone(&schema_generation),
         );
-        let dict_manager = Arc::new(DictionaryManager::new());
         // Sprinter 6bc4a4040eb7 (B4): before anything can write, WAL replay
         // included: a replayed row is a write a live branch must not see either.
         let branch_freeze = if writes {
@@ -3684,6 +4362,7 @@ impl StorageEngine {
             write_census: Arc::new(super::UncommittedWriteCensus::new()),
             table_locks,
             row_locks: Arc::new(super::row_locks::RowLocks::new()),
+            layout_epochs: Arc::new(super::layout_epochs::LayoutEpochs::new()),
             version_gc,
             version_gc_worker,
             branch_manager,
@@ -3725,17 +4404,19 @@ impl StorageEngine {
             group_committer: Arc::new(super::group_commit::GroupCommitter::new(
                 std::time::Duration::from_micros(config.storage.group_commit_window_us),
             )),
-            schema_cache: Arc::new(dashmap::DashMap::new()),
+            schema_cache,
             missing_values_cache: Arc::new(dashmap::DashMap::new()),
             existence_cache: Arc::new(dashmap::DashMap::new()),
             schema_generation,
+            generic_mutation_generation: Arc::new(AtomicU64::new(0)),
+            vector_row_context: std::sync::OnceLock::new(),
             write_watermarks: Arc::new(dashmap::DashMap::new()),
             constraints_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             referencing_fk_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             branch_referencing_fk_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
             // Spec P5.1: a fenced primary persists nothing at close either.
-            index_snapshots_on_close: Arc::new(AtomicBool::new(!mode.is_physical() && fenced.is_none())),
-            row_counter_flush_on_close: Arc::new(AtomicBool::new(!mode.is_physical() && fenced.is_none())),
+            index_snapshots_on_close: Arc::new(AtomicBool::new(writes)),
+            row_counter_flush_on_close: Arc::new(AtomicBool::new(writes)),
             open_mode: mode,
             last_index_open_report: Arc::new(RwLock::new(None)),
             physical_hydration_started: AtomicBool::new(false),
@@ -3744,6 +4425,12 @@ impl StorageEngine {
             replication_census: RwLock::new(None),
             _read_only_log_dir: read_only_log_dir,
         };
+
+        // Spec R5.6: before the store takes a write (WAL replay below included). A
+        // store this engine never writes moves its epochs through its applier.
+        if writes {
+            engine.wire_layout_hook();
+        }
 
         // Load counters from storage
         engine.load_counters()?;
@@ -3763,9 +4450,7 @@ impl StorageEngine {
         // Replay WAL entries for crash recovery, bounded by the durable
         // checkpoint. See `recover_wal_at_open` for the decision table.
         if engine.wal.is_some() {
-            if let Err(e) = engine.recover_wal_at_open() {
-                warn!("WAL recovery failed (data may be incomplete): {}", e);
-            }
+            engine.recover_wal_at_open()?;
         }
 
         // sprinter 1703dba8e82d: reclaim session-private (`pg_temp_*`) tables
@@ -3813,128 +4498,21 @@ impl StorageEngine {
         Ok(engine)
     }
 
-    /// Open-time WAL recovery, bounded by the durable checkpoint.
-    ///
-    /// # Why this is not "replay everything"
-    ///
-    /// The logical WAL lives in `wal:entries:` inside the SAME RocksDB store as
-    /// the `data:` keys it describes, so RocksDB's own physical WAL recovers
-    /// both together. An entry that is still visible after RocksDB has finished
-    /// recovering is therefore, in the overwhelming majority of cases, an entry
-    /// whose effect is ALREADY in the store. Logical redo is only genuinely
-    /// needed for the narrow window where the entry's append landed but the
-    /// corresponding data write did not reach the same atomic batch.
-    ///
-    /// Re-executing an already-applied entry is not free: it is re-running
-    /// history. `Insert`/`Update`/`Delete` are keyed and idempotent, but DDL is
-    /// not — a `DropTable` from six months ago, replayed against a table that
-    /// legitimately exists today, deletes it and every row in it. That is not
-    /// hypothetical: it was reproduced twice on a real 3.58.1 store whose
-    /// retained log held `CreateTable organizations_new` … `DropTable
-    /// organizations`, and opening it destroyed the live `organizations` table
-    /// and its rows.
-    ///
-    /// # The decision table
-    ///
-    /// | `wal:checkpoint` | retained entries | action |
-    /// |---|---|---|
-    /// | any | none | nothing to do; leave the checkpoint as it stands |
-    /// | ABSENT | some | **adopt, do not replay**: record the highest retained LSN as the checkpoint and truncate |
-    /// | present, `>= max` | some | already covered; reclaim them, do not replay |
-    /// | present, `< max` | some | replay only `lsn > checkpoint`, then truncate and advance the checkpoint |
-    ///
-    /// The second row is the fix. A store with no checkpoint key was written by
-    /// a build that never truncated its log, so what it retains is the whole
-    /// history of the database rather than a redo window. Replaying it is
-    /// PROVEN to destroy live data (above), while skipping the redo risks only
-    /// the narrow same-batch window described at the top of this comment — and
-    /// the store's committed data is already durable in RocksDB regardless.
-    /// Conservative here means "do not re-execute history", not "replay
-    /// everything".
-    ///
-    /// Note the checkpoint is deliberately NOT stamped when the log is empty.
-    /// `wal:checkpoint = N` is a claim that entries up to `N` are applied;
-    /// stamping it over an empty log is vacuously true but reclassifies the
-    /// store from "never checkpointed" (unknown provenance, handled
-    /// conservatively) to "checkpointed" (trusted, replayed) without any
-    /// evidence having been gathered. There is no clean-shutdown marker in this
-    /// build (searched for: none exists), so a clean close and a crash are
-    /// indistinguishable at open, and the conservative reading of an
-    /// unclassified store is the one that does not re-execute DDL.
+    /// Current-format logical entries are history of data groups already
+    /// applied by RocksDB. Adopt/prune them without re-executing SQL effects.
+    /// Legacy ambiguity was refused before open-time bookkeeping began.
     fn recover_wal_at_open(&self) -> Result<()> {
         let Some(wal) = &self.wal else {
             return Ok(());
         };
-        let wal_guard = wal.read();
-
-        let checkpoint = wal_guard.checkpoint_lsn()?;
-        let span = wal_guard.retained_entry_span()?;
-
-        let Some((count, min_lsn, max_lsn)) = span else {
-            // Deliberately does NOT stamp a checkpoint over an empty log — see
-            // the last paragraph of this function's doc comment.
-            debug!("WAL clean, no entries to replay (checkpoint: {:?})", checkpoint);
-            return Ok(());
-        };
-
-        // The checkpoint we will record once this open is done. `current_lsn`
-        // comes from `wal:last_lsn` and is the highest LSN ever issued, so it
-        // is >= any retained entry; `max` guards the case where the two
-        // disagree.
-        let target_checkpoint = wal_guard.current_lsn().max(max_lsn);
-
-        match checkpoint {
-            // === LEGACY STORE: adopt, do NOT replay. ===
-            None => {
-                info!(
-                    "WAL upgrade: this store has no checkpoint marker, so its {} retained log \
-                     entries (LSN {}..={}) were written by a build that never truncated the \
-                     logical WAL — they are already applied history, not redo. Adopting LSN {} as \
-                     the checkpoint and reclaiming them WITHOUT replay; re-executing historical \
-                     DDL would drop tables that legitimately exist now.",
-                    count, min_lsn, max_lsn, target_checkpoint
-                );
-                let reclaimed = wal_guard.truncate_to_checkpoint(target_checkpoint)?;
-                info!(
-                    "WAL upgrade complete: {} entries adopted as checkpointed at LSN {}",
-                    reclaimed, target_checkpoint
-                );
-                Ok(())
-            }
-
-            // === Everything retained is at or below the checkpoint. ===
-            Some(cp) if max_lsn <= cp => {
-                debug!(
-                    "WAL clean: {} retained entries (LSN {}..={}) are all at or below checkpoint \
-                     LSN {}; reclaiming without replay",
-                    count, min_lsn, max_lsn, cp
-                );
-                wal_guard.truncate_to_checkpoint(cp.max(target_checkpoint))?;
-                Ok(())
-            }
-
-            // === Genuine crash recovery: replay strictly past the checkpoint. ===
-            Some(cp) => {
-                // Drop the read guard: `replay_wal_after` takes it again.
-                drop(wal_guard);
-
-                // On failure, deliberately do NOT checkpoint or truncate: a
-                // failed replay must stay retryable on the next open.
-                let replayed = self.replay_wal_after(cp)?;
-
-                info!(
-                    "WAL crash recovery: replayed {} of {} retained entries (LSN {}..={}), past \
-                     checkpoint LSN {}",
-                    replayed, count, min_lsn, max_lsn, cp
-                );
-
-                // Truncate the replayed entries to prevent duplicate replay on the next
-                // restart, and advance the checkpoint in the SAME atomic batch so the two
-                // can never disagree on disk.
-                wal.read().truncate_to_checkpoint(target_checkpoint)?;
-                Ok(())
-            }
+        let state = super::wal_recovery::inspect(&self.db)?;
+        if !state.atomic_groups {
+            return Err(Error::storage("WAL recovery requires the atomic-group format marker"));
         }
+        // Early adoption preserved the old history floor. Normal retention may
+        // now prune entries and advance that floor in its own atomic group.
+        wal.read().truncate_to_checkpoint(state.highest)?;
+        Ok(())
     }
 
     /// Open in-memory storage engine
@@ -3995,11 +4573,20 @@ impl StorageEngine {
         // than two.
         super::tde::verify_or_install_key_check(&db, key_manager.as_deref(), &gate)?;
 
+        let dict_manager = Arc::new(DictionaryManager::new());
+        let schema_cache = Arc::new(dashmap::DashMap::new());
+
         // Initialize snapshot manager (see the on-disk StorageEngine::open for
         // why it carries the engine's key manager).
         let snapshot_manager = {
             let mut sm = SnapshotManager::new_non_durable(Arc::clone(&db), Arc::clone(&gate));
             sm.set_key_manager(key_manager.clone());
+            sm.set_current_row_history_codec(Arc::new(EngineCurrentRowHistoryCodec {
+                db: Arc::downgrade(&db),
+                key_manager: key_manager.clone(),
+                dictionaries: Arc::clone(&dict_manager),
+                schemas: Arc::clone(&schema_cache),
+            }));
             Arc::new(sm)
         };
         // W3.2: wire the single-copy-latest-version knob (memory-only: no durable
@@ -4135,23 +4722,27 @@ impl StorageEngine {
             config.storage.statement_timeout_ms.or(config.storage.query_timeout_ms),
             Arc::clone(&schema_generation),
         );
-        let dict_manager = Arc::new(DictionaryManager::new());
         let branch_freeze =
             Self::install_branch_freeze(instance_id, &gate, key_manager.as_ref(), &dict_manager, &branch_manager)?;
 
-        Ok(Self {
+        let row_counters = Arc::new(dashmap::DashMap::new());
+        gate.install_counter_values(Arc::clone(&row_counters));
+        let vector_indexes = Arc::new(VectorIndexManager::new());
+        vector_indexes.set_persistent_key_manager(key_manager.clone());
+        let engine = Self {
             instance_id,
             db: Arc::clone(&db),
             gate,
             config: config.clone(),
             timestamp,
             key_manager,
-            vector_indexes: Arc::new(VectorIndexManager::new()),
+            vector_indexes,
             snapshot_manager,
             conflict_registry,
             write_census: Arc::new(super::UncommittedWriteCensus::new()),
             table_locks,
             row_locks: Arc::new(super::row_locks::RowLocks::new()),
+            layout_epochs: Arc::new(super::layout_epochs::LayoutEpochs::new()),
             version_gc,
             version_gc_worker,
             branch_manager,
@@ -4177,7 +4768,7 @@ impl StorageEngine {
             cpu_monitor,
             consolidation_worker,
             _temp_dir: Some(temp_dir),
-            row_counters: Arc::new(dashmap::DashMap::new()),
+            row_counters,
             bulk_load_mode: Arc::new(AtomicBool::new(false)),
             temp_tables_present: Arc::new(AtomicBool::new(false)),
             lockfree_engine: Arc::new(RwLock::new(None)),
@@ -4194,10 +4785,12 @@ impl StorageEngine {
             group_committer: Arc::new(super::group_commit::GroupCommitter::new(
                 std::time::Duration::from_micros(config.storage.group_commit_window_us),
             )),
-            schema_cache: Arc::new(dashmap::DashMap::new()),
+            schema_cache,
             missing_values_cache: Arc::new(dashmap::DashMap::new()),
             existence_cache: Arc::new(dashmap::DashMap::new()),
             schema_generation,
+            generic_mutation_generation: Arc::new(AtomicU64::new(0)),
+            vector_row_context: std::sync::OnceLock::new(),
             write_watermarks: Arc::new(dashmap::DashMap::new()),
             constraints_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             referencing_fk_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
@@ -4212,7 +4805,10 @@ impl StorageEngine {
             replication_previous_epoch: AtomicU64::new(super::replication_epoch::INITIAL_EPOCH),
             replication_census: RwLock::new(None),
             _read_only_log_dir: None,
-        })
+        };
+        // Spec R5.6: before the store takes a write.
+        engine.wire_layout_hook();
+        Ok(engine)
     }
 
     /// Get configuration
@@ -4265,6 +4861,10 @@ impl StorageEngine {
     /// generation-stamped existence cache.
     pub fn schema_generation(&self) -> u64 {
         self.schema_generation.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn generic_mutation_generation(&self) -> u64 {
+        self.generic_mutation_generation.load(Ordering::Acquire)
     }
 
     /// Bump the schema generation (W1.3), lazily invalidating every
@@ -4488,6 +5088,12 @@ impl StorageEngine {
     /// over the deletion, or serve a later table of the same name.
     pub(crate) fn forget_table_dictionaries(&self, table_name: &str) {
         self.dict_manager.forget_table(table_name);
+    }
+
+    /// Spec R5.3 (review F8): the dictionary manager, for a rename that moves a
+    /// table's or a column's dictionaries in its own write group.
+    pub(crate) fn dictionary_manager(&self) -> &Arc<DictionaryManager> {
+        &self.dict_manager
     }
 
     /// Pre-warm schema cache by loading all table schemas into memory.
@@ -5082,9 +5688,63 @@ impl StorageEngine {
         }
     }
 
+    /// Internal direct bulk ingestion keeps its existing unversioned row/ART
+    /// contract, while vector recovery metadata shares the row's native group.
+    pub(crate) fn put_bulk_row(
+        &self,
+        table: &str,
+        row: u64,
+        schema: &crate::Schema,
+        tuple: &Tuple,
+        key: &Key,
+        value: &[u8],
+    ) -> Result<()> {
+        let Some(mut publication) = self.vector_row_write(table, [row]) else {
+            return self.put(key, value);
+        };
+        self.check_direct_write_budget(key.len() + value.len())?;
+        let mut batch = WriteBatch::default();
+        let sealed = super::tde::seal(self.key_manager.as_deref(), value)?;
+        batch.put(key, sealed.as_ref());
+        publication
+            .plan
+            .stage_tuple(table, row, schema, Some(tuple), &mut batch)?;
+        publication.plan.write_call_started();
+        self.gate.write_observed(
+            &self.db,
+            batch,
+            self.memory_write_options.as_ref(),
+            &publication.attempt,
+        )?;
+        exit_after_ddl_write("row_put", table);
+        publication.plan.row_group_applied();
+        self.vector_indexes.on_row_insert_staged(table, row, schema, tuple);
+        publication.finish()
+    }
+
     /// Put a value (basic put, no MVCC yet)
     #[track_caller]
     pub fn put(&self, key: &Key, value: &[u8]) -> Result<()> {
+        self.put_with_attempt(key, value, None)
+    }
+
+    #[track_caller]
+    pub(crate) fn put_observed(
+        &self,
+        key: &Key,
+        value: &[u8],
+        attempt: &super::write_outcome::WriteAttempt,
+    ) -> Result<()> {
+        self.put_with_attempt(key, value, Some(attempt))
+    }
+
+    #[track_caller]
+    fn put_with_attempt(
+        &self,
+        key: &Key,
+        value: &[u8],
+        attempt: Option<&super::write_outcome::WriteAttempt>,
+    ) -> Result<()> {
         // Periodic disk space check (every 1000 writes) for disk-backed mode
         if let Some(ref db_path) = self.db_path {
             let count = self.write_counter.fetch_add(1, Ordering::Relaxed);
@@ -5112,9 +5772,20 @@ impl StorageEngine {
         // encryption off `seal` borrows the caller's slice and the `put` below
         // is byte-for-byte the call this function made before.
         let stored = super::tde::seal(self.key_manager.as_deref(), value)?;
-        self.gate
-            .put(&self.db, key, stored.as_ref(), self.memory_write_options.as_ref())
-            .map_err(|e| Error::storage(format!("Put failed: {}", e)))
+        match attempt {
+            Some(attempt) => {
+                let mut batch = WriteBatch::default();
+                batch.put(key, stored.as_ref());
+                self.gate
+                    .write_observed(&self.db, batch, self.memory_write_options.as_ref(), attempt)
+            }
+            // Preserve the public put's legacy wrapper. The new observed
+            // owner returns its original typed cap/layout/native error.
+            None => self
+                .gate
+                .put(&self.db, key, stored.as_ref(), self.memory_write_options.as_ref())
+                .map_err(|e| Error::storage(format!("Put failed: {}", e))),
+        }
     }
 
     /// Delete a key
@@ -5127,22 +5798,23 @@ impl StorageEngine {
         // stream fail strict live-row replay, which correctly accepts data: only.
         if !self.is_replaying.load(Ordering::Acquire) {
             if key.starts_with(b"data:") {
-                if let Some(wal) = &self.wal {
-                    let wal = wal.read();
+                if self.wal.is_some() {
                     // Extract table name from key for proper WAL logging
                     let table_name = Self::extract_table_from_key(key);
+                    let _locks = self.lock_main_table_for_write(&table_name)?;
                     // The delete and its history entry are ONE write: the entry exists
                     // exactly when the row is gone (it used to be logged first).
                     let mut batch = WriteBatch::default();
                     batch.delete(key);
-                    wal.append_with_batch(
-                        WalOperation::Delete {
+                    let barrier = self.write_direct_batch(
+                        batch,
+                        Some(WalOperation::Delete {
                             table: table_name,
                             key: key.clone(),
-                        },
-                        batch,
+                        }),
                         self.memory_write_options.as_ref(),
                     )?;
+                    Self::wait_for_direct_replication(barrier);
                     return Ok(());
                 }
             }
@@ -5154,11 +5826,13 @@ impl StorageEngine {
             .map_err(|e| Error::storage(format!("Delete failed: {}", e)))
     }
 
-    /// Log a data INSERT operation to WAL for replication
+    /// Record explicit logical INSERT history.
     ///
-    /// This is used when INSERT is done through a transaction (txn.put()) which
-    /// bypasses the normal StorageEngine::put() WAL logging. Call this after
-    /// txn.put() to ensure the insert is replicated to standbys.
+    /// An owning statement capture stages this entry with that transaction's
+    /// data at commit. Without capture this writes history only: it does not
+    /// commit data, associate unrelated writes, or arrange automatic recovery.
+    /// Internal mutations use captured/derived transaction logging or a data
+    /// batch that stages its operation before the same RocksDB write.
     pub fn log_data_insert(&self, table_name: &str, key: &[u8], tuple_data: &[u8]) -> Result<()> {
         // Skip during replay to avoid re-logging
         if self.is_replaying.load(Ordering::Acquire) {
@@ -5176,8 +5850,8 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// Like `log_data_insert` but appends without a per-statement fsync.
-    /// The entry is still broadcast to HA standbys by the WAL layer.
+    /// Record INSERT history without a local per-call fsync.
+    /// The ownership contract is the same as [`Self::log_data_insert`].
     pub fn log_data_insert_nosync(&self, table_name: &str, key: &[u8], tuple_data: &[u8]) -> Result<()> {
         if self.is_replaying.load(Ordering::Acquire) {
             return Ok(());
@@ -5194,10 +5868,9 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// Fast DML can skip the logical-WAL keyspace in standalone relaxed mode,
-    /// but strict logical WAL and HA primaries still need the append: spec
-    /// P2.1 — the append path is where a sync/semi-sync primary's write waits
-    /// for its standbys to acknowledge its physical sequence.
+    /// Fast DML can skip logical history in standalone relaxed mode. Strict
+    /// logical WAL and HA primaries request an operation staged with the data;
+    /// replication waits on the completed group's physical sequence.
     pub fn fast_dml_requires_logical_wal(&self) -> bool {
         if !self.is_wal_enabled() {
             return false;
@@ -5215,10 +5888,9 @@ impl StorageEngine {
         false
     }
 
-    /// Log a data UPDATE operation to WAL for replication
-    ///
-    /// This is used when UPDATE is done through a transaction which
-    /// bypasses the normal StorageEngine::put() WAL logging.
+    /// Record explicit logical UPDATE history.
+    /// Requires an owning capture for staged transaction data; otherwise this
+    /// writes history only. See [`Self::log_data_insert`]. Startup never redoes it.
     pub fn log_data_update(&self, table_name: &str, key: &[u8], tuple_data: &[u8]) -> Result<()> {
         // Skip during replay to avoid re-logging
         if self.is_replaying.load(Ordering::Acquire) {
@@ -5236,10 +5908,9 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// Log a data DELETE operation to WAL for replication
-    ///
-    /// This is used when DELETE is done through a transaction which
-    /// bypasses the normal StorageEngine::delete() WAL logging.
+    /// Record explicit logical DELETE history.
+    /// Requires an owning capture for staged transaction data; otherwise this
+    /// writes history only. See [`Self::log_data_insert`]. Startup never redoes it.
     pub fn log_data_delete(&self, table_name: &str, key: &[u8]) -> Result<()> {
         // Skip during replay to avoid re-logging
         if self.is_replaying.load(Ordering::Acquire) {
@@ -5256,11 +5927,8 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// Like `log_data_update` but appends without a per-statement fsync.
-    /// The logical WAL entry is still written (so crash-recovery replay and
-    /// logical replication stay consistent), only the synchronous fsync is
-    /// skipped — durability then matches the RocksDB WriteBatch at commit. See
-    /// `StorageConfig::logical_wal_per_statement`.
+    /// Record UPDATE history without a local per-call fsync.
+    /// The ownership contract is the same as [`Self::log_data_insert`].
     pub fn log_data_update_nosync(&self, table_name: &str, key: &[u8], tuple_data: &[u8]) -> Result<()> {
         if self.is_replaying.load(Ordering::Acquire) {
             return Ok(());
@@ -5276,7 +5944,8 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// Like `log_data_delete` but appends without a per-statement fsync.
+    /// Record DELETE history without a local per-call fsync.
+    /// The ownership contract is the same as [`Self::log_data_insert`].
     pub fn log_data_delete_nosync(&self, table_name: &str, key: &[u8]) -> Result<()> {
         if self.is_replaying.load(Ordering::Acquire) {
             return Ok(());
@@ -5399,6 +6068,23 @@ impl StorageEngine {
     /// The engine's key manager, for the batch builders that live in
     /// `transaction.rs` / `time_travel.rs` / `branch.rs` and must apply the
     /// same rule to the batches they build against this engine's `Arc<DB>`.
+    pub(crate) fn vector_row_context(&self) -> Option<Arc<super::vector_row::VectorRowContext>> {
+        if !self.vector_indexes.has_any_index() {
+            return None;
+        }
+        Some(Arc::clone(self.vector_row_context.get_or_init(|| {
+            Arc::new(super::vector_row::VectorRowContext::new(
+                Arc::clone(&self.db),
+                Arc::clone(&self.vector_indexes),
+                Arc::clone(&self.snapshot_manager),
+                Arc::clone(&self.gate),
+                Arc::clone(&self.layout_epochs),
+                self.key_manager.clone(),
+                Arc::clone(&self.generic_mutation_generation),
+            ))
+        })))
+    }
+
     pub(crate) fn key_manager_arc(&self) -> Option<Arc<KeyManager>> {
         self.key_manager.clone()
     }
@@ -5468,11 +6154,84 @@ impl StorageEngine {
         &self.row_locks
     }
 
+    /// Spec R5.6: the engine's per-table layout epochs (`storage::layout_epochs`).
+    pub fn layout_epochs(&self) -> &Arc<super::layout_epochs::LayoutEpochs> {
+        &self.layout_epochs
+    }
+
+    /// Spec R5.6: hand the write gate this engine's layout epochs, and the hook that
+    /// names an index definition's table and drops what readers cache of a changed
+    /// table's layout. The hook holds the caches themselves, not the engine.
+    fn wire_layout_hook(&self) {
+        let hook = Arc::new(EngineLayoutHook {
+            db: Arc::downgrade(&self.db),
+            snapshots: Arc::downgrade(&self.snapshot_manager),
+            key_manager: self.key_manager.clone(),
+            schema_cache: Arc::clone(&self.schema_cache),
+            missing_values_cache: Arc::clone(&self.missing_values_cache),
+            row_cache: Arc::clone(&self.row_cache),
+            schema_generation: Arc::clone(&self.schema_generation),
+            write_watermarks: Arc::clone(&self.write_watermarks),
+        });
+        self.gate.install_layout(Arc::clone(&self.layout_epochs), hook);
+    }
+
+    /// Spec R5.6, on a physical standby: what [`EngineLayoutHook`]'s publication does
+    /// on a primary, for the tables an applied run changed the layout of. The applier
+    /// calls it after the run's catalog bytes are in the store and before it ends the
+    /// change.
+    pub fn drop_layout_caches(&self, tables: &[String]) {
+        publish_layout_change(
+            &self.schema_generation,
+            &self.write_watermarks,
+            &self.schema_cache,
+            &self.missing_values_cache,
+            &self.row_cache,
+            tables,
+        );
+        for table in tables {
+            self.snapshot_manager.invalidate_table_layout(table);
+        }
+    }
+
+    /// Internal deterministic seam after a successful owning native transaction
+    /// group, before any committed graph publication. Empty/refused writes do
+    /// not consume it; no production callback or transaction state is added.
+    #[cfg(feature = "internal-tests")]
+    #[doc(hidden)]
+    pub fn debug_next_after_native_transaction_write(&self, hook: impl FnOnce() + Send + 'static) {
+        super::transaction::debug_next_after_native_transaction_write(hook);
+    }
+
     /// Spec R5.4 (P12): lock row `row_id` of main's `table` for one fast-path write,
     /// which holds it until the guard drops, after its write group is applied and the
     /// table's change epoch bumped. Waits like a table lock, bounded the same way.
     pub fn lock_row_for_fast_write(&self, table: &str, row_id: u64) -> Result<super::row_locks::RowLockGuard<'_>> {
         super::row_locks::RowLockGuard::acquire(&self.row_locks, table, row_id, self.table_locks.row_lock_bounds())
+    }
+
+    /// Spec R5.4 (review F3): a claim of a key of `table` was refused because an open
+    /// transaction took the key out (`hold`, `ArtIndexManager::reserve_insert_tuple_as`):
+    /// wait until it ends, then claim again. It holds the row that had the key locked
+    /// until then (it locked the row before it changed it), so the wait is for that
+    /// row's lock: `txn`'s, kept until `txn` ends, or, with no transaction, taken and
+    /// let go. A hold whose row its owner no longer holds is stale (the owner ended
+    /// without lifting it) and is lifted here. After a commit the key is free; after a
+    /// rollback it is back, and the claim fails as a duplicate.
+    pub fn wait_out_key_hold(
+        &self,
+        table: &str,
+        hold: &super::KeyHold,
+        txn: Option<&super::Transaction>,
+    ) -> Result<()> {
+        if self.row_locks.holder(table, hold.row_id) == Some(hold.owner) {
+            match txn {
+                Some(txn) => txn.lock_row(table, hold.row_id)?,
+                None => drop(self.lock_row_for_fast_write(table, hold.row_id)?),
+            }
+        }
+        self.art_index_manager.clear_stale_hold(hold);
+        Ok(())
     }
 
     /// For the tests: lower the write-group ceiling (spec R5 decision 6,
@@ -5481,6 +6240,29 @@ impl StorageEngine {
     #[doc(hidden)]
     pub fn debug_set_write_group_ceiling(&self, bytes: Option<usize>) {
         self.gate.debug_set_write_group_ceiling(bytes);
+    }
+
+    /// Test the outcome of a failure after the batch applied, at the same point
+    /// a group-fsync error can be reported. Isolated to this thread/next commit.
+    #[cfg(feature = "internal-tests")]
+    #[doc(hidden)]
+    pub fn debug_fail_next_applied_commit(&self) {
+        super::transaction::debug_fail_next_applied_commit();
+    }
+
+    #[cfg(feature = "internal-tests")]
+    #[doc(hidden)]
+    pub fn debug_next_commit_after_barrier(&self, hook: impl FnOnce() + Send + 'static) {
+        super::transaction::debug_next_after_commit_barrier(hook);
+    }
+
+    /// A one-shot test handshake after claiming generic keys, while its table
+    /// and census stay held. Allows a real raw-row corruption + gate refusal to
+    /// exercise unreadable reconciliation and subsequent write quarantine.
+    #[cfg(feature = "internal-tests")]
+    #[doc(hidden)]
+    pub fn debug_generic_after_claim(&self, hook: impl FnOnce() + 'static) {
+        NEXT_GENERIC_AFTER_CLAIM.with(|next| *next.borrow_mut() = Some(Box::new(hook)));
     }
 
     /// For the tests: `[session] lock_timeout_ms` on a running engine.
@@ -5599,6 +6381,7 @@ impl StorageEngine {
         txn.set_row_cache(Arc::clone(self.row_cache()));
         // W2.5: commit raises per-table committed-write watermarks in-band.
         txn.set_write_watermarks(self.write_watermarks_arc());
+        txn.set_vector_row_context(self.vector_row_context());
         // R0.2: embedded global-slot transactions read from a snapshot, so
         // complete those semantics with first-committer-wins validation.
         txn.set_conflict_registry(self.conflict_registry(), true);
@@ -5655,6 +6438,7 @@ impl StorageEngine {
         txn.set_row_cache(Arc::clone(self.row_cache()));
         // W2.5: commit raises per-table committed-write watermarks in-band.
         txn.set_write_watermarks(self.write_watermarks_arc());
+        txn.set_vector_row_context(self.vector_row_context());
         txn.set_conflict_registry(self.conflict_registry(), false);
         // Autocommit statements log per statement; buffering those operations until the
         // commit lets them be written atomically with the data (or dropped on rollback).
@@ -5705,6 +6489,23 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// Model a reported flush failure after this thread's actual state group
+    /// and durability barrier, before its caller can publish cache eviction.
+    #[cfg(feature = "internal-tests")]
+    #[doc(hidden)]
+    pub fn debug_fail_next_sequence_flush_after_apply(&self) {
+        FAIL_NEXT_SEQUENCE_FLUSH_AFTER_APPLY.with(|fail| fail.set(true));
+    }
+
+    /// As above, with an explicit fixture action immediately after NativeOK.
+    /// A native refusal never invokes this hook; no extra production write.
+    #[cfg(feature = "internal-tests")]
+    #[doc(hidden)]
+    pub fn debug_fail_next_sequence_flush_after_apply_with(&self, hook: impl FnOnce() + 'static) {
+        self.debug_fail_next_sequence_flush_after_apply();
+        AFTER_SEQUENCE_STATE_WRITE.with(|next| *next.borrow_mut() = Some(Box::new(hook)));
+    }
+
     /// Persist a sequence high-water record and force it power-loss durable
     /// REGARDLESS of the per-statement autocommit-durability GUC.
     ///
@@ -5719,19 +6520,55 @@ impl StorageEngine {
     ///
     /// The only skip is `memory_only` mode: there is no WAL and no crash
     /// recovery, so sequences are documented-volatile and the fsync is moot.
-    /// Goes through `save_sequence_state` -> `StorageEngine::put`, so the
-    /// record inherits the same at-rest encryption as enum/identity records.
+    /// Uses the observed single-operation batch path, preserving the catalog
+    /// state frame and at-rest encryption while enforcing the owning group's cap.
     ///
     /// A handle that may not write (read-only, physical snapshot or standby)
     /// refuses here, with the gate's own error and before any fsync: `nextval`
     /// / `setval` cannot reserve a value it could never make durable.
     pub fn flush_sequence_state(&self, name: &str, st: crate::storage::catalog::PersistedSeqState) -> Result<()> {
+        let attempt = super::write_outcome::WriteAttempt::default();
+        self.flush_sequence_state_inner(name, st, &attempt)
+    }
+
+    pub(crate) fn flush_sequence_state_observed(
+        &self,
+        name: &str,
+        st: crate::storage::catalog::PersistedSeqState,
+        attempt: &super::write_outcome::WriteAttempt,
+    ) -> Result<()> {
+        self.flush_sequence_state_inner(name, st, attempt)
+    }
+
+    fn flush_sequence_state_inner(
+        &self,
+        name: &str,
+        st: crate::storage::catalog::PersistedSeqState,
+        attempt: &super::write_outcome::WriteAttempt,
+    ) -> Result<()> {
+        #[cfg(feature = "internal-tests")]
+        let failed = FAIL_NEXT_SEQUENCE_FLUSH_AFTER_APPLY.with(|fail| fail.replace(false));
+        #[cfg(feature = "internal-tests")]
+        let after_write = AFTER_SEQUENCE_STATE_WRITE.with(|next| next.borrow_mut().take());
         self.gate.check()?;
-        self.catalog().save_sequence_state(name, &st)?;
+        // Spec R5.6: a sequence's high-water is written on behalf of no statement (no
+        // rollback or retry hands a value back): not the running statement's durable
+        // effect, so its read set is still validated where it ends.
+        super::layout_epochs::outside_statement(|| self.catalog().save_sequence_state_observed(name, &st, attempt))?;
+        #[cfg(feature = "internal-tests")]
+        if let Some(hook) = after_write {
+            hook();
+        }
         if !self.config.storage.memory_only {
             self.group_committer
                 .wait_durable(|| self.db.flush_wal(true).map_err(|e| e.to_string()))
                 .map_err(|e| Error::storage(format!("sequence WAL fsync failed: {}", e)))?;
+        }
+        #[cfg(feature = "internal-tests")]
+        if failed {
+            return Err(Error::storage(
+                "injected sequence durability failure after state applied",
+            ));
         }
         Ok(())
     }
@@ -5918,11 +6755,21 @@ impl StorageEngine {
     /// The row is NOT stored yet, so a claim that is not followed by a durable
     /// write MUST be given back ([`Self::release_index_claim`]) — see
     /// [`IndexClaim`], which is what makes that exhaustive.
+    ///
+    /// Spec R5.4 (review F3): a key an open transaction took out is not free: the claim
+    /// waits for that transaction ([`Self::wait_out_key_hold`]) and claims again.
     #[inline]
     fn claim_index_entries(&self, table_name: &str, row_id: u64, schema: &crate::Schema, tuple: &Tuple) -> Result<()> {
-        self.art_index_manager
-            .reserve_insert_tuple(table_name, row_id, schema, tuple)
-            .map_err(|e| Error::constraint_violation(e.to_string()))
+        loop {
+            match self
+                .art_index_manager
+                .reserve_insert_tuple_as(table_name, row_id, schema, tuple, None)
+            {
+                Ok(None) => return Ok(()),
+                Ok(Some(hold)) => self.wait_out_key_hold(table_name, &hold, None)?,
+                Err(e) => return Err(Error::constraint_violation(e.to_string())),
+            }
+        }
     }
 
     /// Give back a claim whose row never became durable (sprinter 5a78b8288153).
@@ -6015,91 +6862,8 @@ impl StorageEngine {
             return self.insert_tuple_branch_aware(table_name, tuple);
         }
 
-        // Check if automatic time-travel versioning is enabled
-        if self.config.storage.time_travel_enabled {
-            // Use automatic versioning path (zero-config time-travel)
-            self.insert_tuple_versioned(table_name, tuple)
-        } else {
-            // Use legacy non-versioned path (faster, no time-travel support)
-            let catalog = Catalog::new(self);
-
-            // R1.1: volatile row id + post-write flush (see
-            // insert_tuple_versioned_with_schema).
-            let row_id = self.next_row_id_volatile(table_name);
-
-            // Get table schema
-            let schema = catalog.get_table_schema(table_name)?;
-
-            // PK / UNIQUE gate — the SAME gate the versioned arm and the SQL
-            // fast path run, before anything is written. This arm used to skip
-            // it entirely, which made PK/UNIQUE enforcement depend on
-            // `storage.time_travel_enabled` (i.e. on the active profile) for
-            // every caller of plain `insert_tuple`.
-            //
-            // sprinter 5a78b8288153: a CLAIM, not a question — same race, same
-            // close as the other two funnels.
-            let mut claim = IndexClaim::acquire(self, table_name, row_id, &schema, &tuple)?;
-
-            // Check bulk load mode early - skip some operations if enabled
-            let bulk_mode = self.is_bulk_load_mode();
-
-            let stored_tuple =
-                self.transform_tuple_for_column_storage_opts(table_name, row_id, &tuple, &schema, true)?;
-
-            // Serialize transformed tuple (RocksDB LZ4 handles compression at block level)
-            let value = bincode::serialize(&stored_tuple)
-                .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
-            let logical_value = if schema_uses_column_storage(&schema) {
-                bincode::serialize(&tuple).map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?
-            } else {
-                value.clone()
-            };
-
-            // Build key: data:{table_name}:{row_id} (using thread-local buffer)
-            let key = Self::build_data_key(table_name, row_id);
-
-            // Store transformed tuple
-            self.put(&key, &value)?;
-            // sprinter 5a78b8288153: durability point — keep the claimed entries
-            // from here on.
-            claim.row_is_durable();
-            self.flush_row_counter(table_name)?;
-
-            // R1.1: nosync logical-WAL append by default (P0#2 contract).
-            if self.fast_dml_requires_logical_wal() {
-                self.log_data_insert(table_name, &key, &logical_value)?;
-            } else {
-                self.log_data_insert_nosync(table_name, &key, &logical_value)?;
-            }
-
-            // sprinter 5a78b8288153: entries claimed before the write above; the
-            // post-write `on_insert` pass that used to sit here is gone.
-
-            // R5.V1: maintain HNSW vector indexes (single atomic load when
-            // the table has none).
-            let _ = self.vector_indexes.on_row_insert(table_name, row_id, &schema, &tuple);
-
-            // Skip delta tracking in bulk load mode for improved performance
-            if !bulk_mode {
-                // Record delta for incremental MV refresh
-                if let Err(e) = self.mv_delta_tracker.record_insert(table_name, row_id, tuple.clone()) {
-                    tracing::warn!("Failed to record insert delta for table '{}': {}", table_name, e);
-                    // Don't fail the insert if delta recording fails
-                }
-
-                // Record delta for SMFI (Self-Maintaining Filter Index)
-                self.filter_delta_tracker.on_insert(table_name, row_id, &tuple, &schema);
-
-                // Update speculative filters
-                for (i, col) in schema.columns.iter().enumerate() {
-                    if let Some(value) = tuple.values.get(i) {
-                        self.speculative_filter_manager.on_insert(table_name, &col.name, value);
-                    }
-                }
-            }
-
-            Ok(row_id)
-        }
+        let schema = self.catalog().get_table_schema(table_name)?;
+        self.insert_tuple_direct_with_schema(table_name, tuple, &schema, self.config.storage.time_travel_enabled)
     }
 
     /// Unconditionally delete every `data:{table}:*` row for a table, regardless of
@@ -6213,6 +6977,7 @@ impl StorageEngine {
         columns: Option<&[usize]>,
         predicates: &[AnalyzedPredicate],
     ) -> Result<Option<Vec<Tuple>>> {
+        self.check_table_readable(table_name)?;
         if self.is_branch_active() {
             return Ok(None);
         }
@@ -6358,6 +7123,7 @@ impl StorageEngine {
         projection: &[usize],
         predicates: &[AnalyzedPredicate],
     ) -> Result<Option<Vec<Tuple>>> {
+        self.check_table_readable(table_name)?;
         if projection.is_empty() {
             return Ok(None);
         }
@@ -7007,6 +7773,7 @@ impl StorageEngine {
         asc: &[bool],
         k: usize,
     ) -> Result<Option<Vec<Tuple>>> {
+        self.check_table_readable(table_name)?;
         if k == 0 {
             return Ok(Some(Vec::new()));
         }
@@ -7135,6 +7902,7 @@ impl StorageEngine {
         asc: &[bool],
         k: usize,
     ) -> Result<Option<Vec<Tuple>>> {
+        self.check_table_readable(table_name)?;
         if k == 0 {
             return Ok(Some(Vec::new()));
         }
@@ -7288,6 +8056,7 @@ impl StorageEngine {
         projection: &[usize],
         predicates: &[AnalyzedPredicate],
     ) -> Result<Option<Vec<Tuple>>> {
+        self.check_table_readable(table_name)?;
         if projection.is_empty() {
             return Ok(None);
         }
@@ -7438,6 +8207,7 @@ impl StorageEngine {
         columns: &[usize],
         predicates: &[AnalyzedPredicate],
     ) -> Result<Vec<Tuple>> {
+        self.check_table_readable(table_name)?;
         let scan_start = std::time::Instant::now();
         let mut requested: Vec<usize> = columns.to_vec();
         requested.sort_unstable();
@@ -7564,6 +8334,7 @@ impl StorageEngine {
         aggregates: &[ColumnarAggregateSpec],
         predicates: &[AnalyzedPredicate],
     ) -> Result<Vec<Tuple>> {
+        self.check_table_readable(table_name)?;
         let scan_start = std::time::Instant::now();
         let mut requested: Vec<usize> = group_by_columns.to_vec();
         requested.extend(aggregates.iter().filter_map(|aggregate| aggregate.column_index));
@@ -8935,6 +9706,7 @@ impl StorageEngine {
         aggregates: &[ColumnarAggregateSpec],
         predicates: &[AnalyzedPredicate],
     ) -> Result<Option<Vec<Tuple>>> {
+        self.check_table_readable(table_name)?;
         let scan_start = std::time::Instant::now();
         let mut requested: Vec<usize> = group_by_columns.to_vec();
         requested.extend(aggregates.iter().filter_map(|aggregate| aggregate.column_index));
@@ -9422,6 +10194,7 @@ impl StorageEngine {
         decode_hint: RowDecodeHint<'_>,
         missing: Option<&super::row_shape::MissingValues>,
     ) -> Result<Vec<Tuple>> {
+        self.check_table_readable(table_name)?;
         let scan_start = std::time::Instant::now();
         let prefix = format!("data:{}:", table_name);
         let prefix_bytes = prefix.as_bytes();
@@ -9526,6 +10299,7 @@ impl StorageEngine {
     /// Count rows in a table without deserializing tuples (fast COUNT(*) path).
     /// Only counts key prefixes matching `data:{table_name}:` — no deserialization.
     pub fn count_table_rows(&self, table_name: &str) -> Result<usize> {
+        self.check_table_readable(table_name)?;
         // sprinter 6bc4a4040eb7 (B1 fix pass): on a branch the count is the
         // number of rows the BRANCH sees — main's rows it inherits, its own
         // rows, minus its tombstones. Every shortcut below (the PK index, the
@@ -9628,6 +10402,7 @@ impl StorageEngine {
         lower: Option<(i64, bool)>,
         upper: Option<(i64, bool)>,
     ) -> Result<Option<usize>> {
+        self.check_table_readable(table_name)?;
         if self.is_branch_active() {
             return Ok(None);
         }
@@ -9869,7 +10644,7 @@ impl StorageEngine {
         // Fetch schema internally for callers that don't have it
         let catalog = Catalog::new(self);
         let schema = catalog.get_table_schema(table_name).ok();
-        self.get_row_by_pk_inner(table_name, pk_value, schema.as_ref(), true, true)
+        self.get_row_by_pk_inner(table_name, pk_value, schema.as_ref(), PkLookupCache::ReadAndFill, true)
     }
 
     /// PK point lookup using a pre-fetched schema (avoids redundant catalog lookup)
@@ -9879,7 +10654,7 @@ impl StorageEngine {
         pk_value: &crate::Value,
         schema: &crate::Schema,
     ) -> Result<Option<Tuple>> {
-        self.get_row_by_pk_inner(table_name, pk_value, Some(schema), true, true)
+        self.get_row_by_pk_inner(table_name, pk_value, Some(schema), PkLookupCache::ReadAndFill, true)
     }
 
     /// PK point lookup when the caller already parsed/coerced the PK value to
@@ -9890,7 +10665,7 @@ impl StorageEngine {
         pk_value: &crate::Value,
         schema: &crate::Schema,
     ) -> Result<Option<Tuple>> {
-        self.get_row_by_pk_inner(table_name, pk_value, Some(schema), true, false)
+        self.get_row_by_pk_inner(table_name, pk_value, Some(schema), PkLookupCache::ReadAndFill, false)
     }
 
     /// Typed PK lookup for SQL fast SELECTs. It still consumes existing row-cache
@@ -9903,29 +10678,34 @@ impl StorageEngine {
         pk_value: &crate::Value,
         schema: &crate::Schema,
     ) -> Result<Option<Tuple>> {
-        self.get_row_by_pk_inner(table_name, pk_value, Some(schema), false, false)
+        self.get_row_by_pk_inner(table_name, pk_value, Some(schema), PkLookupCache::ReadOnly, false)
     }
 
-    /// PK point lookup for write paths. Cache hits are used, but cache misses
-    /// are not inserted because UPDATE/DELETE immediately invalidate the row.
+    /// PK point lookup for write paths: the row as stored, never the row cache's
+    /// copy, which is not filled either (spec R5.4, review F1). A writer computes
+    /// its new row from what it reads here and trusts it, under the row's lock,
+    /// while the table's change epoch has not moved (`storage::row_locks`); a
+    /// cached image, filled by a reader that read before the last write, would be
+    /// trusted just the same, and the write computed from it lost the last one.
     pub fn get_row_by_pk_for_write_with_schema(
         &self,
         table_name: &str,
         pk_value: &crate::Value,
         schema: &crate::Schema,
     ) -> Result<Option<Tuple>> {
-        self.get_row_by_pk_inner(table_name, pk_value, Some(schema), false, true)
+        self.get_row_by_pk_inner(table_name, pk_value, Some(schema), PkLookupCache::Bypass, true)
     }
 
     /// Write-path PK lookup when the caller already parsed/coerced the PK value
-    /// to the schema's exact PK type.
+    /// to the schema's exact PK type. Storage only, as
+    /// [`Self::get_row_by_pk_for_write_with_schema`].
     pub fn get_row_by_typed_pk_for_write_with_schema(
         &self,
         table_name: &str,
         pk_value: &crate::Value,
         schema: &crate::Schema,
     ) -> Result<Option<Tuple>> {
-        self.get_row_by_pk_inner(table_name, pk_value, Some(schema), false, false)
+        self.get_row_by_pk_inner(table_name, pk_value, Some(schema), PkLookupCache::Bypass, false)
     }
 
     /// Fetch a row directly by its row_id as an owned `Tuple`.
@@ -9945,6 +10725,7 @@ impl StorageEngine {
         row_id: u64,
         schema: &crate::Schema,
     ) -> Result<Option<std::sync::Arc<Tuple>>> {
+        self.check_table_readable(table_name)?;
         // sprinter 6bc4a4040eb7 (B2): on a branch the row is the one the
         // BRANCH sees — the nearest level of its chain, then main — read
         // through the branch view. Reading `bdata:{branch}:` alone (what the
@@ -9968,9 +10749,11 @@ impl StorageEngine {
             }
         }
 
-        // Capture before reading storage: live replay publishes its generation
-        // under the row-cache shard lock, so an old in-flight read cannot refill it.
-        let cache_generation = self.schema_generation();
+        // Capture before reading storage: live replay and every row write publish
+        // under the row-cache shard lock, so an old in-flight read cannot refill it
+        // (spec R5.4, review F1).
+        let fill_ticket =
+            use_row_cache.then(|| self.row_cache.fill_ticket(table_name, row_id, &self.schema_generation));
         // Construct the storage key and fetch directly
         let storage_key = self.branch_aware_data_key(table_name, row_id);
         let raw_value = match self.get(&storage_key)? {
@@ -10025,13 +10808,13 @@ impl StorageEngine {
         // row wider than this reader's schema stays out: this reader resolved
         // the storage references of its own columns only.
         let tuple = std::sync::Arc::new(tuple);
-        if use_row_cache && tuple.values.len() <= width {
-            self.row_cache.put_arc_if_generation(
+        if let Some(ticket) = fill_ticket.filter(|_| tuple.values.len() <= width) {
+            self.row_cache.put_arc_if_ticket(
                 table_name,
                 row_id,
                 std::sync::Arc::clone(&tuple),
                 &self.schema_generation,
-                cache_generation,
+                ticket,
             );
         }
 
@@ -10043,15 +10826,17 @@ impl StorageEngine {
         table_name: &str,
         pk_value: &crate::Value,
         schema: Option<&crate::Schema>,
-        populate_cache_on_miss: bool,
+        cache_use: PkLookupCache,
         coerce_pk_value: bool,
     ) -> Result<Option<Tuple>> {
+        let populate_cache_on_miss = cache_use == PkLookupCache::ReadAndFill;
         let trace_lookup = tracing::enabled!(tracing::Level::DEBUG);
         let lookup_start = trace_lookup.then(std::time::Instant::now);
 
         // Coerce the PK value to match the actual PK column type so that the ART
         // key encoding is identical to the one produced at INSERT time.  Without
         // this, e.g. Int4(1) encodes as 4 bytes while the stored Int8(1) uses 8.
+        self.check_table_readable(table_name)?;
         let pk_column =
             schema.and_then(|schema| schema.columns.iter().enumerate().find(|(_, column)| column.primary_key));
         let coerced: crate::Value;
@@ -10101,6 +10886,16 @@ impl StorageEngine {
         // Look up the row_id in the ART index (zero-copy, no tree clone)
         let row_id = match self.art_index_manager.pk_index_lookup(table_name, &key) {
             Some(rid) => rid,
+            // Spec R5.4 (review F3): for a writer, a key an open transaction took out
+            // still names its committed row, which the writer locks, and so waits for
+            // that transaction: after its commit the row is gone, after its rollback
+            // the writer changes it. It used to find nothing and change nothing.
+            None if cache_use == PkLookupCache::Bypass && self.has_uncommitted_index_removals_for_table(table_name) => {
+                match self.art_index_manager.pk_hold(table_name, &key) {
+                    Some(hold) => hold.row_id,
+                    None => return Ok(None),
+                }
+            }
             None => {
                 if trace_lookup {
                     tracing::debug!(
@@ -10118,8 +10913,9 @@ impl StorageEngine {
         };
 
         // sprinter 6bc4a4040eb7 (B1): a branch session neither reads nor fills
-        // the branch-blind row cache (see `get_row_by_id_arc`).
-        let use_row_cache = !self.is_branch_active();
+        // the branch-blind row cache (see `get_row_by_id_arc`). Spec R5.4 (review
+        // F1): neither does a writer (`PkLookupCache::Bypass`).
+        let use_row_cache = !self.is_branch_active() && cache_use != PkLookupCache::Bypass;
         // Check row cache before going to storage
         if let Some(mut cached) = use_row_cache.then(|| self.row_cache.get(table_name, row_id)).flatten() {
             // Spec R5.2: the cache holds rows as stored; the shape is this
@@ -10147,9 +10943,11 @@ impl StorageEngine {
             return Ok(Some(cached));
         }
 
-        // Capture before reading storage: live replay publishes its generation
-        // under the row-cache shard lock, so an old in-flight read cannot refill it.
-        let cache_generation = self.schema_generation();
+        // Capture before reading storage: live replay and every row write publish
+        // under the row-cache shard lock, so an old in-flight read cannot refill it
+        // (spec R5.4, review F1).
+        let fill_ticket = (populate_cache_on_miss && use_row_cache)
+            .then(|| self.row_cache.fill_ticket(table_name, row_id, &self.schema_generation));
         // Construct the storage key and fetch directly
         let storage_key = self.branch_aware_data_key(table_name, row_id);
         let raw_value = match self.get(&storage_key)? {
@@ -10228,13 +11026,13 @@ impl StorageEngine {
         // Populate row cache with resolved tuple for read lookups. Write paths
         // skip this because they immediately invalidate the same row. A row wider
         // than this reader's schema stays out: only its own columns were resolved.
-        if populate_cache_on_miss && use_row_cache && stored_width <= width {
-            self.row_cache.put_if_generation(
+        if let Some(ticket) = fill_ticket.filter(|_| stored_width <= width) {
+            self.row_cache.put_if_ticket(
                 table_name,
                 row_id,
                 stored_image.unwrap_or_else(|| tuple.clone()),
                 &self.schema_generation,
-                cache_generation,
+                ticket,
             );
         }
 
@@ -10359,276 +11157,172 @@ impl StorageEngine {
         Ok(filtered)
     }
 
-    /// Migrate existing column data to a new storage mode (online)
+    /// Spec R5.5: `ALTER TABLE … ALTER COLUMN … SET STORAGE`'s rows, staged into the
+    /// statement's one write group `ddl`: every row of main's `table` with the column
+    /// moved from `migration.old_mode`'s representation to `migration.new_mode`'s
+    /// (a dictionary reference, a content-addressed reference, a columnar slot, or the
+    /// value), with its version at `timestamp`
+    /// ([`Self::stage_rewritten_rows`]); and what the new representation needs in the
+    /// same group: the dictionary record, the content-addressed payloads the store
+    /// does not hold yet, the columnar batches (the old ones' slots set NULL when the
+    /// column leaves columnar storage, as it always did) and the presence sidecar's
+    /// purge when the column enters or leaves columnar storage. This used to write a
+    /// group per row, then the schema in another: a crash or a reader in between saw
+    /// rows of one representation under a schema of the other.
     ///
-    /// This restructures all existing data for the specified column to the new
-    /// storage format. The migration is performed row-by-row to allow concurrent
-    /// reads during the migration.
-    ///
-    /// # Arguments
-    /// * `table_name` - Table containing the column
-    /// * `col_idx` - Column index in the schema
-    /// * `column` - Column definition (used for type information)
-    /// * `old_mode` - Current storage mode
-    /// * `new_mode` - Target storage mode
-    ///
-    /// # Returns
-    /// Number of rows migrated
-    pub fn migrate_column_storage(
-        &self,
+    /// Up to `limit`, measured on the rows and their versions; 54000 above it, with
+    /// nothing written. The zone-stats lock (decision 9) is taken only once the rows
+    /// are staged, and held until the group is written.
+    pub(crate) fn stage_column_storage_migration<'e>(
+        &'e self,
         table_name: &str,
-        col_idx: usize,
-        column: &crate::Column,
-        old_mode: ColumnStorageMode,
-        new_mode: ColumnStorageMode,
-    ) -> Result<usize> {
-        let prefix = format!("data:{}:", table_name);
-        let prefix_bytes = prefix.as_bytes();
-        let mut migrated = 0;
-        // Spec R5.2: a row older than the column holds no value of it; it is
-        // shaped first, so its missing value lands in the column's new storage
-        // (a columnar read never looks in the row).
+        migration: &super::alter_batch::ColumnMigration,
+        timestamp: u64,
+        limit: &super::alter_batch::RewriteLimit<'_>,
+        ddl: &mut super::DdlBatch<'e>,
+    ) -> Result<super::row_shape::StagedRewrite> {
+        let column = &migration.column;
+        let col_idx = migration.position;
+        let (old_mode, new_mode) = (migration.old_mode, migration.new_mode);
+        // Spec R5.2: a row older than the column holds no value of it; it is shaped
+        // first, so its missing value lands in the column's new storage (a columnar
+        // read never looks in the row).
         let width = Catalog::new(self).get_table_schema(table_name)?.columns.len();
-
-        // Collect keys first to avoid iterator invalidation during modification
-        let mut keys_to_migrate = Vec::new();
-        let mut read_opts = ReadOptions::default();
-        read_opts.set_total_order_seek(true);
-        let iter = self.db.iterator_opt(IteratorMode::Start, read_opts);
-        for item in iter {
-            let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
-            if key.starts_with(prefix_bytes) {
-                keys_to_migrate.push(key.to_vec());
-            } else if key.first() > prefix_bytes.first() {
-                break;
-            }
-        }
-
-        // Migrate each row
-        for key in keys_to_migrate {
-            let raw_value = self
-                .db
-                .get(&key)
-                .map_err(|e| Error::storage(format!("Failed to read row: {}", e)))?
-                .ok_or_else(|| Error::storage("Row disappeared during migration"))?;
-
-            // Deserialize (decrypt first if needed)
-            let stored = self.decode_stored_ref(&key, &raw_value)?;
-            let mut tuple: Tuple = bincode::deserialize(&stored)
-                .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
-
-            self.shape_row(table_name, width, &mut tuple)?;
-            if col_idx >= tuple.values.len() {
-                continue;
-            }
-
-            // Extract row_id from key
-            let row_id = Self::parse_row_id_after_prefix(&key, prefix_bytes.len()).unwrap_or(0);
-
-            // Step 1: Decode from old format to original value
-            let cur_val = tuple
-                .values
-                .get(col_idx)
-                .ok_or_else(|| Error::internal("col_idx out of bounds during migration decode"))?;
-            let original_value = match old_mode {
-                ColumnStorageMode::Dictionary => {
-                    if let crate::Value::DictRef { dict_id } = cur_val {
-                        let s = self.dict_manager.decode(&self.db, table_name, &column.name, *dict_id)?;
-                        crate::Value::String(s)
-                    } else {
-                        cur_val.clone()
+        let shape = self.row_shape(table_name, width)?;
+        let mut columnar_slots: std::collections::BTreeMap<u64, Vec<(u64, crate::Value)>> =
+            std::collections::BTreeMap::new();
+        let mut payloads: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut planned: HashSet<Vec<u8>> = HashSet::new();
+        let staged = {
+            let mut migrate = |row_id: u64, tuple: &mut Tuple, _logical: &mut Tuple| -> Result<()> {
+                // A representation change leaves the logical row unchanged. The
+                // rewrite funnel resolved it before any sidecar is staged/purged.
+                let Some(cur_val) = tuple.values.get(col_idx) else {
+                    return Ok(());
+                };
+                // Step 1: Decode from old format to original value
+                let original_value = match old_mode {
+                    ColumnStorageMode::Dictionary => {
+                        if let crate::Value::DictRef { dict_id } = cur_val {
+                            let s = self.dict_manager.decode(&self.db, table_name, &column.name, *dict_id)?;
+                            crate::Value::String(s)
+                        } else {
+                            cur_val.clone()
+                        }
                     }
-                }
-                ColumnStorageMode::ContentAddressed => {
-                    if let crate::Value::CasRef { hash } = cur_val {
-                        ContentAddressedStore::resolve(&self.db, hash, &column.data_type)?
-                    } else {
-                        cur_val.clone()
+                    ColumnStorageMode::ContentAddressed => {
+                        if let crate::Value::CasRef { hash } = cur_val {
+                            ContentAddressedStore::resolve(&self.db, hash, &column.data_type)?
+                        } else {
+                            cur_val.clone()
+                        }
                     }
-                }
-                ColumnStorageMode::Columnar => {
-                    if matches!(cur_val, crate::Value::ColumnarRef) {
-                        ColumnarStore::get(&self.db, table_name, &column.name, row_id)?.unwrap_or(crate::Value::Null)
-                    } else {
-                        cur_val.clone()
+                    ColumnStorageMode::Columnar => {
+                        if matches!(cur_val, crate::Value::ColumnarRef) {
+                            ColumnarStore::get(&self.db, table_name, &column.name, row_id)?
+                                .unwrap_or(crate::Value::Null)
+                        } else {
+                            cur_val.clone()
+                        }
                     }
-                }
-                ColumnStorageMode::Default => cur_val.clone(),
-            };
+                    ColumnStorageMode::Default => cur_val.clone(),
+                };
 
-            // Step 2: Encode to new format
-            let new_val = match new_mode {
-                ColumnStorageMode::Dictionary => {
-                    if let crate::Value::String(s) = &original_value {
-                        let dict_id = self.dict_manager.encode(&self.db, table_name, &column.name, s)?;
-                        crate::Value::DictRef { dict_id }
-                    } else {
-                        original_value
+                // Step 2: Encode to new format
+                let new_val = match new_mode {
+                    ColumnStorageMode::Dictionary => {
+                        if let crate::Value::String(s) = &original_value {
+                            let dict_id = self.dict_manager.encode(&self.db, table_name, &column.name, s)?;
+                            crate::Value::DictRef { dict_id }
+                        } else {
+                            original_value
+                        }
                     }
-                }
-                ColumnStorageMode::ContentAddressed => {
-                    // For migration, always store regardless of size
-                    match &original_value {
+                    ColumnStorageMode::ContentAddressed => match &original_value {
+                        // For migration, always store regardless of size
                         crate::Value::String(_) | crate::Value::Bytes(_) => {
-                            ContentAddressedStore::store(&self.db, &self.gate, &original_value)?
+                            let (reference, put) = ContentAddressedStore::plan_store(&self.db, &original_value)?;
+                            if let Some((key, payload)) = put {
+                                if planned.insert(key.clone()) {
+                                    payloads.push((key, payload));
+                                }
+                            }
+                            reference
                         }
                         _ => original_value,
+                    },
+                    ColumnStorageMode::Columnar => {
+                        let (batch_id, _) = ColumnarStore::batch_location(row_id);
+                        columnar_slots
+                            .entry(batch_id)
+                            .or_default()
+                            .push((row_id, original_value));
+                        crate::Value::ColumnarRef
                     }
+                    ColumnStorageMode::Default => original_value,
+                };
+
+                // Step 3: the old columnar slot, when the column leaves columnar storage.
+                if old_mode == ColumnStorageMode::Columnar && new_mode != ColumnStorageMode::Columnar {
+                    let (batch_id, _) = ColumnarStore::batch_location(row_id);
+                    columnar_slots
+                        .entry(batch_id)
+                        .or_default()
+                        .push((row_id, crate::Value::Null));
                 }
-                ColumnStorageMode::Columnar => {
-                    // Store in columnar format
-                    ColumnarStore::store(&self.db, &self.gate, table_name, &column.name, row_id, original_value)?;
-                    crate::Value::ColumnarRef
+                if let Some(slot) = tuple.values.get_mut(col_idx) {
+                    *slot = new_val;
                 }
-                ColumnStorageMode::Default => original_value,
+                Ok(())
             };
-            *tuple
-                .values
-                .get_mut(col_idx)
-                .ok_or_else(|| Error::internal("col_idx out of bounds during migration encode"))? = new_val;
+            self.stage_rewritten_rows(table_name, &shape, timestamp, &mut migrate, limit, ddl.batch_mut())?
+        };
 
-            // Step 3: Clean up old columnar data if migrating away from columnar
-            if old_mode == ColumnStorageMode::Columnar && new_mode != ColumnStorageMode::Columnar {
-                // Delete from columnar storage
-                ColumnarStore::delete(&self.db, &self.gate, table_name, &column.name, row_id)?;
-            }
-
-            // Write back row tuple
-            let new_value =
-                bincode::serialize(&tuple).map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
-
-            // Through the one rule, keyed on the key this row is landing under.
-            let final_value = super::tde::seal_row_value(self.key_manager.as_deref(), &key, &new_value)?;
-
-            self.gate
-                .put(&self.db, &key, final_value.as_ref(), None)
-                .map_err(|e| Error::storage(format!("Failed to write migrated row: {}", e)))?;
-
-            migrated += 1;
-        }
-
-        // Flush dictionary changes if we're using dictionary mode
+        // A dictionary entry the encode above added is in memory only until the group
+        // is written; one that is not written is forgotten, and reloaded from the store.
         if new_mode == ColumnStorageMode::Dictionary {
-            self.dict_manager.flush(&self.db, &self.gate)?;
+            self.dict_manager
+                .stage_column(table_name, &column.name, ddl.batch_mut())?;
+            let table = table_name.to_string();
+            ddl.on_abort(move || self.forget_table_dictionaries(&table));
         }
-
-        // R3.3: storage-mode changes touching COLUMNAR invalidate the
-        // presence sidecar (a table that only now became columnar — or that
-        // just lost its last columnar column — must not trust any stale
-        // `colp:` records). The next columnar read re-backfills lazily.
-        if old_mode == ColumnStorageMode::Columnar || new_mode == ColumnStorageMode::Columnar {
-            ColumnarStore::purge_presence(&self.db, &self.gate, table_name)?;
+        for (key, payload) in &payloads {
+            ddl.put_stored(key, payload);
+        }
+        let columnar = old_mode == ColumnStorageMode::Columnar || new_mode == ColumnStorageMode::Columnar;
+        if columnar {
+            let stats = super::columnar::stats_write_lock();
+            for (batch_id, values) in &columnar_slots {
+                ColumnarStore::apply_batch_values(
+                    &self.db,
+                    ddl.batch_mut(),
+                    table_name,
+                    &column.name,
+                    *batch_id,
+                    values,
+                )?;
+            }
+            // R3.3: storage-mode changes touching COLUMNAR invalidate the presence
+            // sidecar (a table that only now became columnar — or that just lost its
+            // last columnar column — must not trust any stale `colp:` records). The
+            // next columnar read re-backfills lazily.
+            ColumnarStore::stage_presence_purge(&self.db, table_name, ddl.batch_mut())?;
+            ddl.hold_until_written(stats);
+        }
+        let measured = ddl.size_in_bytes() as u64;
+        if measured > limit.max_bytes {
+            return Err((limit.refuse)(measured));
         }
 
         tracing::info!(
-            "Migrated {} rows in {}.{} from {:?} to {:?}",
-            migrated,
+            "Staged the migration of {} rows in {}.{} from {:?} to {:?}",
+            staged.rows,
             table_name,
             column.name,
             old_mode,
             new_mode
         );
-
-        Ok(migrated)
-    }
-
-    /// Drop a column from all existing rows in a table
-    ///
-    /// This method updates all existing rows by removing the value
-    /// at the specified column index.
-    ///
-    /// # Arguments
-    /// * `table_name` - Name of the table
-    /// * `col_idx` - Index of the column to drop
-    ///
-    /// # Returns
-    /// Number of rows updated
-    pub fn drop_column_from_rows(&self, table_name: &str, col_idx: usize) -> Result<usize> {
-        let prefix = format!("data:{}:", table_name);
-        let prefix_bytes = prefix.as_bytes();
-        let mut updated = 0;
-
-        // W2.5: this rewrites every `data:` row in
-        // place with NO snapshot-resolvable version. Drop the committed-write
-        // watermark BEFORE the first overwrite so an in-transaction reader whose
-        // fast-read gate was open on this table falls to the snapshot path (see
-        // `invalidate_write_watermark`).
-        self.invalidate_write_watermark(table_name);
-
-        // W3.2: this in-place `data:` rewrite is an
-        // uncovered mutation funnel — materialize any elided (flagged) latest
-        // version or COPY-marker-covered row before narrowing `data:`, else an
-        // AS-OF read predating the DROP loses the pre-drop (wider) value. Gate
-        // hoisted out of the row loop (one relaxed atomic load + one marker-map
-        // probe on the common no-elision/no-COPY path).
-        let needs_version_materialize =
-            self.snapshot_manager.table_has_copy_markers(table_name) || self.snapshot_manager.maybe_elided_rows();
-
-        // Collect keys first to avoid iterator invalidation
-        let mut keys_to_update = Vec::new();
-        let mut read_opts = ReadOptions::default();
-        read_opts.set_total_order_seek(true);
-        let iter = self.db.iterator_opt(IteratorMode::Start, read_opts);
-        for item in iter {
-            let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
-            if key.starts_with(prefix_bytes) {
-                keys_to_update.push(key.to_vec());
-            } else if key.first() > prefix_bytes.first() {
-                break;
-            }
-        }
-
-        // Update each row by removing the column value
-        for key in keys_to_update {
-            let raw_value = self
-                .db
-                .get(&key)
-                .map_err(|e| Error::storage(format!("Failed to read row: {}", e)))?
-                .ok_or_else(|| Error::storage("Row disappeared during update"))?;
-
-            // Deserialize (decrypt first if needed)
-            let stored = self.decode_stored_ref(&key, &raw_value)?;
-            let mut tuple: Tuple = bincode::deserialize(&stored)
-                .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
-
-            // Remove the column value if it exists
-            if col_idx < tuple.values.len() {
-                tuple.values.remove(col_idx);
-
-                // Serialize, then seal through the one rule, keyed on the key
-                // this row is landing under.
-                let new_value = bincode::serialize(&tuple)
-                    .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
-
-                let final_value = super::tde::seal_row_value(self.key_manager.as_deref(), &key, &new_value)?;
-
-                // W3.2: materialize this row's elided/COPY-marker insert version
-                // BEFORE the in-place narrowing overwrite (only rows actually
-                // rewritten need it — an out-of-bounds col_idx leaves `data:`
-                // untouched, so its elided version stays valid).
-                if needs_version_materialize {
-                    if let Some(row_id) = Self::parse_row_id_after_prefix(&key, prefix_bytes.len()) {
-                        self.snapshot_manager
-                            .materialize_copy_marker_row_durable(table_name, row_id)?;
-                    }
-                }
-
-                self.gate
-                    .put(&self.db, &key, final_value.as_ref(), None)
-                    .map_err(|e| Error::storage(format!("Failed to write updated row: {}", e)))?;
-
-                updated += 1;
-            }
-        }
-
-        // W2.5: close any watermark entry a concurrent tracked commit
-        // re-established mid-rewrite (mirrors the merge-to-main choke point).
-        self.bump_schema_generation();
-        // A cached pre-DROP image would keep the
-        // dropped value in place, shifting every later column of a PK lookup.
-        self.row_cache.invalidate_table(table_name);
-
-        Ok(updated)
+        Ok(staged)
     }
 
     /// Rename a table
@@ -10656,6 +11350,159 @@ impl StorageEngine {
     pub fn register_zone_maps(&self, table_name: &str, zone_map: TableZoneMap) {
         self.predicate_pushdown
             .register_zone_maps(table_name.to_string(), zone_map);
+    }
+
+    /// Rare failed-MV reconciliation fences reads as well as writes. The
+    /// healthy path shares the gate's existing quarantine flag; cached SQL
+    /// plans also test the fence in their existing layout-epoch load.
+    #[inline]
+    pub(crate) fn check_table_readable(&self, table: &str) -> Result<()> {
+        if self.gate.has_quarantined_tables() {
+            self.layout_epochs().check_available(table)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn quarantine_materialized_view(&self, view: &str, table: &str, reason: &str) -> Error {
+        // The epoch fence comes first, before any unreliable index is retired.
+        self.layout_epochs().quarantine(table);
+        self.layout_epochs().quarantine(view);
+        self.gate.quarantine_table(table, reason);
+        self.invalidate_schema_cache(table);
+        self.invalidate_schema_cache(view);
+        self.invalidate_missing_values(table);
+        self.invalidate_table_constraints_cache(table);
+        self.forget_table_dictionaries(table);
+        self.data_write_attempt_publication(table.to_string())();
+        Error::storage(format!(
+            "materialized view '{view}' reconciliation failed: {reason}; its backing table is unavailable until reopen"
+        ))
+    }
+
+    /// An executor borrows its engine. Its transaction callbacks own these
+    /// component handles instead, so rollback can outlive that executor without
+    /// an engine Arc capture or an ownership cycle through a transaction slot.
+    pub(crate) fn truncate_rollback_reconciler(
+        &self,
+        table: String,
+        truncated: Vec<u64>,
+    ) -> impl FnOnce(&Transaction) + Send + 'static {
+        let db = Arc::clone(&self.db);
+        let key_manager = self.key_manager_arc();
+        let snapshots = self.snapshot_manager_arc();
+        let art = Arc::clone(&self.art_index_manager);
+        let vectors = Arc::clone(&self.vector_indexes);
+        let row_cache = Arc::clone(&self.row_cache);
+        let gate = Arc::clone(&self.gate);
+        let epoch = Arc::clone(&self.generic_mutation_generation);
+        move |txn| {
+            let restored = (|| -> Result<(crate::Schema, Vec<Tuple>)> {
+                // Read actual metadata/rows, not a snapshot or row cache: a
+                // failed write may have applied. The transaction has restored
+                // its staging before invoking this reconciliation.
+                snapshots.forget_committed_dictionaries();
+                let schema_key = format!("meta:table:{table}");
+                let Some(raw) = db.get(schema_key.as_bytes())? else {
+                    return Ok((crate::Schema::new(Vec::new()), Vec::new()));
+                };
+                let plain = super::tde::open_ref(key_manager.as_deref(), schema_key.as_bytes(), &raw)?;
+                let schema: crate::Schema = bincode::deserialize(&plain)
+                    .map_err(|error| Error::storage(format!("TRUNCATE reconciliation schema: {error}")))?;
+                let missing_prefix = Catalog::attmissing_prefix(&table);
+                let mut missing = HashMap::new();
+                let mut options = ReadOptions::default();
+                options.set_total_order_seek(true);
+                for entry in db.iterator_opt(
+                    IteratorMode::From(missing_prefix.as_bytes(), Direction::Forward),
+                    options,
+                ) {
+                    let (key, raw) = entry?;
+                    let Some(column) = key.strip_prefix(missing_prefix.as_bytes()) else {
+                        break;
+                    };
+                    let plain = super::tde::open_ref(key_manager.as_deref(), &key, &raw)?;
+                    let value: Value = bincode::deserialize(&plain)
+                        .map_err(|error| Error::storage(format!("TRUNCATE reconciliation missing value: {error}")))?;
+                    missing.insert(String::from_utf8_lossy(column).into_owned(), value);
+                }
+                let shape = super::row_shape::RowShape::new(
+                    schema.columns.len(),
+                    Some(Arc::new(super::row_shape::MissingValues::from_schema(&schema, missing))),
+                );
+                let prefix = format!("data:{table}:");
+                let mut options = ReadOptions::default();
+                options.set_total_order_seek(true);
+                let mut rows = Vec::new();
+                for entry in db.iterator_opt(IteratorMode::From(prefix.as_bytes(), Direction::Forward), options) {
+                    let (key, raw) = entry?;
+                    if !key.starts_with(prefix.as_bytes()) {
+                        break;
+                    }
+                    let Some(id) = Self::parse_row_id_after_prefix(&key, prefix.len()) else {
+                        continue;
+                    };
+                    let plain = super::tde::open_ref(key_manager.as_deref(), &key, &raw)?;
+                    let logical = snapshots.logical_current_row_for_history(&table, id, &plain, None)?;
+                    let mut row: Tuple = bincode::deserialize(&logical)
+                        .map_err(|error| Error::storage(format!("TRUNCATE reconciliation row: {error}")))?;
+                    shape.apply(&mut row);
+                    row.row_id = Some(id);
+                    rows.push(row);
+                }
+                let rows = txn.merge_with_write_set_shaped(&table, rows, &shape)?;
+                Ok((schema, rows))
+            })();
+            let rebuilt = restored.and_then(|(schema, rows)| {
+                art.clear_table_indexes(&table);
+                let indexed: Vec<_> = rows
+                    .into_iter()
+                    .filter_map(|tuple| tuple.row_id.map(|id| (id, tuple)))
+                    .collect();
+                art.on_insert_tuples(&table, &schema, &indexed)
+                    .map_err(|error| Error::storage(format!("TRUNCATE reconciliation indexes: {error}")))?;
+                if vectors.table_has_indexes(&table) {
+                    let mut actual: BTreeMap<_, _> = truncated.iter().map(|id| (*id, None)).collect();
+                    actual.extend(indexed.iter().map(|(id, row)| (*id, Some(row.clone()))));
+                    vectors.reconcile_rows_ram_only(&table, &schema, &actual.into_iter().collect::<Vec<_>>())?;
+                }
+                Ok(())
+            });
+            if let Err(error) = rebuilt {
+                // Retire unreliable indexes and quarantine writes as the
+                // generic mutation funnel does. Never expose an authoritative
+                // partial ART result after an unreadable/failed reconciliation.
+                gate.quarantine_table(&table, &error.to_string());
+                vectors.retire_table_indexes(&table, &error.to_string());
+                if let Err(retire) = art.drop_table_indexes(&table) {
+                    tracing::error!("TRUNCATE reconciliation could not retire indexes of {table}: {retire}");
+                }
+                epoch.fetch_add(1, Ordering::Release);
+                tracing::error!(
+                    "TRUNCATE actual-state reconciliation for {table}: {error}; writes quarantined until reopen"
+                );
+            }
+            row_cache.invalidate_table(&table);
+        }
+    }
+
+    /// Fence result/row caches for a successful or possibly-applied write. This
+    /// is a data epoch; advancing schema generation here would refresh another
+    /// REPEATABLE READ transaction's snapshot after an ordinary TRUNCATE.
+    pub(crate) fn truncate_write_attempt_publication(&self, table: String) -> impl FnOnce() + Send + 'static {
+        self.data_write_attempt_publication(table)
+    }
+
+    /// An out-of-band row replacement invalidates cached data, not schemas or
+    /// existing transaction snapshots. Shared by direct TRUNCATE and MV refresh.
+    pub(crate) fn data_write_attempt_publication(&self, table: String) -> impl FnOnce() + Send + 'static {
+        let row_cache = Arc::clone(&self.row_cache);
+        let pushdown = Arc::clone(&self.predicate_pushdown);
+        let epoch = Arc::clone(&self.generic_mutation_generation);
+        move || {
+            row_cache.invalidate_table(&table);
+            pushdown.remove_table(&table);
+            epoch.fetch_add(1, Ordering::Release);
+        }
     }
 
     /// Get reference to the predicate pushdown manager
@@ -11161,17 +12008,57 @@ impl StorageEngine {
         // handle that may not write leaves the directory as it found it.
         self.gate.check()?;
 
+        // A prepared row group may have sampled dirty snapshot state before
+        // this checkpoint. Rearming underneath it could leave another table's
+        // marker valid after that group clears the global clean flag. Defer
+        // before any cache write while a row owner or graph publisher is active.
+        let snapshot_ticket = self.snapshot_manager.snapshot_publication_ticket();
+        let schema_ticket = self.schema_generation();
+        let vector_ticket = match self.vector_indexes.publication_ticket() {
+            Some(ticket)
+                if !self.write_census.any_uncommitted_writes() && !self.table_locks.current_statement_holds_any() =>
+            {
+                ticket
+            }
+            _ => {
+                report.elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+                tracing::debug!("index snapshot checkpoint deferred while writers are active");
+                return Ok(report);
+            }
+        };
+
+        // Ordinary native fast writers keep their shared table owner through
+        // their final ART hook, including with time travel disabled. Serialize
+        // this rare maintenance path against that WHOLE operation; a snapshot
+        // timestamp is not a generation for an older/out-of-order commit.
+        // Acquire all names in the normal sorted order before manager/tree,
+        // dictionary, stats, row or database resources. Never upgrade an outer
+        // statement owner (checked above), which could already hold a later key.
+        let catalog = super::Catalog::new(self);
+        let tables = catalog.list_main_tables()?;
+        let names: Vec<_> = tables.iter().map(String::as_str).collect();
+        let _checkpoint_tables =
+            self.lock_tables_exclusive(super::table_locks::MAIN_LEVEL, &names, "an index snapshot checkpoint")?;
+        if self.write_census.any_uncommitted_writes()
+            || !self.vector_indexes.publication_is_current(vector_ticket)
+            || self.snapshot_manager.snapshot_publication_ticket() != snapshot_ticket
+            || self.schema_generation() != schema_ticket
+        {
+            report.elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+            tracing::debug!("index snapshot checkpoint deferred after waiting for table owners");
+            return Ok(report);
+        }
+
         // Re-arm validity BEFORE exporting. A mutation racing this checkpoint
         // flips the flag (and deletes whatever markers exist); the post-write
         // check below then removes the markers written here.
         self.art_index_manager.mark_snapshot_clean();
         self.vector_indexes.mark_snapshot_clean();
 
-        let catalog = super::Catalog::new(self);
         let marker = snap::SnapshotMarker::current();
         let marker_bytes = bincode::serialize(&marker).map_err(|e| Error::storage(format!("marker serialize: {e}")))?;
 
-        for table_name in catalog.list_tables()? {
+        for table_name in tables {
             if table_name.starts_with("helios_") {
                 continue;
             }
@@ -11247,11 +12134,19 @@ impl StorageEngine {
             }
         }
 
-        // Detect a mutation that raced the checkpoint and drop the markers.
-        if !self.art_index_manager.snapshot_is_clean() {
+        // Detect both an active writer and a completed writer (census ABA).
+        // Native commit publication covers ordinary ART row owners; vector
+        // tickets also cover raw graph operations that have no heap census.
+        let row_or_schema_changed = self.write_census.any_uncommitted_writes()
+            || self.snapshot_manager.snapshot_publication_ticket() != snapshot_ticket
+            || self.schema_generation() != schema_ticket;
+        if row_or_schema_changed || !self.art_index_manager.snapshot_is_clean() {
             self.invalidate_art_snapshot_markers();
         }
-        if !self.vector_indexes.snapshot_is_clean() {
+        if row_or_schema_changed
+            || !self.vector_indexes.publication_is_current(vector_ticket)
+            || !self.vector_indexes.snapshot_is_clean()
+        {
             self.invalidate_vector_snapshot_markers();
         }
 
@@ -11808,7 +12703,11 @@ impl StorageEngine {
     ) -> Result<BranchId> {
         let budget = || deadline.saturating_duration_since(std::time::Instant::now());
         let parent = parent_name.unwrap_or("main");
-        if let Some(freeze) = &self.branch_freeze {
+        // The fork record still reads main's unfrozen definitions after the
+        // child registers. Keep schema exclusion until that record is durable:
+        // otherwise it can collect the old main epoch, then race an ALTER that
+        // freezes the child's definition before its final metadata write.
+        let _schema_statements = if let Some(freeze) = &self.branch_freeze {
             let statements = if parent_id == MAIN_LEVEL {
                 Some(
                     freeze
@@ -11832,8 +12731,10 @@ impl StorageEngine {
                 return Err(Error::branch_create_busy(name, parent));
             }
             drop(creating);
-            drop(statements);
-        }
+            statements
+        } else {
+            None
+        };
         mgr.refuse_if_in_unfinished_merge(parent_id, parent)?;
 
         if let Some(anchor) = anchor {
@@ -11943,7 +12844,7 @@ impl StorageEngine {
         target_name: &str,
         strategy: super::MergeStrategy,
     ) -> Result<super::MergeResult> {
-        self.merge_branch_inner(source_name, target_name, strategy, false)
+        self.merge_branch_inner(source_name, target_name, strategy, false, MergeFkPolicy::Enforced)
     }
 
     /// [`Self::merge_branch`] for a `MERGE … WITH (delete_branch_after = true)`: refused
@@ -11957,7 +12858,18 @@ impl StorageEngine {
         target_name: &str,
         strategy: super::MergeStrategy,
     ) -> Result<super::MergeResult> {
-        self.merge_branch_inner(source_name, target_name, strategy, true)
+        self.merge_branch_inner(source_name, target_name, strategy, true, MergeFkPolicy::Enforced)
+    }
+
+    pub(crate) fn merge_branch_with_fk_policy(
+        &self,
+        source: &str,
+        target: &str,
+        strategy: super::MergeStrategy,
+        source_goes_after: bool,
+        policy: MergeFkPolicy,
+    ) -> Result<super::MergeResult> {
+        self.merge_branch_inner(source, target, strategy, source_goes_after, policy)
     }
 
     fn merge_branch_inner(
@@ -11966,6 +12878,7 @@ impl StorageEngine {
         target_name: &str,
         _strategy: super::MergeStrategy,
         source_goes_after: bool,
+        requested_fk_policy: MergeFkPolicy,
     ) -> Result<super::MergeResult> {
         // sprinter 6bc4a4040eb7 (phase B3): a MERGE reads and changes catalogs
         // by explicit level — the source's own records, the target's chain,
@@ -12000,6 +12913,11 @@ impl StorageEngine {
         // merged by the unfinished merge this statement resumes), and the
         // target likewise.
         let (source_meta, _, pending) = self.merge_ends(source_name, target_name, Some((source_id, target_id)))?;
+        let fk_policy = if pending.is_some() {
+            self.branch_merge_fk_policy(source_id)?
+        } else {
+            requested_fk_policy
+        };
         if source_goes_after {
             self.refuse_drop_of_branch_with_child(source_name)?;
         }
@@ -12068,13 +12986,15 @@ impl StorageEngine {
                 }
                 self.register_merge_intent_exclusion(&intent)?;
                 // Spec R5.1: taken again, and everything validated again under it.
-                self.lock_merge_tables(
-                    &ends,
-                    &merge_owner,
-                    &mut merge_locks,
+                let dependencies = self.merge_fk_dependency_tables(
+                    source_id,
+                    &target_chain,
+                    &intent.steps,
                     &intent.tables,
-                    &intent.main_tables,
+                    fk_policy,
                 )?;
+                let inherited = self.merge_fk_inherited_tables(&target_chain, &dependencies)?;
+                self.lock_merge_tables(&ends, &merge_owner, &mut merge_locks, &dependencies, &inherited)?;
                 // B3 second fix pass: the window from the first run to this one
                 // was open to main's DML: validate its keys again. An error here
                 // leaves the merge pending, with nothing further changed.
@@ -12083,9 +13003,10 @@ impl StorageEngine {
                 let left = intent.tables_left();
                 self.refuse_merged_tables_too_large(&ends, &left)?;
                 self.validate_merge_keys(&ends, &intent.steps, &left)?;
+                self.validate_merge_fks(&ends, &intent.steps, &intent.tables, &left, fk_policy)?;
                 intent
             }
-            None => match self.write_merge_intent(&ends, &merge_owner, &mut merge_locks) {
+            None => match self.write_merge_intent(&ends, &merge_owner, &mut merge_locks, fk_policy) {
                 Ok(intent) => intent,
                 Err(e) => {
                     self.release_merge_exclusion(source_id);
@@ -12269,6 +13190,7 @@ impl StorageEngine {
         ends: &MergeEnds<'_>,
         owner: &super::table_locks::SeparateLockOwner,
         locks: &mut super::table_locks::ExclusiveTableLocks,
+        policy: MergeFkPolicy,
     ) -> Result<BranchMergePlan> {
         let level = if ends.merge_to_main {
             MERGE_TARGET_MAIN
@@ -12279,14 +13201,15 @@ impl StorageEngine {
         let mut held_on_main: HashSet<String> = HashSet::new();
         for attempt in 0..4 {
             let plan = self.plan_branch_merge(ends)?;
-            let on_level: Vec<String> = plan
-                .tables
+            let dependencies =
+                self.merge_fk_dependency_tables(ends.source_id, ends.target_chain, &plan.steps, &plan.tables, policy)?;
+            let inherited = self.merge_fk_inherited_tables(ends.target_chain, &dependencies)?;
+            let on_level: Vec<String> = dependencies
                 .iter()
                 .filter(|table| !held_on_level.contains(*table))
                 .cloned()
                 .collect();
-            let on_main: Vec<String> = plan
-                .main_tables
+            let on_main: Vec<String> = inherited
                 .iter()
                 .filter(|table| !held_on_main.contains(*table))
                 .cloned()
@@ -12325,10 +13248,12 @@ impl StorageEngine {
         ends: &MergeEnds<'_>,
         owner: &super::table_locks::SeparateLockOwner,
         locks: &mut super::table_locks::ExclusiveTableLocks,
+        policy: MergeFkPolicy,
     ) -> Result<MergeIntent> {
-        let plan = self.plan_under_exclusion(ends, owner, locks)?;
+        let plan = self.plan_under_exclusion(ends, owner, locks, policy)?;
         self.refuse_merged_tables_too_large(ends, &plan.tables)?;
         self.validate_merge_keys(ends, &plan.steps, &plan.tables)?;
+        self.validate_merge_fks(ends, &plan.steps, &plan.tables, &plan.tables, policy)?;
         for step in &plan.steps {
             if let MergeAction::AddColumnsOnMain { base_columns, columns } = &step.action {
                 self.preflight_merged_columns(&step.table, ends.source_id, base_columns.len(), columns)?;
@@ -12347,7 +13272,11 @@ impl StorageEngine {
             main_tables: plan.main_tables,
             landed: Vec::new(),
         };
-        self.put_branch_merge_intent(&intent)?;
+        if policy == MergeFkPolicy::Enforced {
+            self.put_branch_merge_intent(&intent)?;
+        } else {
+            self.put_branch_merge_intent_with_fk_policy(&intent, policy)?;
+        }
         Ok(intent)
     }
 
@@ -12660,28 +13589,58 @@ impl StorageEngine {
         self.merge_failpoint_tick(MergeFailSite::TableClaimed)?;
 
         let commit_ts = self.next_commit_timestamp(txn.has_tracked_writes());
-        txn.commit_with_timestamp(commit_ts)?;
-        // The statement's own invalidation runs only if it succeeds, and a later
-        // table can stop it: a result cached during the merge must not outlive this
-        // commit (the generation is part of the result cache's epoch).
-        self.bump_schema_generation();
-        *intent = progressed;
-        if let Err(e) = claim.finish() {
-            tracing::error!("MERGE BRANCH: removing the keys {} no longer holds: {}", table, e);
+        let attempt = super::write_outcome::WriteAttempt::default();
+        let mut claim = Some(claim);
+        let mut applied = false;
+        let mut publication_error = None;
+        let result = txn.commit_with_timestamp_settled(commit_ts, &attempt, |_, outcome, _| {
+            use super::write_outcome::WriteOutcome;
+            match outcome {
+                WriteOutcome::NotWritten => {
+                    // The native group was refused. Restore every eager key while
+                    // this transaction still owns its key/row/census holds.
+                    drop(claim.take());
+                }
+                WriteOutcome::Unknown => {
+                    if let Some(claim) = claim.take() {
+                        claim.disarm_for_reconciliation();
+                    }
+                    self.quarantine_generic_indexes(table, "MERGE BRANCH native outcome is unknown");
+                }
+                WriteOutcome::Applied => {
+                    applied = true;
+                    // A later fsync/ACK error does not turn these rows into an
+                    // abort. Complete all RAM publication before giving up holds.
+                    self.bump_schema_generation();
+                    if let Some(claim) = claim.take() {
+                        if let Err(error) = claim.finish() {
+                            publication_error = Some(Error::storage(format!(
+                                "MERGE BRANCH: removing the keys {table} no longer holds: {error}"
+                            )));
+                        }
+                    }
+                    if self.vector_indexes.table_has_indexes(table) {
+                        let actual: Vec<_> = rows.iter().map(|row| (row.row_id, row.new.clone())).collect();
+                        if let Err(error) = self.vector_indexes.reconcile_rows_ram_only(table, &schema, &actual) {
+                            publication_error.get_or_insert(error);
+                        }
+                    }
+                    if let Some(error) = &publication_error {
+                        self.quarantine_generic_indexes(table, &error.to_string());
+                    }
+                }
+            }
+        });
+        if applied {
+            // The progress record belongs to the same native group as the rows.
+            *intent = progressed;
+        }
+        // Preserve an original native/durability error ahead of a derived one.
+        result?;
+        if let Some(error) = publication_error {
+            return Err(Error::applied_publication_failure(error));
         }
         drop(census);
-        if self.vector_indexes.table_has_indexes(table) {
-            for row in &rows {
-                let _ = match &row.new {
-                    Some(new) => self
-                        .vector_indexes
-                        .on_row_update(table, row.row_id, &schema, row.old.as_ref(), new),
-                    None => self
-                        .vector_indexes
-                        .on_row_delete(table, row.row_id, Some(&schema), row.old.as_ref()),
-                };
-            }
-        }
         let _ = self.increment_lsn();
         Ok(rows.len())
     }
@@ -13310,6 +14269,382 @@ impl StorageEngine {
     /// A statement that claims the key AFTER this check is met by the row phase:
     /// whichever claims first holds it, and the other is refused, so nothing is
     /// duplicated. What stays open until R5 is in the spec.
+    fn merge_fk_definitions(
+        &self,
+        source_chain: &[u64],
+        target_chain: &[u64],
+        steps: &[MergeStep],
+    ) -> Result<std::collections::BTreeMap<String, super::branch_catalog::BranchTableDefinition>> {
+        let mut names: std::collections::BTreeSet<String> =
+            Catalog::new(self).list_main_tables()?.into_iter().collect();
+        names.extend(self.branch_tables_in_chain(target_chain)?.into_keys());
+        names.extend(steps.iter().map(|step| step.table.clone()));
+        let mut definitions = std::collections::BTreeMap::new();
+        for table in names {
+            if let Some((definition, _)) = self.chain_table_definition(target_chain, &table)? {
+                definitions.insert(table, definition);
+            }
+        }
+        for step in steps {
+            let definition = match &step.action {
+                MergeAction::DropOnMain => None,
+                MergeAction::CreateOnMain { definition } => Some(definition.clone()),
+                MergeAction::PutOnBranch { record, .. } => record.definition().cloned(),
+                MergeAction::AddColumnsOnMain { .. } => self
+                    .chain_table_definition(source_chain, &step.table)?
+                    .map(|(definition, _)| definition),
+            };
+            match definition {
+                Some(definition) => {
+                    definitions.insert(step.table.clone(), definition);
+                }
+                None => {
+                    definitions.remove(&step.table);
+                }
+            }
+        }
+        Ok(definitions)
+    }
+
+    /// Validation dependencies are locked/excluded, but never added to the row
+    /// landing list. Recompute under the locks, and again after a crash resume.
+    pub(crate) fn merge_fk_dependency_tables(
+        &self,
+        source: u64,
+        target_chain: &[u64],
+        steps: &[MergeStep],
+        changed: &[String],
+        _policy: MergeFkPolicy,
+    ) -> Result<Vec<String>> {
+        let mut found: std::collections::BTreeSet<String> = changed.iter().cloned().collect();
+        // Even Off/Proxy and NOT ENFORCED preserve declarative schema
+        // dependencies: row checking is optional, dangling FK definitions are not.
+        let source_chain = self.get_branch_chain(source)?;
+        let definitions = self.merge_fk_definitions(&source_chain, target_chain, steps)?;
+        loop {
+            let before = found.len();
+            for (child, definition) in &definitions {
+                for fk in &definition.constraints.foreign_keys {
+                    if found.contains(child) || found.contains(&fk.references_table) {
+                        found.insert(child.clone());
+                        found.insert(fk.references_table.clone());
+                    }
+                }
+            }
+            if found.len() == before {
+                return Ok(found.into_iter().collect());
+            }
+        }
+    }
+
+    pub(crate) fn merge_fk_inherited_tables(&self, target_chain: &[u64], tables: &[String]) -> Result<Vec<String>> {
+        if target_chain.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut inherited = Vec::new();
+        for table in tables {
+            if matches!(
+                self.resolve_branch_table(target_chain, table)?,
+                super::branch_catalog::BranchTableResolution::Inherited
+            ) {
+                inherited.push(table.clone());
+            }
+        }
+        Ok(inherited)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn merge_fk_final_rows(
+        &self,
+        ends: &MergeEnds<'_>,
+        steps: &[MergeStep],
+        remaining: &[String],
+        table: &str,
+        definition: &super::branch_catalog::BranchTableDefinition,
+        source: &BranchView<'_>,
+        target: &BranchView<'_>,
+    ) -> Result<Vec<Tuple>> {
+        let pending = remaining.iter().any(|name| name == table);
+        let replaced = pending
+            && steps.iter().any(|step| {
+                step.table == table
+                    && match &step.action {
+                        MergeAction::CreateOnMain { .. } => true,
+                        MergeAction::PutOnBranch { record, .. } => record.created,
+                        _ => false,
+                    }
+            });
+        let mut rows = HashMap::new();
+        if !replaced {
+            if let Some((current, _)) = self.chain_table_definition(ends.target_chain, table)? {
+                for mut row in target.scan(None, table, &current.schema)? {
+                    let id = row
+                        .row_id
+                        .ok_or_else(|| Error::internal("MERGE FK target row has no identity"))?;
+                    // Branch ADD COLUMN keeps existing FK-column positions;
+                    // new constraints are not added by that branch DDL surface.
+                    row.values.resize(definition.schema.columns.len(), crate::Value::Null);
+                    rows.insert(id, row);
+                }
+            }
+        }
+        if pending {
+            for id in self.branch_changed_row_ids(ends.source_id, table)? {
+                match source.own_entry(None, table, id, definition.schema.columns.len())? {
+                    Some(branch_view::LevelEntry::Row(row)) => {
+                        rows.insert(id, row);
+                    }
+                    Some(branch_view::LevelEntry::Tombstone) => {
+                        rows.remove(&id);
+                    }
+                    None => {}
+                }
+            }
+        }
+        Ok(rows.into_values().collect())
+    }
+
+    /// Validate the final three-way landing, including target children the
+    /// source could not see. No mutation or intent precedes strict refusal.
+    /// Existing invalid rows admitted by Off/Audit are checked only if the
+    /// merge changes that child or breaks a previously valid relationship.
+    fn validate_merge_fks(
+        &self,
+        ends: &MergeEnds<'_>,
+        steps: &[MergeStep],
+        affected: &[String],
+        remaining: &[String],
+        policy: MergeFkPolicy,
+    ) -> Result<()> {
+        use crate::sql::ConstraintEnforcement;
+        use crate::Value;
+        let _memo = super::OverlayCacheScope::enter();
+        let definitions = self.merge_fk_definitions(ends.source_chain, ends.target_chain, steps)?;
+        // Check schema dependencies before looking at any child/parent rows:
+        // an empty or all-NULL child still owns a real FK definition. These
+        // invariants hold in Off/Audit/Proxy/NOT ENFORCED modes as at CREATE.
+        for (child, definition) in &definitions {
+            let before = self
+                .chain_table_definition(ends.target_chain, child)?
+                .map(|(definition, _)| definition);
+            for fk in &definition.constraints.foreign_keys {
+                let fresh = before.as_ref().is_none_or(|before| {
+                    !before.constraints.foreign_keys.iter().any(|old| {
+                        old.name == fk.name
+                            && old.columns == fk.columns
+                            && old.references_table == fk.references_table
+                            && old.references_columns == fk.references_columns
+                    })
+                });
+                if !fresh && !affected.contains(child) && !affected.contains(&fk.references_table) {
+                    continue;
+                }
+                let invalid = |why: &str| {
+                    Error::constraint_violation(format!(
+                        "Foreign key constraint '{}' has an invalid final MERGE schema: {why}",
+                        fk.name
+                    ))
+                };
+                if fk.columns.is_empty() || fk.columns.len() != fk.references_columns.len() {
+                    return Err(invalid("child and parent key arity differ"));
+                }
+                let mut child_columns = fk
+                    .columns
+                    .iter()
+                    .map(|column| {
+                        definition
+                            .schema
+                            .get_column_index(column)
+                            .ok_or_else(|| invalid("child column is absent"))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                child_columns.sort_unstable();
+                if child_columns.windows(2).any(|pair| pair[0] == pair[1]) {
+                    return Err(invalid("child column is repeated"));
+                }
+                let parent = definitions
+                    .get(&fk.references_table)
+                    .ok_or_else(|| invalid("referenced parent table is absent"))?;
+                let mut referenced = fk
+                    .references_columns
+                    .iter()
+                    .map(|column| {
+                        parent
+                            .schema
+                            .get_column_index(column)
+                            .ok_or_else(|| invalid("referenced parent column is absent"))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                referenced.sort_unstable();
+                if referenced.windows(2).any(|pair| pair[0] == pair[1]) {
+                    return Err(invalid("referenced parent column is repeated"));
+                }
+                let unique = parent.unique_rules.iter().any(|rule| {
+                    if rule.columns.len() != referenced.len() {
+                        return false;
+                    }
+                    let mut columns = rule
+                        .columns
+                        .iter()
+                        .map(|column| parent.schema.get_column_index(column))
+                        .collect::<Option<Vec<_>>>();
+                    if let Some(columns) = &mut columns {
+                        columns.sort_unstable();
+                    }
+                    columns.as_ref() == Some(&referenced)
+                });
+                if !unique {
+                    return Err(invalid(
+                        "referenced columns have no qualifying PRIMARY KEY or UNIQUE key",
+                    ));
+                }
+            }
+        }
+        if policy == MergeFkPolicy::Bypass {
+            return Ok(());
+        }
+        let source = BranchView::for_chain(self, ends.source_name, ends.source_chain.to_vec())?;
+        let target = BranchView::for_chain(
+            self,
+            ends.target_name,
+            if ends.merge_to_main {
+                vec![ends.target_id]
+            } else {
+                ends.target_chain.to_vec()
+            },
+        )?;
+        let mut final_rows: HashMap<String, Vec<Tuple>> = HashMap::new();
+        let mut before_keys: HashMap<(String, Vec<String>), HashSet<Vec<Value>>> = HashMap::new();
+        let mut final_keys: HashMap<(String, Vec<String>), HashSet<Vec<Value>>> = HashMap::new();
+        let values = |schema: &crate::Schema, row: &Tuple, columns: &[String]| -> Result<Vec<Value>> {
+            columns
+                .iter()
+                .map(|column| {
+                    schema
+                        .get_column_index(column)
+                        .and_then(|index| row.values.get(index))
+                        .cloned()
+                        .ok_or_else(|| {
+                            Error::constraint_violation(format!(
+                                "Foreign key column '{column}' is absent from final MERGE schema"
+                            ))
+                        })
+                })
+                .collect()
+        };
+        for (child, definition) in &definitions {
+            let changed_ids = if remaining.contains(child) {
+                self.branch_changed_row_ids(ends.source_id, child)?
+            } else {
+                HashSet::new()
+            };
+            let before_child = self
+                .chain_table_definition(ends.target_chain, child)?
+                .map(|(definition, _)| definition);
+            for fk in &definition.constraints.foreign_keys {
+                if fk.enforcement == ConstraintEnforcement::NotEnforced {
+                    continue;
+                }
+                let fresh = before_child.as_ref().is_none_or(|before| {
+                    !before.constraints.foreign_keys.iter().any(|old| {
+                        old.name == fk.name
+                            && old.columns == fk.columns
+                            && old.references_table == fk.references_table
+                            && old.references_columns == fk.references_columns
+                    })
+                });
+                if !fresh && changed_ids.is_empty() && !affected.contains(&fk.references_table) {
+                    continue;
+                }
+                if !final_rows.contains_key(child) {
+                    final_rows.insert(
+                        child.clone(),
+                        self.merge_fk_final_rows(ends, steps, remaining, child, definition, &source, &target)?,
+                    );
+                }
+                let set_key = (fk.references_table.clone(), fk.references_columns.clone());
+                if !final_keys.contains_key(&set_key) {
+                    let mut keys = HashSet::new();
+                    if let Some(parent) = definitions.get(&fk.references_table) {
+                        if !final_rows.contains_key(&fk.references_table) {
+                            final_rows.insert(
+                                fk.references_table.clone(),
+                                self.merge_fk_final_rows(
+                                    ends,
+                                    steps,
+                                    remaining,
+                                    &fk.references_table,
+                                    parent,
+                                    &source,
+                                    &target,
+                                )?,
+                            );
+                        }
+                        for row in &final_rows[&fk.references_table] {
+                            keys.insert(values(&parent.schema, row, &fk.references_columns)?);
+                        }
+                    }
+                    final_keys.insert(set_key.clone(), keys);
+                }
+                let before_parent = self
+                    .chain_table_definition(ends.target_chain, &fk.references_table)?
+                    .map(|(definition, _)| definition);
+                if !before_keys.contains_key(&set_key) {
+                    let mut keys = HashSet::new();
+                    if let Some(parent) = &before_parent {
+                        for row in target.scan(None, &fk.references_table, &parent.schema)? {
+                            keys.insert(values(&parent.schema, &row, &fk.references_columns)?);
+                        }
+                    }
+                    before_keys.insert(set_key.clone(), keys);
+                }
+                for row in &final_rows[child] {
+                    let child_values = values(&definition.schema, row, &fk.columns)?;
+                    if child_values.iter().any(|value| matches!(value, Value::Null)) {
+                        continue;
+                    }
+                    let parent_schema = definitions
+                        .get(&fk.references_table)
+                        .map(|parent| &parent.schema)
+                        .or_else(|| before_parent.as_ref().map(|parent| &parent.schema));
+                    let wanted = parent_schema.map_or_else(
+                        || child_values.clone(),
+                        |schema| {
+                            crate::EmbeddedDatabase::coerce_fk_probe_values(
+                                schema,
+                                &fk.references_columns,
+                                &child_values,
+                            )
+                        },
+                    );
+                    let touched = fresh || row.row_id.is_some_and(|id| changed_ids.contains(&id));
+                    if !touched && !before_keys[&set_key].contains(&wanted) {
+                        continue;
+                    }
+                    if final_keys[&set_key].contains(&wanted) {
+                        continue;
+                    }
+                    if policy == MergeFkPolicy::Audit || fk.enforcement == ConstraintEnforcement::LockFree {
+                        crate::EmbeddedDatabase::record_fk_violation_with(
+                            self,
+                            if policy == MergeFkPolicy::Audit {
+                                crate::FkValidationMode::Audit
+                            } else {
+                                crate::FkValidationMode::Enforced
+                            },
+                            fk,
+                            &child_values,
+                        )?;
+                    } else {
+                        return Err(Error::constraint_violation(format!("Foreign key constraint '{}' violated by MERGE BRANCH {} INTO {}: child '{}' references a missing parent '{}'",
+                            fk.name, ends.source_name, ends.target_name, child, fk.references_table)));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn validate_merge_keys(&self, ends: &MergeEnds<'_>, steps: &[MergeStep], tables: &[String]) -> Result<()> {
         // Main's committed rows by key, when an open main transaction makes its
         // index unreliable, are scanned once for the whole validation.
@@ -13784,10 +15119,9 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// Log a CreateTable operation to WAL
-    ///
-    /// This should be called when creating a new table to ensure the DDL
-    /// operation is replicated to standbys.
+    /// Record explicit logical DDL history; this does not write the catalog.
+    /// Normal DDL stages its operation with its catalog batch through DdlBatch.
+    /// A standalone call owns history only and never enables startup redo.
     pub fn log_create_table(&self, table_name: &str, schema: &crate::Schema) -> Result<()> {
         // Skip if replaying (recovery) or not primary
         if self.is_replaying.load(std::sync::atomic::Ordering::Acquire) {
@@ -13807,10 +15141,9 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// Log a DropTable operation to WAL
-    ///
-    /// This should be called when dropping a table to ensure the DDL
-    /// operation is replicated to standbys.
+    /// Record explicit logical DDL history; this does not write the catalog.
+    /// Normal DDL stages its operation with its catalog batch through DdlBatch.
+    /// A standalone call owns history only and never enables startup redo.
     pub fn log_drop_table(&self, table_name: &str) -> Result<()> {
         // Skip if replaying (recovery) or not primary
         if self.is_replaying.load(std::sync::atomic::Ordering::Acquire) {
@@ -13827,9 +15160,9 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// Log a table rename to the logical WAL. Without this entry, replay
-    /// re-applies the old name's CreateTable+Inserts and resurrects the
-    /// renamed-away table (and an HA standby never learns of the rename).
+    /// Record explicit logical DDL history; this does not write the catalog.
+    /// Normal DDL stages its operation with its catalog batch through DdlBatch.
+    /// A standalone call owns history only and never enables startup redo.
     pub fn log_rename_table(&self, old_name: &str, new_name: &str) -> Result<()> {
         // Skip if replaying (recovery) or not primary
         if self.is_replaying.load(std::sync::atomic::Ordering::Acquire) {
@@ -13847,7 +15180,9 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// Log a Truncate operation to WAL
+    /// Record explicit logical DDL history; this does not write the catalog.
+    /// Normal DDL stages its operation with its catalog batch through DdlBatch.
+    /// A standalone call owns history only and never enables startup redo.
     pub fn log_truncate(&self, table_name: &str) -> Result<()> {
         if self.is_replaying.load(std::sync::atomic::Ordering::Acquire) {
             return Ok(());
@@ -13861,7 +15196,9 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// Log an AlterColumnStorage operation to WAL
+    /// Record explicit logical DDL history; this does not write the catalog.
+    /// Normal DDL stages its operation with its catalog batch through DdlBatch.
+    /// A standalone call owns history only and never enables startup redo.
     pub fn log_alter_column_storage(
         &self,
         table_name: &str,
@@ -13884,7 +15221,9 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// Log a CreateIndex operation to WAL
+    /// Record explicit logical DDL history; this does not write the catalog.
+    /// Normal DDL stages its operation with its catalog batch through DdlBatch.
+    /// A standalone call owns history only and never enables startup redo.
     pub fn log_create_index(
         &self,
         name: &str,
@@ -13909,7 +15248,9 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// Log a DropIndex operation to WAL
+    /// Record explicit logical DDL history; this does not write the catalog.
+    /// Normal DDL stages its operation with its catalog batch through DdlBatch.
+    /// A standalone call owns history only and never enables startup redo.
     pub fn log_drop_index(&self, name: &str) -> Result<()> {
         if self.is_replaying.load(std::sync::atomic::Ordering::Acquire) {
             return Ok(());
@@ -13921,7 +15262,9 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// Log a CreateTrigger operation to WAL
+    /// Record explicit logical DDL history; this does not write the catalog.
+    /// Normal DDL stages its operation with its catalog batch through DdlBatch.
+    /// A standalone call owns history only and never enables startup redo.
     pub fn log_create_trigger(&self, name: &str, table: &str, definition: &[u8]) -> Result<()> {
         if self.is_replaying.load(std::sync::atomic::Ordering::Acquire) {
             return Ok(());
@@ -13937,7 +15280,9 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// Log a DropTrigger operation to WAL
+    /// Record explicit logical DDL history; this does not write the catalog.
+    /// Normal DDL stages its operation with its catalog batch through DdlBatch.
+    /// A standalone call owns history only and never enables startup redo.
     pub fn log_drop_trigger(&self, name: &str, table: Option<&str>) -> Result<()> {
         if self.is_replaying.load(std::sync::atomic::Ordering::Acquire) {
             return Ok(());
@@ -13952,7 +15297,9 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// Log a CreateFunction operation to WAL
+    /// Record explicit logical DDL history; this does not write the catalog.
+    /// Normal DDL stages its operation with its catalog batch through DdlBatch.
+    /// A standalone call owns history only and never enables startup redo.
     pub fn log_create_function(&self, name: &str, definition: &[u8]) -> Result<()> {
         if self.is_replaying.load(std::sync::atomic::Ordering::Acquire) {
             return Ok(());
@@ -13967,7 +15314,9 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// Log a DropFunction operation to WAL
+    /// Record explicit logical DDL history; this does not write the catalog.
+    /// Normal DDL stages its operation with its catalog batch through DdlBatch.
+    /// A standalone call owns history only and never enables startup redo.
     pub fn log_drop_function(&self, name: &str) -> Result<()> {
         if self.is_replaying.load(std::sync::atomic::Ordering::Acquire) {
             return Ok(());
@@ -13979,7 +15328,9 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// Log a CreateProcedure operation to WAL
+    /// Record explicit logical DDL history; this does not write the catalog.
+    /// Normal DDL stages its operation with its catalog batch through DdlBatch.
+    /// A standalone call owns history only and never enables startup redo.
     pub fn log_create_procedure(&self, name: &str, definition: &[u8]) -> Result<()> {
         if self.is_replaying.load(std::sync::atomic::Ordering::Acquire) {
             return Ok(());
@@ -13994,7 +15345,9 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// Log a DropProcedure operation to WAL
+    /// Record explicit logical DDL history; this does not write the catalog.
+    /// Normal DDL stages its operation with its catalog batch through DdlBatch.
+    /// A standalone call owns history only and never enables startup redo.
     pub fn log_drop_procedure(&self, name: &str) -> Result<()> {
         if self.is_replaying.load(std::sync::atomic::Ordering::Acquire) {
             return Ok(());
@@ -14006,7 +15359,9 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// Log a CreateMaterializedView operation to WAL
+    /// Record explicit logical DDL history; this does not write the catalog.
+    /// Normal DDL stages its operation with its catalog batch through DdlBatch.
+    /// A standalone call owns history only and never enables startup redo.
     pub fn log_create_materialized_view(&self, name: &str, definition: &[u8]) -> Result<()> {
         if self.is_replaying.load(std::sync::atomic::Ordering::Acquire) {
             return Ok(());
@@ -14021,7 +15376,9 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// Log a DropMaterializedView operation to WAL
+    /// Record explicit logical DDL history; this does not write the catalog.
+    /// Normal DDL stages its operation with its catalog batch through DdlBatch.
+    /// A standalone call owns history only and never enables startup redo.
     pub fn log_drop_materialized_view(&self, name: &str) -> Result<()> {
         if self.is_replaying.load(std::sync::atomic::Ordering::Acquire) {
             return Ok(());
@@ -14033,7 +15390,9 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// Log a RefreshMaterializedView operation to WAL
+    /// Record explicit logical DDL history; this does not write the catalog.
+    /// Normal DDL stages its operation with its catalog batch through DdlBatch.
+    /// A standalone call owns history only and never enables startup redo.
     pub fn log_refresh_materialized_view(&self, name: &str, concurrent: bool, incremental: bool) -> Result<()> {
         if self.is_replaying.load(std::sync::atomic::Ordering::Acquire) {
             return Ok(());
@@ -14049,7 +15408,9 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// Log an AddConstraint operation to WAL
+    /// Record explicit logical DDL history; this does not write the catalog.
+    /// Normal DDL stages its operation with its catalog batch through DdlBatch.
+    /// A standalone call owns history only and never enables startup redo.
     pub fn log_add_constraint(&self, table: &str, constraint: &[u8]) -> Result<()> {
         if self.is_replaying.load(std::sync::atomic::Ordering::Acquire) {
             return Ok(());
@@ -14064,7 +15425,9 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// Log a DropConstraint operation to WAL
+    /// Record explicit logical DDL history; this does not write the catalog.
+    /// Normal DDL stages its operation with its catalog batch through DdlBatch.
+    /// A standalone call owns history only and never enables startup redo.
     pub fn log_drop_constraint(&self, table: &str, constraint_name: &str) -> Result<()> {
         if self.is_replaying.load(std::sync::atomic::Ordering::Acquire) {
             return Ok(());
@@ -14079,7 +15442,9 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// GH#36: log a full-schema replacement from a column-shape ALTER TABLE.
+    /// Record explicit logical DDL history; this does not write the catalog.
+    /// Normal DDL stages its operation with its catalog batch through DdlBatch.
+    /// A standalone call owns history only and never enables startup redo.
     pub fn log_alter_table_schema(&self, table: &str, schema: &[u8]) -> Result<()> {
         if self.is_replaying.load(std::sync::atomic::Ordering::Acquire) {
             return Ok(());
@@ -14094,7 +15459,9 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// GH#36: log a plain `CREATE [OR REPLACE] VIEW`.
+    /// Record explicit logical DDL history; this does not write the catalog.
+    /// Normal DDL stages its operation with its catalog batch through DdlBatch.
+    /// A standalone call owns history only and never enables startup redo.
     pub fn log_create_view(&self, name: &str, definition: &[u8]) -> Result<()> {
         if self.is_replaying.load(std::sync::atomic::Ordering::Acquire) {
             return Ok(());
@@ -14109,7 +15476,9 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// GH#36: log a plain `DROP VIEW`.
+    /// Record explicit logical DDL history; this does not write the catalog.
+    /// Normal DDL stages its operation with its catalog batch through DdlBatch.
+    /// A standalone call owns history only and never enables startup redo.
     pub fn log_drop_view(&self, name: &str) -> Result<()> {
         if self.is_replaying.load(std::sync::atomic::Ordering::Acquire) {
             return Ok(());
@@ -14121,7 +15490,9 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// GH#36: log a `CREATE SEQUENCE` definition.
+    /// Record explicit logical DDL history; this does not write the catalog.
+    /// Normal DDL stages its operation with its catalog batch through DdlBatch.
+    /// A standalone call owns history only and never enables startup redo.
     pub fn log_create_sequence(&self, name: &str, definition: &[u8]) -> Result<()> {
         if self.is_replaying.load(std::sync::atomic::Ordering::Acquire) {
             return Ok(());
@@ -14136,7 +15507,9 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// GH#36: log an `ALTER SEQUENCE` definition.
+    /// Record explicit logical DDL history; this does not write the catalog.
+    /// Normal DDL stages its operation with its catalog batch through DdlBatch.
+    /// A standalone call owns history only and never enables startup redo.
     pub fn log_alter_sequence(&self, name: &str, definition: &[u8]) -> Result<()> {
         if self.is_replaying.load(std::sync::atomic::Ordering::Acquire) {
             return Ok(());
@@ -14151,7 +15524,9 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// GH#36: log a `DROP SEQUENCE`.
+    /// Record explicit logical DDL history; this does not write the catalog.
+    /// Normal DDL stages its operation with its catalog batch through DdlBatch.
+    /// A standalone call owns history only and never enables startup redo.
     pub fn log_drop_sequence(&self, name: &str) -> Result<()> {
         if self.is_replaying.load(std::sync::atomic::Ordering::Acquire) {
             return Ok(());
@@ -14163,10 +15538,10 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// Replay WAL for crash recovery with optimizations
+    /// Explicitly apply retained logical history at the caller's request.
     ///
-    /// This should be called during engine startup to recover from crashes.
-    /// Returns the number of entries replayed.
+    /// Normal startup and physical/archive recovery never invoke logical redo.
+    /// Returns the number of entries explicitly replayed.
     ///
     /// **Optimizations Applied**:
     /// - Replay flag to skip WAL logging (50% speedup)
@@ -14193,13 +15568,6 @@ impl StorageEngine {
         self.replay_wal_after(0)
     }
 
-    /// Replay only the WAL entries strictly after `after_lsn` (a durable
-    /// checkpoint).
-    ///
-    /// `replay_wal()` is `replay_wal_after(0)` — the whole retained log. Open
-    /// time uses the checkpoint instead; see
-    /// [`StorageEngine::recover_wal_at_open`] for why replaying an
-    /// already-checkpointed entry is not redo but a re-execution of history.
     /// GH#35 (A1): advance the durable logical-WAL checkpoint to the current
     /// LSN and reclaim every entry at or below it.
     ///
@@ -14220,7 +15588,7 @@ impl StorageEngine {
 
     /// GH#35 (A2): whether a clean close advances the checkpoint.
     pub fn wal_checkpoint_on_close(&self) -> bool {
-        !self.open_mode.is_physical() && self.config.storage.wal_checkpoint_on_close
+        self.engine_may_write() && self.gate.is_open() && self.config.storage.wal_checkpoint_on_close
     }
 
     /// Flush RocksDB's memtables at a CLEAN close (`storage.flush_on_close`).
@@ -14393,9 +15761,12 @@ impl StorageEngine {
         rows
     }
 
+    /// Explicitly apply logical history strictly after `after_lsn`.
+    /// The caller owns this choice; startup adopts atomic local groups and
+    /// never invokes replay, including when its checkpoint lags.
     pub fn replay_wal_after(&self, after_lsn: u64) -> Result<usize> {
-        // Spec R5.1, the detector's allow-list: replay runs at open, before any
-        // statement, and on a logical replica's resync, whose primary writes for it.
+        // Spec R5.1, the detector's allow-list: explicitly requested logical
+        // replay/resync, whose caller owns applying this retained history.
         let _allowed = super::table_locks::allow_unlocked_row_writes("WAL replay");
         if let Some(wal) = &self.wal {
             // Set replay flag to skip WAL logging during recovery
@@ -14721,13 +16092,16 @@ impl StorageEngine {
     }
 
     fn apply_live_replicated_counter(&self, table: &str, value: u64) -> Result<()> {
+        let counter_lock = self.gate.counter_lock(table);
+        let counter_guard = counter_lock.lock();
         let (key, durable, target) = self.live_replay_counter(table, value)?;
+        self.publish_live_replay_counter(table, target);
         if target > durable {
             let bytes = bincode::serialize(&target)
                 .map_err(|error| Error::storage(format!("serialize replicated row counter: {error}")))?;
             self.put_internal(&key, &bytes)?;
         }
-        self.publish_live_replay_counter(table, target);
+        drop(counter_guard);
         Ok(())
     }
 
@@ -14794,6 +16168,8 @@ impl StorageEngine {
         // get() decrypts but never consults/populates row caches: index removal
         // must describe the actual stored row, even after a previous delivery.
         let old = self.get(key)?.map(|bytes| decode(&bytes, true)).transpose()?;
+        let counter_lock = self.gate.counter_lock(table);
+        let counter_guard = counter_lock.lock();
         let counter = if new.is_some() {
             Some(self.live_replay_counter(table, row_id)?)
         } else {
@@ -14818,6 +16194,18 @@ impl StorageEngine {
             let cursor_bytes = lsn.to_le_bytes();
             let stored = self.seal_stored(&cursor_bytes)?;
             batch.put(Self::REPLICATION_CURSOR_KEY, stored.as_ref());
+        }
+        let mut vector_write = self.vector_row_write(table, [row_id]);
+        // ART publication requires the same census/outcome proof even when
+        // this table has no vector index. A native error can already be applied.
+        let _live_census = vector_write
+            .is_none()
+            .then(|| self.write_census.hold_for_replay(vec![table.to_string()], false));
+        let live_attempt = super::write_outcome::WriteAttempt::default();
+        if let Some(publication) = vector_write.as_mut() {
+            publication
+                .plan
+                .stage_tuple(table, row_id, &schema, new.as_ref(), &mut batch)?;
         }
         // Preserve the raw put path's resource checks before claiming indexes.
         if let Some(path) = &self.db_path {
@@ -14852,34 +16240,69 @@ impl StorageEngine {
             };
         // Invalidate BEFORE the row becomes visible, including versionless DELETE.
         self.invalidate_write_watermark(table);
-        let written = self.gate.write(&self.db, batch, self.memory_write_options.as_ref());
+        // Allocation state advances even on an uncertain write failure, so
+        // another writer cannot persist a smaller counter afterwards.
+        if let Some((_, _, target)) = &counter {
+            self.publish_live_replay_counter(table, *target);
+        }
+        if let Some(publication) = vector_write.as_mut() {
+            publication.plan.write_call_started();
+        }
+        let attempt = vector_write
+            .as_ref()
+            .map_or(&live_attempt, |publication| &publication.attempt);
+        let written = self
+            .gate
+            .write_observed(&self.db, batch, self.memory_write_options.as_ref(), attempt);
+        let outcome = attempt.outcome();
+        drop(counter_guard);
         if let Err(error) = written {
-            if accounted {
+            let may_undo = vector_write.as_mut().map_or(
+                outcome == super::write_outcome::WriteOutcome::NotWritten,
+                |publication| publication.may_undo_rejected_row(),
+            );
+            if accounted && may_undo {
                 self.data_bytes_written.fetch_sub(write_size, Ordering::Relaxed);
             }
-            let rollback = indexes.rollback();
+            let rollback = if may_undo {
+                format!("{:?}", indexes.rollback())
+            } else {
+                // An ambiguous owning row group may already be durable. Its
+                // authoritative overlay recovers at reopen; never blind-undo.
+                indexes.commit();
+                if vector_write.is_none() {
+                    // Preserve actual applied claim ownership; fence every read
+                    // path before retirement and before the live census drops.
+                    let _ = self.quarantine_generic_indexes(table, &error.to_string());
+                }
+                "not attempted after an uncertain owning row group".to_string()
+            };
             self.publish_live_replay_visibility(table, row_id);
             return Err(Error::storage(format!(
-                "live replication storage write failed: {error}; index rollback: {rollback:?}"
+                "live replication storage write failed: {error}; index rollback: {rollback}"
             )));
         }
+        exit_after_ddl_write("row_replication", table);
         indexes.commit();
-        if let Some((_, _, target)) = counter {
-            self.publish_live_replay_counter(table, target);
+        if let Some(publication) = &vector_write {
+            publication.plan.row_group_applied();
         }
         match &new {
             Some(tuple) => {
                 let _ = self
                     .vector_indexes
-                    .on_row_update(table, row_id, &schema, old.as_ref(), tuple);
+                    .on_row_update_staged(table, row_id, &schema, old.as_ref(), tuple);
             }
             None => {
                 let _ = self
                     .vector_indexes
-                    .on_row_delete(table, row_id, Some(&schema), old.as_ref());
+                    .on_row_delete_staged(table, row_id, Some(&schema), old.as_ref());
             }
         }
         self.publish_live_replay_visibility(table, row_id);
+        if let Some(publication) = vector_write.as_mut() {
+            publication.finish()?;
+        }
         Ok(())
     }
 
@@ -15463,21 +16886,21 @@ impl StorageEngine {
                 // This ensures auto-increment values are preserved across failover
                 info!("Replayed update counter: table={}, new_value={}", table_name, new_value);
 
+                let counter_lock = self.gate.counter_lock(&table_name);
+                let _counter_guard = counter_lock.lock();
                 // Update in-memory counter
                 let counter = self
                     .row_counters
                     .entry(table_name.clone())
                     .or_insert_with(|| std::sync::atomic::AtomicU64::new(0));
 
-                // Only update if new value is higher (prevent going backwards)
-                let current = counter.load(std::sync::atomic::Ordering::SeqCst);
-                if new_value > current {
-                    counter.store(new_value, std::sync::atomic::Ordering::SeqCst);
-                }
+                let target = counter.fetch_max(new_value, Ordering::AcqRel).max(new_value);
+                drop(counter);
 
-                // Persist to storage
+                // Persist the effective maximum, including earlier replayed
+                // entries and the counter recovered from this store.
                 let key = format!("counter:{}", table_name).into_bytes();
-                let value = bincode::serialize(&new_value)
+                let value = bincode::serialize(&target)
                     .map_err(|e| Error::storage(format!("Failed to serialize counter: {}", e)))?;
                 self.put_internal(&key, &value)?;
 
@@ -15716,18 +17139,17 @@ impl StorageEngine {
                     .entry(table_name.clone())
                     .or_insert_with(|| std::sync::atomic::AtomicU64::new(0));
 
-                // Only update if the new value is greater (to handle out-of-order replay)
-                let current = counter.load(std::sync::atomic::Ordering::SeqCst);
-                if *new_value > current {
-                    counter.store(*new_value, std::sync::atomic::Ordering::SeqCst);
-                }
+                // Recovery builds these batches serially; preserve the
+                // effective maximum in the batch as well as in memory.
+                let target = counter.fetch_max(*new_value, Ordering::AcqRel).max(*new_value);
+                drop(counter);
 
                 // Persist the counter, sealed like every other `counter:` write
                 // (`put_internal`, the fast batch, the transaction commit batch)
                 // — a replayed counter must land in the same on-disk form as a
                 // live one.
                 let key = format!("counter:{}", table_name).into_bytes();
-                let value = bincode::serialize(new_value)
+                let value = bincode::serialize(&target)
                     .map_err(|e| Error::storage(format!("Failed to serialize counter: {}", e)))?;
                 let stored = self.seal_stored(&value)?;
                 batch.put(&key, stored.as_ref());
@@ -15788,8 +17210,42 @@ impl StorageEngine {
         tuple: Tuple,
         schema: &crate::Schema,
     ) -> Result<u64> {
-        let catalog = Catalog::new(self);
+        let _locks = self.lock_table_for_write(table_name)?;
+        self.insert_tuple_direct_with_schema(table_name, tuple, schema, true)
+    }
 
+    fn vector_row_write<'a>(
+        &'a self,
+        table: &'a str,
+        rows: impl IntoIterator<Item = u64>,
+    ) -> Option<VectorRowWrite<'a>> {
+        if !self.vector_indexes.table_has_indexes(table) {
+            return None;
+        }
+        let context = self.vector_row_context()?;
+        let mut plan = context.plan();
+        for row in rows {
+            plan.capture(table, row);
+        }
+        Some(VectorRowWrite {
+            engine: self,
+            table,
+            _census: self.write_census.hold_for_replay(vec![table.to_string()], false),
+            plan,
+            attempt: super::write_outcome::WriteAttempt::default(),
+            published: false,
+        })
+    }
+
+    /// Shared direct INSERT tail, including the non-time-travel API route.
+    /// The legacy unversioned route does not fill NULL identity values here.
+    fn insert_tuple_direct_with_schema(
+        &self,
+        table_name: &str,
+        tuple: Tuple,
+        schema: &crate::Schema,
+        fill_identity: bool,
+    ) -> Result<u64> {
         // R1.1: allocate the row id from the volatile counter — the durable
         // next_row_id() pays a counter put PLUS a synced WAL UpdateCounter
         // append per row (one of the two fsyncs that capped plan-arm INSERT
@@ -15809,30 +17265,30 @@ impl StorageEngine {
         // declared type encoded differently (row present on a scan, absent to
         // every point lookup). A NULL in a non-integer PK is now 23502.
         let mut tuple = tuple;
-        let mut generated_identity = false;
-        for (i, col) in schema.columns.iter().enumerate() {
-            crate::note_explicit_identity_pk(self, table_name, col, tuple.values.get(i));
-            if col.primary_key && matches!(tuple.values.get(i), Some(crate::Value::Null)) {
-                let filled = crate::pk_autofill_value(table_name, col, row_id)?;
-                if let Some(slot) = tuple.values.get_mut(i) {
-                    *slot = filled;
-                    generated_identity = true;
+        if fill_identity {
+            let mut generated_identity = false;
+            for (i, col) in schema.columns.iter().enumerate() {
+                crate::note_explicit_identity_pk(self, table_name, col, tuple.values.get(i));
+                if col.primary_key && matches!(tuple.values.get(i), Some(crate::Value::Null)) {
+                    let filled = crate::pk_autofill_value(table_name, col, row_id)?;
+                    if let Some(slot) = tuple.values.get_mut(i) {
+                        *slot = filled;
+                        generated_identity = true;
+                    }
                 }
             }
+            // sprinter 6dc0cc115db9: a SERIAL / IDENTITY value generated HERE is
+            // what `LASTVAL()` must report — `INSERT INTO t (name) VALUES ('a')`
+            // never evaluates a `nextval()` call in this engine (these columns draw
+            // from the row-id allocator, not the sequence store), so hooking only
+            // the evaluator arm would leave `cursor.lastrowid` dead for the exact
+            // shape the item exists to fix. Gated on an actual fill: an INSERT that
+            // supplies the id explicitly does not define `lastval` in PostgreSQL
+            // either. No-op when no session backend is installed.
+            if generated_identity {
+                crate::note_session_lastval(row_id as i64);
+            }
         }
-        // sprinter 6dc0cc115db9: a SERIAL / IDENTITY value generated HERE is
-        // what `LASTVAL()` must report — `INSERT INTO t (name) VALUES ('a')`
-        // never evaluates a `nextval()` call in this engine (these columns draw
-        // from the row-id allocator, not the sequence store), so hooking only
-        // the evaluator arm would leave `cursor.lastrowid` dead for the exact
-        // shape the item exists to fix. Gated on an actual fill: an INSERT that
-        // supplies the id explicitly does not define `lastval` in PostgreSQL
-        // either. No-op when no session backend is installed.
-        if generated_identity {
-            crate::note_session_lastval(row_id as i64);
-        }
-
-        let logical_tuple = tuple.clone();
 
         // PK / UNIQUE enforcement before committing the write. Without this,
         // parameterised INSERTs (`db.execute_params`) and other callers routed
@@ -15851,16 +17307,11 @@ impl StorageEngine {
         // Check bulk load mode early - skip some operations if enabled
         let bulk_mode = self.is_bulk_load_mode();
 
-        let stored_tuple = self.transform_tuple_for_column_storage_opts(table_name, row_id, &tuple, schema, true)?;
-        // Serialize transformed tuple directly (RocksDB LZ4 handles compression at block level)
-        let value = bincode::serialize(&stored_tuple)
-            .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
-        let logical_value = if schema_uses_column_storage(schema) {
-            bincode::serialize(&logical_tuple)
-                .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?
-        } else {
-            value.clone()
-        };
+        let uses_side_storage = schema_uses_column_storage(schema);
+        // Physical refs and sidecar writes are planned inside the durable group.
+        let value =
+            bincode::serialize(&tuple).map_err(|e| Error::storage(format!("Failed to serialize tuple: {e}")))?;
+        let logical_value = value.clone();
 
         // W2.5: allocate the version timestamp and raise the committed-write
         // watermark BEFORE the `data:` row becomes visible. The in-transaction fast
@@ -15887,9 +17338,19 @@ impl StorageEngine {
         // entry. Each of them used to be a write group of its own (about eight per
         // row), the row visible before its version, its counter and its entry.
         let key = Self::build_data_key(table_name, row_id);
-        let written = (|| -> Result<Option<super::time_travel::StagedVersion>> {
-            self.check_direct_write_budget(key.len() + value.len())?;
+        let counter_lock = self.gate.counter_lock(table_name);
+        let counter_guard = counter_lock.lock();
+        let written = (|| -> Result<(Option<super::time_travel::StagedVersion>, Option<u64>)> {
             let mut batch = WriteBatch::default();
+            let (physical, side_write) = if uses_side_storage {
+                let (physical, locks) = self.stage_row_storage(table_name, row_id, &tuple, schema, true, &mut batch)?;
+                (Cow::Owned(physical), Some(locks))
+            } else {
+                (Cow::Borrowed(value.as_slice()), None)
+            };
+            let value = physical.as_ref();
+            self.check_direct_write_budget(key.len() + value.len())?;
+
             let staged_version = match version_timestamp {
                 Some(timestamp) => Some(self.snapshot_manager.stage_data_version_snapshot(
                     &mut batch,
@@ -15909,54 +17370,57 @@ impl StorageEngine {
                 }
             };
             self.stage_row_counter_into(&mut batch, table_name)?;
-            // Skip delta tracking in bulk load mode for improved performance. A
-            // delta that cannot be staged is reported, never the insert's failure.
+            // A tracked row and its delta are one durable effect. Preparation
+            // failure must refuse the whole row before this batch is applied.
+            // Bulk-load mode retains its existing explicit tracking policy.
             if !bulk_mode {
-                if let Err(e) = self
-                    .mv_delta_tracker
-                    .stage_insert(&mut batch, table_name, row_id, tuple.clone())
-                {
-                    tracing::warn!("Failed to record insert delta for table '{}': {}", table_name, e);
-                }
+                self.mv_delta_tracker
+                    .stage_insert(&mut batch, table_name, row_id, tuple.clone())?;
             }
-            // R1.1: the logical-WAL entry rides the row's batch (`append_with_batch`,
-            // which an autocommit statement's capture frame defers to its commit);
-            // fsynced only under strict per-statement logging (P0#2).
-            match &self.wal {
-                Some(wal) if !self.is_replaying.load(Ordering::Acquire) => {
-                    let mut sync_options = WriteOptions::default();
-                    let options = if self.config.storage.logical_wal_per_statement {
-                        sync_options.set_sync(true);
-                        Some(&sync_options)
-                    } else {
-                        self.memory_write_options.as_ref()
-                    };
-                    wal.read()
-                        .append_with_batch(
-                            WalOperation::Insert {
-                                table: table_name.to_string(),
-                                key: key.clone(),
-                                tuple: logical_value.clone(),
-                            },
-                            batch,
-                            options,
-                        )
-                        .map(drop)?;
-                }
-                _ => self
-                    .gate
-                    .write(&self.db, batch, self.memory_write_options.as_ref())
-                    .map_err(|e| Error::storage(format!("Put failed: {}", e)))?,
+            let mut sync_options = WriteOptions::default();
+            let options = if self.config.storage.logical_wal_per_statement {
+                sync_options.set_sync(true);
+                Some(&sync_options)
+            } else {
+                self.memory_write_options.as_ref()
+            };
+            if let Some(publication) = claim._vector_write.as_mut() {
+                publication
+                    .plan
+                    .stage_tuple(table_name, row_id, schema, Some(&tuple), &mut batch)?;
             }
-            Ok(staged_version)
+            let applied = self.write_direct_batch_observed(
+                batch,
+                Some(WalOperation::Insert {
+                    table: table_name.to_string(),
+                    key: key.clone(),
+                    tuple: logical_value.clone(),
+                }),
+                options,
+                claim._vector_write.as_mut(),
+                Some(&claim.attempt),
+            );
+            if let Some(side) = side_write {
+                side.finish(&self.db, applied.is_ok());
+            }
+            let barrier = applied?;
+            Ok((staged_version, barrier))
         })();
+        drop(counter_guard);
+        if claim._vector_write.is_none() {
+            self.fence_uncertain_row_write(table_name, &claim.attempt, &written);
+        }
         if let Some(timestamp) = version_timestamp {
             self.conflict_registry.end_commit(timestamp);
         }
-        let staged_version = written?;
+        let (staged_version, replication_barrier) = written?;
+        exit_after_ddl_write("row_insert", table_name);
         // sprinter 5a78b8288153: durability point — the claimed entries now
         // describe a stored row and must be kept whatever follows.
         claim.row_is_durable();
+        if let Some(publication) = claim._vector_write.as_ref() {
+            publication.plan.row_group_applied();
+        }
         if let Some(staged) = staged_version {
             // Register snapshot (with the WAL LSN for AS OF TRANSACTION queries,
             // staged above) in memory, as `register_snapshot_with_lsn` did.
@@ -15970,7 +17434,9 @@ impl StorageEngine {
 
         // R5.V1: maintain HNSW vector indexes (single atomic load when the
         // table has none) — after the row's group, as before (decision 8).
-        let _ = self.vector_indexes.on_row_insert(table_name, row_id, schema, &tuple);
+        let _ = self
+            .vector_indexes
+            .on_row_insert_staged(table_name, row_id, schema, &tuple);
 
         if !bulk_mode {
             // Record delta for SMFI (Self-Maintaining Filter Index)
@@ -15984,6 +17450,8 @@ impl StorageEngine {
             }
         }
 
+        claim.finish_vector_publication()?;
+        Self::wait_for_direct_replication(replication_barrier);
         Ok(row_id)
     }
 
@@ -16008,6 +17476,7 @@ impl StorageEngine {
     /// Skips delta tracking (MV/SMFI). Used for SQL fast paths where
     /// parser/planner overhead and per-row counter persistence dominate.
     pub fn insert_tuple_fast(&self, table_name: &str, tuple: Tuple, schema: &crate::Schema) -> Result<u64> {
+        let _locks = self.lock_main_table_for_write(table_name)?;
         // sprinter 6bc4a4040eb7 (B2): main-only writer — refused on a branch.
         self.refuse_main_only_write_on_branch("the fast INSERT path")?;
         // W3.2: single-row autocommit INSERT class scope. Version bytes are
@@ -16060,223 +17529,120 @@ impl StorageEngine {
         let mut claim = IndexClaim::acquire(self, table_name, row_id, schema, &tuple)?;
 
         let uses_side_storage = schema_uses_column_storage(schema);
-        let value = if uses_side_storage {
-            let stored_tuple =
-                self.transform_tuple_for_column_storage_opts(table_name, row_id, &tuple, schema, true)?;
-            bincode::serialize(&stored_tuple)
-                .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?
-        } else {
-            bincode::serialize(&tuple).map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?
-        };
+        let value =
+            bincode::serialize(&tuple).map_err(|e| Error::storage(format!("Failed to serialize tuple: {e}")))?;
 
         let key = Self::build_data_key(table_name, row_id);
-        // W3.2: `data:` bytes for this row (both the batched and non-batched
-        // branches below write the same key+value).
-        if crate::write_volume::enabled() {
-            crate::write_volume::add_row();
-            crate::write_volume::add(crate::write_volume::Category::Data, (key.len() + value.len()) as u64);
-        }
         let requires_logical_wal = self.fast_dml_requires_logical_wal();
         let needs_logical_value = requires_logical_wal || self.config.storage.time_travel_enabled;
-        let logical_value = if needs_logical_value {
-            Some(if uses_side_storage {
-                bincode::serialize(&tuple).map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?
-            } else {
-                value.clone()
-            })
-        } else {
-            None
-        };
+        let logical_value = needs_logical_value.then(|| value.clone());
 
-        let data_and_version_batched =
-            self.config.storage.time_travel_enabled && !requires_logical_wal && !uses_side_storage;
-
-        // W2.5: allocate the version timestamp and raise the committed-write
-        // watermark BEFORE any `data:` write becomes visible. The non-batched
-        // branch below puts the row immediately via `self.put`, and the
-        // in-transaction fast read observes `data:` directly — so the watermark
-        // must gate an older-snapshot reader onto the snapshot path before the
-        // row is observable, or that reader could fast-read it in the window
-        // before the bump. (The batched branch defers the row into a WriteBatch
-        // written further below, so raising the watermark here keeps the same
-        // before-visible ordering for both.) Over-raising on a later failed
-        // write only forces the safe snapshot path.
         let version_timestamp = if self.config.storage.time_travel_enabled {
-            let timestamp = self.next_timestamp();
+            let timestamp = self.next_commit_timestamp(true);
             self.note_committed_write(table_name, timestamp);
             Some(timestamp)
         } else {
             None
         };
-
-        if data_and_version_batched {
-            // Mirrors the checks in `put()` before writing this direct batch.
-            if let Some(ref db_path) = self.db_path {
-                let count = self.write_counter.fetch_add(1, Ordering::Relaxed);
-                if count % 1000 == 0 {
-                    Self::check_disk_space(db_path)?;
-                }
-            }
-            if self.memory_limit_bytes > 0 {
-                let write_size = (key.len() + value.len()) as u64;
-                let current = self.data_bytes_written.fetch_add(write_size, Ordering::Relaxed);
-                if current + write_size > self.memory_limit_bytes {
-                    self.data_bytes_written.fetch_sub(write_size, Ordering::Relaxed);
-                    return Err(Error::storage(format!(
-                        "Memory limit exceeded ({} MB). Increase resource_quotas.memory_limit_per_user_mb or use disk-backed mode.",
-                        self.memory_limit_bytes / (1024 * 1024)
-                    )));
-                }
-            }
-        } else {
-            // Spec R5.4 (F1.3): the strict-WAL / HA-primary and side-storage
-            // variant writes the row, its version and `snapshot:` record (time
-            // travel on) and its logical-WAL entry (when the configuration needs
-            // one) as ONE write group. It was three: the row, then the entry, then
-            // the version — a standby and a crash saw the row with neither.
-            self.check_direct_write_budget(key.len() + value.len())?;
+        let counter_lock = self.gate.counter_lock(table_name);
+        let counter_guard = counter_lock.lock();
+        let written = (|| -> Result<(Option<super::time_travel::StagedVersion>, Option<u64>)> {
             let mut batch = WriteBatch::default();
+            let (physical, side_write) = if uses_side_storage {
+                let (physical, locks) = self.stage_row_storage(table_name, row_id, &tuple, schema, true, &mut batch)?;
+                (Cow::Owned(physical), Some(locks))
+            } else {
+                (Cow::Borrowed(value.as_slice()), None)
+            };
+            let value = physical.as_ref();
+            self.check_direct_write_budget(key.len() + value.len())?;
+
+            if crate::write_volume::enabled() {
+                crate::write_volume::add_row();
+                crate::write_volume::add(crate::write_volume::Category::Data, (key.len() + value.len()) as u64);
+            }
             let staged_version = match version_timestamp {
-                Some(timestamp) => {
-                    let logical = logical_value
-                        .as_deref()
-                        .ok_or_else(|| Error::internal("missing logical insert value"))?;
-                    // W3.2: eliding the `v:` copy is sound only when `data:` holds
-                    // this version's logical value byte-for-byte (not side storage).
-                    Some(self.snapshot_manager.stage_data_version_snapshot(
+                Some(timestamp) => Some(
+                    self.snapshot_manager.stage_data_version_snapshot(
                         &mut batch,
                         &key,
                         &value,
                         table_name,
                         row_id,
                         timestamp,
-                        logical,
+                        logical_value
+                            .as_deref()
+                            .ok_or_else(|| Error::internal("missing logical insert value"))?,
                         self.wal_lsn(),
                         !uses_side_storage,
-                    )?)
-                }
+                    )?,
+                ),
                 None => {
                     let sealed = super::tde::seal(self.key_manager.as_deref(), &value)?;
                     batch.put(&key, sealed.as_ref());
                     None
                 }
             };
-            match &self.wal {
-                Some(wal) if requires_logical_wal && !self.is_replaying.load(Ordering::Acquire) => {
-                    let logical = logical_value
+            self.stage_row_counter_into(&mut batch, table_name)?;
+            let operation = if requires_logical_wal {
+                Some(WalOperation::Insert {
+                    table: table_name.to_string(),
+                    key: key.clone(),
+                    tuple: logical_value
                         .as_deref()
-                        .ok_or_else(|| Error::internal("missing logical insert value"))?;
-                    let mut sync_options = WriteOptions::default();
-                    let options = if self.config.storage.logical_wal_per_statement {
-                        sync_options.set_sync(true);
-                        Some(&sync_options)
-                    } else {
-                        self.memory_write_options.as_ref()
-                    };
-                    wal.read()
-                        .append_with_batch(
-                            WalOperation::Insert {
-                                table: table_name.to_string(),
-                                key: key.clone(),
-                                tuple: logical.to_vec(),
-                            },
-                            batch,
-                            options,
-                        )
-                        .map(drop)?;
-                }
-                _ => self
-                    .gate
-                    .write(&self.db, batch, self.memory_write_options.as_ref())
-                    .map_err(|e| Error::storage(format!("Put failed: {}", e)))?,
+                        .ok_or_else(|| Error::internal("missing logical insert value"))?
+                        .to_vec(),
+                })
+            } else {
+                None
+            };
+            let mut sync_options = WriteOptions::default();
+            let options = if self.config.storage.logical_wal_per_statement {
+                sync_options.set_sync(true);
+                Some(&sync_options)
+            } else {
+                self.memory_write_options.as_ref()
+            };
+            if let Some(publication) = claim._vector_write.as_mut() {
+                publication
+                    .plan
+                    .stage_tuple(table_name, row_id, schema, Some(&tuple), &mut batch)?;
             }
-            // sprinter 5a78b8288153: the row is durable HERE on this branch. From
-            // this point the claimed entries belong to a stored row and must be
-            // kept — a later failure must not strip it of its PRIMARY KEY entry.
-            claim.row_is_durable();
-            if let Some(staged) = staged_version {
-                let _ = self.snapshot_manager.finish_staged_version(staged);
+            let applied = self.write_direct_batch_observed(
+                batch,
+                operation,
+                options,
+                claim._vector_write.as_mut(),
+                Some(&claim.attempt),
+            );
+            if let Some(side) = side_write {
+                side.finish(&self.db, applied.is_ok());
             }
+            let barrier = applied?;
+            Ok((staged_version, barrier))
+        })();
+        drop(counter_guard);
+        if claim._vector_write.is_none() {
+            self.fence_uncertain_row_write(table_name, &claim.attempt, &written);
         }
-
-        // sprinter 5a78b8288153: the ART entries for this row were already taken
-        // by the `IndexClaim` above, BEFORE the row was written, so there is no
-        // second index pass here any more — and no `RowState::Stored` refusal to
-        // report, because a refusal now happens before anything is stored and
-        // comes back as this statement's constraint violation.
-        //
-        // That is the whole fix: index maintenance used to run HERE, after the
-        // row was durable (non-batched) or was going to be written regardless
-        // (`data_and_version_batched`, whose row lands below in
-        // `write_data_version_and_register_snapshot` with no `return` in
-        // between). A duplicate that raced past the separate pre-check was
-        // therefore STORED and merely logged at ERROR by
-        // `note_index_maintenance_failure` — loud, per v4.31.0, but still a real
-        // duplicate in the table. Claiming the keys first removes the window the
-        // race needed rather than reporting what fell through it.
-        //
-        // `note_index_maintenance_failure` is still the right report for the
-        // funnels where the row genuinely is a fact before the ART is touched
-        // (UPDATE's re-insert half, the transactional `Stored` arm); it is just
-        // no longer reachable from this one.
-
-        // R5.V1: maintain HNSW vector indexes (single atomic load when the
-        // table has none).
-        let _ = self.vector_indexes.on_row_insert(table_name, row_id, schema, &tuple);
-
-        // Periodically persist row counter (every 64 inserts) for crash safety
-        if row_id % 64 == 0 {
-            let _ = self.flush_row_counter(table_name);
-        }
-
         if let Some(timestamp) = version_timestamp {
-            let logical_value = logical_value
-                .as_deref()
-                .ok_or_else(|| Error::internal("missing logical insert value"))?;
-            // W2.5: this autocommit insert is NOT blocked by open session
-            // transactions when versioning is on (see
-            // `session_txns_block_fast_inserts`), so it can commit a new,
-            // snapshot-gated version WHILE another session reads. The table
-            // watermark was already raised to `timestamp` above, BEFORE the
-            // (batched or non-batched) `data:` row became visible, so a
-            // concurrent reader with an older snapshot keeps taking the
-            // snapshot path for this table.
-            // W3.2: eliding the `v:` copy is sound only when `data:` holds this
-            // version's logical value byte-for-byte — true for the default
-            // row-store, NOT for side-storage (where `data:` is the sidecar image
-            // and `logical_value` is the full tuple). Gate on `!uses_side_storage`;
-            // the funnel then elides iff `storage.elide_latest_version` is on.
-            let allow_elide = !uses_side_storage;
-            // Spec R5.4: the other versioned variant wrote its version with its row,
-            // above.
-            if data_and_version_batched {
-                self.snapshot_manager.write_data_version_and_register_snapshot(
-                    &key,
-                    &value,
-                    table_name,
-                    row_id,
-                    timestamp,
-                    logical_value,
-                    self.wal_lsn(),
-                    self.memory_write_options.as_ref(),
-                    allow_elide,
-                )?;
-                // sprinter 5a78b8288153: the batched branch's `data:` row lands
-                // HERE (the earlier branch only mirrored `put()`'s guards), so
-                // this is its durability point — the claim stops being a phantom
-                // and its entries must be kept from now on.
-                claim.row_is_durable();
-            }
+            self.conflict_registry.end_commit(timestamp);
         }
-
-        // sprinter 5a78b8288153: belt-and-braces for the ONE path that reaches
-        // here with the claim still pending — `data_and_version_batched` is only
-        // ever true when `time_travel_enabled` is on, so the `version_timestamp`
-        // block above always runs for it and always disarms. If a future edit
-        // breaks that coupling, fail towards KEEPING the entries of a row that
-        // was written rather than stripping it: `Ok` is returned below, so the
-        // caller is about to be told the row exists.
+        let (staged_version, replication_barrier) = written?;
+        exit_after_ddl_write("row_insert", table_name);
         claim.row_is_durable();
+        if let Some(publication) = claim._vector_write.as_ref() {
+            publication.plan.row_group_applied();
+        }
+        if let Some(staged) = staged_version {
+            let _ = self.snapshot_manager.finish_staged_version(staged);
+        }
+        let _ = self
+            .vector_indexes
+            .on_row_insert_staged(table_name, row_id, schema, &tuple);
+        claim.finish_vector_publication()?;
+        Self::wait_for_direct_replication(replication_barrier);
+
         Ok(row_id)
     }
 
@@ -16302,6 +17668,7 @@ impl StorageEngine {
         prepared: Vec<(u64, Tuple)>,
         schema: &crate::Schema,
     ) -> Result<u64> {
+        let _table_scope = self.lock_main_table_for_write(table_name)?;
         // sprinter 6bc4a4040eb7 (B2): main-only writer — refused on a branch.
         self.refuse_main_only_write_on_branch("the fast batch INSERT path")?;
         if prepared.is_empty() {
@@ -16439,7 +17806,7 @@ impl StorageEngine {
                     );
                 }
 
-                final_row_id = row_id;
+                final_row_id = final_row_id.max(row_id);
                 indexed_rows.push((row_id, tuple));
             }
             if !indexed_rows.is_empty() {
@@ -16516,7 +17883,7 @@ impl StorageEngine {
                     );
                 }
 
-                final_row_id = row_id;
+                final_row_id = final_row_id.max(row_id);
                 indexed_rows.push((row_id, tuple));
             }
         } else {
@@ -16537,19 +17904,16 @@ impl StorageEngine {
                     );
                 }
 
-                final_row_id = row_id;
+                final_row_id = final_row_id.max(row_id);
                 indexed_rows.push((row_id, tuple));
             }
         }
 
+        let counter_lock = self.gate.counter_lock(table_name);
+        let counter_guard = counter_lock.lock();
         if final_row_id > 0 {
-            let counter_key = format!("counter:{}", table_name);
-            let counter_value = bincode::serialize(&final_row_id)
-                .map_err(|e| Error::storage(format!("Failed to serialize counter: {}", e)))?;
-            // `counter:` is sealed by `put_internal` on every other route; this
-            // batch must agree with it rather than differ by write route.
-            let stored_counter = self.seal_stored(&counter_value)?;
-            batch.put(counter_key.as_bytes(), stored_counter.as_ref());
+            self.raise_row_counter_to(table_name, final_row_id);
+            self.stage_row_counter_into(&mut batch, table_name)?;
         }
 
         // sprinter 5a78b8288153: CLAIM every row's PK/UNIQUE keys before the
@@ -16599,13 +17963,42 @@ impl StorageEngine {
         };
         // W3.4: the durable RocksDB write itself (the funnel's I/O phase).
         let _cps_cm = crate::copy_phase_stats::time(crate::copy_phase_stats::Phase::Commit, batch_rows);
-        let result = self.gate.write(&self.db, batch, self.memory_write_options.as_ref());
+        if let Some(publication) = batch_claim._vector_write.as_mut() {
+            for (row, tuple) in &indexed_rows {
+                publication
+                    .plan
+                    .stage_tuple(table_name, *row, schema, Some(tuple), &mut batch)?;
+            }
+            publication.plan.write_call_started();
+        }
+        let result = match batch_claim._vector_write.as_ref() {
+            Some(publication) => self.gate.write_observed(
+                &self.db,
+                batch,
+                self.memory_write_options.as_ref(),
+                &publication.attempt,
+            ),
+            None => self.gate.write_observed(
+                &self.db,
+                batch,
+                self.memory_write_options.as_ref(),
+                &batch_claim.attempt,
+            ),
+        };
         drop(columnar_guard);
+        drop(counter_guard);
+        if batch_claim._vector_write.is_none() {
+            self.fence_uncertain_row_write(table_name, &batch_claim.attempt, &result);
+        }
         result.map_err(|e| Error::storage(format!("Fast batch insert failed: {}", e)))?;
         // sprinter 5a78b8288153: the single WriteBatch landed — every row of the
         // batch is durable, so the claimed entries stop being phantoms and must
         // be kept from here on.
+        exit_after_ddl_write("row_batch", table_name);
         batch_claim.rows_are_durable();
+        if let Some(publication) = batch_claim._vector_write.as_ref() {
+            publication.plan.row_group_applied();
+        }
         drop(_cps_cm);
 
         if let Some(ts) = commit_ts {
@@ -16635,11 +18028,95 @@ impl StorageEngine {
         for (row_id, tuple) in &indexed_rows {
             // R5.V1: maintain HNSW vector indexes (single atomic load when the
             // table has none).
-            let _ = self.vector_indexes.on_row_insert(table_name, *row_id, schema, tuple);
+            let _ = self
+                .vector_indexes
+                .on_row_insert_staged(table_name, *row_id, schema, tuple);
         }
         drop(_cps_am);
 
+        batch_claim.finish_vector_publication()?;
         Ok(indexed_rows.len() as u64)
+    }
+
+    /// Plan one row's physical representation and every sidecar into the row's
+    /// OWN group. Current old images must be captured before entering here.
+    /// `new_row` also stages presence; it never performs lazy backfill writes.
+    fn stage_row_storage<'e>(
+        &'e self,
+        table: &str,
+        row: u64,
+        tuple: &Tuple,
+        schema: &crate::Schema,
+        new_row: bool,
+        batch: &mut WriteBatch,
+    ) -> Result<(Vec<u8>, RowStorageWrite<'e>)> {
+        let mut locks = RowStorageWrite {
+            dictionary: schema
+                .columns
+                .iter()
+                .any(|column| column.storage_mode == ColumnStorageMode::Dictionary)
+                .then(|| self.dict_manager.write_group()),
+            columnar: schema_has_columnar_columns(schema).then(super::columnar::stats_write_lock),
+        };
+        let mut stored = tuple.clone();
+        for (position, column) in schema.columns.iter().enumerate() {
+            let Some(value) = tuple.values.get(position) else { break };
+            let physical = match column.storage_mode {
+                ColumnStorageMode::Dictionary => match value {
+                    Value::String(value) => {
+                        let dictionaries = locks
+                            .dictionary
+                            .as_mut()
+                            .ok_or_else(|| Error::internal("dictionary write group missing"))?;
+                        let dict_id = dictionaries.encode(&self.db, table, &column.name, value)?;
+                        dictionaries.stage_column(table, &column.name, batch)?;
+                        Value::DictRef { dict_id }
+                    }
+                    _ => value.clone(),
+                },
+                ColumnStorageMode::ContentAddressed => {
+                    let large = match value {
+                        Value::String(value) => value.len() >= super::content_addr::CAS_MIN_SIZE,
+                        Value::Bytes(value) => value.len() >= super::content_addr::CAS_MIN_SIZE,
+                        _ => false,
+                    };
+                    if large {
+                        let (reference, payload) = ContentAddressedStore::plan_store(&self.db, value)?;
+                        if let Some((key, payload)) = payload {
+                            batch.put(key, payload);
+                        }
+                        reference
+                    } else {
+                        value.clone()
+                    }
+                }
+                ColumnStorageMode::Columnar => {
+                    let (batch_id, _) = ColumnarStore::batch_location(row);
+                    ColumnarStore::apply_batch_values(
+                        &self.db,
+                        batch,
+                        table,
+                        &column.name,
+                        batch_id,
+                        std::slice::from_ref(&(row, value.clone())),
+                    )?;
+                    Value::ColumnarRef
+                }
+                ColumnStorageMode::Default => value.clone(),
+            };
+            stored.values[position] = physical;
+        }
+        if new_row
+            && locks.columnar.is_some()
+            && columnar_presence_enabled()
+            && ColumnarStore::presence_manifest_complete(&self.db, table)
+        {
+            let (batch_id, _) = ColumnarStore::batch_location(row);
+            ColumnarStore::apply_presence_updates(&self.db, batch, table, batch_id, &[row], &[])?;
+        }
+        let value = bincode::serialize(&stored)
+            .map_err(|e| Error::storage(format!("Failed to serialize physical row: {e}")))?;
+        Ok((value, locks))
     }
 
     fn transform_tuple_for_column_storage(
@@ -16736,6 +18213,21 @@ impl StorageEngine {
         } else {
             Ok(ColumnarStore::presence_manifest_complete(&self.db, table_name))
         }
+    }
+
+    /// A transactional writer initializes presence in its own commit group.
+    /// The ordinary staged marker is also the commit-time rebuild intent, so
+    /// rollback/savepoints discard it with the rest of the write set. Rebuild
+    /// uses current rows under the stats lock, rather than an early stale scan.
+    fn stage_columnar_presence_writes_active(&self, table_name: &str, txn: &Transaction) -> Result<bool> {
+        if ColumnarStore::presence_manifest_complete(&self.db, table_name) {
+            return Ok(true);
+        }
+        if !columnar_presence_enabled() {
+            return Ok(false);
+        }
+        txn.put(ColumnarStore::presence_marker_key(table_name), vec![1])?;
+        Ok(true)
     }
 
     /// R3.3 read-side liveness: the table's live-row presence map, or `None`
@@ -16863,7 +18355,7 @@ impl StorageEngine {
         if rows.is_empty() || !schema_has_columnar_columns(schema) {
             return Ok(());
         }
-        let maintain_presence = mark_present && self.columnar_presence_writes_active(table_name)?;
+        let maintain_presence = mark_present && self.stage_columnar_presence_writes_active(table_name, txn)?;
         let grouped = group_columnar_row_values(schema, rows);
         for ((idx, batch_id), values) in &grouped {
             let column = schema
@@ -16879,7 +18371,10 @@ impl StorageEngine {
                 values,
             )?;
         }
-        if maintain_presence {
+        // A missing manifest may have stale/corrupt derived records. The
+        // staged cold marker rebuilds from final rows at commit, so do not
+        // read-modify-write those incomplete records in the meantime.
+        if maintain_presence && ColumnarStore::presence_manifest_complete(&self.db, table_name) {
             for (batch_id, set) in group_row_ids_by_batch(rows.iter().map(|(row_id, _)| *row_id)) {
                 ColumnarStore::stage_presence_updates_in_transaction(&self.db, txn, table_name, batch_id, &set, &[])?;
             }
@@ -16900,7 +18395,7 @@ impl StorageEngine {
         if row_ids.is_empty() || !schema_has_columnar_columns(schema) {
             return Ok(());
         }
-        let maintain_presence = self.columnar_presence_writes_active(table_name)?;
+        let maintain_presence = self.stage_columnar_presence_writes_active(table_name, txn)?;
         let by_batch = group_row_ids_by_batch(row_ids.iter().copied());
         for column in schema
             .columns
@@ -16919,7 +18414,10 @@ impl StorageEngine {
                 )?;
             }
         }
-        if maintain_presence {
+        // A missing manifest may have stale/corrupt derived records. The
+        // staged cold marker rebuilds from final rows at commit, so do not
+        // read-modify-write those incomplete records in the meantime.
+        if maintain_presence && ColumnarStore::presence_manifest_complete(&self.db, table_name) {
             for (batch_id, clear) in &by_batch {
                 ColumnarStore::stage_presence_updates_in_transaction(&self.db, txn, table_name, *batch_id, &[], clear)?;
             }
@@ -16984,11 +18482,23 @@ impl StorageEngine {
         schema: &crate::Schema,
         index_update_needed: Option<bool>,
     ) -> Result<u64> {
+        let _locks = self.lock_main_table_for_write(table_name)?;
         // sprinter 6bc4a4040eb7 (B2): main-only writer — refused on a branch.
         self.refuse_main_only_write_on_branch("the fast UPDATE path")?;
+        let mut _vector_write = self.vector_row_write(table_name, [row_id]);
+        let mut cache_publication = DirectRowCachePublication {
+            engine: self,
+            applied: false,
+        };
         // W3.2: UPDATE class scope.
         let _wv = crate::write_volume::stmt_scope(crate::write_volume::StmtClass::Update);
-        self.write_fast_row_update(table_name, row_id, &new_tuple, schema)?;
+        self.write_fast_row_update(table_name, row_id, &new_tuple, schema, _vector_write.as_mut())?;
+        cache_publication.applied = _vector_write.is_none();
+        if let Some(publication) = _vector_write.as_ref() {
+            publication.plan.row_group_applied();
+        }
+        #[cfg(all(test, feature = "vector-search"))]
+        crate::sql::executor::ann_publication_tests::run_hook("writer_row_applied");
 
         // Update ART indexes only if an indexed column actually changed.
         // Common OLTP updates mutate payload columns while the PK/unique keys
@@ -17023,8 +18533,11 @@ impl StorageEngine {
         // vector columns.
         let _ = self
             .vector_indexes
-            .on_row_update(table_name, row_id, schema, Some(old_tuple), &new_tuple);
+            .on_row_update_staged(table_name, row_id, schema, Some(old_tuple), &new_tuple);
 
+        if let Some(publication) = _vector_write.as_mut() {
+            publication.finish()?;
+        }
         Ok(1)
     }
 
@@ -17047,11 +18560,23 @@ impl StorageEngine {
         schema: &crate::Schema,
         vector_old_tuple: Option<&Tuple>,
     ) -> Result<u64> {
+        let _locks = self.lock_main_table_for_write(table_name)?;
         // sprinter 6bc4a4040eb7 (B2): main-only writer — refused on a branch.
         self.refuse_main_only_write_on_branch("the fast UPDATE path")?;
+        let mut _vector_write = self.vector_row_write(table_name, [row_id]);
+        let mut cache_publication = DirectRowCachePublication {
+            engine: self,
+            applied: false,
+        };
         // W3.2: UPDATE class scope.
         let _wv = crate::write_volume::stmt_scope(crate::write_volume::StmtClass::Update);
-        self.write_fast_row_update(table_name, row_id, &new_tuple, schema)?;
+        self.write_fast_row_update(table_name, row_id, &new_tuple, schema, _vector_write.as_mut())?;
+        cache_publication.applied = _vector_write.is_none();
+        if let Some(publication) = _vector_write.as_ref() {
+            publication.plan.row_group_applied();
+        }
+        #[cfg(all(test, feature = "vector-search"))]
+        crate::sql::executor::ann_publication_tests::run_hook("writer_row_applied");
 
         // R5.V1: callers proved no *ART* index column changed, which says
         // nothing about vector columns; maintain HNSW indexes here, after the
@@ -17060,7 +18585,10 @@ impl StorageEngine {
         if vector_old_tuple.is_some() || self.vector_indexes.table_has_indexes(table_name) {
             let _ = self
                 .vector_indexes
-                .on_row_update(table_name, row_id, schema, vector_old_tuple, &new_tuple);
+                .on_row_update_staged(table_name, row_id, schema, vector_old_tuple, &new_tuple);
+        }
+        if let Some(publication) = _vector_write.as_mut() {
+            publication.finish()?;
         }
         Ok(1)
     }
@@ -17074,24 +18602,20 @@ impl StorageEngine {
         row_id: u64,
         new_tuple: &Tuple,
         schema: &crate::Schema,
+        publication: Option<&mut VectorRowWrite<'_>>,
     ) -> Result<()> {
         let logical =
             bincode::serialize(new_tuple).map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
-        let stored_side;
-        let stored: &[u8] = if schema_uses_column_storage(schema) {
-            let stored_tuple = self.transform_tuple_for_column_storage(table_name, row_id, new_tuple, schema)?;
-            stored_side = bincode::serialize(&stored_tuple)
-                .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
-            &stored_side
-        } else {
-            &logical
-        };
         let key = Self::build_data_key(table_name, row_id);
-        self.write_fast_row_change(table_name, row_id, &key, Some((stored, logical.as_slice())))?;
-        if crate::write_volume::enabled() {
-            crate::write_volume::add_row();
-            crate::write_volume::add(crate::write_volume::Category::Data, (key.len() + stored.len()) as u64);
-        }
+        let side_storage = schema_uses_column_storage(schema).then_some((new_tuple, schema));
+        self.write_fast_row_change(
+            table_name,
+            row_id,
+            &key,
+            Some((&logical, &logical)),
+            side_storage,
+            publication,
+        )?;
         Ok(())
     }
 
@@ -17121,20 +18645,28 @@ impl StorageEngine {
         row_id: u64,
         key: &[u8],
         image: Option<(&[u8], &[u8])>,
+        side_storage: Option<(&Tuple, &crate::Schema)>,
+        mut publication: Option<&mut VectorRowWrite<'_>>,
     ) -> Result<()> {
-        if let Some((stored, _)) = image {
-            self.check_direct_write_budget(key.len() + stored.len())?;
+        if side_storage.is_none() {
+            if let Some((stored, _)) = image {
+                self.check_direct_write_budget(key.len() + stored.len())?;
+            }
         }
+        let attempt = super::write_outcome::WriteAttempt::default();
         let versioned = self.config.storage.time_travel_enabled;
         let log_entry = self.fast_dml_requires_logical_wal() && !self.is_replaying.load(Ordering::Acquire);
         let timestamp = versioned.then(|| self.next_commit_timestamp(true));
+        #[cfg(all(test, feature = "vector-search"))]
+        crate::sql::executor::ann_publication_tests::run_hook("writer_timestamp_allocated");
         let mut replication_barrier = None;
         let written = (|| -> Result<Option<super::time_travel::SnapshotMetadata>> {
             let mut batch = WriteBatch::default();
+            let mut side_write = None;
             match image {
                 Some((stored, logical)) => {
-                    let sealed = super::tde::seal(self.key_manager.as_deref(), stored)?;
-                    batch.put(key, sealed.as_ref());
+                    // Freeze the old logical image while ALL old sidecars are
+                    // still durable. New sidecars are staged only after this.
                     if let Some(ts) = timestamp {
                         let sealed_version = super::tde::seal(self.key_manager.as_deref(), logical)?;
                         self.snapshot_manager.stage_row_change_history(
@@ -17145,12 +18677,77 @@ impl StorageEngine {
                             Some(sealed_version.as_ref()),
                         )?;
                     }
+                    let physical;
+                    let stored = if let Some((tuple, schema)) = side_storage {
+                        let (value, locks) =
+                            self.stage_row_storage(table_name, row_id, tuple, schema, false, &mut batch)?;
+                        side_write = Some(locks);
+                        physical = value;
+                        self.check_direct_write_budget(key.len() + physical.len())?;
+                        physical.as_slice()
+                    } else {
+                        stored
+                    };
+                    let sealed = super::tde::seal(self.key_manager.as_deref(), stored)?;
+                    batch.put(key, sealed.as_ref());
+                    if crate::write_volume::enabled() {
+                        crate::write_volume::add_row();
+                        crate::write_volume::add(
+                            crate::write_volume::Category::Data,
+                            (key.len() + stored.len()) as u64,
+                        );
+                    }
                 }
                 None => {
                     batch.delete(key);
                     if let Some(ts) = timestamp {
                         self.snapshot_manager
                             .stage_row_change_history(&mut batch, table_name, row_id, ts, None)?;
+                    }
+                    if let Some((_, schema)) = side_storage {
+                        if schema_has_columnar_columns(schema) {
+                            // Old logical history was frozen above. Null slots,
+                            // stats and presence belong to THIS delete group.
+                            side_write = Some(RowStorageWrite {
+                                dictionary: None,
+                                columnar: Some(super::columnar::stats_write_lock()),
+                            });
+                            let (batch_id, _) = ColumnarStore::batch_location(row_id);
+                            for column in schema
+                                .columns
+                                .iter()
+                                .filter(|column| column.storage_mode == ColumnStorageMode::Columnar)
+                            {
+                                ColumnarStore::apply_batch_values(
+                                    &self.db,
+                                    &mut batch,
+                                    table_name,
+                                    &column.name,
+                                    batch_id,
+                                    &[(row_id, Value::Null)],
+                                )?;
+                            }
+                            if columnar_presence_enabled() {
+                                if ColumnarStore::presence_manifest_complete(&self.db, table_name) {
+                                    ColumnarStore::apply_presence_updates(
+                                        &self.db,
+                                        &mut batch,
+                                        table_name,
+                                        batch_id,
+                                        &[],
+                                        &[row_id],
+                                    )?;
+                                } else {
+                                    ColumnarStore::stage_complete_presence_for_transaction(
+                                        &self.db,
+                                        &mut batch,
+                                        table_name,
+                                        &[(row_id, false)],
+                                        &[],
+                                    )?;
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -17160,6 +18757,23 @@ impl StorageEngine {
                         .stage_snapshot_record(&mut batch, ts, self.wal_lsn())?,
                 ),
                 None => None,
+            };
+            if let Some(publication) = publication.as_deref_mut() {
+                publication
+                    .plan
+                    .stage(key, image.map(|(_, logical)| logical), None, &mut batch)?;
+                publication.plan.write_call_started();
+            }
+            let write = |batch| match publication.as_deref() {
+                Some(publication) => self.gate.write_observed(
+                    &self.db,
+                    batch,
+                    self.memory_write_options.as_ref(),
+                    &publication.attempt,
+                ),
+                None => self
+                    .gate
+                    .write_observed(&self.db, batch, self.memory_write_options.as_ref(), &attempt),
             };
             // W2.5: a versioned change raises the watermark BEFORE it is visible, as
             // a commit does; a versionless one (time travel off) drops it.
@@ -17185,10 +18799,10 @@ impl StorageEngine {
                     // deferred to its commit the entry would land a group later.
                     let wal = wal.read();
                     let staged = wal.stage(vec![operation], &mut batch)?;
-                    let written = self
-                        .gate
-                        .write(&self.db, batch, self.memory_write_options.as_ref())
-                        .map_err(|e| Error::storage(format!("Fast row write failed: {}", e)));
+                    let written = write(batch).map_err(|e| Error::storage(format!("Fast row write failed: {}", e)));
+                    if let Some(side) = side_write.take() {
+                        side.finish(&self.db, written.is_ok());
+                    }
                     let barrier = if written.is_ok() {
                         wal.replication_barrier()
                     } else {
@@ -17204,16 +18818,26 @@ impl StorageEngine {
                     written?;
                     replication_barrier = barrier;
                 }
-                _ => self
-                    .gate
-                    .write(&self.db, batch, self.memory_write_options.as_ref())
-                    .map_err(|e| Error::storage(format!("Fast row write failed: {}", e)))?,
+                _ => {
+                    let result = write(batch).map_err(|e| Error::storage(format!("Fast row write failed: {}", e)));
+                    if let Some(side) = side_write.take() {
+                        side.finish(&self.db, result.is_ok());
+                    }
+                    result?;
+                }
             }
-            // Before the snapshot barrier lifts: a fresh snapshot must not find the
-            // row's old image in the cache.
-            self.row_cache.invalidate(table_name, row_id);
+            exit_after_ddl_write(if image.is_some() { "row_update" } else { "row_delete" }, table_name);
             Ok(metadata)
         })();
+        // A failed write may have landed. Drop stale current/snapshot answers
+        // before the commit barrier lifts in either outcome.
+        self.row_cache.invalidate(table_name, row_id);
+        if versioned {
+            self.snapshot_manager.invalidate_cached_versions(table_name);
+        }
+        if publication.is_none() {
+            self.fence_uncertain_row_write(table_name, &attempt, &written);
+        }
         if let Some(ts) = timestamp {
             self.conflict_registry.end_commit(ts);
         }
@@ -17221,12 +18845,11 @@ impl StorageEngine {
         self.row_locks.note_rows_changed(table_name);
         if let Some(metadata) = written? {
             self.snapshot_manager.publish_staged_snapshot(metadata);
-            self.snapshot_manager.invalidate_cached_versions(table_name);
         }
         // Spec P2.1: a sync/semi-sync primary's write waits for its standbys, as
         // `append_with_batch` waited; after the snapshot barrier lifted, so no new
         // snapshot waits for the acknowledgement too.
-        WriteAheadLog::wait_replicated_sequence(replication_barrier);
+        Self::wait_for_direct_replication(replication_barrier);
         Ok(())
     }
 
@@ -17256,8 +18879,14 @@ impl StorageEngine {
     /// Sprinter 6bc4a4040eb7 (B4): the `data:` write of a fast DELETE, with its delete
     /// event and the snapshot a later `AS OF` resolves to. Spec R5.4: one write group,
     /// its logical-WAL entry in it ([`Self::write_fast_row_change`]).
-    fn delete_row_fast(&self, key: &[u8], table_name: &str, row_id: u64) -> Result<()> {
-        self.write_fast_row_change(table_name, row_id, key, None)
+    fn delete_row_fast(
+        &self,
+        key: &[u8],
+        table_name: &str,
+        row_id: u64,
+        publication: Option<&mut VectorRowWrite<'_>>,
+    ) -> Result<()> {
+        self.write_fast_row_change(table_name, row_id, key, None, None, publication)
     }
 
     /// Sprinter 6bc4a4040eb7 (B4): [`Self::delete`] of a main row, with its delete
@@ -17275,23 +18904,28 @@ impl StorageEngine {
         let Some(Some(event_key)) = event else {
             return self.delete(key);
         };
+        // Review F7: a transaction whose snapshot predates this delete reads the row
+        // through its snapshot (`scan_table_at_transaction_snapshot`), not from the
+        // current `data:`, which no longer has it: raise the table's watermark before
+        // the delete is visible, as a commit does (W2.5).
+        self.note_committed_write(&Self::extract_table_from_key(key), timestamp);
         let mut batch = WriteBatch::default();
         batch.delete(key);
         batch.put(event_key.as_bytes(), super::time_travel::encode_delete_event(timestamp));
         if !self.is_replaying.load(Ordering::Acquire) {
-            if let Some(wal) = &self.wal {
+            if self.wal.is_some() {
                 let table_name = Self::extract_table_from_key(key);
-                return wal
-                    .read()
-                    .append_with_batch(
-                        WalOperation::Delete {
-                            table: table_name,
-                            key: key.clone(),
-                        },
-                        batch,
-                        self.memory_write_options.as_ref(),
-                    )
-                    .map(drop);
+                let _locks = self.lock_main_table_for_write(&table_name)?;
+                let barrier = self.write_direct_batch(
+                    batch,
+                    Some(WalOperation::Delete {
+                        table: table_name,
+                        key: key.clone(),
+                    }),
+                    self.memory_write_options.as_ref(),
+                )?;
+                Self::wait_for_direct_replication(barrier);
+                return Ok(());
             }
         }
         self.gate
@@ -17324,15 +18958,32 @@ impl StorageEngine {
         old_tuple: &Tuple,
         schema: &crate::Schema,
     ) -> Result<u64> {
+        let _locks = self.lock_main_table_for_write(table_name)?;
         // sprinter 6bc4a4040eb7 (B2): main-only writer — refused on a branch.
         self.refuse_main_only_write_on_branch("the fast DELETE path")?;
+        let mut _vector_write = self.vector_row_write(table_name, [row_id]);
+        let mut cache_publication = DirectRowCachePublication {
+            engine: self,
+            applied: false,
+        };
         // W3.2: DELETE class scope. A tombstone carries the `data:` key only.
         let _wv = crate::write_volume::stmt_scope(crate::write_volume::StmtClass::Delete);
         // Item #2 / spec R5.4: a COPY marker-covered row's insert version is staged
         // into the delete's own group (`write_fast_row_change`).
         let key = Self::build_data_key(table_name, row_id);
-        self.delete_row_fast(&key, table_name, row_id)
-            .map_err(|e| Error::storage(format!("Fast delete failed: {}", e)))?;
+        self.write_fast_row_change(
+            table_name,
+            row_id,
+            &key,
+            None,
+            Some((old_tuple, schema)),
+            _vector_write.as_mut(),
+        )
+        .map_err(|e| Error::storage(format!("Fast delete failed: {}", e)))?;
+        cache_publication.applied = _vector_write.is_none();
+        if let Some(publication) = _vector_write.as_ref() {
+            publication.plan.row_group_applied();
+        }
         if crate::write_volume::enabled() {
             crate::write_volume::add_row();
             crate::write_volume::add(crate::write_volume::Category::Data, key.len() as u64);
@@ -17348,13 +18999,12 @@ impl StorageEngine {
         // R5.V1: drop the row's entries from HNSW vector indexes.
         let _ = self
             .vector_indexes
-            .on_row_delete(table_name, row_id, Some(schema), Some(old_tuple));
-
-        // R3.3: one grouped write nulls every columnar column slot and clears
-        // the row's presence bit (previously one read-modify-write per column).
-        self.delete_columnar_rows_grouped(table_name, &[row_id], schema)?;
+            .on_row_delete_staged(table_name, row_id, Some(schema), Some(old_tuple));
 
         self.row_cache.invalidate(table_name, row_id);
+        if let Some(publication) = _vector_write.as_mut() {
+            publication.finish()?;
+        }
         Ok(1)
     }
 
@@ -17368,14 +19018,24 @@ impl StorageEngine {
         pk_key: &[u8],
         pk_value: &crate::Value,
     ) -> Result<u64> {
+        let _locks = self.lock_main_table_for_write(table_name)?;
         // sprinter 6bc4a4040eb7 (B2): main-only writer — refused on a branch.
         self.refuse_main_only_write_on_branch("the fast DELETE path")?;
+        let mut _vector_write = self.vector_row_write(table_name, [row_id]);
+        let mut cache_publication = DirectRowCachePublication {
+            engine: self,
+            applied: false,
+        };
         // W3.2: DELETE class scope (PK-only tombstone; `data:` key bytes).
         let _wv = crate::write_volume::stmt_scope(crate::write_volume::StmtClass::Delete);
         // Item #2 / spec R5.4: see `delete_tuple_fast`.
         let key = Self::build_data_key(table_name, row_id);
-        self.delete_row_fast(&key, table_name, row_id)
+        self.delete_row_fast(&key, table_name, row_id, _vector_write.as_mut())
             .map_err(|e| Error::storage(format!("Fast PK delete failed: {}", e)))?;
+        cache_publication.applied = _vector_write.is_none();
+        if let Some(publication) = _vector_write.as_ref() {
+            publication.plan.row_group_applied();
+        }
         if crate::write_volume::enabled() {
             crate::write_volume::add_row();
             crate::write_volume::add(crate::write_volume::Category::Data, key.len() as u64);
@@ -17391,9 +19051,12 @@ impl StorageEngine {
         // R5.V1: drop the row's entries from HNSW vector indexes. No old
         // tuple on this path (PK-only delete skips the row fetch); the hook
         // deletes by row_id, which is all HNSW needs.
-        let _ = self.vector_indexes.on_row_delete(table_name, row_id, None, None);
+        let _ = self.vector_indexes.on_row_delete_staged(table_name, row_id, None, None);
 
         self.row_cache.invalidate(table_name, row_id);
+        if let Some(publication) = _vector_write.as_mut() {
+            publication.finish()?;
+        }
         Ok(1)
     }
 
@@ -17462,21 +19125,42 @@ impl StorageEngine {
     /// Uses snapshot manager's efficient version resolution.
     ///
     /// Sprinter 6bc4a4040eb7 (B4): for `AS OF`, the row universe is the current rows
-    /// and every row whose newest event is a delete: a row deleted after the snapshot
-    /// is there. A row deleted before delete events existed has none, and is absent at
-    /// every time, as it always was.
+    /// and every row whose newest event is a delete after the snapshot: a row deleted
+    /// since is there. A row deleted before delete events existed has none, and is
+    /// absent at every time, as it always was.
+    /// Logical history crosses DROP COLUMN and storage representation changes.
+    /// Renames and replacing refreshes remain explicit history cuts.
     pub fn scan_table_at_snapshot(&self, table_name: &str, snapshot_ts: u64) -> Result<Vec<Tuple>> {
-        self.scan_snapshot(table_name, snapshot_ts, true)
+        self.refuse_history_before_cuts(table_name, snapshot_ts)?;
+        self.scan_snapshot(table_name, snapshot_ts)
     }
 
-    /// A transaction's view of `table_name` at its snapshot: the rows that exist now,
-    /// each as of the snapshot. A row another transaction deleted since is not there,
-    /// which is what a transaction has always read, and what its writes are built on.
+    /// A transaction's view of `table_name` at its snapshot: the same rows `AS OF`
+    /// reads there, including a row another transaction deleted (or truncated)
+    /// since. Review F7: this used to leave such a row out, so a REPEATABLE READ
+    /// transaction saw a delete committed after its snapshot (SUM 49 / COUNT 9
+    /// instead of 55 / 10). Writes resolve their target rows against current
+    /// storage, not this scan, and a write to a row deleted since conflicts as any
+    /// write to a row changed since does.
     pub(crate) fn scan_table_at_transaction_snapshot(&self, table_name: &str, snapshot_ts: u64) -> Result<Vec<Tuple>> {
-        self.scan_snapshot(table_name, snapshot_ts, false)
+        self.scan_snapshot(table_name, snapshot_ts)
     }
 
-    fn scan_snapshot(&self, table_name: &str, snapshot_ts: u64, deleted_rows: bool) -> Result<Vec<Tuple>> {
+    /// Spec R5.5: refuse a read of `table_name` at `snapshot_ts` from before a cut of
+    /// its history (`storage::table_layout`): what such a read would show is not what
+    /// the name held then. One map lookup when the table has no layout record.
+    pub fn refuse_history_before_cuts(&self, table_name: &str, snapshot_ts: u64) -> Result<()> {
+        if !self.config.storage.time_travel_enabled {
+            return Ok(());
+        }
+        match self.snapshot_manager.table_layout(table_name)? {
+            Some(layout) => layout.refuse_reads_before(table_name, snapshot_ts),
+            None => Ok(()),
+        }
+    }
+
+    fn scan_snapshot(&self, table_name: &str, snapshot_ts: u64) -> Result<Vec<Tuple>> {
+        self.check_table_readable(table_name)?;
         // P0#1 read-side gate: when versioning is disabled (time_travel_enabled=false),
         // the commit path stops writing v:/v_idx:, so any pre-existing version
         // history is stale (older than the advanced `data:` value). Mirror the
@@ -17514,19 +19198,16 @@ impl StorageEngine {
                 seen_rows.insert(row_id);
             }
         }
-        if deleted_rows {
-            seen_rows.extend(self.snapshot_manager.rows_with_delete_event(table_name)?);
-        }
+        seen_rows.extend(self.snapshot_manager.rows_deleted_after(table_name, snapshot_ts)?);
 
         // W3.5 Stage 1 + spec R5.2: the query plan is built against the CURRENT
         // catalog, so a resolved version written under an older schema is shaped
         // to the current width — a pre-ADD-COLUMN version (narrower) reads the
         // column's missing value, or NULL with none, as PostgreSQL's old tuples
-        // do; a pre-DROP-COLUMN version (wider; `drop_column_from_rows` writes no
-        // new version, so a pre-DROP snapshot legitimately resolves the wide
-        // version) is truncated, matching the pre-W3.5 projection. Resolved once;
-        // `None` disables the shaping (strict mode, or an unresolvable schema —
-        // never worse than the pre-W3.5 raw decode).
+        // do. A pre-DROP-COLUMN version is first brought to today's layout (spec
+        // R5.5, below): truncating it shifted every column after the dropped one.
+        // Resolved once; `None` disables the shaping (strict mode, or an
+        // unresolvable schema — never worse than the pre-W3.5 raw decode).
         let target_width = if self.null_pad_snapshot_schema() {
             self.catalog()
                 .get_table_schema(table_name)
@@ -17536,13 +19217,24 @@ impl StorageEngine {
             None
         };
 
+        // Spec R5.5: the table's layout record, once for the scan.
+        let layout = self.snapshot_manager.table_layout(table_name)?;
+
         // For each row, read the version at the snapshot timestamp
         // This implements MVCC snapshot isolation: we see the most recent
         // version <= snapshot_ts
         for row_id in seen_rows {
-            if let Some(value) = self
-                .snapshot_manager
-                .read_at_snapshot(table_name, row_id, snapshot_ts)?
+            // Spec R5.5: a row a rename moved here without its history, which existed at
+            // the snapshot and changed since, has nothing right to read there: refused
+            // (phase B4's rule for an anchor). Asked before the read, whatever it finds
+            // (`SnapshotManager::history_lost_at`).
+            if let Some(layout) = layout.as_deref() {
+                self.snapshot_manager
+                    .refuse_lost_history(layout, table_name, row_id, snapshot_ts)?;
+            }
+            if let Some((source, value)) =
+                self.snapshot_manager
+                    .read_at_snapshot_sourced(table_name, row_id, snapshot_ts)?
             {
                 // Deserialize tuple directly (RocksDB handles decompression)
                 let mut tuple: Tuple = bincode::deserialize(&value)
@@ -17551,6 +19243,19 @@ impl StorageEngine {
                 // Attach row_id to tuple for DML operations
                 tuple.row_id = Some(row_id);
 
+                // Spec R5.5: a version older than a DROP COLUMN loses the dropped
+                // column's value, so every later column reads its own, under either
+                // `snapshot_schema_evolution` (the position, not the width, is wrong
+                // otherwise). Nothing when the table's layout never moved.
+                if let (Some(layout), super::time_travel::ImageSource::Version(written)) = (layout.as_deref(), source) {
+                    if layout.changed_since(written) {
+                        let time = self.snapshot_manager.version_layout_time(table_name, row_id, written)?;
+                        layout.bring_forward(table_name, time, &mut tuple)?;
+                    }
+                }
+                self.snapshot_manager
+                    .normalize_snapshot_tuple(table_name, row_id, source, &mut tuple)?;
+
                 if let Some(width) = target_width {
                     self.shape_row(table_name, width, &mut tuple)?;
                 }
@@ -17558,7 +19263,7 @@ impl StorageEngine {
                 tuples.push(tuple);
             }
             // If read_at_snapshot returns None, the row didn't exist at snapshot_ts
-            // (it was created after the snapshot), so we skip it
+            // (it was created after the snapshot), so we skip it.
         }
 
         Ok(tuples)
@@ -17615,6 +19320,9 @@ impl StorageEngine {
 
     /// Get next row ID for a table (thread-safe)
     pub fn next_row_id(&self, table_name: &str) -> Result<u64> {
+        let _table_scope = self.lock_table_for_write(table_name)?;
+        let allocation_lock = self.gate.counter_lock(table_name);
+        let _allocation = allocation_lock.lock();
         // Get or initialize counter
         let next = if let Some(counter) = self.row_counters.get(table_name) {
             counter.fetch_add(1, Ordering::Relaxed) + 1
@@ -17631,19 +19339,19 @@ impl StorageEngine {
         let value =
             bincode::serialize(&next).map_err(|e| Error::storage(format!("Failed to serialize counter: {}", e)))?;
 
-        self.put_internal(&key, &value)?;
-
-        // Log to WAL for HA replication (only if WAL is enabled and not replaying)
-        // This ensures sequence values are preserved across failover
-        if !self.is_replaying.load(Ordering::Acquire) {
-            if let Some(wal) = &self.wal {
-                let wal = wal.read();
-                wal.append(WalOperation::UpdateCounter {
-                    table_name: table_name.to_string(),
-                    new_value: next,
-                })?;
-            }
-        }
+        let stored = super::tde::seal(self.key_manager.as_deref(), &value)?;
+        let barrier = if let Some(wal) = self.wal.as_ref().filter(|_| !self.is_replaying.load(Ordering::Acquire)) {
+            wal.read()
+                .append_counter_with_value(table_name, next, stored.as_ref())?
+                .1
+        } else {
+            self.gate
+                .put(&self.db, &key, stored.as_ref(), self.memory_write_options.as_ref())
+                .map_err(|error| Error::storage(format!("Failed to persist row counter: {error}")))?;
+            None
+        };
+        drop(_allocation);
+        Self::wait_for_direct_replication(barrier);
 
         Ok(next)
     }
@@ -17733,6 +19441,9 @@ impl StorageEngine {
     /// Called after a batch of volatile row ID allocations to ensure
     /// the counter survives a crash.
     pub fn flush_row_counter(&self, table_name: &str) -> Result<()> {
+        let _table_scope = self.lock_table_for_write(table_name)?;
+        let counter_lock = self.gate.counter_lock(table_name);
+        let _counter_guard = counter_lock.lock();
         let current = if let Some(counter) = self.row_counters.get(table_name) {
             counter.load(Ordering::Relaxed)
         } else {
@@ -17769,12 +19480,9 @@ impl StorageEngine {
         if self.config.storage.memory_only {
             return Ok(());
         }
-        for entry in self.row_counters.iter() {
-            let current = entry.value().load(Ordering::Relaxed);
-            let key = format!("counter:{}", entry.key()).into_bytes();
-            let value = bincode::serialize(&current)
-                .map_err(|e| Error::storage(format!("Failed to serialize counter: {}", e)))?;
-            self.put_internal(&key, &value)?;
+        let tables: Vec<_> = self.row_counters.iter().map(|entry| entry.key().clone()).collect();
+        for table in tables {
+            self.flush_row_counter(&table)?;
         }
         Ok(())
     }
@@ -17815,7 +19523,7 @@ impl StorageEngine {
                 .insert(table_name.to_string(), std::sync::atomic::AtomicU64::new(target));
             true
         };
-        if changed {
+        if changed && self.engine_may_write() && self.gate.is_open() {
             self.flush_row_counter(table_name)?;
         }
         Ok(())
@@ -19817,6 +21525,7 @@ impl StorageEngine {
     /// `BranchView::scan(Some(txn), ..)` instead (sql/executor/scan.rs
     /// `txn_base_tuples`), which also merges its staged branch writes.
     pub fn scan_table_branch_aware_with_schema(&self, table_name: &str, schema: &crate::Schema) -> Result<Vec<Tuple>> {
+        self.check_table_readable(table_name)?;
         // sprinter 6bc4a4040eb7 (B1): the SESSION's binding. Main (no binding)
         // is the standard scan; a binding whose branch was dropped or merged
         // since it was validated is refused (3D000) rather than read.
@@ -19903,323 +21612,321 @@ impl StorageEngine {
         Ok(row_id)
     }
 
-    /// Update tuples with branch isolation
-    ///
-    /// When a branch is active, updates branch-specific data.
-    /// Updates to a branch are isolated from the main branch.
-    pub fn update_tuples_branch_aware(
+    /// Current durable main row for a writer. Never read/fill the shared row
+    /// cache: its contents are a reader optimization, not a mutation preimage.
+    fn current_generic_mutation_row(&self, table: &str, row: u64, schema: &crate::Schema) -> Result<Option<Tuple>> {
+        let key = Self::build_data_key(table, row);
+        self.get_internal(&key)?
+            .map(|plain| self.decode_stored_row(table, schema, row, &plain))
+            .transpose()
+    }
+
+    /// A failed owning native call is not proof that its rows stayed unchanged.
+    /// Fence before its snapshot barrier and key claims can be released. A
+    /// known pre-write refusal keeps the existing undo/retry path.
+    fn fence_uncertain_row_write<T>(
         &self,
-        table_name: &str,
-        mut updates: Vec<(u64, Tuple)>, // (row_id, updated_tuple)
-    ) -> Result<u64> {
-        // sprinter 6bc4a4040eb7 (B1): the SESSION's binding (`None` = main);
-        // a dropped/merged binding is refused before anything is written.
-        //
-        // B2 (fix pass): REFUSED on a branch. This funnel writes outside any
-        // transaction and checks nothing, so on a branch it could only enforce
-        // PRIMARY KEY / UNIQUE by trusting a caller — and an UPDATE's key claim
-        // needs a transaction to live in until the row lands. Every SQL UPDATE
-        // on a branch runs in a transaction (the params family's
-        // `params_branch_dml_needs_implicit_transaction`) and writes through
-        // the branch view there, so nothing reaches this today; a future caller
-        // fails closed instead of writing unchecked rows.
+        table: &str,
+        attempt: &super::write_outcome::WriteAttempt,
+        result: &Result<T>,
+    ) {
+        if let Err(error) = result {
+            if attempt.outcome() == super::write_outcome::WriteOutcome::Unknown {
+                self.quarantine_generic_indexes(table, &error.to_string());
+            }
+        }
+    }
+
+    pub(crate) fn quarantine_generic_indexes(&self, table: &str, reason: &str) -> Error {
+        self.layout_epochs.quarantine(table);
+        self.gate.quarantine_table(table, reason);
+        self.row_cache.invalidate_table(table);
+        self.generic_mutation_generation.fetch_add(1, Ordering::Release);
+        // Cache/plan/data fences precede any backend/ART retirement wait.
+        self.vector_indexes.retire_table_indexes(table, reason);
+        if let Err(error) = self.art_index_manager.drop_table_indexes(table) {
+            tracing::error!("Failed to retire unusable indexes of {table}: {error}");
+        }
+        Error::storage(format!(
+            "indexes of table '{table}' are unavailable after reconciliation failed: {reason}; reopen to rebuild"
+        ))
+    }
+
+    /// Finish claims as soon as the batch applies, before a later fsync can
+    /// report an error. On an uncertain write, read actual rows under the
+    /// caller's exclusive table guard and reconcile instead of undoing blindly.
+    fn commit_generic_mutations(
+        &self,
+        table: &str,
+        schema: &crate::Schema,
+        txn: Transaction,
+        mutations: &[GenericRowMutation],
+    ) -> Result<()> {
+        txn.note_index_key_removal(table);
+        let census = txn.write_census_hold();
+        let proposed: Vec<_> = mutations
+            .iter()
+            .map(|row| MergedRowChange {
+                row_id: row.row_id,
+                old: Some(&row.old),
+                new: row.new.as_ref(),
+            })
+            .collect();
+        let claim = match self
+            .art_index_manager
+            .claim_merged_table_keys(table, schema, &proposed)
+            .map_err(|error| Error::constraint_violation(error.to_string()))?
+        {
+            MergedKeysOutcome::Claimed(claim) => claim,
+            MergedKeysOutcome::HeldBy {
+                wanted_by,
+                constraint,
+                columns,
+            } => {
+                let wanted = mutations
+                    .iter()
+                    .find(|row| row.row_id == wanted_by)
+                    .and_then(|row| row.new.as_ref());
+                let key = wanted.map_or_else(
+                    || format!("({})", columns.join(", ")),
+                    |row| merge_key_text(schema, &columns, row),
+                );
+                return Err(Error::constraint_violation(format!(
+                    "Duplicate key value violates UNIQUE constraint \"{constraint}\": {key}"
+                )));
+            }
+        };
+        let state = Arc::new(parking_lot::Mutex::new(GenericIndexCommit {
+            claim: Some(claim),
+            applied: false,
+            settle_error: None,
+        }));
+        let committed = Arc::clone(&state);
+        let cache_epoch = Arc::clone(&self.generic_mutation_generation);
+        let row_cache = Arc::clone(&self.row_cache);
+        let cached_table = table.to_string();
+        let row_ids: Vec<_> = mutations.iter().map(|row| row.row_id).collect();
+        txn.after_write_attempt(move || {
+            // The transaction's ordinary row-cache fence is success-only. A
+            // possibly-applied failure needs the same stale-fill protection
+            // before fresh readers pass the barrier, not after reconciliation.
+            for row in row_ids {
+                row_cache.invalidate(&cached_table, row);
+            }
+            cache_epoch.fetch_add(1, Ordering::Release);
+        });
+        txn.after_commit(move || {
+            let mut state = committed.lock();
+            state.applied = true;
+            if let Some(claim) = state.claim.take() {
+                if let Err(error) = claim.finish() {
+                    state.settle_error = Some(error.to_string());
+                }
+            }
+        });
+        #[cfg(feature = "internal-tests")]
+        {
+            let hook = NEXT_GENERIC_AFTER_CLAIM.with(|next| next.borrow_mut().take());
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        let timestamp = self.next_commit_timestamp(txn.has_tracked_writes());
+        let result = txn.commit_with_timestamp(timestamp);
+        let (applied, settle_error, claim) = {
+            let mut state = state.lock();
+            (state.applied, state.settle_error.take(), state.claim.take())
+        };
+        let mut reconciled = None;
+        if !applied || settle_error.is_some() {
+            if let Some(claim) = claim {
+                claim.disarm_for_reconciliation();
+            }
+            let mut actual_rows = Vec::with_capacity(mutations.len());
+            for row in mutations {
+                let current = self
+                    .current_generic_mutation_row(table, row.row_id, schema)
+                    .map_err(|error| self.quarantine_generic_indexes(table, &error.to_string()))?;
+                actual_rows.push((row.row_id, current));
+            }
+            let actual: Vec<_> = actual_rows
+                .iter()
+                .map(|(row, tuple)| MergedRowChange {
+                    row_id: *row,
+                    old: None,
+                    new: tuple.as_ref(),
+                })
+                .collect();
+            self.art_index_manager
+                .reconcile_mutated_rows(table, schema, &proposed, &actual)
+                .map_err(|error| self.quarantine_generic_indexes(table, &error.to_string()))?;
+            reconciled = Some(actual_rows);
+        }
+        // Actual-state reconciliation, including a possibly-applied error,
+        // changes only RAM. Persistent row images already rode the heap group;
+        // rollback must not emit a graph/snapshot repair write.
+        if let Some(actual) = &reconciled {
+            self.vector_indexes
+                .reconcile_rows_ram_only(table, schema, actual)
+                .map_err(|error| self.quarantine_generic_indexes(table, &error.to_string()))?;
+        }
+        // Applied-but-later-fsync-error still needs derived publication. For an
+        // uncertain failed write publish only actual changes; refused no-ops do
+        // not create deltas or side effects. MV deltas already rode the batch.
+        for (position, row) in mutations.iter().enumerate() {
+            let actual = reconciled.as_ref().and_then(|rows| rows.get(position));
+            let new = match actual {
+                Some((_, actual)) => actual.as_ref(),
+                None => row.new.as_ref(),
+            };
+            if !applied && new.is_some_and(|new| new.values == row.old.values) {
+                continue;
+            }
+            match new {
+                Some(new) => {
+                    self.filter_delta_tracker
+                        .on_update(table, row.row_id, &row.old, new, schema);
+                    if reconciled.is_none() {
+                        let _ = self
+                            .vector_indexes
+                            .on_row_update(table, row.row_id, schema, Some(&row.old), new);
+                    }
+                    for (column, value) in schema.columns.iter().zip(&new.values) {
+                        self.speculative_filter_manager.on_insert(table, &column.name, value);
+                    }
+                }
+                None => {
+                    self.filter_delta_tracker.on_delete(table, row.row_id, &row.old, schema);
+                    if reconciled.is_none() {
+                        let _ = self
+                            .vector_indexes
+                            .on_row_delete(table, row.row_id, Some(schema), Some(&row.old));
+                    }
+                }
+            }
+            self.row_cache.invalidate(table, row.row_id);
+        }
+        // The attempted-write hook already fenced result-cache hits and late
+        // fills BEFORE end_commit, including after a possibly-applied error.
+        drop(census);
+        if let Some(error) = settle_error {
+            tracing::warn!("Generic mutation index settlement of {table} was reconciled: {error}");
+        }
+        result
+    }
+
+    /// Update main rows atomically, including their indexes and derived data.
+    /// Repeated row IDs use the last supplied image and count once.
+    pub fn update_tuples_branch_aware(&self, table_name: &str, updates: Vec<(u64, Tuple)>) -> Result<u64> {
         if let Some(view) = self.branch_view()? {
             return Err(Error::branch_write_unsupported(
                 "an UPDATE outside a transaction",
                 view.name(),
             ));
         }
-        // Main from here on (the branch arm returned above).
-        let branch_id: Option<u64> = None;
-        let catalog = Catalog::new(self);
-        let schema = catalog.get_table_schema(table_name)?;
-
-        let mut update_count = 0u64;
-
-        for (row_id, tuple) in updates {
-            // Get current timestamp for versioning
-            let timestamp = self.next_timestamp();
-
-            // W2.5: this generic autocommit UPDATE funnel (reached when the fast
-            // update path bails — e.g. a non-PK predicate, or any UPDATE issued
-            // while a session transaction is open) writes the new `v:` version
-            // WITHOUT a `v_idx:` reverse-index entry (the intentional un-indexed
-            // -autocommit-version design that `version_gc_tests.rs`'s C15 chain
-            // rule depends on), so `read_at_snapshot` keeps resolving the
-            // PRE-update version for every snapshot. A watermark bump to
-            // `timestamp` would leave the table fast-read eligible for a reader
-            // whose snapshot post-dates this update, which would then fast-read
-            // the NEW `data:` value while the snapshot path resolves the OLD one
-            // — a non-repeatable read once that reader flips onto the snapshot
-            // path (its own write / DDL). Instead INVALIDATE the watermark: the
-            // table returns to the default-closed snapshot path (matching the
-            // pre-W2.5 behavior exactly) until a snapshot-correct write
-            // re-establishes it. A reader whose snapshot predates this update is
-            // still forced onto the snapshot path by the post-scan re-check
-            // (absent entry => "changed"). Branch overlays (`bdata:`/`bv:`) are
-            // branch-blind and never enter the map (a branch session never
-            // reads it — sprinter 6bc4a4040eb7 B1).
-            if branch_id.is_none() {
-                self.invalidate_write_watermark(table_name);
-            }
-
-            // Item #2: on the main branch, preserve a COPY marker-covered row's
-            // insert version (at the COPY ts) before this path rewrites `data:`
-            // and records the old value at `timestamp-1`. Without it the copy
-            // slice `[copy_ts, timestamp-1)` would have no version and AS-OF
-            // there would wrongly treat the row as not-yet-existing.
-            if branch_id.is_none() {
-                self.snapshot_manager
-                    .materialize_copy_marker_row_durable(table_name, row_id)?;
-            }
-
-            // Determine the key based on whether we're in a branch
-            let current_key = if let Some(bid) = branch_id {
-                // Branch update: read from and write to branch-specific key
-                format!("bdata:{}:{}:{}", bid, table_name, row_id).into_bytes()
-            } else {
-                // Main branch update: read from and write to standard key
-                format!("data:{}:{}", table_name, row_id).into_bytes()
-            };
-
-            // PRESERVE OLD VERSION FOR TIME-TRAVEL
-            // Read the current (old) value before overwriting it (decrypt if TDE enabled)
-            let mut old_tuple_for_delta: Option<Tuple> = None;
-            if let Ok(Some(old_value)) = self.get_internal(&current_key) {
-                // Deserialize old tuple for delta tracking
-                old_tuple_for_delta = bincode::deserialize(&old_value).ok();
-                // Spec R5.2: the pre-image the deltas and the vector hook read.
-                if let Some(old) = old_tuple_for_delta.as_mut() {
-                    self.shape_row(table_name, schema.columns.len(), old)?;
-                }
-
-                // Write old value to version history with the OLD timestamp
-                // The old timestamp is captured before the update
-                let old_timestamp = timestamp.saturating_sub(1);
-
-                let old_version_key = if let Some(bid) = branch_id {
-                    format!("bv:{}:{}:{}:{}", bid, table_name, row_id, old_timestamp)
-                } else {
-                    format!("v:{}:{}:{}", table_name, row_id, old_timestamp)
-                };
-
-                // Store the old value in version history (only if not already there, encrypted if TDE enabled)
-                if self.get_internal(old_version_key.as_bytes())?.is_none() {
-                    self.put_internal(old_version_key.as_bytes(), &old_value)?;
-                }
-            }
-
-            // Serialize the logical tuple for WAL/recovery, but store the
-            // physical tuple format for main-branch tables that use side
-            // storage. Branch overlays are row-oriented and remain logical.
-            let logical_value =
-                bincode::serialize(&tuple).map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
-            let value = if branch_id.is_none() && schema_uses_column_storage(&schema) {
-                let stored_tuple = self.transform_tuple_for_column_storage(table_name, row_id, &tuple, &schema)?;
-                bincode::serialize(&stored_tuple)
-                    .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?
-            } else {
-                logical_value.clone()
-            };
-
-            // Write updated tuple to current key (overwrites old value)
-            self.put(&current_key, &value)?;
-
-            // Log to WAL for replication (put() no longer logs to avoid INSERT/UPDATE confusion)
-            self.log_data_update(table_name, &current_key, &logical_value)?;
-
-            // Write versioned copy of NEW value for time-travel (encrypted if TDE enabled)
-            let version_key = if let Some(bid) = branch_id {
-                format!("bv:{}:{}:{}:{}", bid, table_name, row_id, timestamp)
-            } else {
-                format!("v:{}:{}:{}", table_name, row_id, timestamp)
-            };
-            self.put_internal(version_key.as_bytes(), &value)?;
-
-            // Register snapshot with WAL LSN
-            if let Some(lsn) = self.wal_lsn() {
-                let _ = self.snapshot_manager.register_snapshot_with_lsn(timestamp, lsn);
-            } else {
-                let _ = self.snapshot_manager.register_snapshot(timestamp);
-            }
-
-            // Record delta for incremental MV refresh
-            if let Some(ref old_tuple) = old_tuple_for_delta {
-                if let Err(e) =
-                    self.mv_delta_tracker
-                        .record_update(table_name, row_id, old_tuple.clone(), tuple.clone())
-                {
-                    tracing::warn!("Failed to record update delta for table '{}': {}", table_name, e);
-                    // Don't fail the update if delta recording fails
-                }
-            }
-
-            // Record delta for SMFI (Self-Maintaining Filter Index)
-            if let Some(old_tuple) = old_tuple_for_delta.as_ref() {
-                self.filter_delta_tracker
-                    .on_update(table_name, row_id, old_tuple, &tuple, &schema);
-            }
-
-            // R5.V1: maintain HNSW vector indexes (main branch only — the
-            // vector index is process-wide and serves main-branch kNN, so
-            // branch-isolated overlay writes must not mutate it).
-            if branch_id.is_none() {
-                let _ = self.vector_indexes.on_row_update(
-                    table_name,
-                    row_id,
-                    &schema,
-                    old_tuple_for_delta.as_ref(),
-                    &tuple,
-                );
-            }
-
-            // Update speculative filters (track new values)
-            for (i, col) in schema.columns.iter().enumerate() {
-                if let Some(value) = tuple.values.get(i) {
-                    self.speculative_filter_manager.on_insert(table_name, &col.name, value);
-                }
-            }
-
-            // Invalidate row cache entry (stale after update)
-            self.row_cache.invalidate(table_name, row_id);
-
-            update_count += 1;
+        let mut last = HashMap::with_capacity(updates.len());
+        for (row, tuple) in updates {
+            last.insert(row, tuple);
         }
-
-        Ok(update_count)
+        let mut updates: Vec<_> = last.into_iter().collect();
+        updates.sort_unstable_by_key(|(row, _)| *row);
+        let _exclusive =
+            self.lock_tables_exclusive(super::table_locks::MAIN_LEVEL, &[table_name], "a generic UPDATE")?;
+        self.gate.check_table_available(table_name)?;
+        let schema = self.catalog().get_table_schema(table_name)?;
+        let mut txn = self.begin_autocommit_transaction()?;
+        txn.set_write_census(self.write_census());
+        txn.log_staged_writes_at_commit(self.logical_wal_per_statement());
+        for (row, _) in &updates {
+            txn.lock_row(table_name, *row)?;
+        }
+        let mut changes = Vec::with_capacity(updates.len());
+        for (row, mut tuple) in updates {
+            let Some(old) = self.current_generic_mutation_row(table_name, row, &schema)? else {
+                continue;
+            };
+            self.shape_row(table_name, schema.columns.len(), &mut tuple)?;
+            for (column, value) in schema.columns.iter().zip(&tuple.values) {
+                if column.primary_key && matches!(value, Value::Null) {
+                    return Err(Error::constraint_violation(format!(
+                        "null value in primary key column '{}'",
+                        column.name
+                    )));
+                }
+            }
+            let value = bincode::serialize(&tuple)
+                .map_err(|error| Error::storage(format!("Failed to serialize tuple: {error}")))?;
+            txn.put(Self::build_data_key(table_name, row), value)?;
+            self.mv_delta_tracker.stage_mutation_in_transaction(
+                &txn,
+                table_name,
+                row,
+                old.clone(),
+                Some(tuple.clone()),
+            )?;
+            changes.push(GenericRowMutation {
+                row_id: row,
+                old,
+                new: Some(tuple),
+            });
+        }
+        if changes.is_empty() {
+            return Ok(0);
+        }
+        let row_refs: Vec<_> = changes
+            .iter()
+            .filter_map(|row| row.new.as_ref().map(|tuple| (row.row_id, tuple)))
+            .collect();
+        self.stage_columnar_rows_grouped_in_transaction(table_name, &row_refs, &schema, &txn, false)?;
+        self.commit_generic_mutations(table_name, &schema, txn, &changes)?;
+        Ok(changes.len() as u64)
     }
 
-    /// Delete tuples with branch isolation
-    ///
-    /// When a branch is active, marks tuples as deleted in branch-specific storage.
-    /// Deletions in a branch are isolated from the main branch.
+    /// Delete main rows atomically, including index key release. Branch rows
+    /// continue to use the branch overlay's deferred durability surface.
     pub fn delete_tuples_branch_aware(&self, table_name: &str, row_ids: Vec<u64>) -> Result<u64> {
-        tracing::debug!(
-            "delete_tuples_branch_aware: called for table '{}' with row_ids {:?}",
-            table_name,
-            row_ids
-        );
-
-        let timestamp = self.next_timestamp();
-
-        // Get schema for delta tracking (best effort)
-        let catalog = Catalog::new(self);
-        let schema_result = catalog.get_table_schema(table_name);
-
-        // sprinter 6bc4a4040eb7 (B1): the SESSION's binding (`None` = main);
-        // a dropped/merged binding is refused before anything is deleted.
-        //
-        // B2: on a branch every row is hidden through the branch view — its
-        // own image cleared AND its own tombstone written (the pre-B2 arm left
-        // the image behind next to the tombstone), never into main's derived
-        // structures or the dead `bv:` history.
         if let Some(view) = self.branch_view()? {
-            // B2 fix pass: one durability barrier for the whole delete.
             let view = view.with_deferred_durability();
-            let mut delete_count = 0u64;
-            for row_id in &row_ids {
-                view.delete(None, table_name, *row_id)?;
-                delete_count += 1;
+            for row in &row_ids {
+                view.delete(None, table_name, *row)?;
             }
             view.sync()?;
-            return Ok(delete_count);
+            return Ok(row_ids.len() as u64);
         }
-        // Main from here on (the branch arm returned above).
-        {
-            // Main branch delete: preserve old value for time-travel before deleting
-            let mut delete_count = 0u64;
-            // W2.5 note: no watermark bump here. This path removes the row's
-            // `data:` key (`self.delete_row_with_event` below), and a transaction's
-            // snapshot scan (`scan_table_at_transaction_snapshot`) seeds its row-id
-            // universe from the CURRENT `data:` prefix — so a deleted row is
-            // uniformly absent from BOTH the fast (current-data) and the slow
-            // (snapshot) read path. There is no fast/slow
-            // divergence for a delete, so the watermark need not (and, to keep
-            // the fast path available, should not) advance on it. Contrast the
-            // UPDATE/INSERT funnels, which leave the row present in `data:` with
-            // a newer version the snapshot path must hide.
-            for row_id in &row_ids {
-                // Item #2: preserve a COPY marker-covered row's insert version
-                // (at the COPY ts) before removing `data:`, so AS-OF reads in
-                // [copy_ts, delete_ts) still resolve the copied value.
-                self.snapshot_manager
-                    .materialize_copy_marker_row_durable(table_name, *row_id)?;
-                let key = format!("data:{}:{}", table_name, row_id).into_bytes();
-
-                // PRESERVE DELETED VERSION FOR TIME-TRAVEL
-                // Read the current value before deleting it (decrypt if TDE enabled)
-                let mut deleted_tuple_for_delta: Option<Tuple> = None;
-                if let Ok(Some(old_value)) = self.get_internal(&key) {
-                    // Deserialize old tuple for delta tracking
-                    deleted_tuple_for_delta = bincode::deserialize(&old_value).ok();
-                    // Spec R5.2: the pre-image the deltas read.
-                    if let (Some(deleted), Ok(schema)) = (deleted_tuple_for_delta.as_mut(), schema_result.as_ref()) {
-                        self.shape_row(table_name, schema.columns.len(), deleted)?;
-                    }
-
-                    // Write deleted value to version history (encrypted if TDE enabled)
-                    let old_timestamp = timestamp.saturating_sub(1);
-                    let version_key = format!("v:{}:{}:{}", table_name, row_id, old_timestamp);
-
-                    // Store the deleted value in version history (only if not already there)
-                    if self.get_internal(version_key.as_bytes())?.is_none() {
-                        self.put_internal(version_key.as_bytes(), &old_value)?;
-                    }
-                }
-
-                // Now delete the current value, and say when (sprinter 6bc4a4040eb7,
-                // B4). The snapshot is registered below.
-                self.delete_row_with_event(&key, timestamp)?;
-
-                // Record delta for incremental MV refresh
-                if let Some(ref deleted_tuple) = deleted_tuple_for_delta {
-                    if let Err(e) = self
-                        .mv_delta_tracker
-                        .record_delete(table_name, *row_id, deleted_tuple.clone())
-                    {
-                        tracing::warn!("Failed to record delete delta for table '{}': {}", table_name, e);
-                        // Don't fail the delete if delta recording fails
-                    }
-                }
-
-                // Record delta for SMFI (Self-Maintaining Filter Index)
-                if let Ok(ref schema) = schema_result {
-                    if let Some(tuple) = deleted_tuple_for_delta.as_ref() {
-                        self.filter_delta_tracker.on_delete(table_name, *row_id, tuple, schema);
-                    }
-                }
-
-                // R5.V1: drop the row's entries from HNSW vector indexes.
-                let _ = self.vector_indexes.on_row_delete(
-                    table_name,
-                    *row_id,
-                    schema_result.as_ref().ok(),
-                    deleted_tuple_for_delta.as_ref(),
-                );
-
-                // Invalidate row cache entry (row deleted)
-                self.row_cache.invalidate(table_name, *row_id);
-
-                delete_count += 1;
-            }
-
-            // R3.3: null the deleted rows' columnar slots and clear their
-            // presence bits in one grouped write. (Pre-R3.3 this path left
-            // stale values in `col:` batches; the row-walk masked them, the
-            // presence sidecar must not.)
-            if let Ok(ref schema) = schema_result {
-                self.delete_columnar_rows_grouped(table_name, &row_ids, schema)?;
-            }
-
-            // Register snapshot for main branch delete
-            if let Some(lsn) = self.wal_lsn() {
-                let _ = self.snapshot_manager.register_snapshot_with_lsn(timestamp, lsn);
-            } else {
-                let _ = self.snapshot_manager.register_snapshot(timestamp);
-            }
-
-            Ok(delete_count)
+        let mut row_ids = row_ids;
+        row_ids.sort_unstable();
+        row_ids.dedup();
+        let _exclusive =
+            self.lock_tables_exclusive(super::table_locks::MAIN_LEVEL, &[table_name], "a generic DELETE")?;
+        self.gate.check_table_available(table_name)?;
+        let schema = self.catalog().get_table_schema(table_name)?;
+        let mut txn = self.begin_autocommit_transaction()?;
+        txn.set_write_census(self.write_census());
+        txn.log_staged_writes_at_commit(self.logical_wal_per_statement());
+        for row in &row_ids {
+            txn.lock_row(table_name, *row)?;
         }
+        let mut deleted = Vec::with_capacity(row_ids.len());
+        for row in row_ids {
+            let Some(old) = self.current_generic_mutation_row(table_name, row, &schema)? else {
+                continue;
+            };
+            txn.delete(Self::build_data_key(table_name, row))?;
+            self.mv_delta_tracker
+                .stage_mutation_in_transaction(&txn, table_name, row, old.clone(), None)?;
+            deleted.push(GenericRowMutation {
+                row_id: row,
+                old,
+                new: None,
+            });
+        }
+        if deleted.is_empty() {
+            return Ok(0);
+        }
+        let row_ids: Vec<_> = deleted.iter().map(|row| row.row_id).collect();
+        self.stage_columnar_deletes_grouped_in_transaction(table_name, &row_ids, &schema, &txn)?;
+        self.commit_generic_mutations(table_name, &schema, txn, &deleted)?;
+        Ok(deleted.len() as u64)
     }
 
     // --- v3.4 Storage Maintenance API ---
@@ -20303,4 +22010,497 @@ pub struct StorageStats {
     pub approximate_size: u64,
     /// Estimated number of keys
     pub key_count: u64,
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod counter_replay_order_tests {
+    use super::*;
+
+    #[test]
+    fn immediate_and_batched_counter_replay_persist_the_effective_maximum() {
+        for batched in [false, true] {
+            let db = crate::EmbeddedDatabase::new_in_memory().unwrap();
+            db.execute("CREATE TABLE replay_counter (n INT)").unwrap();
+            db.storage.raise_row_counter_to("replay_counter", 90);
+            db.storage.flush_row_counter("replay_counter").unwrap();
+            let operation = WalOperation::UpdateCounter {
+                table_name: "replay_counter".into(),
+                new_value: 40,
+            };
+            if batched {
+                let mut batch = WriteBatch::default();
+                db.storage.apply_wal_operation_to_batch(&operation, &mut batch).unwrap();
+                db.storage.write_gate().write(&db.storage.db(), batch, None).unwrap();
+            } else {
+                db.storage.apply_wal_operation(operation).unwrap();
+            }
+            let bytes = db.storage.get(&b"counter:replay_counter".to_vec()).unwrap().unwrap();
+            assert_eq!(bincode::deserialize::<u64>(&bytes).unwrap(), 90);
+            assert_eq!(db.storage.next_row_id("replay_counter").unwrap(), 91);
+        }
+    }
+}
+
+#[cfg(all(test, feature = "vector-search"))]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+mod vector_checkpoint_interleaving_tests {
+    use super::*;
+    use crate::storage::ArtIndexManager;
+
+    fn database(path: &Path) -> crate::EmbeddedDatabase {
+        let mut config = Config::default();
+        config.storage.path = Some(path.to_path_buf());
+        config.storage.memory_only = false;
+        config.storage.time_travel_enabled = false;
+        config.storage.wal_checkpoint_interval_entries = 0;
+        config.storage.wal_checkpoint_interval_secs = 0;
+        config.storage.wal_checkpoint_on_close = false;
+        config.storage.flush_on_close = false;
+        config.storage.version_gc_interval_secs = Some(0);
+        let db = crate::EmbeddedDatabase::with_config(config).unwrap();
+        db.storage.set_index_snapshots_on_close(false);
+        db.storage.set_row_counter_flush_on_close(false);
+        db
+    }
+
+    fn seed(db: &crate::EmbeddedDatabase) {
+        for table in ["cache_a", "cache_b"] {
+            db.execute(&format!("CREATE TABLE {table} (id INT PRIMARY KEY, emb VECTOR(2))"))
+                .unwrap();
+            let values = (1..=32)
+                .map(|id| format!("({id},'[{},0]')", id * 100))
+                .collect::<Vec<_>>()
+                .join(",");
+            db.execute(&format!("INSERT INTO {table} VALUES {values}")).unwrap();
+            db.execute(&format!("CREATE INDEX idx_{table} ON {table} USING hnsw (emb)"))
+                .unwrap();
+        }
+        let report = db.storage.persist_index_snapshots().unwrap();
+        assert!(report.persisted);
+        assert_eq!(report.vector_graphs, 2, "both real Standard dumps exist");
+        for index in ["idx_cache_a", "idx_cache_b"] {
+            assert!(db
+                .storage
+                .db
+                .get(super::super::index_snapshot::vec_snapshot_marker_key(index))
+                .unwrap()
+                .is_some());
+        }
+    }
+
+    #[test]
+    fn checkpoint_does_not_rearm_global_markers_after_a_row_captured_dirty_policy() {
+        let root = tempfile::tempdir().unwrap();
+        let db = database(root.path());
+        seed(&db);
+        db.execute("UPDATE cache_a SET emb='[900,0]' WHERE id=1").unwrap();
+        let engine = &db.storage;
+        let manager = engine.vector_indexes();
+        assert!(!manager.snapshot_is_clean());
+        let marker_b = super::super::index_snapshot::vec_snapshot_marker_key("idx_cache_b");
+        assert!(engine.db.get(&marker_b).unwrap().is_none());
+        let table_owner = engine.lock_table_for_write("cache_a").unwrap();
+        let schema = engine.catalog().get_table_schema("cache_a").unwrap();
+        let key = ArtIndexManager::encode_key(&[Value::Int4(1)]);
+        let row = engine.art_indexes().pk_index_lookup("cache_a", &key).unwrap();
+        let _row_lock = engine.lock_row_for_fast_write("cache_a", row).unwrap();
+        let old = engine.get_row_by_id("cache_a", row, &schema).unwrap().unwrap();
+        let new = Tuple::new(vec![Value::Int4(1), Value::Vector(vec![800.0, 0.0])]);
+        let data_key = StorageEngine::build_data_key("cache_a", row);
+        let mut batch = WriteBatch::default();
+        batch.put(&data_key, bincode::serialize(&new).unwrap());
+        let mut publication = engine.vector_row_write("cache_a", [row]).unwrap();
+        publication
+            .plan
+            .stage_tuple("cache_a", row, &schema, Some(&new), &mut batch)
+            .unwrap();
+        assert!(engine.has_uncommitted_writes(), "real owning row census is held");
+        let before = engine.db.latest_sequence_number();
+        // A separate checkpoint thread has no ambient statement owner. It
+        // must skip on the captured row census, before waiting for A's lock.
+        let (done, observed) = std::sync::mpsc::channel();
+        let checkpoint_engine = Arc::clone(engine);
+        let checkpoint = std::thread::spawn(move || {
+            done.send(checkpoint_engine.persist_index_snapshots()).unwrap();
+        });
+        let report = match observed.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(result) => {
+                checkpoint.join().unwrap();
+                result.unwrap()
+            }
+            Err(error) => {
+                // Reap even a baseline checkpoint waiting for A's owner.
+                drop(publication);
+                drop(_row_lock);
+                drop(table_owner);
+                checkpoint.join().unwrap();
+                panic!("checkpoint failed to skip the existing row census: {error}");
+            }
+        };
+        assert!(
+            !report.persisted,
+            "an active prepared row must skip BEFORE rearming: {report:?}"
+        );
+        assert_eq!(
+            engine.db.latest_sequence_number(),
+            before,
+            "skipped checkpoint writes nothing"
+        );
+        assert!(
+            !manager.snapshot_is_clean(),
+            "dirty policy is not reset under an existing owner"
+        );
+        assert!(engine.db.get(&marker_b).unwrap().is_none());
+        engine
+            .write_direct_batch_with_vector(batch, None, None, Some(&mut publication))
+            .unwrap();
+        publication.plan.row_group_applied();
+        manager.on_row_update_staged("cache_a", row, &schema, Some(&old), &new);
+        publication.finish().unwrap();
+        drop(publication);
+        drop(_row_lock);
+        drop(table_owner);
+        // The low-level KV API leaves index maintenance to its caller. This is
+        // a valid caller-owned B write + public graph hook, after A consumed
+        // the global dirty flag. Its old B dump must never regain eligibility.
+        let table_b = engine.lock_table_for_write("cache_b").unwrap();
+        let schema_b = engine.catalog().get_table_schema("cache_b").unwrap();
+        let row_b = engine.art_indexes().pk_index_lookup("cache_b", &key).unwrap();
+        let row_b_owner = engine.lock_row_for_fast_write("cache_b", row_b).unwrap();
+        let old_b = engine.get_row_by_id("cache_b", row_b, &schema_b).unwrap().unwrap();
+        let new_b = Tuple::new(vec![Value::Int4(1), Value::Vector(vec![0.0, 0.0])]);
+        engine
+            .put(
+                &StorageEngine::build_data_key("cache_b", row_b),
+                &bincode::serialize(&new_b).unwrap(),
+            )
+            .unwrap();
+        manager.on_row_update("cache_b", row_b, &schema_b, Some(&old_b), &new_b);
+        drop(row_b_owner);
+        drop(table_b);
+        assert!(
+            engine.db.get(&marker_b).unwrap().is_none(),
+            "later raw B mutation cannot trust a stale dump"
+        );
+        assert_eq!(manager.search("idx_cache_b", &vec![0.0, 0.0], 1).unwrap()[0].1, 0.0);
+        drop(db);
+        let reopened = database(root.path());
+        let report = reopened.storage.last_index_open_report().unwrap();
+        assert_eq!(
+            report.vector_reloaded, 0,
+            "both invalid dumps must be rebuilt: {report:?}"
+        );
+        assert_eq!(report.vector_rebuilt, 2, "{report:?}");
+        assert_eq!(
+            reopened
+                .storage
+                .vector_indexes()
+                .search("idx_cache_b", &vec![0.0, 0.0], 1)
+                .unwrap()[0]
+                .1,
+            0.0
+        );
+        eprintln!("vector-checkpoint-receipt captured_dirty_policy=1");
+    }
+
+    #[test]
+    fn checkpoint_skips_a_raw_vector_publication_already_in_progress_before_rearm() {
+        let root = tempfile::tempdir().unwrap();
+        let db = database(root.path());
+        seed(&db);
+        assert!(!db.storage.has_uncommitted_writes());
+        let manager = db.storage.vector_indexes();
+        assert!(manager.snapshot_is_clean());
+        let active = manager.begin_publication();
+        assert!(
+            manager.publication_ticket().is_none(),
+            "raw mutator is already in progress"
+        );
+        let before = db.storage.db.latest_sequence_number();
+        let report = db.storage.persist_index_snapshots().unwrap();
+        assert!(!report.persisted, "raw graph owner must skip BEFORE rearm: {report:?}");
+        assert_eq!(db.storage.db.latest_sequence_number(), before);
+        assert!(manager.snapshot_is_clean());
+        drop(active);
+        eprintln!("vector-checkpoint-receipt preexisting_raw_publication=1");
+    }
+}
+
+#[cfg(test)]
+mod read_only_hydration_tests {
+    use super::*;
+
+    #[test]
+    fn ordinary_read_only_open_rebuilds_indexes_and_counters_without_repair_writes() {
+        for history in [false, true] {
+            let path = tempfile::tempdir().unwrap();
+            let mut cfg = Config::default();
+            cfg.storage.path = Some(path.path().to_path_buf());
+            cfg.storage.memory_only = false;
+            cfg.storage.time_travel_enabled = history;
+            cfg.storage.elide_latest_version = false;
+            cfg.storage.flush_on_close = false;
+            cfg.storage.wal_checkpoint_on_close = false;
+            cfg.storage.version_gc_interval_secs = Some(0);
+            let primary = crate::EmbeddedDatabase::with_config(cfg.clone()).unwrap();
+            primary.storage.set_index_snapshots_on_close(false);
+            primary.storage.set_row_counter_flush_on_close(false);
+            primary.execute("CREATE TABLE ro_rows (id INT PRIMARY KEY)").unwrap();
+            primary.execute("INSERT INTO ro_rows VALUES (1), (2)").unwrap();
+            let before = primary.storage.db.latest_sequence_number();
+            // ON is the default the public read-only opener uses, even when
+            // this existing store was written with elision disabled.
+            cfg.storage.elide_latest_version = true;
+            let readonly = StorageEngine::open_read_only(path.path(), &cfg).unwrap();
+            readonly.catalog().rebuild_all_indexes().unwrap();
+            let schema = readonly.catalog().get_table_schema("ro_rows").unwrap();
+            assert_eq!(readonly.scan_table_with_schema("ro_rows", &schema).unwrap().len(), 2);
+            // Actual-state counter reconciliation remains available in RAM.
+            readonly.reseed_row_counter_from_max_row_id("ro_rows", 999).unwrap();
+            assert_eq!(readonly.write_gate().refusals(), 0);
+            assert!(!readonly.index_snapshots_on_close());
+            assert!(!readonly.row_counter_flush_on_close());
+            assert!(!readonly.wal_checkpoint_on_close());
+            drop(readonly);
+            let public = crate::EmbeddedDatabase::open_read_only(path.path()).unwrap();
+            assert_eq!(
+                public.query("SELECT id FROM ro_rows ORDER BY id", &[]).unwrap().len(),
+                2
+            );
+            assert_eq!(public.storage.write_gate().refusals(), 0);
+            drop(public);
+            assert_eq!(primary.storage.db.latest_sequence_number(), before);
+            assert_eq!(primary.storage.write_gate().refusals(), 0);
+        }
+    }
+}
+
+#[cfg(all(test, feature = "vector-search"))]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+mod art_checkpoint_serialization_tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    struct Resume(Option<mpsc::Sender<()>>);
+    impl Resume {
+        fn release(&mut self) {
+            if let Some(send) = self.0.take() {
+                let _ = send.send(());
+            }
+        }
+    }
+    impl Drop for Resume {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
+    fn database(path: &Path, history: bool) -> crate::EmbeddedDatabase {
+        let mut config = Config::default();
+        config.storage.path = Some(path.to_path_buf());
+        config.storage.memory_only = false;
+        config.storage.time_travel_enabled = history;
+        config.storage.wal_checkpoint_interval_entries = 0;
+        config.storage.wal_checkpoint_interval_secs = 0;
+        config.storage.wal_checkpoint_on_close = false;
+        config.storage.flush_on_close = false;
+        config.storage.version_gc_interval_secs = Some(0);
+        let db = crate::EmbeddedDatabase::with_config(config).unwrap();
+        db.storage.set_index_snapshots_on_close(false);
+        db.storage.set_row_counter_flush_on_close(false);
+        db
+    }
+    fn seed(db: &crate::EmbeddedDatabase) {
+        db.execute("CREATE TABLE plain_a (id INT PRIMARY KEY, label INT)")
+            .unwrap();
+        db.execute("INSERT INTO plain_a VALUES (1,100),(2,200)").unwrap();
+        db.execute("CREATE INDEX idx_plain_label ON plain_a(label)").unwrap();
+        db.execute("CREATE TABLE ticks_b (id INT PRIMARY KEY, value INT)")
+            .unwrap();
+        db.execute("INSERT INTO ticks_b VALUES (1,0)").unwrap();
+        assert!(
+            !db.storage.vector_indexes().has_any_index(),
+            "the writer has NO vector census/ticket"
+        );
+        assert!(db.storage.persist_index_snapshots().unwrap().persisted);
+    }
+
+    fn native_before_art_is_serialized(history: bool) {
+        let root = tempfile::tempdir().unwrap();
+        let db = database(root.path(), history);
+        seed(&db);
+        let old_ticket = db.storage.snapshot_manager.snapshot_publication_ticket();
+        // B begins before A announces its older commit, so B can really land
+        // a newer timestamp while A is paused without a snapshot barrier wait.
+        if history {
+            db.execute("BEGIN").unwrap();
+            db.execute("UPDATE ticks_b SET value=1 WHERE id=1").unwrap();
+        }
+        let (allocated_send, allocated_receive) = mpsc::channel();
+        let (allow_native_send, allow_native_receive) = mpsc::channel();
+        let mut allow_native = Resume(Some(allow_native_send));
+        let (native_send, native_receive) = mpsc::channel();
+        let (allow_art_send, allow_art_receive) = mpsc::channel();
+        let mut allow_art = Resume(Some(allow_art_send));
+        let engine = Arc::clone(&db.storage);
+        let writer = std::thread::spawn(move || {
+            let schema = engine.catalog().get_table_schema("plain_a").unwrap();
+            let key = super::super::ArtIndexManager::encode_key(&[Value::Int4(1)]);
+            let row = engine.art_indexes().pk_index_lookup("plain_a", &key).unwrap();
+            let _row = engine.lock_row_for_fast_write("plain_a", row).unwrap();
+            let old = engine.get_row_by_id("plain_a", row, &schema).unwrap().unwrap();
+            let hook_engine = Arc::clone(&engine);
+            let arm_native = move || {
+                let observed = Arc::clone(&hook_engine);
+                crate::sql::executor::ann_publication_tests::arm("writer_row_applied", move || {
+                    native_send
+                        .send(observed.snapshot_manager.snapshot_publication_ticket())
+                        .unwrap();
+                    allow_art_receive.recv_timeout(Duration::from_secs(60)).unwrap();
+                });
+            };
+            if history {
+                crate::sql::executor::ann_publication_tests::arm("writer_timestamp_allocated", move || {
+                    allocated_send.send(()).unwrap();
+                    allow_native_receive.recv_timeout(Duration::from_secs(60)).unwrap();
+                    arm_native();
+                });
+            } else {
+                arm_native();
+            }
+            // The closure above owns only cloned component handles. The actual
+            // supported API still holds its table owner through final ART work.
+            engine.update_tuple_fast(
+                "plain_a",
+                row,
+                Tuple::new(vec![Value::Int4(1), Value::Int4(999)]),
+                &old,
+                &schema,
+            )
+        });
+        let expected_ticket = if history {
+            allocated_receive.recv_timeout(Duration::from_secs(60)).unwrap();
+            db.execute("COMMIT").unwrap();
+            let later = db.storage.snapshot_manager.snapshot_publication_ticket();
+            assert!(later > old_ticket, "real B committed a newer snapshot before A applied");
+            allow_native.release();
+            later
+        } else {
+            old_ticket
+        };
+        let native_ticket = native_receive.recv_timeout(Duration::from_secs(60)).unwrap();
+        assert_eq!(
+            native_ticket, expected_ticket,
+            "A's native write cannot be detected by a moved newest-snapshot ticket in this control"
+        );
+        assert!(
+            !db.storage.has_uncommitted_writes(),
+            "no-vector native fast writer has no txn census"
+        );
+        let physical = db
+            .storage
+            .art_indexes()
+            .pk_index_lookup("plain_a", &super::super::ArtIndexManager::encode_key(&[Value::Int4(1)]))
+            .unwrap();
+        let raw = db
+            .storage
+            .db
+            .get(StorageEngine::build_data_key("plain_a", physical))
+            .unwrap()
+            .unwrap();
+        let actual: Tuple = bincode::deserialize(&raw).unwrap();
+        assert_eq!(
+            actual.values,
+            vec![Value::Int4(1), Value::Int4(999)],
+            "native row really landed before ART hook"
+        );
+        let (checkpoint_done_send, checkpoint_done_receive) = mpsc::channel();
+        let checkpoint_engine = Arc::clone(&db.storage);
+        let checkpoint = std::thread::spawn(move || {
+            let report = checkpoint_engine.persist_index_snapshots();
+            checkpoint_done_send.send(()).unwrap();
+            report
+        });
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut finished_early = false;
+        let waited = loop {
+            if checkpoint_done_receive.try_recv().is_ok() {
+                finished_early = true;
+                break false;
+            }
+            // The existing diagnostic returns (exclusive, shared) waiters.
+            if db.storage.debug_table_lock_waiters("plain_a").0 > 0 {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::yield_now();
+        };
+        // Always release/join the real writer before asserting, including on
+        // the baseline red path. No leaked blocked thread is an accepted red.
+        allow_art.release();
+        assert_eq!(writer.join().unwrap().unwrap(), 1);
+        let report = checkpoint.join().unwrap().unwrap();
+        assert!(
+            waited && !finished_early,
+            "checkpoint must wait for actual table-exclusive ownership through ART publication"
+        );
+        assert!(
+            report.persisted,
+            "quiescent checkpoint completes after writer leaves: {report:?}"
+        );
+        assert!(db
+            .storage
+            .db
+            .get(super::super::index_snapshot::art_snapshot_marker_key("plain_a"))
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            db.query("SELECT id FROM plain_a WHERE label=999", &[]).unwrap()[0].values,
+            vec![Value::Int4(1)]
+        );
+        assert!(db
+            .query("SELECT id FROM plain_a WHERE label=100", &[])
+            .unwrap()
+            .is_empty());
+        drop(db);
+        let reopened = database(root.path(), history);
+        assert!(reopened.storage.last_index_open_report().unwrap().tables_from_snapshot >= 1);
+        assert_eq!(
+            reopened.query("SELECT id FROM plain_a WHERE label=999", &[]).unwrap()[0].values,
+            vec![Value::Int4(1)]
+        );
+        assert!(reopened
+            .query("SELECT id FROM plain_a WHERE label=100", &[])
+            .unwrap()
+            .is_empty());
+        eprintln!("art-checkpoint-receipt native_before_art_history_{}=1", history);
+    }
+
+    #[test]
+    fn checkpoint_waits_for_nonvector_fast_update_with_time_travel_off() {
+        native_before_art_is_serialized(false);
+    }
+    #[test]
+    fn checkpoint_waits_for_an_older_native_commit_while_newest_snapshot_ticket_is_unchanged() {
+        native_before_art_is_serialized(true);
+    }
+    #[test]
+    fn checkpoint_skips_instead_of_upgrading_an_outer_statement_table_owner() {
+        let root = tempfile::tempdir().unwrap();
+        let db = database(root.path(), false);
+        seed(&db);
+        let _outer = db.storage.lock_main_table_for_write("ticks_b").unwrap();
+        let before = db.storage.db.latest_sequence_number();
+        let report = db.storage.persist_index_snapshots().unwrap();
+        assert!(
+            !report.persisted,
+            "do not acquire earlier table names while an outer owner holds ticks_b"
+        );
+        assert_eq!(db.storage.db.latest_sequence_number(), before);
+        eprintln!("art-checkpoint-receipt existing_owner_skip=1");
+    }
 }

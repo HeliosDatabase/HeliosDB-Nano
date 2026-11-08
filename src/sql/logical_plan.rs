@@ -970,6 +970,10 @@ pub enum LogicalPlan {
         param_types: Vec<DataType>,
         /// The statement to prepare
         statement: Box<LogicalPlan>,
+        /// Spec R5.6: the statement's text (as the parser renders it), to plan it again
+        /// once a schema change of one of its tables leaves `statement` of an old layout.
+        #[serde(default)]
+        source_sql: String,
     },
 
     /// Execute a prepared statement

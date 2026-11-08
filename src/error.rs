@@ -287,6 +287,11 @@ pub const BRANCH_MERGE_KEY_CLAIMED_MARKER: &str = "another transaction holds the
 /// ([`Error::branch_materialize_too_large`]). SQLSTATE 54000.
 pub const BRANCH_MATERIALIZE_TOO_LARGE_MARKER: &str = "too large for one atomic write";
 
+/// An owning row group succeeded, but its derived vector publication failed.
+/// This is a system/storage error, never a pre-write refusal or retryable
+/// serialization error, even when its original derived cause carries one.
+pub const APPLIED_PUBLICATION_FAILURE_MARKER: &str = "row changes were already applied";
+
 /// Spec R5.2, decision 2(h): the marker of a prepared statement whose result
 /// shape moved after it was Described, refused at Execute with nothing run
 /// ([`Error::cached_plan_result_changed`]), and of a result row whose field count
@@ -304,6 +309,11 @@ pub const RESULT_TYPE_REFUSED_BEFORE_RUN_MARKER: &str = "the statement did not r
 /// it runs in has staged rows of the table it would change
 /// ([`Error::ddl_over_staged_rows`]). SQLSTATE 0A000.
 pub const DDL_OVER_STAGED_ROWS_MARKER: &str = "after writing it in the same transaction is not supported";
+
+/// Spec R5.3 (review F17): the marker of a `CREATE` / `ALTER SEQUENCE` parameter out
+/// of range ([`Error::sequence_parameter_invalid`]). SQLSTATE 22023, PostgreSQL's
+/// `invalid_parameter_value`.
+pub const SEQUENCE_PARAMETER_INVALID_MARKER: &str = "invalid sequence parameter";
 
 /// Spec R5.3: the marker of `EXPLAIN ANALYZE` of a statement it cannot run as
 /// part of the statement's transaction ([`Error::explain_analyze_unsupported`]).
@@ -789,6 +799,38 @@ impl Error {
         ))
     }
 
+    /// Scope the original publication cause to the derived group. In particular,
+    /// its cap refusal's "nothing was written" never describes the owning rows.
+    pub(crate) fn applied_publication_failure(cause: Self) -> Self {
+        if cause.is_applied_publication_failure() {
+            return cause;
+        }
+        Error::Storage(format!(
+            "{APPLIED_PUBLICATION_FAILURE_MARKER}; derived vector publication failed. Reopen the database before \
+             continuing and do not retry these row changes. Cause for the derived vector group only (its refusal \
+             does not undo the row group): {cause}"
+        ))
+    }
+
+    /// Whether this error reports a derived publication failure after the row
+    /// changes applied. Retrying those row changes can apply them a second time.
+    pub fn is_applied_publication_failure(&self) -> bool {
+        match self {
+            Self::Storage(message)
+            | Self::Transaction(message)
+            | Self::QueryExecution(message)
+            | Self::Generic(message) => message.contains(APPLIED_PUBLICATION_FAILURE_MARKER),
+            _ => false,
+        }
+    }
+
+    /// Spec R5.3 (review F17): a `CREATE` / `ALTER SEQUENCE` parameter out of range
+    /// (MINVALUE above MAXVALUE, START or RESTART outside them, INCREMENT 0), refused
+    /// before anything is written. SQLSTATE 22023; it used to reach a client as XX000.
+    pub fn sequence_parameter_invalid(detail: impl std::fmt::Display) -> Self {
+        Error::QueryExecution(format!("{detail} ({SEQUENCE_PARAMETER_INVALID_MARKER})"))
+    }
+
     /// Spec R5.1: this statement waited `waited` for `table`'s writer lock and gave
     /// up. `holder` says what it is behind ("an open transaction holds it", "ALTER
     /// TABLE … ADD COLUMN holds it"). SQLSTATE 55P03.
@@ -909,6 +951,29 @@ impl Error {
         Error::QueryExecution(format!(
             "cannot create branch {name} AS OF that time: {what_happened} since, and \
              {BRANCH_ANCHOR_UNREADABLE_MARKER}. Branch from a later time, after its rows last changed, or AS OF NOW"
+        ))
+    }
+
+    /// Spec R5.5: a read of `table` at a snapshot older than `what_happened`, a change
+    /// its rows as they were before cannot be read across (`storage::table_layout`):
+    /// `AS OF`, or a transaction whose snapshot is older. The marker is the branch
+    /// anchor's, refused for the same reason. SQLSTATE 0A000.
+    pub fn history_before_layout_change(table: &str, what_happened: &str) -> Self {
+        Error::QueryExecution(format!(
+            "cannot read table \"{table}\" as of that time: {what_happened} since, and \
+             {BRANCH_ANCHOR_UNREADABLE_MARKER} under its definition now. Read it as of a later time (in a \
+             transaction: begin a new one)"
+        ))
+    }
+
+    /// Spec R5.5: an `ALTER TABLE` whose one write group (the new row images and their
+    /// versions, with the copies main's live branches take of them) measured above
+    /// `[storage] max_atomic_rewrite_bytes`. Nothing was written. SQLSTATE 54000.
+    pub fn atomic_alter_too_large(table: &str, what: &str, bytes: u64, limit: u64) -> Self {
+        Error::QueryExecution(format!(
+            "ALTER TABLE {table} {what} rewrites every row in one atomic write, and at {bytes} bytes it \
+             {ATOMIC_REWRITE_TOO_LARGE_MARKER} ({limit}): nothing was written. Copy the table instead \
+             (CREATE TABLE … AS SELECT the columns it keeps, then RENAME), or raise the setting"
         ))
     }
 
@@ -1151,5 +1216,25 @@ impl From<rocksdb::Error> for Error {
 impl From<sqlparser::parser::ParserError> for Error {
     fn from(err: sqlparser::parser::ParserError) -> Self {
         Error::SqlParse(err.to_string())
+    }
+}
+
+#[cfg(test)]
+mod applied_publication_tests {
+    use super::*;
+    #[test]
+    fn applied_publication_context_keeps_derived_cause_and_is_idempotent() {
+        let original = Error::write_group_too_large(1024, 64);
+        assert!(!original.is_applied_publication_failure());
+        let cause = original.to_string();
+        let applied = Error::applied_publication_failure(original);
+        assert!(applied.is_applied_publication_failure());
+        let message = applied.to_string();
+        assert!(message.contains(APPLIED_PUBLICATION_FAILURE_MARKER));
+        assert!(message.contains("do not retry these row changes"));
+        assert!(message.contains("Cause for the derived vector group only"));
+        assert!(message.contains(&cause));
+        assert!(message.contains(BRANCH_MATERIALIZE_TOO_LARGE_MARKER));
+        assert_eq!(Error::applied_publication_failure(applied).to_string(), message);
     }
 }

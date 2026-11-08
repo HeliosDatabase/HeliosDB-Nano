@@ -40,6 +40,13 @@
 //!    Then the census hold (below), and the row-cache /
 //!    committed-write-watermark invalidation of every touched row —
 //!    invalidated before the new bytes are visible.
+//!    Spec R5.6: a batch that changes a table's layout (a key of
+//!    `storage::layout_epochs::LAYOUT_PREFIXES`) is a run of its own, and each
+//!    table it names is marked in flight in the engine's layout epochs before its
+//!    write; the change ends in step 4 once the engine's and the SQL layer's caches
+//!    of those layouts are dropped (`end_layout_change`), so a reader whose statement
+//!    overlapped it is refused and runs again, and one after it finds no plan,
+//!    schema or missing value from before it.
 //! 3. **Apply** verbatim through [`LocalWriter::apply_source_with`]: per
 //!    batch, in order, one write of the source bytes plus the node-local
 //!    cursor (fsynced, or — from a receiver's poll — deferred to one fsync
@@ -51,8 +58,10 @@
 //! |---|---|
 //! | `Dict` | `forget_cached_dictionaries` — first, so the rows below decode against the new entries |
 //! | `MetaAttMissing` | `clear_missing_values` — before the rows too; a narrow row's absent column reads the value this run wrote (`storage::row_shape`) |
+//! | `MetaTableLayout` | `clear_missing_values`, which also forgets the loaded layout records: a version older than the run's `DROP COLUMN` is read across it (`storage::table_layout`) |
 //! | `MetaTable` | schema/constraints/statistics/row caches of the table; then by schema change: dropped → `drop_table_indexes` + vector hook; created → registered and backfilled (step 5); pure column rename → `rename_column_in_indexes`; columns appended → nothing, or the new UNIQUE flags registered and backfilled; anything else, or a schema more than one batch of the run wrote → the table is re-derived; `pg_temp_*` → `note_temp_table_present` |
 //! | `MetaIndex` delete | `drop_index` (memory only) + vector hook |
+//! | any layout key (spec R5.6) | after the two rows above: `StorageEngine::drop_layout_caches` and [`DerivedStateListener::on_layout_change`] for the tables it names, then their layout epochs' change ends |
 //! | `Data` | new image decoded with the post-run schema (`decode_stored_row`, the scan's decode); `stage_replicated_row(old, new).commit()` per row, a key swapped between rows inside the run resolved by removing every refused row's old keys before adding the new ones; vector hook; row-id counter raised to the row id; `publish_live_replay_visibility`; decode failure → the table is re-derived |
 //! | `TableConstraints` | constraints cache; new UNIQUE / FK indexes (`register_unique_constraint_indexes`, `create_fk_index`) registered and backfilled; a constraint that disappeared, or a set more than one batch of the run wrote → the table is re-derived |
 //! | `MetaIndex` put | ART family: `register_index_definition` + backfill of that index (a definition more than one batch of the run wrote: its registration is dropped and the table it names re-derived, which registers it); vector family: vector hook |
@@ -145,6 +154,7 @@ use super::physical::{walk_raw_batch, Durability, LocalWriter, PhysicalBatch, Ph
 use super::physical_vector::StandbyVectorHook;
 use crate::sql::TableConstraints;
 use crate::storage::keyspace::{classify, KeyClass};
+use crate::storage::layout_epochs::LayoutChange;
 use crate::storage::{index_family, ArtIndexType, IndexFamily, StorageEngine, UncommittedWriteHold};
 use crate::{Schema, Tuple, Value};
 
@@ -201,18 +211,24 @@ pub fn decode_raw_batch(raw: &[u8]) -> Result<Vec<RawOp<'_>>> {
     Ok(ops)
 }
 
-/// Does `batch` write or delete a key of the branch registry (`branch:`, the git
-/// links)? Such a batch ends a run (`PhysicalApplier::apply_run`).
-fn changes_branch_registry(batch: &PhysicalBatch) -> Result<bool> {
-    let mut found = false;
+/// What bounds a run (`PhysicalApplier::apply_run`) at `batch`: `(layout, registry)`.
+/// `layout`: it writes or deletes a key that changes a table's layout (spec R5.6,
+/// `storage::layout_epochs::LAYOUT_PREFIXES`); such a batch is a run of its own, so
+/// its tables are in flight for one write and its publication only. `registry`: it
+/// changes the branch registry (`branch:`, the git links); the batches after it are a
+/// run of their own.
+fn run_bounds(batch: &PhysicalBatch) -> Result<(bool, bool)> {
+    let mut layout = false;
+    let mut registry = false;
     walk_raw_batch(batch.data(), |op| {
         let key = match op {
             RawOp::Put { key, .. } | RawOp::Delete { key } => key,
             RawOp::DeleteRange { start, .. } => start,
         };
-        found |= matches!(classify(key).class, KeyClass::Branch | KeyClass::Git);
+        layout |= crate::storage::layout_epochs::layout_key(key).is_some();
+        registry |= matches!(classify(key).class, KeyClass::Branch | KeyClass::Git);
     })?;
-    Ok(found)
+    Ok((layout, registry))
 }
 
 /// Two parts of one run, as one result: the later position, every row and rebuild.
@@ -240,6 +256,14 @@ pub trait DerivedStateListener: Send + Sync {
     fn on_full_rebuild(&self) {
         self.on_catalog_change(KeyClass::Unknown, &[], false);
     }
+
+    /// Spec R5.6: an applied run changed the layout of `tables` (their definition,
+    /// missing values, index definitions, shape or layout records), its bytes are in
+    /// the store and the engine's caches of them are dropped, and their layout epochs
+    /// still show the change in flight: drop what the SQL layer caches of plans built
+    /// under the old layouts. Called before the change ends, so no reader trusts an
+    /// epoch while one of those plans can still be served. By default nothing.
+    fn on_layout_change(&self, _tables: &[String]) {}
 }
 
 /// A listener for an engine nobody serves SQL from (tests, tools).
@@ -591,10 +615,18 @@ impl PhysicalApplier {
         // BRANCH` marks the branch dropped and then deletes its keys in groups; in one
         // run, a session bound to it went on resolving it as live while those groups
         // landed, and read half its rows, none, or main's through it, before 3D000.
+        // Spec R5.6: a batch that changes a table's layout is a run of its own, so the
+        // layout epochs of its tables are in flight for its write and publication only.
         let mut start = 0;
         let mut total: Option<Applied> = None;
         for (index, batch) in batches.iter().enumerate() {
-            if index + 1 < batches.len() && changes_branch_registry(batch)? {
+            let (layout, registry) = run_bounds(batch)?;
+            if layout && index > start {
+                let part = self.apply_run_once(batches.get(start..index).unwrap_or_default(), durability)?;
+                total = Some(merge_applied(total, part));
+                start = index;
+            }
+            if (layout || registry) && index + 1 < batches.len() {
                 let part = self.apply_run_once(batches.get(start..=index).unwrap_or_default(), durability)?;
                 total = Some(merge_applied(total, part));
                 start = index + 1;
@@ -666,16 +698,26 @@ impl PhysicalApplier {
         //    store before the run's first write (a key an earlier batch of the
         //    run writes into a later one's range is noted by its own record).
         let mut touched = Touched::default();
+        // Spec R5.6: the tables whose layout the run changes, named before its write (a
+        // deleted index definition is still in the store).
+        let mut layout_tables: BTreeSet<String> = BTreeSet::new();
         for (index, batch) in run.iter().enumerate() {
             touched.batch = index;
             for op in decode_raw_batch(batch.data())? {
                 match op {
-                    RawOp::Put { key, .. } => touched.note(key, true),
-                    RawOp::Delete { key } => touched.note(key, false),
+                    RawOp::Put { key, value } => {
+                        self.note_layout_key(key, Some(value), &mut layout_tables);
+                        touched.note(key, true);
+                    }
+                    RawOp::Delete { key } => {
+                        self.note_layout_key(key, None, &mut layout_tables);
+                        touched.note(key, false);
+                    }
                     RawOp::DeleteRange { start, end } => self.enumerate_range(start, end, &mut touched)?,
                 }
             }
         }
+        layout_tables.extend(touched.meta_tables.iter().cloned());
 
         // 2. Pre-read (the images before the run), census hold, invalidate
         //    before visible.
@@ -686,12 +728,38 @@ impl PhysicalApplier {
         // logical WAL) leaves every index exact: no hold.
         let _hold =
             (every_table || !held.is_empty()).then(|| self.engine.write_census().hold_for_replay(held, every_table));
+        // The census alone misses a complete apply/publication between an ANN
+        // reader's two checks. Advance every affected table's completed row
+        // generation before this run releases its census, on error paths too.
+        struct RowPublication<'a> {
+            engine: &'a StorageEngine,
+            touched: &'a Touched,
+        }
+        impl Drop for RowPublication<'_> {
+            fn drop(&mut self) {
+                for table in self.touched.data.keys() {
+                    self.engine.row_locks().note_rows_changed(table);
+                }
+            }
+        }
+        let _row_publication = RowPublication {
+            engine: &self.engine,
+            touched: &touched,
+        };
         for (table, rows) in &touched.data {
             self.engine.invalidate_write_watermark(table);
             for row_id in rows.keys() {
                 self.engine.row_cache().invalidate(table, *row_id);
             }
         }
+
+        // Spec R5.6: the run's layout change is in flight from before its write until
+        // the layout half of its publication is done (`Self::publish`).
+        let mut layout = (!layout_tables.is_empty()).then(|| {
+            self.engine
+                .layout_epochs()
+                .begin_change(layout_tables.iter().map(String::as_str))
+        });
 
         // 3. Apply verbatim: one write per batch, in order.
         let mut written = 0_u64;
@@ -704,11 +772,13 @@ impl PhysicalApplier {
                     if written > 0 {
                         self.rederive_failed_run(&touched, written, &mut state);
                     }
+                    self.end_layout_change(&mut layout);
                     return Err(error.into());
                 }
             }
         }
         if written == 0 {
+            self.end_layout_change(&mut layout);
             return Ok(Applied {
                 source_sequence: last.last_sequence(),
                 ..Applied::default()
@@ -729,8 +799,9 @@ impl PhysicalApplier {
             self.engine.bump_schema_generation();
         }
 
-        // 4b. Publish the rest, once for the run.
-        self.publish(&touched, &mut work, &mut state);
+        // 4b. Publish the rest, once for the run (the layout change ends inside).
+        self.publish(&touched, &mut work, &mut state, &mut layout);
+        self.end_layout_change(&mut layout);
 
         // 5. Re-derive what the run created or queued.
         let mut attempt: BTreeSet<String> = work.register.iter().chain(&work.rederive).cloned().collect();
@@ -1033,9 +1104,29 @@ impl PhysicalApplier {
             self.engine.clear_missing_values();
         }
         self.publish_time_travel(touched, state);
+        // Volatile allocator hydration only. Replicated write groups retain
+        // byte identity; this path never normalizes or creates floor records.
+        let tracker = self.engine.mv_delta_tracker();
+        tracker.observe_physical_id(touched.delta_id_max);
+        for key in &touched.delta_floor_keys {
+            match self.writer.db().get(key) {
+                Ok(Some(bytes)) => match crate::storage::mv_delta::decode_delta_id(&bytes) {
+                    Ok(id) => tracker.observe_physical_id(id),
+                    Err(error) => warn!("physical applier: invalid delta allocator floor: {}", error),
+                },
+                Ok(None) => {}
+                Err(error) => warn!("physical applier: cannot read delta allocator floor: {}", error),
+            }
+        }
     }
 
-    fn publish(&self, touched: &Touched, work: &mut BatchWork, state: &mut ApplierState) {
+    fn publish(
+        &self,
+        touched: &Touched,
+        work: &mut BatchWork,
+        state: &mut ApplierState,
+        layout: &mut Option<LayoutChange>,
+    ) {
         if touched.dictionaries {
             // Before any row below is decoded against a dictionary.
             self.engine.forget_cached_dictionaries();
@@ -1046,6 +1137,15 @@ impl PhysicalApplier {
         }
         self.publish_meta_tables(touched, work);
         self.publish_index_deletes(touched, work, state);
+        // Spec R5.6: everything a reader resolves a table's layout from is published:
+        // the schema and missing values (`publish_meta_tables`, above, and the drop of
+        // the engine's caches in `end_layout_change`), the indexes gone, the SQL layer's
+        // plans. The layout change ends here, before the rows below are staged into
+        // the indexes: the census hold keeps every reader of those off them meanwhile,
+        // and a plan of the old layout was the defect (merged-tree review M3: a plan
+        // cached before a volatile `ADD COLUMN`, served through all of this run's
+        // publication, decoded no column of the new layout and read it NULL in every row).
+        self.end_layout_change(layout);
         self.stage_rows(touched, work);
         self.publish_constraints(touched, work);
         self.publish_index_puts(work);
@@ -1061,6 +1161,47 @@ impl PhysicalApplier {
         self.publish_listener(touched);
         self.publish_epoch(touched);
         self.publish_unknown(touched, state);
+    }
+
+    /// Spec R5.6: the tables a layout key of the run names, into `tables`. Read before
+    /// the run's first write: a deleted index definition is still in the store.
+    fn note_layout_key(&self, key: &[u8], value: Option<&[u8]>, tables: &mut BTreeSet<String>) {
+        use crate::storage::layout_epochs::{layout_key, LayoutKey};
+        match layout_key(key) {
+            None => {}
+            Some(LayoutKey::Tables(table, other)) => {
+                tables.insert(table.to_string());
+                if let Some(other) = other {
+                    tables.insert(other.to_string());
+                }
+            }
+            Some(LayoutKey::Index(name)) => {
+                let definition = match value {
+                    Some(value) => self
+                        .engine
+                        .decode_stored_ref(key, value)
+                        .ok()
+                        .and_then(|plain| crate::storage::Catalog::decode_persisted_index_definition(name, &plain)),
+                    None => self.engine.catalog().get_index_definition(name).ok().flatten(),
+                };
+                if let Some(definition) = definition {
+                    tables.insert(definition.table_name);
+                }
+            }
+        }
+    }
+
+    /// Spec R5.6: the run's layout change is published: drop what readers cache of
+    /// those tables' layouts (the engine's schema, missing values and rows, the SQL
+    /// layer's plans), then end it. Once; later calls find nothing.
+    fn end_layout_change(&self, layout: &mut Option<LayoutChange>) {
+        let Some(change) = layout.take() else {
+            return;
+        };
+        let tables = change.tables();
+        self.engine.drop_layout_caches(&tables);
+        self.listener.on_layout_change(&tables);
+        drop(change);
     }
 
     /// Spec P5.1 §1: an applied run carried `repl:epoch` — the engine's
@@ -1855,6 +1996,7 @@ impl PhysicalApplier {
 
     fn rebuild_all_locked(&self, state: &mut ApplierState) -> crate::Result<()> {
         let engine = &self.engine;
+        engine.mv_delta_tracker().recover_durable_ids()?;
         let art = engine.art_indexes();
         let _hold = engine.write_census().hold_for_replay(Vec::new(), true);
         let tables: BTreeSet<String> = engine.catalog().list_tables_including_temp()?.into_iter().collect();
@@ -2057,6 +2199,8 @@ struct Touched {
     snapshots: BTreeSet<Vec<u8>>,
     version_tables: BTreeSet<String>,
     max_version_ts: Option<u64>,
+    delta_id_max: u64,
+    delta_floor_keys: BTreeSet<Vec<u8>>,
     copy_markers: BTreeSet<Vec<u8>>,
     vidx: BTreeSet<Vec<u8>>,
     branch_tables: BTreeSet<String>,
@@ -2240,6 +2384,11 @@ impl Touched {
             // time is the clock's, though, and a promoted standby's clock must be past
             // it (merged-tree review, M12): `publish_time_travel`.
             KeyClass::MetaTableShape => self.table_shapes = true,
+            // Spec R5.5: a table's layout record, which a read of a version older than
+            // a DROP COLUMN takes it through. The serving engine's loaded records are
+            // forgotten with the missing values (`clear_missing_values`), at the same
+            // two points of the publication.
+            KeyClass::MetaTableLayout => self.missing_values = true,
             KeyClass::BranchFrozen
             | KeyClass::BranchKey
             | KeyClass::MetaTableIncarnation
@@ -2255,12 +2404,13 @@ impl Touched {
             // receivers' cursors, durable index snapshots (only an open loads
             // them, and a physical open does not), the TDE and elision
             // sentinels (checked at open), GC anchors, the legacy counter key,
-            // MV delta bookkeeping (refresh never runs on a standby), the
-            // legacy snapshot maps, and the sync change log.
+            // legacy snapshot maps, and the sync change log. Delta allocator
+            // evidence below raises volatile state for later promotion.
             KeyClass::WalEntries
             | KeyClass::WalLastLsn
             | KeyClass::WalCheckpoint
             | KeyClass::WalPrunedThrough
+            | KeyClass::WalAtomicGroups
             | KeyClass::ReplAppliedLsn
             | KeyClass::PhysicalCursor
             | KeyClass::IdxSnap
@@ -2271,13 +2421,19 @@ impl Touched {
             | KeyClass::ElideSentinel
             | KeyClass::VgcAnchor
             | KeyClass::LegacyCounter
-            | KeyClass::MetaDelta
-            | KeyClass::Delta
             | KeyClass::SnapshotMap
             | KeyClass::ChangeLog
             | KeyClass::ChangeIndex
             | KeyClass::ChangeMeta
             | KeyClass::SyncAppliedLsn => {}
+            KeyClass::Delta => {
+                if let Some(id) = crate::storage::mv_delta::delta_key_id(key) {
+                    self.delta_id_max = self.delta_id_max.max(id);
+                }
+            }
+            KeyClass::MetaDelta => {
+                self.delta_floor_keys.insert(key.to_vec());
+            }
             KeyClass::Unknown => self.unknown.push(key.to_vec()),
         }
     }
@@ -2790,6 +2946,57 @@ mod tests {
             fn digest(&self) -> [u8; 32] {
                 range_digest(self.applier.writer().db(), None, b"").unwrap()
             }
+        }
+
+        #[test]
+        fn delta_allocator_floors_publish_without_changing_physical_source_bytes() {
+            let primary = Primary::new(&["CREATE TABLE t (id INT PRIMARY KEY)"]);
+            let standby = primary.standby("standby", None);
+            let tracker = primary.database.storage.mv_delta_tracker();
+            let mut delayed = WriteBatch::default();
+            tracker
+                .stage_insert(&mut delayed, "t", 1, crate::Tuple::new(vec![crate::Value::Int4(1)]))
+                .unwrap();
+            let mut overtaking = WriteBatch::default();
+            for id in 2..=65 {
+                tracker
+                    .stage_insert(
+                        &mut overtaking,
+                        "t",
+                        id,
+                        crate::Tuple::new(vec![crate::Value::Int4(id as i32)]),
+                    )
+                    .unwrap();
+            }
+            let gate = primary.database.storage.write_gate();
+            gate.write(&primary.raw, overtaking, None).unwrap();
+            assert_eq!(
+                tracker
+                    .purge_deltas_before(chrono::Utc::now() + chrono::Duration::days(1))
+                    .unwrap(),
+                64
+            );
+            gate.write(&primary.raw, delayed, None).unwrap();
+            let run = primary.groups_after(standby.cursor());
+            let before_refusals = standby.engine.write_gate().refusals();
+            standby.applier.apply_run(&run, Durability::Synced).unwrap();
+            assert_eq!(standby.engine.mv_delta_tracker().current_delta_id(), 65);
+            assert_eq!(standby.engine.write_gate().refusals(), before_refusals);
+            assert_eq!(standby.digest(), range_digest(&primary.raw, None, b"").unwrap());
+            assert!(!standby.applier.stats().derived_state_suspect);
+            // A fresh strict physical image recovers the same allocator while
+            // leaving both the checkpoint's sequence and all bytes unchanged.
+            let path = primary.root.path().join("delta-reference");
+            rocksdb::checkpoint::Checkpoint::new(&primary.raw)
+                .unwrap()
+                .create_checkpoint(&path)
+                .unwrap();
+            let reference = StorageEngine::open_physical_snapshot(&path, &primary_config(&path)).unwrap();
+            let raw = reference.db();
+            let sequence = raw.latest_sequence_number();
+            assert_eq!(reference.mv_delta_tracker().current_delta_id(), 65);
+            assert_eq!(range_digest(&raw, None, b"").unwrap(), standby.digest());
+            assert_eq!(raw.latest_sequence_number(), sequence);
         }
 
         /// The `data:{table}:` keys one batch's records write or delete.

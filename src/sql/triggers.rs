@@ -799,6 +799,48 @@ impl TriggerRegistry {
         Ok(count)
     }
 
+    /// Spec R5.3 (review F8): `ALTER TABLE old RENAME TO new` — every trigger of
+    /// `old`, and its BEFORE-row rewrite recipe, now belongs to `new`, as their
+    /// records do (the rename moves them in its write group). Left under the old
+    /// name, a renamed table's trigger stopped firing, `DROP TRIGGER t ON new` said
+    /// it did not exist, and `DROP TRIGGER t ON old` "succeeded" without touching
+    /// the record, which brought the trigger back at the next restart. Returns how
+    /// many triggers moved.
+    pub fn rename_table_triggers(&self, old_table: &str, new_table: &str) -> Result<usize> {
+        let mut triggers = self
+            .triggers
+            .write()
+            .map_err(|e| Error::Generic(format!("Failed to acquire write lock: {}", e)))?;
+        let moving: Vec<(String, String)> = triggers
+            .keys()
+            .filter(|(table, _)| table == old_table)
+            .cloned()
+            .collect();
+        let count = moving.len();
+        for key in moving {
+            if let Some(mut definition) = triggers.remove(&key) {
+                definition.table_name = new_table.to_string();
+                triggers.insert((new_table.to_string(), key.1), definition);
+            }
+        }
+        drop(triggers);
+
+        if let Ok(mut mutations) = self.row_mutations.write() {
+            let moving: Vec<(String, String)> = mutations
+                .keys()
+                .filter(|(table, _)| table == old_table)
+                .cloned()
+                .collect();
+            for key in moving {
+                if let Some(mutation) = mutations.remove(&key) {
+                    mutations.insert((new_table.to_string(), key.1), mutation);
+                }
+            }
+            self.row_mutation_count.store(mutations.len(), AtomicOrdering::Release);
+        }
+        Ok(count)
+    }
+
     /// Get trigger storage key
     ///
     /// Format: trigger:{table_name}:{trigger_name}

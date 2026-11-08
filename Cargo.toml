@@ -3,9 +3,9 @@ members = [".", "bindings/python"]
 
 [package]
 name = "heliosdb-nano"
-version = "4.41.1"
+version = "4.42.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.88"
 authors = ["Daniel Moya <daniel.moya@HeliosDatabase.com>"]
 license = "Apache-2.0"
 description = "PostgreSQL-compatible embedded database with TDE + ZKE encryption, HNSW vector search, Product Quantization, git-like branching, time-travel queries, materialized views, row-level security, and 50+ enterprise features"
@@ -188,9 +188,9 @@ tree-sitter-sequel      = { version = "0.3",  optional = true }
 # CPU ONNX runtime + pre-quantised models; ~150 MB at first run for
 # the model cache, no on-disk impact on the binary itself.
 #
-# 7.x, not 4.x, for a security reason: fastembed 4.9 -> hf-hub 0.4 -> ureq 2
-# -> webpki-roots 0.26.11 (RUSTSEC-2026-0381, trusts distrusted emSign
-# intermediates). 7.x uses hf-hub 0.5 -> ureq 3 -> webpki-roots >= 1.0.10.
+# Retain the security-patched dependency graph: fastembed 7.5 uses hf-hub 0.5
+# -> ureq 3 -> webpki-roots >= 1.0.10. Audit the resolved root store against
+# RUSTSEC-2026-0381; the version family alone does not establish its safety.
 # default-features = false drops fastembed's native-tls defaults (openssl
 # stack, banned in deny.toml) and the image-model stack we never call; the
 # model download (hf-hub) and the build-time ONNX Runtime download (ort-sys)
@@ -203,9 +203,9 @@ tree-sitter-sequel      = { version = "0.3",  optional = true }
 # Microsoft's official ONNX Runtime >= 1.24 (glibc >= 2.27) instead:
 #   ORT_LIB_PATH=<onnxruntime-linux-x64-1.24.x>/lib ORT_PREFER_DYNAMIC_LINK=1 \
 #     cargo build --features code-embed
-# and run with that lib directory on LD_LIBRARY_PATH. MSRV: fastembed 7.5 needs
-# Rust 1.88 and ort rc.15 needs 1.92, above this crate's rust-version (the
-# default build is unaffected).
+# and run with that lib directory on LD_LIBRARY_PATH. Default MSRV: Rust 1.88
+# (home/time). The optional code-embed feature requires Rust 1.92 because
+# fastembed 7.5 pins ort/ort-sys =2.0.0-rc.15 (fastembed itself needs 1.88).
 fastembed = { version = "7.5", optional = true, default-features = false, features = [
     "hf-hub-rustls-tls",
     "ort-download-binaries-rustls-tls",

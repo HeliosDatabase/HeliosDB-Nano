@@ -66,6 +66,24 @@ unobserved — which is precisely what happened to the `internal-tests` feature,
 why: a suite that ran nothing reports success, and that is how the `internal-tests`
 rot stayed invisible.
 
+## Supported compiler checks
+
+The default build requires Rust 1.88 or newer. The optional `code-embed`
+feature requires Rust 1.92 or newer: fastembed 7.5 pins ort/ort-sys 2.0.0-rc.15.
+`rust-toolchain.toml` keeps development and the full regression matrix on stable;
+`.github/workflows/tests.yml` also checks the two minimum compilers on every PR:
+
+```bash
+cargo +1.88.0 check --locked --lib --bins
+cargo +1.92.0 check --locked --lib --bins --features code-embed
+```
+
+On this shared host, run these under the same fleet build lock and memory scope
+as every other Cargo gate. These are compile checks; all runtime, feature,
+security and performance gates below remain required. Keep the security-patched
+lockfile: pinning `time` to 0.3.45 to compile on Rust 1.85 would reintroduce
+RUSTSEC-2026-0009 (patched in 0.3.47, whose minimum is Rust 1.88).
+
 ## The gates
 
 ### 1. `cargo test --lib` — the cheapest signal

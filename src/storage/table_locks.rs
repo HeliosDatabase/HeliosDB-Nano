@@ -462,21 +462,18 @@ struct WaitBudget {
 
 impl WaitBudget {
     fn new(locks: &TableLocks, lock_timeout: Duration) -> Self {
-        let started = Instant::now();
         Self {
-            started,
+            started: Instant::now(),
             lock_timeout,
-            statement_deadline: locks
-                .statement_timeout()
-                .and_then(|timeout| started.checked_add(timeout)),
+            statement_deadline: locks.statement_deadline(),
         }
     }
 
     /// Has the client given up, or the statement run out of time? Looked at FIRST
     /// whenever a waiter wakes: work a client gave up on must not start because the lock
-    /// came free at that moment. Each wait counts its own `statement_timeout` from where
-    /// it starts: this layer does not know when the statement did. Nothing it would
-    /// change has been touched, so these are the normal 57014s.
+    /// came free at that moment. The `statement_timeout` counts from the statement's
+    /// start where an entry point recorded it ([`TableLocks::statement_deadline`]).
+    /// Nothing it would change has been touched, so these are the normal 57014s.
     fn check_statement(&self, table: &str) -> Result<()> {
         if crate::session_take_cancel_request() {
             return Err(Error::query_cancelled(format!(
@@ -594,12 +591,24 @@ impl TableLocks {
         ms.map(Duration::from_millis)
     }
 
+    /// When this statement's `statement_timeout` runs out: counted from the statement's
+    /// start (`crate::statement_started_tls`, recorded by every session and embedded
+    /// entry point), else from now. Spec R5.4 (review F12): PostgreSQL bounds the
+    /// whole statement; counting from the start of each wait let a statement that
+    /// reached a row wait 0.4 s in run to 0.9 s under a 500 ms timeout.
+    fn statement_deadline(&self) -> Option<Instant> {
+        let timeout = self.statement_timeout()?;
+        crate::statement_started_tls()
+            .unwrap_or_else(Instant::now)
+            .checked_add(timeout)
+    }
+
     /// Spec R5.4: what bounds a wait for a row's write lock (`storage::row_locks`): the
     /// same as a wait for a table's. Read when a wait begins.
     pub(crate) fn row_lock_bounds(&self) -> super::row_locks::RowLockBounds {
         super::row_locks::RowLockBounds {
             lock_timeout: self.timeout(),
-            statement_timeout: self.statement_timeout(),
+            statement_deadline: self.statement_deadline(),
         }
     }
 
@@ -669,6 +678,28 @@ impl TableLocks {
                 .as_ref()
                 .is_some_and(|owner| owner.engine == self.engine && owner.held.lock().iter().next().is_some())
         })
+    }
+
+    /// A raw autocommit write may use this statement's owner, which
+    /// releases its locks before its deferred replication wait. An unrelated
+    /// transaction owner cannot be borrowed: its locks outlive this commit.
+    /// `false` means there is no ambient owner of this engine.
+    pub(crate) fn lock_raw_write_shared_in_statement(&self, level: u64, table: &str) -> Result<bool> {
+        let owner = CURRENT.with(|current| {
+            current
+                .borrow()
+                .as_ref()
+                .filter(|owner| owner.engine == self.engine)
+                .cloned()
+        });
+        let Some(owner) = owner else { return Ok(false) };
+        if owner.kind == OwnerKind::Transaction {
+            return Err(Error::transaction(
+                "raw autocommit writes cannot borrow an unrelated transaction's table locks",
+            ));
+        }
+        self.lock_shared(&owner, level, table)?;
+        Ok(true)
     }
 
     /// Sprinter 6bc4a4040eb7 (B4): the fork fence's wait, which stands in a schema
@@ -1312,10 +1343,11 @@ impl Drop for StatementLockScope<'_> {
         };
         let owner = CURRENT.with(|current| current.replace(previous));
         if let Some(owner) = owner {
-            let held_exclusively = self.locks.release_all(&owner);
+            self.locks.release_all(&owner);
             THREAD_OWNER.with(|cached| *cached.borrow_mut() = Some(owner));
-            // An autocommit TRUNCATE's commit left this to do, now that it let go.
-            if held_exclusively && EXCLUSIVE_GUARDS.with(Cell::get) == 0 {
+            // Direct DML and autocommit TRUNCATE left this until their row
+            // guards and the statement's shared/exclusive table locks let go.
+            if EXCLUSIVE_GUARDS.with(Cell::get) == 0 {
                 if let Some(barrier) = DEFERRED_BARRIER.with(Cell::take) {
                     super::wal::WriteAheadLog::wait_replicated_sequence(Some(barrier));
                 }
@@ -1425,11 +1457,11 @@ impl Drop for ExclusiveTableLocks {
     }
 }
 
-/// Spec R5.1: a commit's replication wait, when this thread's statement holds a table
-/// exclusively on its own account: an autocommit TRUNCATE, whose commit runs inside its
-/// statement's scope. It waits until the scope let go, so no writer waits for a standby
-/// behind it. `true`: deferred. A commit under a guard is a merge's landing, which still
-/// waits where it is; a transaction's owner lets go for itself before it gets here.
+/// Spec R5.1: a durable statement's replication wait is deferred until its
+/// statement scope has released shared or exclusive table locks. Its row/zone
+/// guards must be declared after that scope and dropped before it. Transaction
+/// owners retain locks across statements and never defer to that later lifetime.
+/// An explicit exclusive guard uses `defer_replication_wait` instead.
 pub fn defer_commit_replication_wait(barrier: Option<u64>) -> bool {
     let Some(barrier) = barrier else {
         return false;
@@ -1437,19 +1469,19 @@ pub fn defer_commit_replication_wait(barrier: Option<u64>) -> bool {
     if EXCLUSIVE_GUARDS.with(Cell::get) != 0 {
         return false;
     }
-    let holds_exclusively = CURRENT.with(|current| {
+    let holds_statement_locks = CURRENT.with(|current| {
         current
             .borrow()
             .as_ref()
-            .is_some_and(|owner| owner.kind == OwnerKind::Statement && owner.held.lock().exclusive > 0)
+            .is_some_and(|owner| owner.kind == OwnerKind::Statement && owner.held.lock().iter().next().is_some())
     });
-    if holds_exclusively {
+    if holds_statement_locks {
         DEFERRED_BARRIER.with(|deferred| {
             let highest = deferred.get().map_or(barrier, |earlier| earlier.max(barrier));
             deferred.set(Some(highest));
         });
     }
-    holds_exclusively
+    holds_statement_locks
 }
 
 /// Spec R5.1: a DDL write's replication wait, while this thread holds an exclusive
@@ -1532,6 +1564,24 @@ impl TransactionLocks {
         }
     }
 
+    /// Raw staging must retain THIS transaction's locks. An unrelated
+    /// bound transaction cannot lend its longer-lived owner to this commit.
+    pub(crate) fn ensure_raw_write_shared(&self, level: u64, table: &str) -> Result<()> {
+        let unrelated_transaction = CURRENT.with(|current| {
+            current.borrow().as_ref().is_some_and(|owner| {
+                owner.engine == self.locks.engine
+                    && owner.kind == OwnerKind::Transaction
+                    && self.hold.get().is_none_or(|hold| hold.owner.id != owner.id)
+            })
+        });
+        if unrelated_transaction {
+            return Err(Error::transaction(
+                "raw writes cannot borrow an unrelated transaction's table locks",
+            ));
+        }
+        self.ensure_shared(level, table)
+    }
+
     /// The transaction staged its first row of `table` (decision 1's "first staged
     /// write"). Every SQL path locked at its statement by now, so this is for a
     /// transaction driven directly on the storage API, which has no statement. What
@@ -1539,7 +1589,12 @@ impl TransactionLocks {
     /// its exclusive locks.
     pub(crate) fn ensure_shared(&self, level: u64, table: &str) -> Result<()> {
         let key = TableKey::new(level, table.as_bytes());
-        let held = CURRENT.with(|current| current.borrow().as_ref().is_some_and(|owner| owner.holds(key)));
+        let held = CURRENT.with(|current| {
+            current
+                .borrow()
+                .as_ref()
+                .is_some_and(|owner| owner.engine == self.locks.engine && owner.holds(key))
+        });
         if held {
             return Ok(());
         }
@@ -2118,20 +2173,59 @@ mod tests {
         });
     }
 
-    /// An autocommit TRUNCATE's commit defers its standby wait to its scope; nothing else
-    /// does.
     #[test]
-    fn only_a_statement_holding_a_table_exclusively_defers_a_commit_wait() {
+    fn statement_waits_defer_until_nested_row_and_table_scopes_have_ended() {
+        use super::super::row_locks::{RowLockBounds, RowLockGuard, RowLocks};
         let locks = locks(20);
         assert!(!defer_commit_replication_wait(Some(7)), "no statement");
         let statement = locks.statement_scope();
+        assert!(!defer_commit_replication_wait(Some(7)), "no table held");
         statement.lock_shared(MAIN_LEVEL, "t").unwrap();
-        assert!(!defer_commit_replication_wait(Some(7)), "held shared");
+        let rows = RowLocks::new();
+        let row = RowLockGuard::acquire(
+            &rows,
+            "t",
+            1,
+            RowLockBounds {
+                lock_timeout: Duration::from_millis(20),
+                statement_deadline: None,
+            },
+        )
+        .unwrap();
+        let nested = locks.statement_scope();
+        assert!(!defer_commit_replication_wait(None));
+        assert!(defer_commit_replication_wait(Some(7)), "shared table holder defers");
+        drop(nested);
+        assert_eq!(DEFERRED_BARRIER.with(Cell::get), Some(7));
+        assert!(
+            rows.holder("t", 1).is_some(),
+            "row remains protected until publication ends"
+        );
+        drop(row);
+        assert_eq!(rows.holder("t", 1), None);
+        assert_eq!(DEFERRED_BARRIER.with(Cell::get), Some(7), "no wait while table held");
         statement.lock_exclusive(MAIN_LEVEL, "u", "TRUNCATE").unwrap();
-        assert!(!defer_commit_replication_wait(None), "nothing to wait for");
-        assert!(defer_commit_replication_wait(Some(7)));
+        assert!(defer_commit_replication_wait(Some(9)), "exclusive table holder defers");
+        assert_eq!(DEFERRED_BARRIER.with(Cell::get), Some(9));
         drop(statement);
-        assert_eq!(DEFERRED_BARRIER.with(Cell::get), None, "the scope ran it");
+        assert_eq!(
+            DEFERRED_BARRIER.with(Cell::get),
+            None,
+            "the unlocked outer scope ran it"
+        );
+    }
+
+    #[test]
+    fn a_direct_write_does_not_defer_its_reply_to_a_transaction_owner() {
+        let locks = locks(20);
+        let txn = TransactionLocks::new(Arc::clone(&locks));
+        {
+            let _bound = txn.bind();
+            let statement = locks.statement_scope();
+            statement.lock_shared(MAIN_LEVEL, "t").unwrap();
+            assert!(!defer_commit_replication_wait(Some(7)));
+            assert_eq!(DEFERRED_BARRIER.with(Cell::get), None);
+        }
     }
 
     #[test]

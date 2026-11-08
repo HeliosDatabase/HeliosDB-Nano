@@ -966,3 +966,289 @@ async fn a_recover_that_goes_on_to_follow_hands_its_token_to_the_start() {
     drop(following);
     drop(primary);
 }
+
+/// Mandatory scale cell from STANDBY_RECOVERY_PLAN §6: an actual >=1GiB
+/// logical dataset, exactly1% clustered row changes, native child SIGKILL,
+/// dirty-start refusal, resumed byte-digest equality and writes through tail.
+/// Kept outside the ordinary bounded tier; the release scale stage names it.
+#[cfg(feature = "internal-tests")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "mandatory P4 scale acceptance; run explicitly under the fleet24GiB scope"]
+async fn a_gib_dataset_with_one_percent_changed_resumes_after_kill_and_tails_new_writes() {
+    use heliosdb_nano::replication::physical_tls::ReplicationTransport;
+    use heliosdb_nano::replication::physical_wire::WireLimits;
+    use heliosdb_nano::replication::recover_primary::{
+        recover_from_primary, DirectoryState, PrimaryRecoverOptions, RecoverRoute,
+    };
+    use std::os::unix::process::ExitStatusExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    const BASE: i32 = 20_000;
+    const PAYLOAD: usize = 55 * 1024;
+    const CHANGED: i32 = BASE / 100;
+    fn payload(id: i32, version: u64) -> String {
+        const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        let mut state = (id as u64 + 1).wrapping_mul(0x9e3779b97f4a7c15) ^ version.wrapping_mul(0xd6e8feb86659fd93);
+        let mut bytes = Vec::with_capacity(PAYLOAD);
+        for _ in 0..PAYLOAD {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            bytes.push(ALPHABET[(state % ALPHABET.len() as u64) as usize]);
+        }
+        String::from_utf8(bytes).unwrap()
+    }
+    let pair = pair();
+    let dir = pair.dir.path().to_path_buf();
+    let data = dir.join("primary");
+    let config = pruning_primary_config(false).replace(
+        "wal_retention_secs = 60",
+        "operation_timeout_secs = 900\nwal_retention_secs = 60",
+    );
+    // Seed with ordinary memtables, so >=1GiB does not manufacture tens of
+    // thousands of tiny SSTs. Reopen with tiny buffers only for retention churn.
+    let seed_config = config.replace(
+        "rocksdb_write_buffer_size = 65536",
+        "rocksdb_write_buffer_size = 16777216",
+    );
+    let receiver_config = "[replication.physical]\noperation_timeout_secs = 900\n";
+    let recover_config = dir.join("scale-recover.toml");
+    std::fs::write(&recover_config, receiver_config).unwrap();
+    let mut primary = Daemon::spawn(
+        &dir,
+        "primary-scale",
+        &data,
+        &pair.token,
+        &pair.primary_args,
+        Some(&seed_config),
+    );
+    let mut writer = connect(pair.pg_p).await;
+    create_table(&writer).await;
+    let statement = writer.prepare("INSERT INTO t VALUES ($1,$2)").await.unwrap();
+    for id in 1..=BASE {
+        assert_eq!(writer.execute(&statement, &[&id, &payload(id, 0)]).await.unwrap(), 1);
+    }
+    let logical_bytes: i64 = writer
+        .query_one("SELECT CAST(SUM(LENGTH(v)) AS BIGINT) FROM t", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(logical_bytes, i64::from(BASE) * PAYLOAD as i64);
+    assert!(logical_bytes >= 1 << 30, "the actual SQL dataset must be at least1GiB");
+    let standby_dir = dir.join("standby");
+    let mut standby = Daemon::spawn(
+        &dir,
+        "standby-scale",
+        &standby_dir,
+        &pair.token,
+        &pair.standby_args,
+        Some(receiver_config),
+    );
+    wait_http(pair.http_s, "/ready", 200, Duration::from_secs(900), &standby).await;
+    let through = primary_sequence(&writer).await;
+    wait_listed(pair.http_p, through, Duration::from_secs(600), &primary).await;
+    standby.stop();
+    let before = cursor_of(&standby_dir);
+    drop(writer);
+    primary.stop();
+    primary = Daemon::spawn(
+        &dir,
+        "primary-scale-pruning",
+        &data,
+        &pair.token,
+        &pair.primary_args,
+        Some(&config),
+    );
+    writer = connect(pair.pg_p).await;
+    let update = writer.prepare("UPDATE t SET v=$1 WHERE id=$2").await.unwrap();
+    // A contiguous range makes the chosen1% locality explicit. A uniformly
+    // random mutation can touch most leaves and properly select a full copy.
+    for id in BASE / 2 + 1..=BASE / 2 + CHANGED {
+        assert_eq!(writer.execute(&update, &[&payload(id, 1), &id]).await.unwrap(), 1);
+    }
+    let last = BASE;
+    let mut version = 1_u64;
+    let mut pruned = prune_archived_wal(&data);
+    let deadline = Instant::now() + Duration::from_secs(180);
+    while pruned == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "retention precondition: {}",
+            primary.tail(20)
+        );
+        version += 1;
+        for id in BASE / 2 + 1..=BASE / 2 + CHANGED {
+            assert_eq!(writer.execute(&update, &[&payload(id, version), &id]).await.unwrap(), 1);
+        }
+        pruned += prune_archived_wal(&data);
+    }
+    // Retention churn stays within the SAME1% rows: no hidden filler rows or
+    // logical changes outside the independently declared mutation interval.
+    for _ in 0..3 {
+        version += 1;
+        for id in BASE / 2 + 1..=BASE / 2 + CHANGED {
+            assert_eq!(writer.execute(&update, &[&payload(id, version), &id]).await.unwrap(), 1);
+        }
+        prune_archived_wal(&data);
+    }
+    let killed = recover_async(
+        from_primary(&pair, &standby_dir, &["--config", &text(&recover_config)]),
+        vec![(
+            "HELIOSDB_NANO_TEST_KILL_FAST_FORWARD_AT".into(),
+            "after-ingest:0".into(),
+        )],
+    )
+    .await;
+    assert_eq!(
+        killed.status.signal(),
+        Some(libc::SIGKILL),
+        "{}{}",
+        stdout(&killed),
+        stderr(&killed)
+    );
+    let mut refused = Daemon::spawn(
+        &dir,
+        "scale-dirty-refused",
+        &standby_dir,
+        &pair.token,
+        &pair.standby_args,
+        Some(receiver_config),
+    );
+    let body = wait_ready_body(pair.http_s, Duration::from_secs(60), &refused, |code, body| {
+        code == 503 && body["state"] == "needs_recovery"
+    })
+    .await;
+    assert!(body["reason"]
+        .as_str()
+        .unwrap()
+        .contains("fast-forward from the primary interrupted"));
+    assert!(refused.alive());
+    refused.stop();
+    let mut wire = WireLimits::default();
+    wire.operation_timeout = Duration::from_secs(900);
+    let options = PrimaryRecoverOptions {
+        data_dir: standby_dir.clone(),
+        layout: DirectoryState::Physical {
+            history: physical_stage_history(&standby_dir).unwrap(),
+        },
+        config: Config::default(),
+        primary_host: format!("127.0.0.1:{}", pair.repl_p),
+        sources: vec![format!("127.0.0.1:{}", pair.repl_p).parse().unwrap()],
+        transport: ReplicationTransport {
+            tls: None,
+            allow_insecure_remote: false,
+        },
+        token: heliosdb_nano::replication::read_replication_token(&pair.token).unwrap(),
+        wire,
+        full: false,
+        no_full_copy: true,
+        full_copy_threshold: 50,
+        leaf_bytes: 64 * 1024,
+        replace: false,
+        stage_dir: dir.join("standby.recover-stage"),
+    };
+    let (start_tx, start_rx) = tokio::sync::oneshot::channel::<()>();
+    let (committed_tx, committed_rx) = std::sync::mpsc::channel::<()>();
+    // FnMut+Send borrows this receiver; Mutex makes the shared capture Sync.
+    let committed_rx = std::sync::Mutex::new(committed_rx);
+    let finished = Arc::new(AtomicBool::new(false));
+    let seen_finished = Arc::clone(&finished);
+    let during_id = last + 1;
+    let pg = pair.pg_p;
+    let during = tokio::spawn(async move {
+        start_rx.await.unwrap();
+        let client = connect(pg).await;
+        assert_eq!(
+            client
+                .execute("INSERT INTO t VALUES ($1,'during recovery')", &[&during_id])
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(
+            !seen_finished.load(Ordering::SeqCst),
+            "the acknowledged write must occur during recovery"
+        );
+        committed_tx.send(()).unwrap();
+    });
+    let mut start_tx = Some(start_tx);
+    let mut lines = Vec::new();
+    let report = recover_from_primary(&options, &mut |line| {
+        eprintln!("P4_SCALE_PROGRESS {line}");
+        lines.push(line.to_string());
+        if line.contains(" to ship") {
+            if let Some(start) = start_tx.take() {
+                start.send(()).unwrap();
+                // Deterministic handoff: writer is a separate task. This is test
+                // coordination after the source cut, never a storage lock wait.
+                tokio::task::block_in_place(|| {
+                    committed_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(60))
+                        .unwrap()
+                });
+            }
+        }
+    })
+    .await
+    .unwrap();
+    finished.store(true, Ordering::SeqCst);
+    during.await.unwrap();
+    assert!(start_tx.is_none(), "the real differing-leaf plan must be observed");
+    assert!(matches!(report.route, RecoverRoute::FastForward));
+    assert!(report.bytes_total >= 1 << 30);
+    assert!(
+        report.bytes_shipped > 0 && report.bytes_shipped * 10 < report.bytes_total,
+        "{report:?}"
+    );
+    assert!(report.to > before.1);
+    let cursor = cursor_of(&standby_dir);
+    assert_eq!(cursor, (report.to, report.to));
+    let actual = digest_of(&standby_dir);
+    let expected = export_digest_at(&data, report.to);
+    assert_eq!(actual, expected);
+    stage_reopens(&standby_dir);
+    let resumed = Daemon::spawn(
+        &dir,
+        "standby-scale-resumed",
+        &standby_dir,
+        &pair.token,
+        &pair.standby_args,
+        Some(receiver_config),
+    );
+    let want: Vec<i32> = (1..=during_id).collect();
+    assert_eq!(settle(pair.pg_s, &want, Duration::from_secs(900)).await, Ok(want));
+    assert!(resumed.log().contains("Resuming physical standby"));
+    assert!(!resumed.log().contains("Bootstrapping physical standby"));
+    let reader = connect(pair.pg_s).await;
+    for id in [BASE / 2, BASE / 2 + 1, BASE / 2 + CHANGED, BASE / 2 + CHANGED + 1] {
+        let value: String = reader
+            .query_one("SELECT v FROM t WHERE id=$1", &[&id])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            value,
+            payload(
+                id,
+                if id > BASE / 2 && id <= BASE / 2 + CHANGED {
+                    version
+                } else {
+                    0
+                }
+            )
+        );
+    }
+    let digest = actual.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+    let receipt = serde_json::json!({"dataset_rows":BASE,"payload_bytes_per_row":PAYLOAD,"logical_bytes":logical_bytes,
+        "changed_rows":CHANGED,"changed_fraction":0.01,"retention_pruning_rows_added":0,"changed_row_versions":version,"mutation_locality":"one contiguous row-id interval",
+        "killed_phase":"after-ingest:0","dirty_start_status":503,"route":report.route.as_str(),
+        "from_sequence":before.1,"cut_sequence":report.to,"default_cf_digest":digest,
+        "leaves_total":report.leaves_total,"leaves_differing":report.leaves_differing,
+        "bytes_total":report.bytes_total,"bytes_shipped":report.bytes_shipped,
+        "shipped_fraction":report.bytes_shipped as f64/report.bytes_total as f64,
+        "acknowledged_during_recovery":during_id,"tail_resumed_without_bootstrap":true,
+        "elapsed_seconds":report.duration.as_secs_f64()});
+    eprintln!("P4_SCALE_CASE {receipt}");
+}

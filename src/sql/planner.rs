@@ -2457,11 +2457,13 @@ impl<'a> Planner<'a> {
                     .iter()
                     .filter_map(|dt| self.sql_data_type_to_data_type(dt).ok())
                     .collect();
+                let source_sql = statement.to_string();
                 let inner_plan = self.statement_to_plan(*statement.clone())?;
                 Ok(LogicalPlan::Prepare {
                     name: name.to_string(),
                     param_types,
                     statement: Box::new(inner_plan),
+                    source_sql,
                 })
             }
             Statement::Execute { name, parameters, .. } => {
@@ -7324,7 +7326,7 @@ impl<'a> Planner<'a> {
                 // operations `ADD COLUMN c …, ADD FOREIGN KEY (c) REFERENCES …`,
                 // planned as exactly that — the two plans that already exist —
                 // so the foreign key goes through the ONE executor body both
-                // families share (`alter_table_add_foreign_key`: 42P01 / 42703 /
+                // families share (`alter_add_foreign_key` in `src/alter_table.rs`: 42P01 / 42703 /
                 // 42830 validation, auto-naming, index creation) instead of a
                 // new plan field. `ColumnDef` has no room for a foreign key and
                 // `LogicalPlan` is persisted positionally, so nothing is added

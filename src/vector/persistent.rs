@@ -128,6 +128,13 @@ struct IndexState {
     elem_to_row: HashMap<ElementId, u64>,
     row_to_elem: HashMap<u64, ElementId>,
     tombstones: HashSet<ElementId>,
+    /// Latest logical row images ride their owning heap groups. Graph hooks
+    /// never erase them; a complete replacement consumes the whole namespace.
+    row_images: HashMap<u64, Option<Vector>>,
+    /// A row image can precede its rerank record. Read-only repair must not
+    /// fault a stale vector from RocksDB while serving its corrected graph.
+    rerank_overrides: HashMap<ElementId, Vector>,
+    rederived_from_rows: bool,
 }
 
 impl IndexState {
@@ -146,6 +153,9 @@ impl IndexState {
             elem_to_row: HashMap::new(),
             row_to_elem: HashMap::new(),
             tombstones: HashSet::new(),
+            row_images: HashMap::new(),
+            rerank_overrides: HashMap::new(),
+            rederived_from_rows: false,
         }
     }
 
@@ -304,6 +314,65 @@ impl IndexState {
 fn prefix(index_id: u64) -> String {
     format!("__vidx:{index_id}:")
 }
+/// The versioned authoritative overlay is part of the existing Vidx key class.
+/// Values are sealed by the owning engine, independently of raw graph records.
+pub(crate) fn row_image_key(index_id: u64, row_id: u64) -> Vec<u8> {
+    format!("{}row_image:{row_id}", prefix(index_id)).into_bytes()
+}
+
+#[derive(Serialize, Deserialize)]
+struct RowImageV1 {
+    version: u8,
+    vector: Option<Vector>,
+}
+
+pub(crate) fn encode_row_image(
+    key_manager: Option<&crate::crypto::KeyManager>,
+    vector: Option<&Vector>,
+) -> Result<Vec<u8>> {
+    let plain = ser(&RowImageV1 {
+        version: 1,
+        vector: vector.cloned(),
+    })?;
+    Ok(crate::storage::tde::seal(key_manager, &plain)?.into_owned())
+}
+
+fn decode_row_image(
+    key_manager: Option<&crate::crypto::KeyManager>,
+    key: &[u8],
+    value: &[u8],
+) -> Result<Option<Vector>> {
+    let plain = crate::storage::tde::open_ref(key_manager, key, value)?;
+    use bincode::Options;
+    let image: RowImageV1 = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .with_limit(plain.len() as u64)
+        .reject_trailing_bytes()
+        .deserialize(plain.as_ref())
+        .map_err(|error| Error::storage(format!("persistent row-image payload: {error}")))?;
+    if image.version != 1 {
+        return Err(Error::storage(format!(
+            "unsupported persistent row-image version {}",
+            image.version
+        )));
+    }
+    Ok(image.vector)
+}
+
+fn parse_row_image_suffix(suffix: &[u8]) -> Result<u64> {
+    let digits = suffix
+        .strip_prefix(b"row_image:")
+        .ok_or_else(|| Error::storage("invalid persistent row-image key"))?;
+    let text = std::str::from_utf8(digits).map_err(|_| Error::storage("invalid persistent row-image row id"))?;
+    let row = text
+        .parse::<u64>()
+        .map_err(|_| Error::storage("invalid persistent row-image row id"))?;
+    if text != row.to_string() {
+        return Err(Error::storage("noncanonical persistent row-image row id"));
+    }
+    Ok(row)
+}
+
 fn key_meta(p: &str) -> Vec<u8> {
     format!("{p}meta").into_bytes()
 }
@@ -793,6 +862,341 @@ fn graph_insert(st: &mut IndexState, row_id: u64, vector: &Vector) -> Result<(El
     Ok((elem, touched))
 }
 
+/// Read-only hydration from actual graph records plus latest row-group images.
+/// A fully caught-up graph is reused. Only an unfinished graph publication builds
+/// a replacement in RAM; no gate or durable cursor is touched.
+fn read_state_from_db(db: &DB, index_id: u64, key_manager: Option<&crate::crypto::KeyManager>) -> Result<IndexState> {
+    let p = prefix(index_id);
+    let meta_bytes = db
+        .get(key_meta(&p))
+        .map_err(map_db)?
+        .ok_or_else(|| Error::storage(format!("vector-persist: index {index_id} not found")))?;
+    let meta: PersistedMeta = de(&meta_bytes)?;
+    check_schema_version(&meta)?;
+
+    let mut st = IndexState::new(meta.config.clone());
+    st.entry_point = meta.entry_point;
+    st.next_element_id = meta.next_element_id;
+    st.layer_count = meta.layer_count;
+    st.element_count = meta.element_count;
+
+    // Reconstruct the quantizer if a codebook was persisted.
+    let pq_active = if let Some(cb_bytes) = db.get(key_pq(&p)).map_err(map_db)? {
+        st.pq = Some(Arc::new(quantizer_from_codebook(&meta.config, &cb_bytes)?));
+        true
+    } else {
+        false
+    };
+
+    if st.config.pq_enabled != st.pq.is_some() {
+        return Err(Error::storage("persistent graph PQ metadata/codebook mismatch"));
+    }
+
+    // Bound both sides: the engine has a prefix extractor and range
+    // tombstones must not hide records outside one extractor block.
+    let pb = p.as_bytes();
+    let mut options = rocksdb::ReadOptions::default();
+    options.set_total_order_seek(true);
+    options.set_iterate_lower_bound(pb.to_vec());
+    let mut upper = pb.to_vec();
+    if let Some(last) = upper.last_mut() {
+        *last += 1;
+    }
+    options.set_iterate_upper_bound(upper);
+    let iter = db.iterator_opt(IteratorMode::From(pb, Direction::Forward), options);
+    let mut full_vectors = HashMap::new();
+    for item in iter {
+        let (k, v) = item.map_err(map_db)?;
+        if !k.starts_with(pb) {
+            break;
+        }
+        let suffix = std::str::from_utf8(&k[pb.len()..])
+            .map_err(|e| Error::storage(format!("vector-persist: non-utf8 key: {e}")))?;
+        let mut parts = suffix.split(':');
+        match parts.next() {
+            Some("meta") | Some("pq") => {}
+            Some("tomb") => {
+                let set: Vec<ElementId> = de(&v)?;
+                st.tombstones = set.into_iter().collect();
+            }
+            Some("vec") => {
+                let e = parse_id(parts.next())?;
+                let vector = decode_vector(&meta.config, &v)?;
+                if !pq_active {
+                    st.vectors.insert(e, vector.clone());
+                }
+                full_vectors.insert(e, v.to_vec());
+            }
+            Some("code") => {
+                let e = parse_id(parts.next())?;
+                st.codes.insert(e, de::<QuantizedVector>(&v)?);
+            }
+            Some("lvl") => {
+                let e = parse_id(parts.next())?;
+                st.levels.insert(e, de::<u32>(&v)?);
+            }
+            Some("adj") => {
+                let layer = parse_id(parts.next())? as u32;
+                let e = parse_id(parts.next())?;
+                st.adjacency.insert((layer, e), de::<Vec<ElementId>>(&v)?);
+            }
+            Some("map") => {
+                let e = parse_id(parts.next())?;
+                st.elem_to_row.insert(e, de::<u64>(&v)?);
+            }
+            Some("row_image") => {
+                let row = parse_row_image_suffix(suffix.as_bytes())?;
+                st.row_images.insert(row, decode_row_image(key_manager, &k, &v)?);
+            }
+            Some("rmap") => {
+                let row = parse_id(parts.next())?;
+                st.row_to_elem.insert(row, de::<ElementId>(&v)?);
+            }
+            _ => {}
+        }
+    }
+
+    reconcile_row_images(&mut st, &full_vectors)?;
+    Ok(st)
+}
+
+fn row_image_matches(st: &IndexState, row: u64, image: &Option<Vector>, full: Option<&[u8]>) -> Result<bool> {
+    let Some(vector) = image else {
+        return Ok(!st.row_to_elem.contains_key(&row));
+    };
+    if vector.len() != st.config.dimension {
+        return Err(Error::storage("persistent row image has the wrong vector dimension"));
+    }
+    let Some(element) = st.row_to_elem.get(&row) else {
+        return Ok(false);
+    };
+    if st.elem_to_row.get(element) != Some(&row) || st.tombstones.contains(element) {
+        return Ok(false);
+    }
+    let Some(full) = full else {
+        return Ok(false);
+    };
+    if encode_vector(&st.config, vector)? != full {
+        return Ok(false);
+    }
+    if let Some(pq) = &st.pq {
+        let expected = pq
+            .encode(vector)
+            .map_err(|error| Error::storage(format!("persistent row image PQ: {error}")))?;
+        return Ok(st
+            .codes
+            .get(element)
+            .is_some_and(|actual| actual.codes == expected.codes));
+    }
+    Ok(true)
+}
+
+fn reconcile_row_images(st: &mut IndexState, full_vectors: &HashMap<ElementId, Vec<u8>>) -> Result<()> {
+    if st.row_images.is_empty() {
+        return Ok(());
+    }
+    let mut mismatch = false;
+    for (&row, image) in &st.row_images {
+        let full = st
+            .row_to_elem
+            .get(&row)
+            .and_then(|element| full_vectors.get(element))
+            .map(Vec::as_slice);
+        mismatch |= !row_image_matches(st, row, image, full)?;
+    }
+    if !mismatch {
+        return Ok(());
+    }
+    // Keep IDs for unaffected rows. Re-numbering from zero would allow a later
+    // incremental hook to overwrite another row's still-durable vec key.
+    let max_durable = full_vectors
+        .keys()
+        .chain(st.elem_to_row.keys())
+        .chain(st.levels.keys())
+        .copied()
+        .max();
+    let mut next = st.next_element_id;
+    if let Some(max) = max_durable {
+        next = next.max(
+            max.checked_add(1)
+                .ok_or_else(|| Error::storage("persistent element ids exhausted"))?,
+        );
+    }
+    let mut rows: std::collections::BTreeMap<u64, (u64, Vector)> = std::collections::BTreeMap::new();
+    for (&row, &element) in &st.row_to_elem {
+        if st.tombstones.contains(&element) {
+            continue;
+        }
+        match full_vectors.get(&element) {
+            Some(vector) => {
+                rows.insert(row, (element, decode_vector(&st.config, vector)?));
+            }
+            None if st.row_images.contains_key(&row) => {}
+            None => {
+                return Err(Error::storage(
+                    "persistent graph has an unrecoverable missing row vector",
+                ))
+            }
+        }
+    }
+    for (&row, image) in &st.row_images {
+        match image {
+            None => {
+                rows.remove(&row);
+            }
+            Some(vector) => {
+                if vector.len() != st.config.dimension {
+                    return Err(Error::storage("persistent row image dimension mismatch"));
+                }
+                if let Some((_, value)) = rows.get_mut(&row) {
+                    *value = vector.clone();
+                } else {
+                    let element = next;
+                    next = next
+                        .checked_add(1)
+                        .ok_or_else(|| Error::storage("persistent element ids exhausted"))?;
+                    rows.insert(row, (element, vector.clone()));
+                }
+            }
+        }
+    }
+    let mut fresh = IndexState::new(st.config.clone());
+    fresh.pq = st.pq.clone();
+    let mut ordered: Vec<_> = rows
+        .into_iter()
+        .map(|(row, (element, vector))| (element, row, vector))
+        .collect();
+    ordered.sort_by_key(|(element, _, _)| *element);
+    for (element, row, vector) in ordered {
+        fresh.next_element_id = element;
+        let (actual, _) = graph_insert(&mut fresh, row, &vector)?;
+        if actual != element {
+            return Err(Error::storage("persistent repair changed an element id"));
+        }
+        if fresh.pq.is_some() {
+            let matches_disk = full_vectors.get(&element) == Some(&encode_vector(&fresh.config, &vector)?);
+            if !matches_disk {
+                fresh.rerank_overrides.insert(
+                    element,
+                    decode_vector(&fresh.config, &encode_vector(&fresh.config, &vector)?)?,
+                );
+            }
+        }
+    }
+    fresh.next_element_id = fresh.next_element_id.max(next);
+    fresh.row_images = std::mem::take(&mut st.row_images);
+    fresh.rederived_from_rows = true;
+    *st = fresh;
+    Ok(())
+}
+
+/// An owned lease serializes a prepared replacement with ordinary mutators
+/// without holding an index-state or manager-registry lock across WriteGate.
+#[derive(Default)]
+struct WriteLease {
+    busy: parking_lot::Mutex<bool>,
+    ready: parking_lot::Condvar,
+    retired: std::sync::atomic::AtomicBool,
+    #[cfg(feature = "internal-tests")]
+    waiters: std::sync::atomic::AtomicUsize,
+}
+
+impl WriteLease {
+    fn acquire(self: &Arc<Self>) -> Result<HeldWriteLease> {
+        self.acquire_or_retired()
+            .ok_or_else(|| Error::storage("persistent vector index was retired"))
+    }
+
+    fn acquire_or_retired(self: &Arc<Self>) -> Option<HeldWriteLease> {
+        let mut busy = self.busy.lock();
+        if *busy {
+            #[cfg(feature = "internal-tests")]
+            self.waiters.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            crate::runtime_offload::off_worker(|| {
+                while *busy {
+                    self.ready.wait(&mut busy);
+                }
+            });
+            #[cfg(feature = "internal-tests")]
+            self.waiters.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        if self.retired.load(std::sync::atomic::Ordering::Acquire) {
+            return None;
+        }
+        *busy = true;
+        drop(busy);
+        Some(HeldWriteLease(Arc::clone(self)))
+    }
+}
+
+struct HeldWriteLease(Arc<WriteLease>);
+
+impl Drop for HeldWriteLease {
+    fn drop(&mut self) {
+        *self.0.busy.lock() = false;
+        self.0.ready.notify_all();
+    }
+}
+
+/// A full graph staged in another owner's data group. Dropping it leaves the
+/// live graph unchanged; publish only after that exact group succeeds.
+pub(crate) struct PreparedPersistentReplacement {
+    db: Arc<DB>,
+    prefix: Vec<u8>,
+    before: [u8; 32],
+    target: Arc<RwLock<IndexState>>,
+    fresh: Option<IndexState>,
+    write: HeldWriteLease,
+}
+
+fn retire_state(target: &RwLock<IndexState>, write: &HeldWriteLease) {
+    write.0.retired.store(true, std::sync::atomic::Ordering::Release);
+    let mut current = target.write();
+    let mut empty = IndexState::new(current.config.clone());
+    empty.pq = current.pq.clone();
+    *current = empty;
+}
+
+impl PreparedPersistentReplacement {
+    pub(crate) fn publish(mut self) {
+        // No manager registry lookup: a concurrent index drop may be waiting
+        // for our lease while holding that registry's write lock.
+        if let Some(fresh) = self.fresh.take() {
+            *self.target.write() = fresh;
+        }
+    }
+}
+
+impl Drop for PreparedPersistentReplacement {
+    fn drop(&mut self) {
+        if self.fresh.is_none() {
+            return;
+        } // explicitly published
+        match crate::storage::VectorIndexManager::index_image_digest(&self.db, &self.prefix, |_| {}) {
+            Ok(actual) if actual == self.before => {} // known unchanged
+            Ok(_) => retire_state(&self.target, &self.write),
+            Err(error) => {
+                retire_state(&self.target, &self.write);
+                tracing::error!("persistent replacement could not verify actual state: {error}; old handle retired");
+            }
+        }
+        // The lease releases only after actual changed state has retired every
+        // old handle; a waiting direct mutator cannot resurrect old records.
+    }
+}
+
+/// A purge's owned retirement target, settled before registry teardown.
+pub(crate) struct PersistentRetirement {
+    target: Arc<RwLock<IndexState>>,
+    write: HeldWriteLease,
+}
+
+impl PersistentRetirement {
+    pub(crate) fn retire(self) {
+        retire_state(&self.target, &self.write);
+    }
+}
+
 /// A durable, crash-recoverable vector index backed by RocksDB.
 pub struct PersistentVectorIndex {
     /// Written only through `gate`.
@@ -801,9 +1205,16 @@ pub struct PersistentVectorIndex {
     gate: Arc<WriteGate>,
     index_id: u64,
     state: Arc<RwLock<IndexState>>,
+    writes: Arc<WriteLease>,
+    key_manager: Option<Arc<crate::crypto::KeyManager>>,
 }
 
 impl PersistentVectorIndex {
+    #[cfg(feature = "internal-tests")]
+    pub(crate) fn write_waiters(&self) -> usize {
+        self.writes.waiters.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Create a new, empty index (PQ inactive — full vectors resident in RAM, persisted
     /// at the configured rerank precision: F32 / F16 / I8).
     pub fn create(db: Arc<DB>, gate: Arc<WriteGate>, index_id: u64, config: PqHnswConfig) -> Result<Self> {
@@ -820,6 +1231,8 @@ impl PersistentVectorIndex {
             gate,
             index_id,
             state: Arc::new(RwLock::new(state)),
+            writes: Arc::new(WriteLease::default()),
+            key_manager: None,
         })
     }
 
@@ -875,6 +1288,8 @@ impl PersistentVectorIndex {
             gate,
             index_id,
             state: Arc::new(RwLock::new(state)),
+            writes: Arc::new(WriteLease::default()),
+            key_manager: None,
         })
     }
 
@@ -882,83 +1297,35 @@ impl PersistentVectorIndex {
     /// the index was created with PQ. Errors if it does not exist or the on-disk schema
     /// version is unknown.
     pub fn open(db: Arc<DB>, gate: Arc<WriteGate>, index_id: u64) -> Result<Self> {
-        let p = prefix(index_id);
-        let meta_bytes = db
-            .get(key_meta(&p))
-            .map_err(map_db)?
-            .ok_or_else(|| Error::storage(format!("vector-persist: index {index_id} not found")))?;
-        let meta: PersistedMeta = de(&meta_bytes)?;
-        check_schema_version(&meta)?;
+        Self::open_with_key_manager(db, gate, index_id, None)
+    }
 
-        let mut st = IndexState::new(meta.config.clone());
-        st.entry_point = meta.entry_point;
-        st.next_element_id = meta.next_element_id;
-        st.layer_count = meta.layer_count;
-        st.element_count = meta.element_count;
-
-        // Reconstruct the quantizer if a codebook was persisted.
-        let pq_active = if let Some(cb_bytes) = db.get(key_pq(&p)).map_err(map_db)? {
-            st.pq = Some(Arc::new(quantizer_from_codebook(&meta.config, &cb_bytes)?));
-            true
-        } else {
-            false
-        };
-
-        // Scan the contiguous keyspace for this index and rebuild the in-memory mirror.
-        let pb = p.as_bytes();
-        let iter = db.iterator(IteratorMode::From(pb, Direction::Forward));
-        for item in iter {
-            let (k, v) = item.map_err(map_db)?;
-            if !k.starts_with(pb) {
-                break;
-            }
-            let suffix = std::str::from_utf8(&k[pb.len()..])
-                .map_err(|e| Error::storage(format!("vector-persist: non-utf8 key: {e}")))?;
-            let mut parts = suffix.split(':');
-            match parts.next() {
-                Some("meta") | Some("pq") => {}
-                Some("tomb") => {
-                    let set: Vec<ElementId> = de(&v)?;
-                    st.tombstones = set.into_iter().collect();
-                }
-                Some("vec") => {
-                    // Full vectors stay on disk when PQ is active (rerank only).
-                    if !pq_active {
-                        let e = parse_id(parts.next())?;
-                        st.vectors.insert(e, decode_vector(&meta.config, &v)?);
-                    }
-                }
-                Some("code") => {
-                    let e = parse_id(parts.next())?;
-                    st.codes.insert(e, de::<QuantizedVector>(&v)?);
-                }
-                Some("lvl") => {
-                    let e = parse_id(parts.next())?;
-                    st.levels.insert(e, de::<u32>(&v)?);
-                }
-                Some("adj") => {
-                    let layer = parse_id(parts.next())? as u32;
-                    let e = parse_id(parts.next())?;
-                    st.adjacency.insert((layer, e), de::<Vec<ElementId>>(&v)?);
-                }
-                Some("map") => {
-                    let e = parse_id(parts.next())?;
-                    st.elem_to_row.insert(e, de::<u64>(&v)?);
-                }
-                Some("rmap") => {
-                    let row = parse_id(parts.next())?;
-                    st.row_to_elem.insert(row, de::<ElementId>(&v)?);
-                }
-                _ => {}
-            }
-        }
-
+    pub(crate) fn open_with_key_manager(
+        db: Arc<DB>,
+        gate: Arc<WriteGate>,
+        index_id: u64,
+        key_manager: Option<Arc<crate::crypto::KeyManager>>,
+    ) -> Result<Self> {
+        let st = read_state_from_db(&db, index_id, key_manager.as_deref())?;
         Ok(Self {
             db,
             gate,
             index_id,
             state: Arc::new(RwLock::new(st)),
+            writes: Arc::new(WriteLease::default()),
+            key_manager,
         })
+    }
+
+    pub(crate) fn with_key_manager(mut self, key_manager: Option<Arc<crate::crypto::KeyManager>>) -> Self {
+        self.key_manager = key_manager;
+        self
+    }
+
+    /// Shared with mutator error settlement: read actual durable truth without
+    /// performing a repair write or trusting the attempted in-memory mutation.
+    fn reload_actual_state(&self) -> Result<IndexState> {
+        read_state_from_db(&self.db, self.index_id, self.key_manager.as_deref())
     }
 
     /// Apply one replicated record of this index's keyspace to the in-memory
@@ -990,8 +1357,7 @@ impl PersistentVectorIndex {
     /// index with [`Self::open`] over the same keys, which is always valid
     /// because the keys are already the primary's.
     pub fn apply_record(&self, suffix: &[u8], value: Option<&[u8]>) -> Result<()> {
-        let mut st = self.state.write();
-        apply_record_to(&mut st, self.index_id, suffix, value)
+        self.apply_records(std::iter::once((suffix, value)))
     }
 
     /// [`Self::apply_record`] for every record one replicated batch wrote to
@@ -1003,11 +1369,208 @@ impl PersistentVectorIndex {
     /// reassigned to another row. Stops at the first error (see
     /// [`Self::apply_record`]).
     pub fn apply_records<'r>(&self, records: impl IntoIterator<Item = (&'r [u8], Option<&'r [u8]>)>) -> Result<()> {
+        let _write = self.writes.acquire()?;
         let mut st = self.state.write();
+        let was_rederived = st.rederived_from_rows;
+        let mut affected = HashSet::new();
         for (suffix, value) in records {
-            apply_record_to(&mut st, self.index_id, suffix, value)?;
+            if suffix.starts_with(b"row_image:") {
+                let row = parse_row_image_suffix(suffix)?;
+                match value {
+                    Some(value) => {
+                        let image =
+                            decode_row_image(self.key_manager.as_deref(), &row_image_key(self.index_id, row), value)?;
+                        st.row_images.insert(row, image);
+                    }
+                    None => {
+                        st.row_images.remove(&row);
+                    }
+                }
+                affected.insert(row);
+            } else {
+                if let Some(digits) = suffix.strip_prefix(b"rmap:") {
+                    let row = std::str::from_utf8(digits)
+                        .ok()
+                        .and_then(|digits| digits.parse::<u64>().ok())
+                        .ok_or_else(|| Error::storage("invalid persistent row mapping id"))?;
+                    affected.insert(row);
+                }
+                apply_record_to(&mut st, self.index_id, suffix, value)?;
+            }
+        }
+        let mut mismatch = was_rederived;
+        for row in affected {
+            if let Some(image) = st.row_images.get(&row) {
+                let full = match st.row_to_elem.get(&row) {
+                    Some(element) => self.db.get(key_vec(&prefix(self.index_id), *element)).map_err(map_db)?,
+                    None => None,
+                };
+                mismatch |= !row_image_matches(&st, row, image, full.as_deref())?;
+            }
+        }
+        if mismatch {
+            // Only unfinished publication takes the full read-only repair path.
+            // Normal caught-up replay validates its touched rows incrementally.
+            *st = self.reload_actual_state()?;
+        } else if st.row_images.is_empty() {
+            st.rerank_overrides.clear();
+            st.rederived_from_rows = false;
         }
         Ok(())
+    }
+
+    /// Row hooks consume the latest committed overlay, never their caller's
+    /// possibly older tuple. None means a legacy/raw index without an overlay.
+    pub(crate) fn latest_row_image(&self, row: u64) -> Result<Option<Option<Vector>>> {
+        let key = row_image_key(self.index_id, row);
+        self.db
+            .get(&key)
+            .map_err(map_db)?
+            .map(|value| decode_row_image(self.key_manager.as_deref(), &key, &value))
+            .transpose()
+    }
+
+    pub(crate) fn apply_latest_row_image(&self, row: u64) -> Result<bool> {
+        let _write = self.writes.acquire()?;
+        let Some(image) = self.latest_row_image(row)? else {
+            return Ok(false);
+        };
+        {
+            let mut current = self.state.write();
+            let full = match current.row_to_elem.get(&row) {
+                Some(element) => self.db.get(key_vec(&prefix(self.index_id), *element)).map_err(map_db)?,
+                None => None,
+            };
+            let matches = row_image_matches(&current, row, &image, full.as_deref())?;
+            current.row_images.insert(row, image.clone());
+            if matches {
+                return Ok(true);
+            }
+        }
+        // Original mutators serialize each native graph group under their owned
+        // lease and reload actual state on error. The authoritative row image
+        // remains in its owning heap group throughout remove/insert.
+        self.remove_holding_lease(row)?;
+        if let Some(vector) = &image {
+            self.insert_holding_lease(row, vector)?;
+        }
+        if self.latest_row_image(row)? != Some(image) {
+            *self.state.write() = self.reload_actual_state()?;
+            return Err(Error::transaction(
+                "serialization failure: persistent row image changed during graph publication",
+            ));
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn retirement_target(&self) -> Option<PersistentRetirement> {
+        Some(PersistentRetirement {
+            target: Arc::clone(&self.state),
+            write: self.writes.acquire_or_retired()?,
+        })
+    }
+
+    /// Replace only RAM with the actual committed graph/row-image truth.
+    /// Rollback/error reconciliation must never repair durable records here.
+    pub(crate) fn reload_actual_ram(&self) -> Result<()> {
+        let write = self.writes.acquire()?;
+        match self.reload_actual_state() {
+            Ok(actual) => {
+                *self.state.write() = actual;
+                Ok(())
+            }
+            Err(error) => {
+                retire_state(&self.state, &write);
+                Err(error)
+            }
+        }
+    }
+
+    /// Share the existing per-index state and write lease for preparation after
+    /// the manager registry guard has been released. No second cache is opened.
+    pub(crate) fn replacement_handle(&self) -> Self {
+        Self {
+            db: Arc::clone(&self.db),
+            gate: Arc::clone(&self.gate),
+            index_id: self.index_id,
+            state: Arc::clone(&self.state),
+            writes: Arc::clone(&self.writes),
+            key_manager: self.key_manager.clone(),
+        }
+    }
+
+    /// Prepare a complete replacement from current logical table rows, stage
+    /// every old-key delete and fresh record into the caller's group, and keep
+    /// the existing live state untouched until explicit publication. Preserves
+    /// construction config, quantizer/codebook and rerank precision.
+    pub(crate) fn stage_replacement(
+        &self,
+        rows: &[(u64, Vector)],
+        batch: &mut WriteBatch,
+    ) -> Result<PreparedPersistentReplacement> {
+        let write = self.writes.acquire()?;
+        let mut fresh = {
+            let current = self.state.read();
+            if current.config.pq_enabled != current.pq.is_some() {
+                return Err(Error::storage(
+                    "persistent replacement has inconsistent PQ metadata/codebook",
+                ));
+            }
+            let mut fresh = IndexState::new(current.config.clone());
+            fresh.pq = current.pq.clone();
+            fresh
+        };
+        let mut seen = HashSet::new();
+        for (row, vector) in rows {
+            if vector.len() != fresh.config.dimension {
+                return Err(Error::query_execution(format!(
+                    "vector dimension mismatch: expected {}, got {}",
+                    fresh.config.dimension,
+                    vector.len()
+                )));
+            }
+            if !seen.insert(*row) {
+                return Err(Error::storage("persistent replacement contains a duplicate row id"));
+            }
+            graph_insert(&mut fresh, *row, vector)?;
+        }
+        let p = prefix(self.index_id);
+        let before =
+            crate::storage::VectorIndexManager::index_image_digest(&self.db, p.as_bytes(), |key| batch.delete(key))?;
+        batch.put(key_meta(&p), fresh.meta_bytes()?);
+        if let Some(pq) = fresh.pq.as_ref() {
+            batch.put(key_pq(&p), ser(&*pq.codebook())?);
+        }
+        for (&element, &row) in &fresh.elem_to_row {
+            batch.put(key_map(&p, element), ser(&row)?);
+            batch.put(key_rmap(&p, row), ser(&element)?);
+            if let Some(level) = fresh.levels.get(&element) {
+                batch.put(key_lvl(&p, element), ser(level)?);
+            }
+            if let Some(code) = fresh.codes.get(&element) {
+                batch.put(key_code(&p, element), ser(code)?);
+            }
+        }
+        // Full vectors must ride this group even under PQ: rerank faults them
+        // from these keys, so a fresh code can never name an old vector image.
+        for (row, vector) in rows {
+            let element = fresh
+                .row_to_elem
+                .get(row)
+                .ok_or_else(|| Error::storage("persistent replacement omitted a row mapping"))?;
+            batch.put(key_vec(&p, *element), encode_vector(&fresh.config, vector)?);
+        }
+        for (&(layer, element), neighbours) in &fresh.adjacency {
+            batch.put(key_adj(&p, layer, element), ser(neighbours)?);
+        }
+        Ok(PreparedPersistentReplacement {
+            db: Arc::clone(&self.db),
+            prefix: p.into_bytes(),
+            before,
+            target: Arc::clone(&self.state),
+            fresh: Some(fresh),
+            write,
+        })
     }
 
     /// Whether an index with the given id exists in the store.
@@ -1019,29 +1582,42 @@ impl PersistentVectorIndex {
     /// that owns `db`.
     pub fn drop_index(db: &DB, gate: &WriteGate, index_id: u64) -> Result<()> {
         let p = prefix(index_id);
-        let pb = p.as_bytes();
         let mut wb = WriteBatch::default();
-        let iter = db.iterator(IteratorMode::From(pb, Direction::Forward));
-        for item in iter {
-            let (k, _) = item.map_err(map_db)?;
-            if !k.starts_with(pb) {
-                break;
-            }
-            wb.delete(k);
-        }
+        crate::storage::VectorIndexManager::index_image_digest(db, p.as_bytes(), |key| wb.delete(key))?;
         gate.write(db, wb, None)?;
         Ok(())
     }
 
     /// Drop this index's persisted RocksDB keyspace.
     pub fn drop_storage(&self) -> Result<()> {
-        Self::drop_index(&self.db, &self.gate, self.index_id)
+        let Some(write) = self.writes.acquire_or_retired() else {
+            return Ok(());
+        };
+        let p = prefix(self.index_id);
+        let mut batch = WriteBatch::default();
+        let before =
+            crate::storage::VectorIndexManager::index_image_digest(&self.db, p.as_bytes(), |key| batch.delete(key))?;
+        let outcome = self.gate.write(&self.db, batch, None);
+        let retire = if outcome.is_ok() {
+            true
+        } else {
+            match crate::storage::VectorIndexManager::index_image_digest(&self.db, p.as_bytes(), |_| {}) {
+                Ok(actual) => actual != before,
+                Err(error) => {
+                    tracing::error!("persistent drop could not verify actual state: {error}; old handle retired");
+                    true
+                }
+            }
+        };
+        if retire {
+            retire_state(&self.state, &write);
+        }
+        outcome
     }
-
-    // ── Low-level write-through mutators (substrate; used directly in P1 tests) ──
 
     /// Store an element's rerank vector, row mapping, and level (no graph edges).
     pub fn put_vector(&self, elem_id: ElementId, row_id: u64, vector: &Vector, level: u32) -> Result<()> {
+        let _write = self.writes.acquire()?;
         let mut st = self.state.write();
         if vector.len() != st.config.dimension {
             return Err(Error::query_execution(format!(
@@ -1073,12 +1649,36 @@ impl PersistentVectorIndex {
         }
 
         wb.put(key_meta(&p), st.meta_bytes()?);
-        self.gate.write(&self.db, wb, None)?;
+        self.apply_prepared_batch(&mut st, wb)?;
         Ok(())
+    }
+
+    /// Native errors may have applied. Reconstruct actual graph/row-image
+    /// truth before releasing the write lease, so neither a cap refusal nor an
+    /// ambiguous durability error leaves a successfully queryable partial RAM
+    /// mutation. The parser is shared with open/physical hydration.
+    fn apply_prepared_batch(&self, state: &mut IndexState, batch: WriteBatch) -> Result<()> {
+        match self.gate.write(&self.db, batch, None) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                match self.reload_actual_state() {
+                    Ok(actual) => *state = actual,
+                    Err(reload) => {
+                        self.writes.retired.store(true, std::sync::atomic::Ordering::Release);
+                        let mut empty = IndexState::new(state.config.clone());
+                        empty.pq = state.pq.clone();
+                        *state = empty;
+                        tracing::error!("persistent mutation could not reload actual state: {reload}; handle retired");
+                    }
+                }
+                Err(error)
+            }
+        }
     }
 
     /// Store an element's neighbor list at a given layer.
     pub fn put_adjacency(&self, layer: u32, elem_id: ElementId, neighbors: Vec<ElementId>) -> Result<()> {
+        let _write = self.writes.acquire()?;
         let mut st = self.state.write();
         let p = prefix(self.index_id);
         let mut wb = WriteBatch::default();
@@ -1088,26 +1688,30 @@ impl PersistentVectorIndex {
             st.layer_count = layer as usize + 1;
             wb.put(key_meta(&p), st.meta_bytes()?);
         }
-        self.gate.write(&self.db, wb, None)?;
+        self.apply_prepared_batch(&mut st, wb)?;
         Ok(())
     }
 
     /// Set (or clear) the graph entry point.
     pub fn set_entry_point(&self, ep: Option<ElementId>) -> Result<()> {
+        let _write = self.writes.acquire()?;
         let mut st = self.state.write();
         st.entry_point = ep;
-        self.gate
-            .put(&self.db, key_meta(&prefix(self.index_id)), st.meta_bytes()?, None)?;
+        let mut batch = WriteBatch::default();
+        batch.put(key_meta(&prefix(self.index_id)), st.meta_bytes()?);
+        self.apply_prepared_batch(&mut st, batch)?;
         Ok(())
     }
 
     /// Mark an element as soft-deleted (excluded from search; reclaimed by `compact`).
     pub fn mark_tombstone(&self, elem_id: ElementId) -> Result<()> {
+        let _write = self.writes.acquire()?;
         let mut st = self.state.write();
         st.tombstones.insert(elem_id);
         let set: Vec<ElementId> = st.tombstones.iter().copied().collect();
-        self.gate
-            .put(&self.db, key_tomb(&prefix(self.index_id)), ser(&set)?, None)?;
+        let mut batch = WriteBatch::default();
+        batch.put(key_tomb(&prefix(self.index_id)), ser(&set)?);
+        self.apply_prepared_batch(&mut st, batch)?;
         Ok(())
     }
 
@@ -1117,6 +1721,11 @@ impl PersistentVectorIndex {
     /// PQ is active, its code; the new element's keys + every touched adjacency list +
     /// metadata are flushed atomically in one batch. Returns the assigned element id.
     pub fn insert(&self, row_id: u64, vector: &Vector) -> Result<ElementId> {
+        let _write = self.writes.acquire()?;
+        self.insert_holding_lease(row_id, vector)
+    }
+
+    fn insert_holding_lease(&self, row_id: u64, vector: &Vector) -> Result<ElementId> {
         let mut st = self.state.write();
         if vector.len() != st.config.dimension {
             return Err(Error::query_execution(format!(
@@ -1144,7 +1753,7 @@ impl PersistentVectorIndex {
             wb.put(key_adj(&p, layer_u, e), ser(&nbrs)?);
         }
         wb.put(key_meta(&p), st.meta_bytes()?);
-        self.gate.write(&self.db, wb, None)?;
+        self.apply_prepared_batch(&mut st, wb)?;
         Ok(elem)
     }
 
@@ -1179,6 +1788,10 @@ impl PersistentVectorIndex {
         ef: usize,
         filter: Option<&dyn Fn(u64) -> bool>,
     ) -> Result<Vec<(u64, f32)>> {
+        if self.writes.retired.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(Error::storage("persistent vector index was retired"));
+        }
+
         let st = self.state.read();
         if query.len() != st.config.dimension {
             return Err(Error::query_execution(format!(
@@ -1224,9 +1837,13 @@ impl PersistentVectorIndex {
                 let Some(&row) = st.elem_to_row.get(&c.id) else {
                     continue;
                 };
-                let dist = match self.db.get(key_vec(&p, c.id)).map_err(map_db)? {
-                    Some(bytes) => metric_dist(metric, query, &decode_vector(&st.config, &bytes)?),
-                    None => c.dist,
+                let dist = if let Some(vector) = st.rerank_overrides.get(&c.id) {
+                    metric_dist(metric, query, vector)
+                } else {
+                    match self.db.get(key_vec(&p, c.id)).map_err(map_db)? {
+                        Some(bytes) => metric_dist(metric, query, &decode_vector(&st.config, &bytes)?),
+                        None => c.dist,
+                    }
                 };
                 reranked.push((row, dist));
             }
@@ -1248,6 +1865,11 @@ impl PersistentVectorIndex {
     /// hole. Promotes the entry point if it was removed. Persisted atomically. Returns
     /// whether the row existed. No stale edges remain — recall stays stable under churn.
     pub fn remove(&self, row_id: u64) -> Result<bool> {
+        let _write = self.writes.acquire()?;
+        self.remove_holding_lease(row_id)
+    }
+
+    fn remove_holding_lease(&self, row_id: u64) -> Result<bool> {
         let mut st = self.state.write();
         let Some(elem) = st.row_to_elem.get(&row_id).copied() else {
             return Ok(false);
@@ -1300,6 +1922,7 @@ impl PersistentVectorIndex {
 
         // Drop the element's own data (both resident forms + on-disk keys).
         st.vectors.remove(&elem);
+        st.rerank_overrides.remove(&elem);
         st.codes.remove(&elem);
         st.levels.remove(&elem);
         st.elem_to_row.remove(&elem);
@@ -1340,7 +1963,7 @@ impl PersistentVectorIndex {
             wb.put(key_tomb(&p), ser(&set)?);
         }
         wb.put(key_meta(&p), st.meta_bytes()?);
-        self.gate.write(&self.db, wb, None)?;
+        self.apply_prepared_batch(&mut st, wb)?;
         Ok(true)
     }
 
@@ -1348,6 +1971,7 @@ impl PersistentVectorIndex {
     /// reclaiming space and clearing tombstones; persisted atomically. Preserves the PQ
     /// codebook (when active), reloading full vectors from disk to re-encode.
     pub fn compact(&self) -> Result<()> {
+        let _write = self.writes.acquire()?;
         let mut st = self.state.write();
         let p = prefix(self.index_id);
 
@@ -1365,7 +1989,11 @@ impl PersistentVectorIndex {
             let Some(&row) = st.elem_to_row.get(&elem) else {
                 continue;
             };
-            let full = if let Some(v) = st.vectors.get(&elem) {
+            let full = if let Some(v) = st.row_images.get(&row).and_then(Option::as_ref) {
+                v.clone()
+            } else if let Some(v) = st.rerank_overrides.get(&elem) {
+                v.clone()
+            } else if let Some(v) = st.vectors.get(&elem) {
                 v.clone()
             } else {
                 match self.db.get(key_vec(&p, elem)).map_err(map_db)? {
@@ -1426,7 +2054,7 @@ impl PersistentVectorIndex {
         for (&(layer, elem), nbrs) in &st.adjacency {
             wb.put(key_adj(&p, layer, elem), ser(nbrs)?);
         }
-        self.gate.write(&self.db, wb, None)?;
+        self.apply_prepared_batch(&mut st, wb)?;
         Ok(())
     }
 
@@ -1537,6 +2165,294 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Arc::new(DB::open_default(dir.path()).unwrap());
         (dir, db)
+    }
+
+    fn raw_index_image(db: &DB, id: u64) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let prefix = prefix(id).into_bytes();
+        let mut options = rocksdb::ReadOptions::default();
+        options.set_total_order_seek(true);
+        db.iterator_opt(IteratorMode::From(&prefix, Direction::Forward), options)
+            .map(|item| item.unwrap())
+            .take_while(|(key, _)| key.starts_with(&prefix))
+            .map(|(key, value)| (key.to_vec(), value.to_vec()))
+            .collect()
+    }
+
+    #[test]
+    fn row_image_keys_and_payloads_fail_closed_without_repair_writes() {
+        for suffix in [
+            "row_image:1:extra",
+            "row_image:01",
+            "row_image:+1",
+            "row_image:",
+            "row_image:18446744073709551616",
+        ] {
+            let (_dir, db) = test_db();
+            let index = PersistentVectorIndex::create(Arc::clone(&db), WriteGate::open(), 91, sample_config()).unwrap();
+            index.insert(1, &vec![1.0, 0.0, 0.0]).unwrap();
+            let value = encode_row_image(None, Some(&vec![0.0, 1.0, 0.0])).unwrap();
+            db.put(row_image_key(91, 1), &value).unwrap();
+            db.put(format!("{}{suffix}", prefix(91)), &value).unwrap();
+            let before = raw_index_image(&db, 91);
+            let sequence = db.latest_sequence_number();
+            assert!(
+                PersistentVectorIndex::open(Arc::clone(&db), WriteGate::closed("read-only"), 91).is_err(),
+                "{suffix}"
+            );
+            assert!(index.apply_record(suffix.as_bytes(), Some(&value)).is_err(), "{suffix}");
+            assert_eq!(db.latest_sequence_number(), sequence);
+            assert_eq!(raw_index_image(&db, 91), before);
+        }
+        let key = row_image_key(91, 1);
+        let mut trailing = encode_row_image(None, Some(&vec![0.0, 1.0, 0.0])).unwrap();
+        trailing.push(0);
+        assert!(decode_row_image(None, &key, &trailing).is_err());
+        let unsupported = ser(&RowImageV1 {
+            version: 2,
+            vector: None,
+        })
+        .unwrap();
+        assert!(decode_row_image(None, &key, &unsupported)
+            .unwrap_err()
+            .to_string()
+            .contains("version 2"));
+    }
+
+    #[cfg(feature = "encryption")]
+    #[test]
+    fn row_images_are_sealed_and_refuse_a_different_key() {
+        let key = crate::crypto::KeyManager::generate_random();
+        let other = crate::crypto::KeyManager::generate_random();
+        let row_key = row_image_key(17, 1);
+        let vector = vec![17.125, -89.25, 0.0625];
+        let plain = ser(&RowImageV1 {
+            version: 1,
+            vector: Some(vector.clone()),
+        })
+        .unwrap();
+        let sealed = encode_row_image(Some(&key), Some(&vector)).unwrap();
+        assert_ne!(sealed, plain);
+        assert!(!sealed.windows(plain.len()).any(|bytes| bytes == plain));
+        assert_eq!(decode_row_image(Some(&key), &row_key, &sealed).unwrap(), Some(vector));
+        assert!(decode_row_image(Some(&other), &row_key, &sealed).is_err());
+        assert!(decode_row_image(None, &row_key, &sealed).is_err());
+        let tombstone = encode_row_image(Some(&key), None).unwrap();
+        assert_eq!(decode_row_image(Some(&key), &row_key, &tombstone).unwrap(), None);
+    }
+
+    #[test]
+    fn unfinished_row_images_preserve_other_element_ids_and_late_hooks_take_latest_truth() {
+        let (_dir, db) = test_db();
+        let index = PersistentVectorIndex::create(Arc::clone(&db), WriteGate::open(), 92, sample_config()).unwrap();
+        for row in 1..=3 {
+            index.insert(row, &vec![row as f32, 0.0, 0.0]).unwrap();
+        }
+        let other_id = index.elem_of(3).unwrap();
+        let other_key = key_vec(&prefix(92), other_id);
+        let other_value = db.get(&other_key).unwrap().unwrap();
+        db.put(
+            row_image_key(92, 1),
+            encode_row_image(None, Some(&vec![9.0, 0.0, 0.0])).unwrap(),
+        )
+        .unwrap();
+        db.put(row_image_key(92, 2), encode_row_image(None, None).unwrap())
+            .unwrap();
+        db.put(
+            row_image_key(92, 4),
+            encode_row_image(None, Some(&vec![4.0, 0.0, 0.0])).unwrap(),
+        )
+        .unwrap();
+        // An interrupted incremental publication removed an old mapping but
+        // never inserted its replacement. Other vector IDs remain durable.
+        index.remove(1).unwrap();
+        let before = raw_index_image(&db, 92);
+        let sequence = db.latest_sequence_number();
+        let recovered = PersistentVectorIndex::open(Arc::clone(&db), WriteGate::open(), 92).unwrap();
+        assert_eq!(recovered.len(), 3);
+        assert_eq!(recovered.elem_of(3), Some(other_id));
+        assert!(recovered.elem_of(1).unwrap() > other_id);
+        assert!(recovered.elem_of(4).unwrap() > other_id);
+        assert_eq!(recovered.elem_of(2), None);
+        assert_eq!(recovered.search(&vec![9.0, 0.0, 0.0], 1, 32).unwrap()[0].0, 1);
+        assert_eq!(raw_index_image(&db, 92), before, "recovery is RAM only");
+        assert_eq!(db.latest_sequence_number(), sequence);
+        // Two successive owning row groups may beat the first delayed hook.
+        // That hook must read the second durable image, never its old caller.
+        db.put(
+            row_image_key(92, 1),
+            encode_row_image(None, Some(&vec![10.0, 0.0, 0.0])).unwrap(),
+        )
+        .unwrap();
+        assert!(recovered.apply_latest_row_image(1).unwrap());
+        assert_eq!(db.get(&other_key).unwrap().unwrap(), other_value);
+        let reopened = PersistentVectorIndex::open(Arc::clone(&db), WriteGate::closed("read-only"), 92).unwrap();
+        assert_eq!(reopened.search(&vec![10.0, 0.0, 0.0], 1, 32).unwrap()[0].0, 1);
+        assert_eq!(reopened.elem_of(3), Some(other_id));
+        assert!(reopened.elem_of(2).is_none());
+    }
+
+    #[test]
+    fn row_image_recovery_and_apply_keep_pq_precision_and_bytes() {
+        for pq in [false, true] {
+            for precision in [VectorPrecision::F32, VectorPrecision::F16, VectorPrecision::I8] {
+                let (_dir, db) = test_db();
+                let mut config = PqHnswConfig::new(4, DistanceMetric::L2);
+                config.rerank_precision = precision;
+                config.pq_config = pq.then_some(ProductQuantizerConfig {
+                    num_subquantizers: 2,
+                    num_centroids: 4,
+                    dimension: 4,
+                    training_iterations: 2,
+                    min_training_samples: 8,
+                });
+                let training: Vec<_> = (0..32).map(|row| rand_vec(row, 4)).collect();
+                let index = if pq {
+                    PersistentVectorIndex::create_with_pq(Arc::clone(&db), WriteGate::open(), 93, config, &training)
+                        .unwrap()
+                } else {
+                    PersistentVectorIndex::create(Arc::clone(&db), WriteGate::open(), 93, config).unwrap()
+                };
+                index.insert(1, &training[0]).unwrap();
+                index.insert(2, &training[1]).unwrap();
+                let config = ser(&index.config()).unwrap();
+                let codebook = db.get(key_pq(&prefix(93))).unwrap();
+                let value = encode_row_image(None, Some(&vec![7.25, -2.5, 1.125, 3.0])).unwrap();
+                db.put(row_image_key(93, 1), &value).unwrap();
+                let tombstone = encode_row_image(None, None).unwrap();
+                db.put(row_image_key(93, 2), &tombstone).unwrap();
+                let image = raw_index_image(&db, 93);
+                let sequence = db.latest_sequence_number();
+                index
+                    .apply_records([
+                        (b"row_image:1".as_slice(), Some(value.as_slice())),
+                        (b"row_image:2".as_slice(), Some(tombstone.as_slice())),
+                    ])
+                    .unwrap();
+                let readonly =
+                    PersistentVectorIndex::open(Arc::clone(&db), WriteGate::closed("read-only"), 93).unwrap();
+                let query = vec![7.25, -2.5, 1.125, 3.0];
+                assert_eq!(
+                    index.search(&query, 8, 64).unwrap(),
+                    readonly.search(&query, 8, 64).unwrap()
+                );
+                assert_eq!(readonly.len(), 1);
+                assert_eq!(readonly.elem_of(2), None);
+                assert_eq!(ser(&readonly.config()).unwrap(), config);
+                assert_eq!(readonly.pq_active(), pq);
+                assert_eq!(db.get(key_pq(&prefix(93))).unwrap(), codebook);
+                assert_eq!(raw_index_image(&db, 93), image);
+                assert_eq!(db.latest_sequence_number(), sequence);
+            }
+        }
+    }
+
+    #[test]
+    fn full_replacement_is_staged_without_publication_and_preserves_pq_and_precision() {
+        for pq in [false, true] {
+            for precision in [VectorPrecision::F32, VectorPrecision::F16, VectorPrecision::I8] {
+                let (_dir, db) = test_db();
+                let gate = WriteGate::open();
+                let mut config = PqHnswConfig::new(4, DistanceMetric::L2);
+                config.m = 4;
+                config.m0 = 8;
+                config.ef_construction = 32;
+                config.rerank_precision = precision;
+                config.pq_config = pq.then_some(ProductQuantizerConfig {
+                    num_subquantizers: 2,
+                    num_centroids: 4,
+                    dimension: 4,
+                    training_iterations: 2,
+                    min_training_samples: 8,
+                });
+                let training: Vec<_> = (0..32).map(|row| rand_vec(row, 4)).collect();
+                let index = if pq {
+                    PersistentVectorIndex::create_with_pq(Arc::clone(&db), Arc::clone(&gate), 77, config, &training)
+                        .unwrap()
+                } else {
+                    PersistentVectorIndex::create(Arc::clone(&db), Arc::clone(&gate), 77, config).unwrap()
+                };
+                index.insert(1, &training[0]).unwrap();
+                let before_config = ser(&index.config()).unwrap();
+                let before_codebook = db.get(key_pq(&prefix(77))).unwrap();
+                let before_sequence = db.latest_sequence_number();
+                let rows: Vec<_> = (100..108).map(|row| (row, rand_vec(row, 4))).collect();
+                let mut batch = WriteBatch::default();
+                let prepared = index.stage_replacement(&rows, &mut batch).unwrap();
+                assert_eq!(
+                    db.latest_sequence_number(),
+                    before_sequence,
+                    "preparation writes nothing"
+                );
+                assert!(index.elem_of(1).is_some(), "old live state remains until publication");
+                assert!(index.elem_of(100).is_none());
+                assert_eq!(index.len(), 1);
+                gate.write(&db, batch, None).unwrap();
+                prepared.publish();
+                assert_eq!(index.len(), rows.len());
+                assert!(index.elem_of(1).is_none());
+                assert_eq!(ser(&index.config()).unwrap(), before_config);
+                assert_eq!(
+                    db.get(key_pq(&prefix(77))).unwrap(),
+                    before_codebook,
+                    "codebook is preserved"
+                );
+                assert_eq!(index.pq_active(), pq);
+                let answer = index.search(&rows[2].1, 8, 64).unwrap();
+                assert_eq!(answer.len(), rows.len());
+                assert!(answer.iter().all(|(row, _)| *row >= 100));
+                let current_sequence = db.latest_sequence_number();
+                let readonly =
+                    PersistentVectorIndex::open(Arc::clone(&db), WriteGate::closed("read-only vector"), 77).unwrap();
+                assert_eq!(readonly.search(&rows[2].1, 8, 64).unwrap(), answer);
+                assert_eq!(ser(&readonly.config()).unwrap(), before_config);
+                assert_eq!(
+                    db.latest_sequence_number(),
+                    current_sequence,
+                    "read-only reconstruction changes no bytes"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rejected_replacement_preserves_live_handle_and_applied_discard_prevents_resurrection() {
+        let (_dir, db) = test_db();
+        let gate = WriteGate::open();
+        let index = PersistentVectorIndex::create(Arc::clone(&db), Arc::clone(&gate), 88, sample_config()).unwrap();
+        index.insert(1, &vec![1.0, 0.0, 0.0]).unwrap();
+        let rows = vec![(10, vec![0.0, 1.0, 0.0]), (11, vec![0.0, 0.0, 1.0])];
+        let before = db.latest_sequence_number();
+        let mut batch = WriteBatch::default();
+        let prepared = index.stage_replacement(&rows, &mut batch).unwrap();
+        gate.debug_set_write_group_ceiling(Some(64));
+        assert!(gate.write(&db, batch, None).is_err());
+        drop(prepared);
+        gate.debug_set_write_group_ceiling(None);
+        assert_eq!(db.latest_sequence_number(), before);
+        assert_eq!(index.search(&vec![1.0, 0.0, 0.0], 1, 16).unwrap()[0].0, 1);
+        index.insert(2, &vec![0.0, 0.0, 1.0]).unwrap();
+        let mut batch = WriteBatch::default();
+        let prepared = index.stage_replacement(&rows, &mut batch).unwrap();
+        gate.write(&db, batch, None).unwrap();
+        let applied = db.latest_sequence_number();
+        drop(prepared); // models an applied native error before normal publication
+        assert!(index
+            .insert(99, &vec![1.0, 1.0, 1.0])
+            .unwrap_err()
+            .to_string()
+            .contains("retired"));
+        assert!(index.search(&vec![0.0, 1.0, 0.0], 1, 16).is_err());
+        assert_eq!(
+            db.latest_sequence_number(),
+            applied,
+            "retirement never writes an old graph over actual bytes"
+        );
+        let reopened = PersistentVectorIndex::open(Arc::clone(&db), WriteGate::closed("read-only vector"), 88).unwrap();
+        assert_eq!(reopened.len(), 2);
+        assert!(reopened.elem_of(10).is_some());
+        assert!(reopened.elem_of(11).is_some());
+        assert!(reopened.elem_of(99).is_none());
+        assert_eq!(db.latest_sequence_number(), applied);
     }
 
     fn sample_config() -> PqHnswConfig {

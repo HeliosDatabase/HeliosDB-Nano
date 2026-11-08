@@ -28,6 +28,10 @@ pub struct PreparedStatement {
     /// populated. If the engine's plan cache has been cleared since (DDL),
     /// the cached plan is considered stale and re-fetched.
     pub cached_plan_epoch: u64,
+    /// Spec R5.6: the layout epochs `cached_plan` was built under. The pin is used
+    /// only while they are current; a schema change of one of its tables since makes
+    /// Execute plan again.
+    pub cached_plan_layout: crate::storage::LayoutStamp,
     /// Catalog-dispatcher decision made once at Parse (R5.W2):
     /// - `Some(true)`  — the pg_catalog / information_schema emulator
     ///   serves this query; Execute runs the (substituted) catalog path.
@@ -265,7 +269,13 @@ impl PreparedStatementManager {
 
     /// Populate (or refresh) a statement's cached plan (R5.W2).
     /// No-op if the statement has been evicted in the meantime.
-    pub fn set_cached_plan(&self, name: &str, plan: Arc<LogicalPlan>, epoch: u64) -> Result<()> {
+    pub fn set_cached_plan(
+        &self,
+        name: &str,
+        plan: Arc<LogicalPlan>,
+        epoch: u64,
+        layout: crate::storage::LayoutStamp,
+    ) -> Result<()> {
         use crate::error::LockResultExt;
         let mut statements = self
             .statements
@@ -274,6 +284,7 @@ impl PreparedStatementManager {
         if let Some(stmt) = statements.get_mut(name) {
             stmt.cached_plan = Some(plan);
             stmt.cached_plan_epoch = epoch;
+            stmt.cached_plan_layout = layout;
         }
         Ok(())
     }
@@ -752,6 +763,7 @@ mod tests {
             result_schema: None,
             cached_plan: None,
             cached_plan_epoch: 0,
+            cached_plan_layout: crate::storage::LayoutStamp::empty(),
             is_catalog: None,
             result_shape: Default::default(),
         };
@@ -856,6 +868,7 @@ mod tests {
                 result_schema: None,
                 cached_plan: None,
                 cached_plan_epoch: 0,
+                cached_plan_layout: crate::storage::LayoutStamp::empty(),
                 is_catalog: None,
                 result_shape: Default::default(),
             };
@@ -870,6 +883,7 @@ mod tests {
             result_schema: None,
             cached_plan: None,
             cached_plan_epoch: 0,
+            cached_plan_layout: crate::storage::LayoutStamp::empty(),
             is_catalog: None,
             result_shape: Default::default(),
         };

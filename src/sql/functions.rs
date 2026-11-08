@@ -9,8 +9,8 @@ use super::logical_plan::{FunctionParam, ParamMode};
 use super::procedural::{ExecutionContext, ProceduralBlock, ProceduralExecutor, ProceduralParser, ProceduralStatement};
 use crate::{DataType, Error, Result, Value};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, RwLock, RwLockWriteGuard};
 
 /// Stored function definition
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,12 +50,90 @@ pub struct StoredProcedure {
     pub created_at: u64,
 }
 
+/// A cold DDL edit owns the existing map write guard until its durable
+/// outcome is settled. Readers never observe an uncommitted routine body.
+/// Previous entries move into this guard instead of cloning their bodies.
+pub(crate) struct RoutineDdlEdit<'a, T> {
+    entries: RwLockWriteGuard<'a, HashMap<String, T>>,
+    unavailable: &'a RwLock<HashMap<&'static str, HashSet<String>>>,
+    kind: &'static str,
+    name: String,
+    previous: Option<T>,
+    outcome: RoutineEditOutcome,
+}
+
+#[derive(Clone, Copy)]
+enum RoutineEditOutcome {
+    Unwritten,
+    Applied,
+    Unknown,
+}
+
+impl<T: Serialize> RoutineDdlEdit<'_, T> {
+    pub(crate) fn unchanged(&self) -> Result<bool> {
+        match (self.previous.as_ref(), self.entries.get(&self.name)) {
+            (None, None) => Ok(true),
+            (Some(before), Some(after)) => {
+                let before = bincode::serialize(before)
+                    .map_err(|error| Error::storage(format!("Cannot compare routine BEFORE: {error}")))?;
+                let after = bincode::serialize(after)
+                    .map_err(|error| Error::storage(format!("Cannot compare routine AFTER: {error}")))?;
+                Ok(before == after)
+            }
+            _ => Ok(false),
+        }
+    }
+}
+
+impl<T> RoutineDdlEdit<'_, T> {
+    pub(crate) fn begin_commit(&mut self) {
+        // A panic after entering the commit must not blindly restore an old
+        // body over a possibly-applied group.
+        self.outcome = RoutineEditOutcome::Unknown;
+    }
+
+    pub(crate) fn settle(&mut self, applied: Option<bool>) {
+        self.outcome = match applied {
+            Some(true) => RoutineEditOutcome::Applied,
+            Some(false) => RoutineEditOutcome::Unwritten,
+            None => RoutineEditOutcome::Unknown,
+        };
+    }
+}
+
+impl<T> Drop for RoutineDdlEdit<'_, T> {
+    fn drop(&mut self) {
+        match self.outcome {
+            RoutineEditOutcome::Applied => {}
+            RoutineEditOutcome::Unwritten => match self.previous.take() {
+                Some(previous) => {
+                    self.entries.insert(self.name.clone(), previous);
+                }
+                None => {
+                    self.entries.remove(&self.name);
+                }
+            },
+            RoutineEditOutcome::Unknown => {
+                // No durable repair: retire only this unreconstructible name.
+                // Every mutator checks the fence under this same map owner.
+                if let Ok(mut unavailable) = self.unavailable.write() {
+                    unavailable.entry(self.kind).or_default().insert(self.name.clone());
+                }
+                self.entries.remove(&self.name);
+            }
+        }
+    }
+}
+
 /// Registry for user-defined functions and procedures
 pub struct FunctionRegistry {
     /// Stored functions
     functions: Arc<RwLock<HashMap<String, StoredFunction>>>,
     /// Stored procedures
     procedures: Arc<RwLock<HashMap<String, StoredProcedure>>>,
+    /// Only unresolved native outcomes populate this cold writer fence.
+    /// Read/query paths keep their original map lookup and allocation cost.
+    unavailable: RwLock<HashMap<&'static str, HashSet<String>>>,
 }
 
 impl FunctionRegistry {
@@ -64,26 +142,49 @@ impl FunctionRegistry {
         Self {
             functions: Arc::new(RwLock::new(HashMap::new())),
             procedures: Arc::new(RwLock::new(HashMap::new())),
+            unavailable: RwLock::new(HashMap::new()),
         }
     }
 
-    /// Register a function
-    pub fn register_function(&self, func: StoredFunction) -> Result<()> {
-        let mut functions = self
+    fn check_routine_available(&self, kind: &'static str, name: &str) -> Result<()> {
+        let unavailable = self
+            .unavailable
+            .read()
+            .map_err(|error| Error::storage(format!("Cannot read routine availability: {error}")))?;
+        if unavailable.get(kind).is_some_and(|names| names.contains(name)) {
+            return Err(Error::storage(format!("{kind} '{name}' is unavailable after an unresolved native DDL outcome; reopen to reload its durable definition")));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn begin_function_create(&self, func: StoredFunction) -> Result<RoutineDdlEdit<'_, StoredFunction>> {
+        let mut entries = self
             .functions
             .write()
-            .map_err(|e| Error::internal(format!("Failed to acquire function lock: {}", e)))?;
-
+            .map_err(|error| Error::internal(format!("Failed to acquire function lock: {error}")))?;
         let name = func.name.to_lowercase();
-
-        if functions.contains_key(&name) && !func.or_replace {
+        self.check_routine_available("function", &name)?;
+        if entries.contains_key(&name) && !func.or_replace {
             return Err(Error::query_execution(format!(
                 "Function '{}' already exists",
                 func.name
             )));
         }
+        let previous = entries.insert(name.clone(), func);
+        Ok(RoutineDdlEdit {
+            entries,
+            unavailable: &self.unavailable,
+            kind: "function",
+            name,
+            previous,
+            outcome: RoutineEditOutcome::Unwritten,
+        })
+    }
 
-        functions.insert(name, func);
+    /// Register a function without a durable DDL owner (standalone registry API).
+    pub fn register_function(&self, func: StoredFunction) -> Result<()> {
+        let mut edit = self.begin_function_create(func)?;
+        edit.settle(Some(true));
         Ok(())
     }
 
@@ -101,6 +202,7 @@ impl FunctionRegistry {
             .functions
             .write()
             .map_err(|e| Error::internal(format!("Failed to acquire function lock: {}", e)))?;
+        self.check_routine_available("function", &func.name.to_lowercase())?;
         functions.insert(func.name.to_lowercase(), func);
         Ok(())
     }
@@ -112,27 +214,39 @@ impl FunctionRegistry {
             .procedures
             .write()
             .map_err(|e| Error::internal(format!("Failed to acquire procedure lock: {}", e)))?;
+        self.check_routine_available("procedure", &proc.name.to_lowercase())?;
         procedures.insert(proc.name.to_lowercase(), proc);
         Ok(())
     }
 
-    /// Register a procedure
-    pub fn register_procedure(&self, proc: StoredProcedure) -> Result<()> {
-        let mut procedures = self
+    pub(crate) fn begin_procedure_create(&self, proc: StoredProcedure) -> Result<RoutineDdlEdit<'_, StoredProcedure>> {
+        let mut entries = self
             .procedures
             .write()
-            .map_err(|e| Error::internal(format!("Failed to acquire procedure lock: {}", e)))?;
-
+            .map_err(|error| Error::internal(format!("Failed to acquire procedure lock: {error}")))?;
         let name = proc.name.to_lowercase();
-
-        if procedures.contains_key(&name) && !proc.or_replace {
+        self.check_routine_available("procedure", &name)?;
+        if entries.contains_key(&name) && !proc.or_replace {
             return Err(Error::query_execution(format!(
                 "Procedure '{}' already exists",
                 proc.name
             )));
         }
+        let previous = entries.insert(name.clone(), proc);
+        Ok(RoutineDdlEdit {
+            entries,
+            unavailable: &self.unavailable,
+            kind: "procedure",
+            name,
+            previous,
+            outcome: RoutineEditOutcome::Unwritten,
+        })
+    }
 
-        procedures.insert(name, proc);
+    /// Register a procedure without a durable DDL owner.
+    pub fn register_procedure(&self, proc: StoredProcedure) -> Result<()> {
+        let mut edit = self.begin_procedure_create(proc)?;
+        edit.settle(Some(true));
         Ok(())
     }
 
@@ -148,40 +262,96 @@ impl FunctionRegistry {
         procedures.get(&name.to_lowercase()).cloned()
     }
 
-    /// Drop a function
-    pub fn drop_function(&self, name: &str, if_exists: bool) -> Result<bool> {
-        let mut functions = self
+    pub(crate) fn begin_function_drop(
+        &self,
+        name: &str,
+        if_exists: bool,
+    ) -> Result<RoutineDdlEdit<'_, StoredFunction>> {
+        let mut entries = self
             .functions
             .write()
-            .map_err(|e| Error::internal(format!("Failed to acquire function lock: {}", e)))?;
-
-        let name_lower = name.to_lowercase();
-
-        if functions.remove(&name_lower).is_some() {
-            Ok(true)
-        } else if if_exists {
-            Ok(false)
-        } else {
-            Err(Error::query_execution(format!("Function '{}' does not exist", name)))
+            .map_err(|error| Error::internal(format!("Failed to acquire function lock: {error}")))?;
+        let normalized = name.to_lowercase();
+        self.check_routine_available("function", &normalized)?;
+        if !entries.contains_key(&normalized) && !if_exists {
+            return Err(Error::query_execution(format!("Function '{name}' does not exist")));
         }
+        let previous = entries.remove(&normalized);
+        Ok(RoutineDdlEdit {
+            entries,
+            unavailable: &self.unavailable,
+            kind: "function",
+            name: normalized,
+            previous,
+            outcome: RoutineEditOutcome::Unwritten,
+        })
     }
 
-    /// Drop a procedure
-    pub fn drop_procedure(&self, name: &str, if_exists: bool) -> Result<bool> {
-        let mut procedures = self
+    pub(crate) fn begin_procedure_drop(
+        &self,
+        name: &str,
+        if_exists: bool,
+    ) -> Result<RoutineDdlEdit<'_, StoredProcedure>> {
+        let mut entries = self
             .procedures
             .write()
-            .map_err(|e| Error::internal(format!("Failed to acquire procedure lock: {}", e)))?;
-
-        let name_lower = name.to_lowercase();
-
-        if procedures.remove(&name_lower).is_some() {
-            Ok(true)
-        } else if if_exists {
-            Ok(false)
-        } else {
-            Err(Error::query_execution(format!("Procedure '{}' does not exist", name)))
+            .map_err(|error| Error::internal(format!("Failed to acquire procedure lock: {error}")))?;
+        let normalized = name.to_lowercase();
+        self.check_routine_available("procedure", &normalized)?;
+        if !entries.contains_key(&normalized) && !if_exists {
+            return Err(Error::query_execution(format!("Procedure '{name}' does not exist")));
         }
+        let previous = entries.remove(&normalized);
+        Ok(RoutineDdlEdit {
+            entries,
+            unavailable: &self.unavailable,
+            kind: "procedure",
+            name: normalized,
+            previous,
+            outcome: RoutineEditOutcome::Unwritten,
+        })
+    }
+
+    // Preserve the public Option lookup and its healthy map/body-clone cost.
+    // Only a negative invocation lookup consults the cold unresolved-name fence.
+    fn get_function_checked(&self, name: &str) -> Result<Option<StoredFunction>> {
+        let function = self.get_function(name);
+        if function.is_none() {
+            self.check_routine_available("function", &name.to_lowercase())?;
+        }
+        Ok(function)
+    }
+
+    fn get_procedure_checked(&self, name: &str) -> Result<Option<StoredProcedure>> {
+        let procedure = self.get_procedure(name);
+        if procedure.is_none() {
+            self.check_routine_available("procedure", &name.to_lowercase())?;
+        }
+        Ok(procedure)
+    }
+
+    pub(crate) fn function_exists_checked(&self, name: &str) -> Result<bool> {
+        let exists = self.function_exists(name);
+        if !exists {
+            self.check_routine_available("function", &name.to_lowercase())?;
+        }
+        Ok(exists)
+    }
+
+    /// Drop a function without a durable DDL owner.
+    pub fn drop_function(&self, name: &str, if_exists: bool) -> Result<bool> {
+        let mut edit = self.begin_function_drop(name, if_exists)?;
+        let existed = edit.previous.is_some();
+        edit.settle(Some(true));
+        Ok(existed)
+    }
+
+    /// Drop a procedure without a durable DDL owner.
+    pub fn drop_procedure(&self, name: &str, if_exists: bool) -> Result<bool> {
+        let mut edit = self.begin_procedure_drop(name, if_exists)?;
+        let existed = edit.previous.is_some();
+        edit.settle(Some(true));
+        Ok(existed)
     }
 
     /// Check if a function exists
@@ -224,7 +394,7 @@ impl FunctionRegistry {
         sql_executor: impl FnMut(&str) -> Result<Vec<Vec<Value>>>,
     ) -> Result<Value> {
         let func = self
-            .get_function(name)
+            .get_function_checked(name)?
             .ok_or_else(|| Error::query_execution(format!("Function '{}' does not exist", name)))?;
 
         // Validate argument count
@@ -476,7 +646,7 @@ impl FunctionRegistry {
         sql_executor: impl FnMut(&str) -> Result<Vec<Vec<Value>>>,
     ) -> Result<()> {
         let proc = self
-            .get_procedure(name)
+            .get_procedure_checked(name)?
             .ok_or_else(|| Error::query_execution(format!("Procedure '{}' does not exist", name)))?;
 
         // Execute based on language
@@ -737,3 +907,19 @@ mod tests {
         assert_eq!(result, Value::Int4(42));
     }
 }
+
+#[cfg(all(test, feature = "internal-tests"))]
+#[path = "routine_outcome_guard_tests.rs"]
+mod routine_outcome_guard_tests;
+
+#[cfg(all(test, feature = "internal-tests"))]
+#[path = "routine_lookup_fence_tests.rs"]
+mod routine_lookup_fence_tests;
+
+#[cfg(all(test, feature = "internal-tests"))]
+#[path = "routine_bridge_owner_tests.rs"]
+mod routine_bridge_owner_tests;
+
+#[cfg(all(test, feature = "internal-tests"))]
+#[path = "routine_trigger_lookup_tests.rs"]
+mod routine_trigger_lookup_tests;

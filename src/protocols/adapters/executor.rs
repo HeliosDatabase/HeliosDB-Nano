@@ -164,7 +164,8 @@ impl QueryExecutorAdapter for LiteQueryExecutorAdapter {
         }
 
         // Create planner and convert to logical plan
-        let planner = Planner::new();
+        let catalog = self.storage.catalog();
+        let planner = Planner::with_catalog(&catalog);
         let first_stmt = statements.first().ok_or_else(|| Error::sql_parse("Empty query"))?;
         let plan = planner.statement_to_plan(first_stmt.clone())?;
 
@@ -272,7 +273,8 @@ impl QueryExecutorAdapter for LiteQueryExecutorAdapter {
         }
 
         // Create planner and convert to logical plan
-        let planner = Planner::new();
+        let catalog = self.storage.catalog();
+        let planner = Planner::with_catalog(&catalog);
         let first_stmt = statements.first().ok_or_else(|| Error::sql_parse("Empty query"))?;
         let plan = planner.statement_to_plan(first_stmt.clone())?;
 
@@ -315,7 +317,7 @@ impl QueryExecutorAdapter for LiteQueryExecutorAdapter {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::Config;
+    use crate::{Config, Value};
 
     #[test]
     fn test_executor_adapter_create_table() -> Result<()> {
@@ -345,6 +347,33 @@ mod tests {
         // Select data
         let result = adapter.execute_query("SELECT * FROM users")?;
         assert_eq!(result.rows.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn adapter_prepared_layout_is_checked_and_a_fresh_plan_reads_current_schema() -> Result<()> {
+        let config = Config::in_memory();
+        let storage = Arc::new(StorageEngine::open_in_memory(&config)?);
+        let adapter = LiteQueryExecutorAdapter::new(Arc::clone(&storage));
+        adapter.execute_query("CREATE TABLE users (id INT, name TEXT)")?;
+        adapter.execute_query("INSERT INTO users VALUES (1, 'Alice')")?;
+        let prepared = adapter.prepare_statement("SELECT * FROM users")?;
+        let before = adapter.execute_prepared(&prepared, &[])?;
+        assert_eq!(
+            before.rows[0].values,
+            vec![Value::Int4(1), Value::String("Alice".into())]
+        );
+
+        let catalog = storage.catalog();
+        let mut schema = catalog.get_table_schema("users")?;
+        schema.columns.push(crate::Column::new("extra", crate::DataType::Int4));
+        catalog.update_table_schema("users", &schema)?;
+        let stale = adapter.execute_prepared(&prepared, &[]).unwrap_err();
+        assert!(crate::storage::layout_epochs::is_layout_changed(&stale), "{stale}");
+        let fresh = adapter.prepare_statement("SELECT id, name FROM users")?;
+        let after = adapter.execute_prepared(&fresh, &[])?;
+        assert_eq!(after.rows.len(), 1);
+        assert_eq!(after.rows[0].values, before.rows[0].values);
         Ok(())
     }
 

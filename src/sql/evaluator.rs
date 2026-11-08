@@ -1550,7 +1550,7 @@ impl Evaluator {
                 // silently resolving to a different schema's name.
                 let base = fun_dispatch.strip_prefix("public.").unwrap_or(fun_dispatch);
                 if !base.contains('.') {
-                    if let Some(bridge) = crate::sql::udf_bridge::resolve(base) {
+                    if let Some(bridge) = crate::sql::udf_bridge::resolve_owned(base)? {
                         return crate::sql::udf_bridge::call_scalar(&bridge, base, &arg_values);
                     }
                 }

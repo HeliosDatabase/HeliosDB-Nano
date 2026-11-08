@@ -358,9 +358,12 @@ fn a_branch_keeps_a_column_main_drops() {
     assert!(main_rows.iter().all(|r| r.values.len() == 2), "main's own DROP COLUMN");
 }
 
-/// A version wider than the current catalog (written before a `DROP COLUMN`, which
-/// writes no version) is truncated to the current width on `AS OF`, not a hard error,
-/// and the dropped column's stored value is not exposed.
+/// A version wider than the current catalog (written before a `DROP COLUMN`) is read
+/// at the current width on `AS OF`, not a hard error, and the dropped column's stored
+/// value is not exposed. Spec R5.5: the DROP writes a version of every row in its
+/// group, and an older version is taken across it by the table's layout record (the
+/// dropped column here is the last: `tests/statement_atomicity_alter.rs` drops a middle
+/// one).
 #[test]
 fn wider_than_catalog_version_truncates() {
     let db = EmbeddedDatabase::new_in_memory().unwrap();

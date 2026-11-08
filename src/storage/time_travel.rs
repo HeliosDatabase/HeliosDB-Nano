@@ -45,6 +45,34 @@ pub type Scn = u64;
 /// Transaction ID
 pub type TransactionId = u64;
 
+/// A commit's pending key, if present: outer `None` means read the committed
+/// store, inner `None` means this commit deletes the key. Used only to decode a
+/// NEW physical row; old-row materialization always reads committed sidecars.
+pub(crate) type PendingHistoryRead<'a> = dyn Fn(&[u8]) -> Option<Option<Vec<u8>>> + 'a;
+
+/// The engine's current-row decoder, without owning the engine itself. This is
+/// a WRITE-TIME interface: its columnar reads are valid only while the caller
+/// still holds the old sidecars intact, or supplies the new commit's overlay.
+/// It must never be used to resolve a historical `ColumnarRef`.
+pub(crate) trait CurrentRowHistoryCodec: Send + Sync {
+    fn forget_committed_dictionaries(&self);
+    fn dictionary_writer_lock(&self) -> parking_lot::ReentrantMutexGuard<'_, ()>;
+    fn validate_staged_dictionary(&self, key: &[u8], proposed: &[u8]) -> Result<()>;
+    fn table_uses_side_storage(&self, table: &str) -> Result<bool>;
+    /// A retained tuple is ALREADY in today's layout. Only immutable dictionary
+    /// IDs and CAS hashes may be resolved; historical columnar slots never are.
+    fn logical_retained_tuple(&self, table: &str, row: u64, tuple: &mut crate::Tuple) -> Result<()>;
+
+    /// `None` preserves the caller's bytes (the row is already logical).
+    fn logical_row(
+        &self,
+        table: &str,
+        row: u64,
+        plain: &[u8],
+        pending: Option<&PendingHistoryRead<'_>>,
+    ) -> Result<Option<Vec<u8>>>;
+}
+
 /// W3.2: durable sentinel key. Written once (per DB) the first time elision is
 /// enabled, so a later reopen with `elide_latest_version = false` still knows a
 /// prior session may have left flagged rows and keeps the materialize-before-
@@ -158,6 +186,150 @@ pub(crate) fn version_index_key(table: &str, row_id: u64, commit_ts: u64) -> Str
 /// The key family of the `snapshot:{timestamp}` records.
 const SNAPSHOT_RECORD_PREFIX: &[u8] = b"snapshot:";
 
+/// The snapshot index: beside every `snapshot:{timestamp}` record, in the same
+/// write, `scn_map:@{wall_secs:020}:{timestamp:020}` holding the snapshot's SCN
+/// and transaction id (two big-endian u64). The record keys are the timestamp in
+/// decimal, which neither sorts by number nor names the wall-clock second, SCN
+/// or transaction id a lookup starts from, so a lookup the in-memory map could
+/// not answer walked every record (about 1 ms per 1000 commits, without bound
+/// under infinite retention). On this index `AS OF TIMESTAMP` and a `VERSIONS
+/// BETWEEN` bound are one seek. `AS OF SCN` / `AS OF TRANSACTION` use the
+/// ID-ordered indexes below: wall clock and commit registration order do not
+/// establish any ordering of their IDs.
+///
+/// `scn_map:` is an existing, classified family (`KeyClass::SnapshotMap`: the
+/// legacy id maps R1.4 stopped writing, `scn_map:{scn}` in decimal): a physical
+/// standby replicates it and derives nothing from it, and recovery skips it. The
+/// `@` keeps the index apart from the legacy keys, which begin with a digit.
+const SNAPSHOT_INDEX_PREFIX: &[u8] = b"scn_map:@";
+
+/// `scn_map:@~` (after every index key): every `snapshot:` record at or below
+/// this timestamp (u64 BE) has its index key. Records above it are given one at
+/// open (`recover_snapshots_with_policy`): those of a store an older binary
+/// wrote, and those since the last GC moved it.
+const SNAPSHOT_INDEX_MARKER: &[u8] = b"scn_map:@~";
+
+/// The index key of a snapshot of wall-clock second `wall_secs` and `timestamp`.
+fn snapshot_index_key(wall_secs: u64, timestamp: u64) -> String {
+    format!("scn_map:@{wall_secs:020}:{timestamp:020}")
+}
+
+/// The index key of `metadata` (a second before the epoch indexes as 0).
+fn snapshot_index_key_of(metadata: &SnapshotMetadata) -> String {
+    snapshot_index_key(
+        u64::try_from(metadata.wall_clock_unix_secs()).unwrap_or(0),
+        metadata.timestamp,
+    )
+}
+
+/// The index value of `metadata`: its SCN, then its transaction id.
+fn snapshot_index_value(metadata: &SnapshotMetadata) -> [u8; 16] {
+    let mut value = [0u8; 16];
+    for (slot, byte) in value.iter_mut().zip(
+        metadata
+            .scn
+            .to_be_bytes()
+            .into_iter()
+            .chain(metadata.transaction_id.to_be_bytes()),
+    ) {
+        *slot = byte;
+    }
+    value
+}
+
+/// Read options confined to the index (`SNAPSHOT_INDEX_PREFIX`): total order,
+/// both bounds, so a seek or step never leaves it (`tests/prefix_mode_scans.rs`).
+fn index_read_options() -> ReadOptions {
+    let mut read = bounded_read_options(SNAPSHOT_INDEX_PREFIX);
+    read.set_iterate_lower_bound(SNAPSHOT_INDEX_PREFIX.to_vec());
+    // The wall-clock keys start with a fixed-width decimal number. Keep marker
+    // and ID-index subspaces out of these iterators, including a forward lookup
+    // beyond the newest wall time (which must not walk every ID key on a miss).
+    read.set_iterate_upper_bound(b"scn_map:@:".to_vec());
+    read
+}
+
+/// Separate completeness marker for the exact ID indexes. Older builds may have
+/// a wall-clock index marker without any ID keys. Open backfills them before this
+/// marker is written; a read-only physical image without it falls back to records.
+const SNAPSHOT_ID_INDEX_MARKER: &[u8] = b"scn_map:@id-v1";
+
+/// An ID and timestamp are both encoded at fixed width, so one reverse seek gives
+/// its newest retained snapshot, regardless of wall-clock rollback, concurrent
+/// registration order, or how many snapshots reuse a transaction ID. A key per
+/// occurrence means GC deletes only that snapshot's mapping, without a read/modify/
+/// write race against a newer registration. The keys stay in the existing replicated
+/// `SnapshotMap` family and ride the snapshot record's batch.
+#[derive(Clone, Copy)]
+enum SnapshotId {
+    Scn(Scn),
+    Transaction(TransactionId),
+}
+
+impl SnapshotId {
+    fn prefix(self) -> String {
+        match self {
+            Self::Scn(id) => format!("scn_map:@s:{id:020}:"),
+            Self::Transaction(id) => format!("scn_map:@t:{id:020}:"),
+        }
+    }
+
+    fn key(self, timestamp: u64) -> String {
+        format!("{}{timestamp:020}", self.prefix())
+    }
+}
+
+fn put_snapshot_id_indexes(batch: &mut WriteBatch, metadata: &SnapshotMetadata) {
+    batch.put(SnapshotId::Scn(metadata.scn).key(metadata.timestamp).as_bytes(), []);
+    batch.put(
+        SnapshotId::Transaction(metadata.transaction_id)
+            .key(metadata.timestamp)
+            .as_bytes(),
+        [],
+    );
+}
+
+fn delete_snapshot_indexes(batch: &mut WriteBatch, metadata: &SnapshotMetadata) {
+    batch.delete(snapshot_index_key_of(metadata).as_bytes());
+    batch.delete(SnapshotId::Scn(metadata.scn).key(metadata.timestamp).as_bytes());
+    batch.delete(
+        SnapshotId::Transaction(metadata.transaction_id)
+            .key(metadata.timestamp)
+            .as_bytes(),
+    );
+}
+
+/// One snapshot index entry ([`SNAPSHOT_INDEX_PREFIX`]).
+#[derive(Debug, Clone, Copy)]
+struct IndexEntry {
+    wall_secs: u64,
+    timestamp: u64,
+}
+
+impl IndexEntry {
+    /// The entry `key` / `value` hold, or `None` for anything else in the family
+    /// (the marker).
+    fn parse(key: &[u8], value: &[u8]) -> Option<Self> {
+        // Retain the value-format check even though time lookups need only the key.
+        if value.len() != 16 {
+            return None;
+        }
+        let rest = key.strip_prefix(SNAPSHOT_INDEX_PREFIX)?;
+        if rest.len() != 41 || rest.get(20) != Some(&b':') {
+            return None;
+        }
+        let number = |digits: &[u8]| -> Option<u64> { std::str::from_utf8(digits).ok()?.parse().ok() };
+        Some(Self {
+            wall_secs: number(rest.get(..20)?)?,
+            timestamp: number(rest.get(21..)?)?,
+        })
+    }
+
+    fn wall_secs_i64(&self) -> i64 {
+        i64::try_from(self.wall_secs).unwrap_or(i64::MAX)
+    }
+}
+
 /// The snapshots the in-memory map has let go of by count, or left out at
 /// open-time recovery, while their `snapshot:` records stay in the store
 /// (`SnapshotManager::evict_from_memory`, `recover_snapshots_with_policy`).
@@ -165,14 +337,24 @@ const SNAPSHOT_RECORD_PREFIX: &[u8] = b"snapshot:";
 /// The map keeps the newest `max_snapshots` (plus slack) so it stays bounded on
 /// a busy store; it used to drop the records with them, so `AS OF` reached only
 /// the last ~1000 snapshots, however recent the anchor. A record now lives
-/// until the version-GC low watermark passes it (`gc_old_snapshots`). A lookup the map cannot
-/// answer now walks the records (`SnapshotManager::for_each_stored_snapshot`),
+/// until the version-GC low watermark passes it (`gc_old_snapshots`). A lookup
+/// the map cannot answer reads the snapshot index ([`SNAPSHOT_INDEX_PREFIX`]),
 /// and these watermarks say when it cannot: every record the store holds and
 /// the map does not is at or below `through_ts` and `max_wall_secs`.
 #[derive(Default)]
 struct EvictedSnapshots {
     /// Whether any snapshot was let go of by count.
     any: AtomicBool,
+    /// Whether the store may hold records without index keys that the index
+    /// cannot be trusted to cover: a physical image of a primary that never
+    /// indexed (no marker), or an open that could not write the missing keys.
+    /// Lookups then walk the records, as they did before the index.
+    unindexed: AtomicBool,
+    /// The ID indexes may be absent even when the older wall-clock index exists.
+    ids_unindexed: AtomicBool,
+    /// Index entries and records read by lookups the map could not answer: what
+    /// the tests count to show a lookup's cost does not grow with history.
+    records_read: AtomicU64,
     /// The newest timestamp let go of.
     through_ts: AtomicU64,
     /// The latest wall-clock second (`wall_clock_unix_secs`) let go of.
@@ -189,6 +371,9 @@ struct SnapshotSpan {
     count: usize,
     earliest: Option<i64>,
     latest: Option<i64>,
+    /// The span came from the index, which does not count: the error then
+    /// names no count.
+    uncounted: bool,
 }
 
 impl SnapshotSpan {
@@ -209,6 +394,7 @@ impl SnapshotSpan {
             count: self.count.max(stored.count),
             earliest: pick(self.earliest, stored.earliest, i64::min),
             latest: pick(self.latest, stored.latest, i64::max),
+            uncounted: self.uncounted || stored.uncounted,
         }
     }
 }
@@ -331,6 +517,20 @@ impl SnapshotMetadata {
 /// Snapshot cache key: (table_name, row_id, snapshot_ts)
 type SnapshotCacheKey = (String, u64, u64);
 
+/// Spec R5.5: where a snapshot read found a row's image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageSource {
+    /// A version (`v:`) the row's commit at this timestamp wrote: the layout of
+    /// that time (`storage::table_layout`).
+    Version(u64),
+    /// The row's `data:` image: an elided latest version, a COPY-marker row, a row
+    /// with no version at all. Today's layout.
+    Current,
+}
+
+/// A cached snapshot read: the generation it was read at, and what it found.
+type CachedSnapshotRead = (u64, Option<(ImageSource, Vec<u8>)>);
+
 /// Snapshot Manager
 ///
 /// Manages historical snapshots for time-travel queries.
@@ -358,7 +558,7 @@ pub struct SnapshotManager {
     /// per-table generation it was computed at (`snapshot_cache_gen`); a stale
     /// entry is rejected on read and overwritten, replacing the former
     /// per-write O(cache-size) linear scan of `invalidate_cache_for_row`.
-    snapshot_cache: Arc<Mutex<LruCache<SnapshotCacheKey, (u64, Option<Vec<u8>>)>>>,
+    snapshot_cache: Arc<Mutex<LruCache<SnapshotCacheKey, CachedSnapshotRead>>>,
     /// W2.2(c): per-table snapshot-cache generation counters. A committed write
     /// to a table bumps its counter (O(1)); reads compare the cached entry's
     /// stamp and lazily evict on mismatch. Per-table (not per-row) is a safe
@@ -415,9 +615,19 @@ pub struct SnapshotManager {
     /// `None` (the default configuration) makes every use a single `Option`
     /// check with no allocation and no copy.
     key_manager: Option<Arc<KeyManager>>,
+    /// Shares only the engine's DB/schema/dictionary handles, never an
+    /// `Arc<StorageEngine>`, so installing it cannot create an ownership cycle.
+    current_row_history_codec: Option<Arc<dyn CurrentRowHistoryCodec>>,
     /// The snapshots the in-memory map let go of by count, whose records the
     /// store keeps for lookups the map cannot answer.
     evicted: EvictedSnapshots,
+    /// Spec R5.5: each table's layout record (`meta:table_layout:{t}`) once read, a
+    /// table with none too ([`Self::table_layout`]).
+    table_layouts: dashmap::DashMap<String, Option<Arc<super::table_layout::TableLayout>>>,
+    /// Spec R5.5: moved by every invalidation of [`Self::table_layouts`], before its
+    /// entry goes: a load that read the record before a change and lands after it is
+    /// refused.
+    table_layouts_epoch: AtomicU64,
 }
 
 /// Snapshot cache configuration
@@ -491,7 +701,10 @@ impl SnapshotManager {
             elide_latest_version: AtomicBool::new(false),
             maybe_elided_rows: AtomicBool::new(false),
             key_manager: None,
+            current_row_history_codec: None,
             evicted: EvictedSnapshots::default(),
+            table_layouts: dashmap::DashMap::new(),
+            table_layouts_epoch: AtomicU64::new(0),
         }
     }
 
@@ -529,7 +742,10 @@ impl SnapshotManager {
             elide_latest_version: AtomicBool::new(false),
             maybe_elided_rows: AtomicBool::new(false),
             key_manager: None,
+            current_row_history_codec: None,
             evicted: EvictedSnapshots::default(),
+            table_layouts: dashmap::DashMap::new(),
+            table_layouts_epoch: AtomicU64::new(0),
         }
     }
 
@@ -558,7 +774,10 @@ impl SnapshotManager {
             elide_latest_version: AtomicBool::new(false),
             maybe_elided_rows: AtomicBool::new(false),
             key_manager: None,
+            current_row_history_codec: None,
             evicted: EvictedSnapshots::default(),
+            table_layouts: dashmap::DashMap::new(),
+            table_layouts_epoch: AtomicU64::new(0),
         }
     }
 
@@ -575,6 +794,73 @@ impl SnapshotManager {
     /// row on a database whose live rows are ciphertext.
     pub fn set_key_manager(&mut self, key_manager: Option<Arc<KeyManager>>) {
         self.key_manager = key_manager;
+    }
+
+    pub(crate) fn set_current_row_history_codec(&mut self, codec: Arc<dyn CurrentRowHistoryCodec>) {
+        self.current_row_history_codec = Some(codec);
+    }
+
+    pub(crate) fn forget_committed_dictionaries(&self) {
+        if let Some(codec) = &self.current_row_history_codec {
+            codec.forget_committed_dictionaries();
+        }
+    }
+
+    pub(crate) fn dictionary_writer_lock(&self) -> Option<parking_lot::ReentrantMutexGuard<'_, ()>> {
+        self.current_row_history_codec
+            .as_ref()
+            .map(|codec| codec.dictionary_writer_lock())
+    }
+
+    pub(crate) fn validate_staged_dictionary(&self, key: &[u8], proposed: &[u8]) -> Result<()> {
+        match &self.current_row_history_codec {
+            Some(codec) => codec.validate_staged_dictionary(key, proposed),
+            None => super::dictionary::DictionaryManager::validate_staged(&self.db, key, proposed),
+        }
+    }
+
+    /// A current row's logical plaintext for a NEW version. The optional lookup
+    /// sees the commit's pending sidecar values; old preimages must pass `None`.
+    /// Inline rows keep their original bytes and are never serialized again.
+    pub(crate) fn logical_current_row_for_history<'a>(
+        &self,
+        table: &str,
+        row: u64,
+        plain: &'a [u8],
+        pending: Option<&PendingHistoryRead<'_>>,
+    ) -> Result<Cow<'a, [u8]>> {
+        match &self.current_row_history_codec {
+            Some(codec) => match codec.logical_row(table, row, plain, pending)? {
+                Some(logical) => Ok(Cow::Owned(logical)),
+                None => Ok(Cow::Borrowed(plain)),
+            },
+            None => Ok(Cow::Borrowed(plain)),
+        }
+    }
+
+    /// Preserve an OLD, still-current stored row before any sidecar mutation.
+    /// Reuse inline ciphertext verbatim; only a decoded physical row is sealed
+    /// again, once, as its logical image. Historical reads never call this.
+    fn current_row_history_image<'a>(&self, table: &str, row: u64, stored: &'a [u8]) -> Result<Cow<'a, [u8]>> {
+        if !self
+            .current_row_history_codec
+            .as_ref()
+            .map(|codec| codec.table_uses_side_storage(table))
+            .transpose()?
+            .unwrap_or(false)
+        {
+            return Ok(Cow::Borrowed(stored));
+        }
+        let plain = tde::open_ref(
+            self.key_manager.as_deref(),
+            format!("data:{table}:{row}").as_bytes(),
+            stored,
+        )?;
+        let logical = self.logical_current_row_for_history(table, row, plain.as_ref(), None)?;
+        match logical {
+            Cow::Borrowed(_) => Ok(Cow::Borrowed(stored)),
+            Cow::Owned(logical) => Ok(Cow::Owned(self.seal_stored(&logical)?.into_owned())),
+        }
     }
 
     /// Whether registering (and garbage-collecting) snapshots persists their
@@ -600,6 +886,38 @@ impl SnapshotManager {
     #[inline]
     fn decode_stored_opt(&self, storage_key: &[u8], raw: Option<Vec<u8>>) -> Result<Option<Vec<u8>>> {
         tde::open_opt(self.key_manager.as_deref(), storage_key, raw)
+    }
+
+    /// Normalize a decoded snapshot image AFTER bringing it into today's layout.
+    /// A dropped physical field is therefore gone before it could refuse a read.
+    /// Current-source images may use current sidecars; retained versions may use
+    /// only immutable dictionary/CAS payloads and never mutable columnar slots.
+    pub(crate) fn normalize_snapshot_tuple(
+        &self,
+        table: &str,
+        row: u64,
+        source: ImageSource,
+        tuple: &mut crate::Tuple,
+    ) -> Result<bool> {
+        if !super::table_layout::has_physical_storage_refs(tuple) {
+            return Ok(false);
+        }
+        let Some(codec) = &self.current_row_history_codec else {
+            return super::table_layout::refuse_physical_version(table, row, tuple).map(|()| false);
+        };
+        match source {
+            ImageSource::Version(_) => codec.logical_retained_tuple(table, row, tuple)?,
+            ImageSource::Current => {
+                let plain = bincode::serialize(tuple)
+                    .map_err(|e| Error::storage(format!("snapshot current tuple does not encode: {e}")))?;
+                if let Some(logical) = codec.logical_row(table, row, &plain, None)? {
+                    *tuple = bincode::deserialize(&logical)
+                        .map_err(|e| Error::storage(format!("logical snapshot tuple does not decode: {e}")))?;
+                }
+                super::table_layout::refuse_physical_version(table, row, tuple)?;
+            }
+        }
+        Ok(true)
     }
 
     /// W3.2: wire the `storage.elide_latest_version` knob at open (called from
@@ -727,7 +1045,7 @@ impl SnapshotManager {
 
         // Store in-memory
         self.snapshots.write().insert(timestamp, metadata.clone());
-        self.txn_to_timestamp.write().insert(txn_id, timestamp);
+        self.map_transaction_timestamp(txn_id, timestamp);
         self.scn_to_timestamp.write().insert(scn, timestamp);
 
         if self.persist_metadata {
@@ -842,12 +1160,7 @@ impl SnapshotManager {
             self.memory_answers(best)
         };
         if !memory_answers {
-            let mut stored = SnapshotSpan::default();
-            self.for_each_stored_snapshot(|metadata| {
-                stored.add(metadata.wall_clock_unix_secs());
-                Self::closer_at_or_before(&mut best, metadata, target_secs);
-            })?;
-            span = span.widened(stored);
+            span = span.widened(self.stored_closest_at_or_before(&mut best, target_secs)?);
         }
 
         best.map(|(_, timestamp)| timestamp).ok_or_else(|| {
@@ -866,14 +1179,18 @@ impl SnapshotManager {
             } else {
                 ""
             };
+            let counted = if span.uncounted {
+                String::new()
+            } else {
+                format!(" ({} snapshots)", span.count)
+            };
             match (span.earliest, span.latest) {
                 (Some(lo), Some(hi)) => Error::query_execution(format!(
                     "No snapshot at or before {target} (literal '{ts_str}' interpreted as UTC unless it \
-                     carries an offset); earliest snapshot {}, latest {} ({} snapshots). Use an explicit \
+                     carries an offset); earliest snapshot {}, latest {}{counted}. Use an explicit \
                      offset such as '… -03:00', a later timestamp, or AS OF TRANSACTION <id>.{collected}",
                     fmt(lo),
                     fmt(hi),
-                    span.count
                 )),
                 _ => Error::query_execution(format!(
                     "No snapshot at or before {target} (literal '{ts_str}'): this database has no \
@@ -949,9 +1266,7 @@ impl SnapshotManager {
                     return Ok(if is_start { 0 } else { u64::MAX });
                 }
                 if !memory_answers {
-                    self.for_each_stored_snapshot(|metadata| {
-                        Self::range_candidate(&mut best_match, metadata, target_secs, is_start);
-                    })?;
+                    self.stored_range_candidate(&mut best_match, target_secs, is_start)?;
                 }
 
                 // If no matching snapshot found, use boundary values
@@ -978,11 +1293,22 @@ impl SnapshotManager {
     fn resolve_transaction(&self, txn_id: TransactionId) -> Result<u64> {
         let mut found = self.txn_to_timestamp.read().get(&txn_id).copied();
         if !self.memory_holds_every_snapshot_after(found) {
-            self.for_each_stored_snapshot(|metadata| {
-                if metadata.transaction_id == txn_id && found.is_none_or(|ts| metadata.timestamp > ts) {
-                    found = Some(metadata.timestamp);
+            let mut newer = |timestamp: u64| {
+                if found.is_none_or(|ts| timestamp > ts) {
+                    found = Some(timestamp);
                 }
-            })?;
+            };
+            if self.id_index_trusted() {
+                if let Some(timestamp) = self.newest_indexed_id(SnapshotId::Transaction(txn_id))? {
+                    newer(timestamp);
+                }
+            } else {
+                self.for_each_stored_snapshot(|metadata| {
+                    if metadata.transaction_id == txn_id {
+                        newer(metadata.timestamp);
+                    }
+                })?;
+            }
         }
         found.ok_or_else(|| {
             Error::query_execution(format!("Transaction {txn_id} not found or has been garbage collected"))
@@ -994,11 +1320,15 @@ impl SnapshotManager {
     pub fn resolve_scn(&self, scn: Scn) -> Result<u64> {
         let mut found = self.scn_to_timestamp.read().get(&scn).copied();
         if found.is_none() && self.evicted.any.load(Ordering::Acquire) {
-            self.for_each_stored_snapshot(|metadata| {
-                if metadata.scn == scn {
-                    found = Some(metadata.timestamp);
-                }
-            })?;
+            if self.id_index_trusted() {
+                found = self.newest_indexed_id(SnapshotId::Scn(scn))?;
+            } else {
+                self.for_each_stored_snapshot(|metadata| {
+                    if metadata.scn == scn {
+                        found = Some(metadata.timestamp);
+                    }
+                })?;
+            }
         }
         found.ok_or_else(|| Error::query_execution(format!("SCN {scn} not found or has been garbage collected")))
     }
@@ -1062,11 +1392,174 @@ impl SnapshotManager {
         }
     }
 
+    /// Whether the snapshot index covers every record (`EvictedSnapshots::unindexed`).
+    fn index_trusted(&self) -> bool {
+        !self.evicted.unindexed.load(Ordering::Acquire)
+    }
+
+    /// Whether every retained snapshot has both of its exact ID index keys.
+    fn id_index_trusted(&self) -> bool {
+        !self.evicted.ids_unindexed.load(Ordering::Acquire)
+    }
+
+    /// `AS OF TIMESTAMP` beyond the in-memory map: one seek of the index (the
+    /// last entry at or before the end of `target_secs`: the latest second, the
+    /// newest snapshot of it), or the walk of every record when the index is
+    /// not trusted. Returns what it saw, for the error.
+    fn stored_closest_at_or_before(&self, best: &mut Option<(i64, u64)>, target_secs: i64) -> Result<SnapshotSpan> {
+        let mut stored = SnapshotSpan::default();
+        if !self.index_trusted() {
+            self.for_each_stored_snapshot(|metadata| {
+                stored.add(metadata.wall_clock_unix_secs());
+                Self::closer_at_or_before(best, metadata, target_secs);
+            })?;
+            return Ok(stored);
+        }
+        stored.uncounted = true;
+        let target = u64::try_from(target_secs).unwrap_or(0);
+        if let Some(entry) = self.index_entry_near(target, u64::MAX, false)? {
+            let candidate = (entry.wall_secs_i64(), entry.timestamp);
+            if entry.wall_secs <= target && best.is_none_or(|b| candidate > b) {
+                *best = Some(candidate);
+            }
+        }
+        if best.is_none() {
+            // Nothing at or before it: what exists starts at the first entry.
+            if let Some(first) = self.index_entry_near(0, 0, true)? {
+                stored.earliest = Some(first.wall_secs_i64());
+                stored.latest = Some(first.wall_secs_i64());
+            }
+        }
+        Ok(stored)
+    }
+
+    /// A `VERSIONS BETWEEN` bound beyond the in-memory map: one seek of the
+    /// index (the first entry at or after `target_secs` for the start, the last
+    /// at or before it for the end), or the walk when the index is not trusted.
+    fn stored_range_candidate(&self, best: &mut Option<u64>, target_secs: i64, is_start: bool) -> Result<()> {
+        if !self.index_trusted() {
+            return self.for_each_stored_snapshot(|metadata| {
+                Self::range_candidate(best, metadata, target_secs, is_start);
+            });
+        }
+        let target = u64::try_from(target_secs).unwrap_or(0);
+        let entry = if is_start {
+            self.index_entry_near(target, 0, true)?
+                .filter(|entry| i64::try_from(entry.wall_secs).is_ok_and(|secs| secs >= target_secs))
+        } else {
+            self.index_entry_near(target, u64::MAX, false)?
+                .filter(|entry| entry.wall_secs <= target)
+        };
+        if let Some(entry) = entry {
+            let better = if is_start {
+                best.is_none_or(|b| entry.timestamp < b)
+            } else {
+                best.is_none_or(|b| entry.timestamp > b)
+            };
+            if better {
+                *best = Some(entry.timestamp);
+            }
+        }
+        Ok(())
+    }
+
+    /// The index entry nearest the key of `(wall_secs, timestamp)`: the first at
+    /// or after it (`forward`), or the last at or before it. One seek.
+    fn index_entry_near(&self, wall_secs: u64, timestamp: u64, forward: bool) -> Result<Option<IndexEntry>> {
+        let mut iter = self.db.raw_iterator_opt(index_read_options());
+        let key = snapshot_index_key(wall_secs, timestamp);
+        if forward {
+            iter.seek(key.as_bytes());
+        } else {
+            iter.seek_for_prev(key.as_bytes());
+        }
+        self.index_entry_at(&mut iter, forward)
+    }
+
+    /// The entry the iterator is on, stepping (`forward` or back) past anything
+    /// in the family that is not one (the marker).
+    fn index_entry_at(&self, iter: &mut rocksdb::DBRawIterator<'_>, forward: bool) -> Result<Option<IndexEntry>> {
+        while iter.valid() {
+            self.evicted.records_read.fetch_add(1, Ordering::Relaxed);
+            if let Some(entry) = Self::index_entry_under(iter) {
+                return Ok(Some(entry));
+            }
+            if forward {
+                iter.next();
+            } else {
+                iter.prev();
+            }
+        }
+        iter.status()
+            .map_err(|e| Error::storage(format!("Iterator error reading the snapshot index: {e}")))?;
+        Ok(None)
+    }
+
+    /// The index entry under the iterator, if it is on one.
+    fn index_entry_under(iter: &rocksdb::DBRawIterator<'_>) -> Option<IndexEntry> {
+        iter.key()
+            .zip(iter.value())
+            .and_then(|(key, value)| IndexEntry::parse(key, value))
+    }
+
+    /// The newest retained occurrence of `id`: one seek, independent of history
+    /// length and of how many times a transaction ID was reused. A point in wall-clock
+    /// order cannot answer this query: wall time can move backwards and registrations
+    /// can publish in a different order than the IDs were allocated.
+    fn newest_indexed_id(&self, id: SnapshotId) -> Result<Option<u64>> {
+        let prefix = id.prefix();
+        let mut read = bounded_read_options(prefix.as_bytes());
+        read.set_iterate_lower_bound(prefix.as_bytes().to_vec());
+        let mut iter = self.db.raw_iterator_opt(read);
+        iter.seek_for_prev(id.key(u64::MAX).as_bytes());
+        let found = if let Some(key) = iter.key() {
+            self.evicted.records_read.fetch_add(1, Ordering::Relaxed);
+            let suffix = key
+                .strip_prefix(prefix.as_bytes())
+                .ok_or_else(|| Error::storage("snapshot ID index escaped its bounds"))?;
+            if suffix.len() != 20 || !suffix.iter().all(u8::is_ascii_digit) {
+                return Err(Error::storage("malformed snapshot ID index key"));
+            }
+            Some(
+                std::str::from_utf8(suffix)
+                    .ok()
+                    .and_then(|text| text.parse::<u64>().ok())
+                    .ok_or_else(|| Error::storage("malformed snapshot ID index timestamp"))?,
+            )
+        } else {
+            None
+        };
+        iter.status()
+            .map_err(|e| Error::storage(format!("Iterator error reading the snapshot ID index: {e}")))?;
+        if let Some(timestamp) = found {
+            // The completeness marker proves that writers supply an index key;
+            // it cannot prove that an existing key still describes its record.
+            // A stale or corrupt key must never select a different history.
+            let key = format!("snapshot:{timestamp}");
+            self.evicted.records_read.fetch_add(1, Ordering::Relaxed);
+            let value = self
+                .db
+                .get(key.as_bytes())
+                .map_err(|e| Error::storage(format!("snapshot ID index record read failed: {e}")))?
+                .ok_or_else(|| Error::storage("snapshot ID index points to a missing snapshot record"))?;
+            let metadata = Self::decode_snapshot_record(&key, &value, true)?
+                .ok_or_else(|| Error::storage("snapshot ID index points to malformed snapshot metadata"))?;
+            let matches_id = match id {
+                SnapshotId::Scn(expected) => metadata.scn == expected,
+                SnapshotId::Transaction(expected) => metadata.transaction_id == expected,
+            };
+            if metadata.timestamp != timestamp || !matches_id {
+                return Err(Error::storage("snapshot ID index identity mismatch"));
+            }
+        }
+        Ok(found)
+    }
+
     /// Visit every `snapshot:` record in the store, decoded; one that does not
     /// decode is skipped, as the open-time recovery skips it. A bounded walk of
     /// the family (total order, an upper bound at its end; see
-    /// `tests/prefix_mode_scans.rs`), for the lookups the in-memory map cannot
-    /// answer alone ([`EvictedSnapshots`]).
+    /// `tests/prefix_mode_scans.rs`): the lookups' fallback while the snapshot
+    /// index is not trusted (`EvictedSnapshots::unindexed`).
     fn for_each_stored_snapshot(&self, mut visit: impl FnMut(&SnapshotMetadata)) -> Result<()> {
         let iter = self.db.iterator_opt(
             rocksdb::IteratorMode::From(SNAPSHOT_RECORD_PREFIX, rocksdb::Direction::Forward),
@@ -1078,6 +1571,7 @@ impl SnapshotManager {
             if !key.starts_with(SNAPSHOT_RECORD_PREFIX) {
                 break;
             }
+            self.evicted.records_read.fetch_add(1, Ordering::Relaxed);
             if let Some(metadata) = deserialize_snapshot_metadata(&value) {
                 visit(&metadata);
             }
@@ -1117,6 +1611,12 @@ impl SnapshotManager {
             )));
         }
         Ok(())
+    }
+
+    /// Existing monotonic commit publication, for rare checkpoint race checks.
+    /// Pruning retained snapshot metadata cannot move this ticket backwards.
+    pub(crate) fn snapshot_publication_ticket(&self) -> u64 {
+        self.newest_snapshot_ts.load(Ordering::Acquire)
     }
 
     /// R4.3: newest recovered/registered snapshot timestamp, if any.
@@ -1225,7 +1725,26 @@ impl SnapshotManager {
     /// This implements O(log N) time-travel queries using a reverse timestamp index.
     /// The reverse index uses `u64::MAX - timestamp` to enable efficient lookups.
     /// Additionally, uses an LRU cache for frequently accessed snapshots.
+    ///
+    /// The image is in the layout of the time it was written: a reader that decodes it
+    /// under today's schema takes it through [`Self::bring_version_forward`] first, or
+    /// reads it with [`Self::read_at_snapshot_in_layout`] (spec R5.5). These raw-byte
+    /// APIs preserve the stored layout; legacy physical references are interpreted
+    /// only at those decoded-row funnels, after dropped fields have been removed.
     pub fn read_at_snapshot(&self, table_name: &str, row_id: u64, snapshot_ts: u64) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .read_at_snapshot_sourced(table_name, row_id, snapshot_ts)?
+            .map(|(_, image)| image))
+    }
+
+    /// Spec R5.5: [`Self::read_at_snapshot`], and where the image came from: the
+    /// version of a commit (its timestamp), or the row's current image.
+    pub(crate) fn read_at_snapshot_sourced(
+        &self,
+        table_name: &str,
+        row_id: u64,
+        snapshot_ts: u64,
+    ) -> Result<Option<(ImageSource, Vec<u8>)>> {
         // W2.2(c): capture the table's cache generation BEFORE the lookup. An
         // entry is a hit only when its stamp still matches; storing this
         // pre-lookup generation means a write that bumps the counter during the
@@ -1252,8 +1771,12 @@ impl SnapshotManager {
         // were sealed. Callers (`Transaction::get`,
         // `StorageEngine::scan_table_at_snapshot`) bincode-deserialize the
         // result and must never see ciphertext.
-        let stored = self.read_at_snapshot_uncached(table_name, row_id, snapshot_ts)?;
-        let result = self.decode_stored_opt(b"v:<version value>", stored)?;
+        let result = match self.read_at_snapshot_uncached(table_name, row_id, snapshot_ts)? {
+            Some((source, stored)) => self
+                .decode_stored_opt(b"v:<version value>", Some(stored))?
+                .map(|image| (source, image)),
+            None => None,
+        };
 
         // Store in cache if enabled (stamped with the pre-lookup generation)
         if let Some(gen) = cache_gen {
@@ -1267,7 +1790,19 @@ impl SnapshotManager {
     /// Read a versioned value without using cache (internal method)
     ///
     /// This is the core implementation that performs the actual database lookup.
-    fn read_at_snapshot_uncached(&self, table_name: &str, row_id: u64, snapshot_ts: u64) -> Result<Option<Vec<u8>>> {
+    fn read_at_snapshot_uncached(
+        &self,
+        table_name: &str,
+        row_id: u64,
+        snapshot_ts: u64,
+    ) -> Result<Option<(ImageSource, Vec<u8>)>> {
+        let current = |what: &str| -> Result<Option<(ImageSource, Vec<u8>)>> {
+            let data_key = format!("data:{}:{}", table_name, row_id);
+            self.db
+                .get(data_key.as_bytes())
+                .map_err(|e| Error::storage(format!("Failed to read {what}: {e}")))
+                .map(|opt| opt.map(|v| (ImageSource::Current, v)))
+        };
         // Use reverse timestamp index for O(log N) lookup
         // Reverse timestamp allows us to find the latest version <= snapshot_ts
         let reverse_ts = u64::MAX - snapshot_ts;
@@ -1309,15 +1844,12 @@ impl SnapshotManager {
                                 // latest version and its value is the current
                                 // `data:` row (no later mutation materialized it,
                                 // else the flag would be clear). Read `data:`.
-                                let data_key = format!("data:{}:{}", table_name, row_id);
-                                return self
-                                    .db
-                                    .get(data_key.as_bytes())
-                                    .map_err(|e| Error::storage(format!("Failed to read elided version data: {}", e)))
-                                    .map(|opt| opt.map(|v| v.to_vec()));
+                                return current("elided version data");
                             }
                             // Non-elided: fetch the actual versioned `v:` data.
-                            return self.get_version_by_exact_timestamp(table_name, row_id, actual_ts);
+                            return Ok(self
+                                .get_version_by_exact_timestamp(table_name, row_id, actual_ts)?
+                                .map(|image| (ImageSource::Version(actual_ts), image)));
                         }
                     }
                 }
@@ -1357,17 +1889,192 @@ impl SnapshotManager {
             // No MVCC versions at all — row was written via non-versioned path
             // (marker-covered & visible, or a genuine pre-MVCC fast insert).
             // Read from the data key directly.
-            let data_key = format!("data:{}:{}", table_name, row_id);
-            return self
-                .db
-                .get(data_key.as_bytes())
-                .map_err(|e| Error::storage(format!("Failed to read data key fallback: {}", e)))
-                .map(|opt| opt.map(|v| v.to_vec()));
+            return current("data key fallback");
         }
 
         // Versions exist but none at or before our snapshot — row was created
         // after our snapshot started. Not visible to this transaction.
         Ok(None)
+    }
+
+    /// Spec R5.5: `table`'s layout record (`storage::table_layout`), from memory after
+    /// the first call; `None` when the table has none, which is every table no `DROP
+    /// COLUMN`, rename or storage move has changed. Loaded under
+    /// [`Self::table_layouts_epoch`]'s rule: a writer writes the record durably, then
+    /// [`Self::invalidate_table_layout`]; a load that read the old record either lands
+    /// before that and is removed, or after it and is refused.
+    pub(crate) fn table_layout(&self, table_name: &str) -> Result<Option<Arc<super::table_layout::TableLayout>>> {
+        if let Some(entry) = self.table_layouts.get(table_name) {
+            return Ok(entry.value().clone());
+        }
+        let epoch = self.table_layouts_epoch.load(Ordering::Acquire);
+        let key = super::table_layout::TableLayout::key(table_name);
+        let raw = self
+            .db
+            .get(&key)
+            .map_err(|e| Error::storage(format!("Failed to read the layout record of '{}': {}", table_name, e)))?;
+        let loaded = match tde::open_opt(self.key_manager.as_deref(), &key, raw)? {
+            Some(plain) => Some(Arc::new(super::table_layout::TableLayout::decode(table_name, &plain)?)),
+            None => None,
+        };
+        if let dashmap::mapref::entry::Entry::Vacant(slot) = self.table_layouts.entry(table_name.to_string()) {
+            if self.table_layouts_epoch.load(Ordering::Acquire) == epoch {
+                slot.insert(loaded.clone());
+            }
+        }
+        Ok(loaded)
+    }
+
+    /// Spec R5.5: forget `table`'s loaded layout record. After the durable write.
+    pub(crate) fn invalidate_table_layout(&self, table_name: &str) {
+        self.table_layouts_epoch.fetch_add(1, Ordering::AcqRel);
+        self.table_layouts.remove(table_name);
+    }
+
+    /// Spec R5.5: forget every table's loaded layout record.
+    pub(crate) fn clear_table_layouts(&self) {
+        self.table_layouts_epoch.fetch_add(1, Ordering::AcqRel);
+        self.table_layouts.clear();
+    }
+
+    /// Spec R5.5: the time whose layout a version of row `row_id` written at
+    /// `written` has. A version's own timestamp, except the pre-image a rewrite or a
+    /// first change writes for a row with no version at all
+    /// ([`REWRITE_PRE_IMAGE_TS`]): its content is the row as that change found it,
+    /// so its layout is the one just before the row's next event.
+    pub(crate) fn version_layout_time(&self, table_name: &str, row_id: u64, written: u64) -> Result<u64> {
+        if written != REWRITE_PRE_IMAGE_TS {
+            return Ok(written);
+        }
+        let prefix = format!("v_idx:{}:{}:", table_name, row_id);
+        let oldest = version_index_key(table_name, row_id, REWRITE_PRE_IMAGE_TS);
+        // Newest first: the event just before the pre-image's key is the next one.
+        let events = self.db.iterator_opt(
+            rocksdb::IteratorMode::From(oldest.as_bytes(), rocksdb::Direction::Reverse),
+            bounded_read_options(prefix.as_bytes()),
+        );
+        for item in events {
+            let (key, value) = item.map_err(|e| Error::storage(format!("Version index read failed: {}", e)))?;
+            if !key.starts_with(prefix.as_bytes()) {
+                break;
+            }
+            if *key == *oldest.as_bytes() {
+                continue;
+            }
+            return Ok(decode_version_index_value(&value)
+                .map_or(REWRITE_PRE_IMAGE_TS, |(event_ts, _)| event_ts.saturating_sub(1)));
+        }
+        Ok(REWRITE_PRE_IMAGE_TS)
+    }
+
+    /// Spec R5.5 with phase B4's rule: the cut that left row `row_id` with nothing to
+    /// read at `snapshot_ts`, if one did. A rename (or a refresh's swap) moved the row
+    /// here without its history; it existed at the snapshot (its id is at or under what
+    /// the cut moved), has no event at or before it and one since: what it was then is
+    /// lost, and leaving it out would show the table without it. `AS OF`, a
+    /// transaction's reads and a branch's anchor all ask this, BEFORE their read and
+    /// whatever it finds: the snapshot cache can still hold the image such a row read
+    /// while it had no version at all (a transaction's commit does not move the cache's
+    /// generation), and whether a read is refused must not depend on what is cached.
+    pub(crate) fn history_lost_at(
+        &self,
+        layout: &super::table_layout::TableLayout,
+        table_name: &str,
+        row_id: u64,
+        snapshot_ts: u64,
+    ) -> Result<Option<super::table_layout::HistoryCut>> {
+        let Some(cause) = layout.lost_history(row_id, snapshot_ts) else {
+            return Ok(None);
+        };
+        let (at_or_before, changed_since) = self.row_events_around(table_name, row_id, snapshot_ts)?;
+        Ok((at_or_before.is_none() && changed_since).then_some(cause))
+    }
+
+    /// [`Self::history_lost_at`] as `AS OF`'s and a transaction's refusal (0A000).
+    pub(crate) fn refuse_lost_history(
+        &self,
+        layout: &super::table_layout::TableLayout,
+        table_name: &str,
+        row_id: u64,
+        snapshot_ts: u64,
+    ) -> Result<()> {
+        match self.history_lost_at(layout, table_name, row_id, snapshot_ts)? {
+            Some(cause) => Err(Error::history_before_layout_change(
+                table_name,
+                &super::table_layout::describe_cut(cause, table_name),
+            )),
+            None => Ok(()),
+        }
+    }
+
+    /// Spec R5.5: take `tuple`, the image a read of `table` found at `source`, into
+    /// today's layout: through every `DROP COLUMN` after the version it is, refused
+    /// at a cut (`storage::table_layout`). A current image is in today's layout.
+    pub(crate) fn bring_version_forward(
+        &self,
+        table_name: &str,
+        row_id: u64,
+        source: ImageSource,
+        tuple: &mut crate::Tuple,
+    ) -> Result<()> {
+        if let ImageSource::Version(written) = source {
+            if let Some(layout) = self.table_layout(table_name)? {
+                if layout.changed_since(written) {
+                    let time = self.version_layout_time(table_name, row_id, written)?;
+                    layout.bring_forward(table_name, time, tuple)?;
+                }
+            }
+        }
+        self.normalize_snapshot_tuple(table_name, row_id, source, tuple)?;
+        Ok(())
+    }
+
+    /// Spec R5.5: [`Self::read_at_snapshot`] for a reader that decodes the image under
+    /// today's schema (`Transaction::get`): a version older than a `DROP COLUMN` is
+    /// re-encoded in today's layout, `layout` being the table's record
+    /// ([`Self::table_layout`]), read by the caller. A decode and an encode only for
+    /// such a version.
+    pub(crate) fn read_at_snapshot_in_layout(
+        &self,
+        table_name: &str,
+        row_id: u64,
+        snapshot_ts: u64,
+        layout: Option<&super::table_layout::TableLayout>,
+    ) -> Result<Option<Vec<u8>>> {
+        if let Some(layout) = layout {
+            self.refuse_lost_history(layout, table_name, row_id, snapshot_ts)?;
+        }
+        let Some((source, image)) = self.read_at_snapshot_sourced(table_name, row_id, snapshot_ts)? else {
+            return Ok(None);
+        };
+        let changed_layout = match (source, layout) {
+            (ImageSource::Version(written), Some(layout)) => layout.changed_since(written),
+            _ => false,
+        };
+        let side_storage = self
+            .current_row_history_codec
+            .as_ref()
+            .map(|codec| codec.table_uses_side_storage(table_name))
+            .transpose()?
+            .unwrap_or(false);
+        if !changed_layout && !side_storage {
+            return Ok(Some(image));
+        }
+        let mut tuple: crate::Tuple = bincode::deserialize(&image)
+            .map_err(|e| Error::storage(format!("Failed to deserialize a row version: {}", e)))?;
+        if let (ImageSource::Version(written), Some(layout)) = (source, layout) {
+            if changed_layout {
+                let time = self.version_layout_time(table_name, row_id, written)?;
+                layout.bring_forward(table_name, time, &mut tuple)?;
+            }
+        }
+        let normalized = self.normalize_snapshot_tuple(table_name, row_id, source, &mut tuple)?;
+        if !changed_layout && !normalized {
+            return Ok(Some(image));
+        }
+        bincode::serialize(&tuple)
+            .map(Some)
+            .map_err(|e| Error::storage(format!("Failed to serialize a row version: {}", e)))
     }
 
     /// Get a specific version by exact timestamp
@@ -1540,7 +2247,7 @@ impl SnapshotManager {
             version_value,
             sealed_version,
             &metadata,
-            allow_elide,
+            allow_elide && data_value == version_value,
         )?;
         Ok(StagedVersion {
             table_name: table_name.to_string(),
@@ -1637,37 +2344,59 @@ impl SnapshotManager {
     /// deleted before delete events existed has none and stays out, which is what
     /// it always was: absent at every time.
     pub(crate) fn rows_with_delete_event(&self, table_name: &str) -> Result<Vec<u64>> {
+        self.rows_deleted_after(table_name, 0)
+    }
+
+    /// The rows of `table` whose newest event is a delete at a timestamp after
+    /// `after`: the rows a snapshot at `after` (a transaction's, or `AS OF`'s)
+    /// adds to the current ones, because they existed then (review F7). A row
+    /// deleted at or before it reads as absent there anyway, so it is left out.
+    ///
+    /// One step per row with history, not per event: past a row's newest event,
+    /// a row with more of them is left with one seek.
+    pub(crate) fn rows_deleted_after(&self, table_name: &str, after: u64) -> Result<Vec<u64>> {
         let prefix = format!("v_idx:{}:", table_name);
-        let iter = self.db.iterator_opt(
-            rocksdb::IteratorMode::From(prefix.as_bytes(), rocksdb::Direction::Forward),
-            bounded_read_options(prefix.as_bytes()),
-        );
+        let mut iter = self.db.raw_iterator_opt(bounded_read_options(prefix.as_bytes()));
+        iter.seek(prefix.as_bytes());
         let mut rows = Vec::new();
-        let mut current: Option<Vec<u8>> = None;
-        for item in iter {
-            let (key, value) = item.map_err(|e| Error::storage(format!("Version index scan failed: {}", e)))?;
+        while iter.valid() {
+            let (Some(key), Some(value)) = (iter.key(), iter.value()) else {
+                break;
+            };
             let Some(rest) = key.strip_prefix(prefix.as_bytes()) else {
                 break;
             };
             // `{row_id}:{reverse_ts}`. A row's events are contiguous, newest first.
             // Anything else is a table whose name extends this one past a ':'.
             let Some(colon) = rest.iter().position(|byte| *byte == b':') else {
+                iter.next();
                 continue;
             };
-            let Some(row_text) = rest.get(..colon) else {
-                continue;
-            };
-            if current.as_deref() == Some(row_text) {
-                continue;
+            let deleted_after = is_delete_event(value)
+                && decode_version_index_value(value).is_some_and(|(event_ts, _)| event_ts > after);
+            if deleted_after {
+                if let Some(row_id) = rest
+                    .get(..colon)
+                    .and_then(|row| std::str::from_utf8(row).ok())
+                    .and_then(|text| text.parse().ok())
+                {
+                    rows.push(row_id);
+                }
             }
-            current = Some(row_text.to_vec());
-            if !is_delete_event(&value) {
-                continue;
-            }
-            if let Some(row_id) = std::str::from_utf8(row_text).ok().and_then(|text| text.parse().ok()) {
-                rows.push(row_id);
+            // The row's older events: step once, and seek past the rest of them
+            // (the first key after `{prefix}{row}:`, its ':' raised to ';').
+            let row_prefix = key.get(..prefix.len() + colon + 1).unwrap_or_default().to_vec();
+            iter.next();
+            if iter.key().is_some_and(|next| next.starts_with(&row_prefix)) {
+                let mut past_row = row_prefix;
+                if let Some(last) = past_row.last_mut() {
+                    *last = b';';
+                }
+                iter.seek(&past_row);
             }
         }
+        iter.status()
+            .map_err(|e| Error::storage(format!("Version index scan failed: {e}")))?;
         Ok(rows)
     }
 
@@ -1780,16 +2509,13 @@ impl SnapshotManager {
             .get(data_key.as_bytes())
             .map_err(|e| Error::storage(format!("marker materialize data read failed: {}", e)))?;
         if let Some(old_value) = old_value {
-            // `old_value` is the STORED `data:` image, copied verbatim into
-            // `v:`. It is deliberately NOT sealed again: on an encrypted
-            // database it is already ciphertext (re-sealing would double-encrypt
-            // and the read would return a ciphertext blob as if it were a row),
-            // and on a legacy plaintext row the tolerant decode handles it. The
-            // property being preserved is "the `v:` twin holds exactly what
-            // `data:` held", which a verbatim copy gives for free.
+            let old_value = self.current_row_history_image(table_name, row_id, &old_value)?;
+            // Capture logical values while the old current sidecars are intact.
+            // Inline ciphertext is reused; a physical row is decoded and sealed
+            // exactly once by current_row_history_image.
             let mut batch = WriteBatch::default();
             let version_key = format!("v:{}:{}:{}", table_name, row_id, marker_ts);
-            batch.put(version_key.as_bytes(), &old_value);
+            batch.put(version_key.as_bytes(), old_value.as_ref());
             let reverse_ts = u64::MAX - marker_ts;
             let index_key = format!("v_idx:{}:{}:{:020}", table_name, row_id, reverse_ts);
             batch.put(index_key.as_bytes(), marker_ts.to_be_bytes());
@@ -1838,12 +2564,10 @@ impl SnapshotManager {
             .get(data_key.as_bytes())
             .map_err(|e| Error::storage(format!("elided version materialize data read failed: {}", e)))?;
         if let Some(old_value) = old_value {
-            // Verbatim copy of the stored `data:` image — see
-            // `materialize_copy_marker_row_durable_inner` for why it must not be
-            // sealed again.
+            let old_value = self.current_row_history_image(table_name, row_id, &old_value)?;
             let mut batch = WriteBatch::default();
             let version_key = format!("v:{}:{}:{}", table_name, row_id, event_ts);
-            batch.put(version_key.as_bytes(), &old_value);
+            batch.put(version_key.as_bytes(), old_value.as_ref());
             batch.put(&index_key, encode_version_index_value(event_ts, false));
             self.write_batch(batch, "elided version materialize")?;
         }
@@ -1870,10 +2594,9 @@ impl SnapshotManager {
             .get(data_key.as_bytes())
             .map_err(|e| Error::storage(format!("elided version backfill data read failed: {}", e)))?;
         if let Some(old_value) = old_value {
-            // Verbatim copy of the stored `data:` image (see
-            // `materialize_copy_marker_row_durable_inner`).
+            let old_value = self.current_row_history_image(table_name, row_id, &old_value)?;
             let version_key = format!("v:{}:{}:{}", table_name, row_id, event_ts);
-            batch.put(version_key.as_bytes(), &old_value);
+            batch.put(version_key.as_bytes(), old_value.as_ref());
             batch.put(&index_key, encode_version_index_value(event_ts, false));
         }
         Ok(())
@@ -1907,10 +2630,9 @@ impl SnapshotManager {
             .get(data_key.as_bytes())
             .map_err(|e| Error::storage(format!("marker backfill data read failed: {}", e)))?;
         if let Some(old_value) = old_value {
-            // Verbatim copy of the stored `data:` image (see
-            // `materialize_copy_marker_row_durable_inner`).
+            let old_value = self.current_row_history_image(table_name, row_id, &old_value)?;
             let version_key = format!("v:{}:{}:{}", table_name, row_id, marker_ts);
-            batch.put(version_key.as_bytes(), &old_value);
+            batch.put(version_key.as_bytes(), old_value.as_ref());
             let reverse_ts = u64::MAX - marker_ts;
             let index_key = format!("v_idx:{}:{}:{:020}", table_name, row_id, reverse_ts);
             batch.put(index_key.as_bytes(), marker_ts.to_be_bytes());
@@ -1944,6 +2666,28 @@ impl SnapshotManager {
         batch.put(version_key.as_bytes(), sealed);
         let index_key = format!("v_idx:{}:{}:{:020}", table_name, row_id, u64::MAX - timestamp);
         batch.put(index_key.as_bytes(), encode_version_index_value(timestamp, false));
+        Ok(())
+    }
+
+    /// A rewrite's data row may contain references whose payload is mutable or
+    /// purged by the rewrite. Its history instead carries logical row values. Both
+    /// images are sealed before any side storage changes: `before` in the old layout,
+    /// `after` in the new layout. COPY/elided/no-history pre-images use `before` too.
+    pub(crate) fn stage_logical_rewritten_row_version(
+        &self,
+        batch: &mut WriteBatch,
+        table_name: &str,
+        row_id: u64,
+        timestamp: u64,
+        after: &[u8],
+        before: &[u8],
+    ) -> Result<()> {
+        self.stage_row_pre_history_with_image(batch, table_name, row_id, timestamp, Some(before))?;
+        batch.put(format!("v:{table_name}:{row_id}:{timestamp}").as_bytes(), after);
+        batch.put(
+            version_index_key(table_name, row_id, timestamp).as_bytes(),
+            encode_version_index_value(timestamp, false),
+        );
         Ok(())
     }
 
@@ -1982,18 +2726,45 @@ impl SnapshotManager {
     /// COPY marker covers it.
     ///
     /// The `data:` reads return the image before the change: `batch` is not applied.
-    fn stage_row_pre_history(
+    // Explicit transactions use the same pre-image staging as autocommit writes:
+    // otherwise the first transactional change to a non-versioned row loses what
+    // snapshots from before the transaction must read.
+    pub(crate) fn stage_row_pre_history(
         &self,
         batch: &mut WriteBatch,
         table_name: &str,
         row_id: u64,
         timestamp: u64,
     ) -> Result<()> {
-        let data_key = format!("data:{}:{}", table_name, row_id);
-        if self.copy_markers.covering_ts(table_name, row_id).is_some() {
-            self.materialize_copy_marker_row(batch, table_name, row_id, timestamp)?;
-            if self.maybe_elided_rows() {
-                self.materialize_elided_latest_version(batch, table_name, row_id)?;
+        self.stage_row_pre_history_with_image(batch, table_name, row_id, timestamp, None)
+    }
+
+    fn stage_row_pre_history_with_image(
+        &self,
+        batch: &mut WriteBatch,
+        table_name: &str,
+        row_id: u64,
+        timestamp: u64,
+        before: Option<&[u8]>,
+    ) -> Result<()> {
+        if let Some(marker_ts) = self.copy_markers.covering_ts(table_name, row_id) {
+            match before {
+                Some(image) => {
+                    if marker_ts < timestamp && !self.has_any_version_index(table_name, row_id)? {
+                        self.stage_pre_image(batch, table_name, row_id, marker_ts, Some(image))?;
+                    }
+                    if self.maybe_elided_rows() {
+                        if let Some((event_ts, _)) = self.find_flagged_latest_version(table_name, row_id)? {
+                            self.stage_pre_image(batch, table_name, row_id, event_ts, Some(image))?;
+                        }
+                    }
+                }
+                None => {
+                    self.materialize_copy_marker_row(batch, table_name, row_id, timestamp)?;
+                    if self.maybe_elided_rows() {
+                        self.materialize_elided_latest_version(batch, table_name, row_id)?;
+                    }
+                }
             }
             return Ok(());
         }
@@ -2016,40 +2787,49 @@ impl SnapshotManager {
             }
         };
         match newest {
-            None => {
-                let previous = self
-                    .db
-                    .get(data_key.as_bytes())
-                    .map_err(|e| Error::storage(format!("row history data read failed: {}", e)))?;
-                if let Some(previous) = previous {
-                    const OLDER_THAN_ANY_SNAPSHOT: u64 = REWRITE_PRE_IMAGE_TS;
-                    let version_key = format!("v:{}:{}:{}", table_name, row_id, OLDER_THAN_ANY_SNAPSHOT);
-                    batch.put(version_key.as_bytes(), &previous);
-                    let index_key = format!(
-                        "v_idx:{}:{}:{:020}",
-                        table_name,
-                        row_id,
-                        u64::MAX - OLDER_THAN_ANY_SNAPSHOT
-                    );
-                    batch.put(
-                        index_key.as_bytes(),
-                        encode_version_index_value(OLDER_THAN_ANY_SNAPSHOT, false),
-                    );
-                }
-            }
+            None => self.stage_pre_image(batch, table_name, row_id, REWRITE_PRE_IMAGE_TS, before)?,
             // W3.2: the newest event is elided; its value is `data:` until now.
-            Some((index_key, Some((event_ts, true)))) => {
-                let previous = self
-                    .db
-                    .get(data_key.as_bytes())
-                    .map_err(|e| Error::storage(format!("elided version backfill data read failed: {}", e)))?;
-                if let Some(previous) = previous {
-                    let version_key = format!("v:{}:{}:{}", table_name, row_id, event_ts);
-                    batch.put(version_key.as_bytes(), &previous);
-                    batch.put(&index_key, encode_version_index_value(event_ts, false));
-                }
+            Some((_, Some((event_ts, true)))) => {
+                self.stage_pre_image(batch, table_name, row_id, event_ts, before)?;
             }
             Some(_) => {}
+        }
+        Ok(())
+    }
+
+    /// Materialize one prior event from the supplied logical image, or the
+    /// pre-write data row for callers whose data row is already logical. Never
+    /// double-seal the image: the supplied bytes and data: are both stored bytes.
+    fn stage_pre_image(
+        &self,
+        batch: &mut WriteBatch,
+        table_name: &str,
+        row_id: u64,
+        event_ts: u64,
+        before: Option<&[u8]>,
+    ) -> Result<()> {
+        let image = match before {
+            Some(image) => Some(Cow::Borrowed(image)),
+            None => self
+                .db
+                .get(format!("data:{table_name}:{row_id}").as_bytes())
+                .map_err(|e| Error::storage(format!("row history data read failed: {e}")))?
+                .map(Cow::Owned),
+        };
+        if let Some(image) = image {
+            let logical = if before.is_some() {
+                Cow::Borrowed(image.as_ref())
+            } else {
+                self.current_row_history_image(table_name, row_id, image.as_ref())?
+            };
+            batch.put(
+                format!("v:{table_name}:{row_id}:{event_ts}").as_bytes(),
+                logical.as_ref(),
+            );
+            batch.put(
+                version_index_key(table_name, row_id, event_ts).as_bytes(),
+                encode_version_index_value(event_ts, false),
+            );
         }
         Ok(())
     }
@@ -2087,9 +2867,7 @@ impl SnapshotManager {
     pub(crate) fn stage_rewrite_snapshot(&self, batch: &mut WriteBatch, timestamp: u64) -> Result<SnapshotMetadata> {
         let (metadata, _, _) = self.allocate_snapshot_metadata(timestamp, None);
         if self.persist_metadata {
-            let value = bincode::serialize(&metadata)
-                .map_err(|e| Error::storage(format!("Failed to serialize metadata: {}", e)))?;
-            batch.put(format!("snapshot:{}", metadata.timestamp).as_bytes(), value);
+            Self::put_snapshot_record(batch, &metadata)?;
         }
         Ok(metadata)
     }
@@ -2132,7 +2910,16 @@ impl SnapshotManager {
         // W3.2: this funnel is INSERT-only (fresh row_id via `insert_tuple_fast`),
         // so there is never a prior flagged version of this row to materialize —
         // the flagged-latest materialize is a mutation-path concern only.
-        let elide = allow_elide && self.elide_latest_version();
+        let logical = self.logical_current_row_for_history(table_name, row_id, value, None)?;
+        let elide = allow_elide && self.elide_latest_version() && matches!(logical, Cow::Borrowed(_));
+        // An already sealed copy is reusable only when normalization preserved
+        // its plaintext. Physical row references always get a full logical v:.
+        let sealed_value = if matches!(logical, Cow::Borrowed(_)) {
+            sealed_value
+        } else {
+            None
+        };
+        let value = logical.as_ref();
 
         let reverse_ts = u64::MAX - timestamp;
         let index_key = format!("v_idx:{}:{}:{:020}", table_name, row_id, reverse_ts);
@@ -2171,16 +2958,28 @@ impl SnapshotManager {
     /// The `snapshot:` record of `metadata`, into `batch`.
     fn append_snapshot_metadata_to_batch(&self, batch: &mut WriteBatch, metadata: &SnapshotMetadata) -> Result<()> {
         if self.persist_metadata {
-            // R1.4: snapshot: alone — txn_map:/scn_map: were write-only
-            // (recover_snapshots rebuilds every in-memory map from the
-            // snapshot: entries; nothing ever read the other two), costing
-            // two keys of write amplification per autocommit statement.
-            let snapshot_key = format!("snapshot:{}", metadata.timestamp);
-            let snapshot_value = bincode::serialize(metadata)
-                .map_err(|e| Error::storage(format!("Failed to serialize metadata: {}", e)))?;
-            batch.put(snapshot_key.as_bytes(), snapshot_value);
+            // R1.4: the per-id `txn_map:` / `scn_map:` maps were write-only
+            // (recovery rebuilds the in-memory maps from `snapshot:` alone) and
+            // are not written. The one index key that is (review F16) is what a
+            // lookup past the in-memory map seeks instead of walking every record.
+            Self::put_snapshot_record(batch, metadata)?;
         }
 
+        Ok(())
+    }
+
+    /// A snapshot's `snapshot:` record and its index key ([`SNAPSHOT_INDEX_PREFIX`]),
+    /// into `batch`: every writer of a record goes through here, so no record is
+    /// without its key.
+    fn put_snapshot_record(batch: &mut WriteBatch, metadata: &SnapshotMetadata) -> Result<()> {
+        let value =
+            bincode::serialize(metadata).map_err(|e| Error::storage(format!("Failed to serialize metadata: {e}")))?;
+        batch.put(format!("snapshot:{}", metadata.timestamp).as_bytes(), value);
+        batch.put(
+            snapshot_index_key_of(metadata).as_bytes(),
+            snapshot_index_value(metadata),
+        );
+        put_snapshot_id_indexes(batch, metadata);
         Ok(())
     }
 
@@ -2194,7 +2993,7 @@ impl SnapshotManager {
         metadata: SnapshotMetadata,
     ) -> Result<SnapshotMetadata> {
         self.snapshots.write().insert(timestamp, metadata.clone());
-        self.txn_to_timestamp.write().insert(txn_id, timestamp);
+        self.map_transaction_timestamp(txn_id, timestamp);
         self.scn_to_timestamp.write().insert(scn, timestamp);
         self.invalidate_cache_for_row(table_name, row_id);
 
@@ -2263,12 +3062,10 @@ impl SnapshotManager {
     /// write calls for nothing. GC still deletes legacy keys from databases
     /// written by older versions.
     fn persist_snapshot_metadata(&self, metadata: &SnapshotMetadata) -> Result<()> {
-        let key = format!("snapshot:{}", metadata.timestamp);
-        let value =
-            bincode::serialize(metadata).map_err(|e| Error::storage(format!("Failed to serialize metadata: {}", e)))?;
-
+        let mut batch = WriteBatch::default();
+        Self::put_snapshot_record(&mut batch, metadata)?;
         self.gate
-            .put(&self.db, key.as_bytes(), value, None)
+            .write(&self.db, batch, None)
             .map_err(|e| Error::storage(format!("Failed to persist metadata: {}", e)))
     }
 
@@ -2334,6 +3131,7 @@ impl SnapshotManager {
                     delete_batch.delete(snap_key.as_bytes());
                     delete_batch.delete(txn_key.as_bytes());
                     delete_batch.delete(scn_key.as_bytes());
+                    delete_snapshot_indexes(&mut delete_batch, &metadata);
                 }
 
                 // Note: We don't delete the versioned data (v:*) here
@@ -2367,7 +3165,19 @@ impl SnapshotManager {
             false
         };
 
-        if (!removed.is_empty() && self.persist_metadata) || swept {
+        // Every record this manager writes has its index key, so the index covers
+        // every record up to the newest registered (`SNAPSHOT_INDEX_MARKER`): the
+        // next open re-indexes only what was registered after this.
+        if self.persist_metadata {
+            let through = self.newest_snapshot_ts.load(Ordering::Acquire).to_be_bytes();
+            delete_batch.put(SNAPSHOT_INDEX_MARKER, through);
+            // GC runs only after open completed its ID backfill, or on a new store
+            // whose registrations always stage all the keys together.
+            if self.id_index_trusted() {
+                delete_batch.put(SNAPSHOT_ID_INDEX_MARKER, through);
+            }
+        }
+        if self.persist_metadata || swept {
             self.write_batch(delete_batch, "Failed to delete old snapshots")?;
         }
 
@@ -2408,9 +3218,7 @@ impl SnapshotManager {
         if self.non_durable_writes && !self.persist_metadata {
             let mut batch = WriteBatch::default();
             for metadata in evict.iter().filter_map(|ts| snapshots.get(ts)) {
-                let value = bincode::serialize(metadata)
-                    .map_err(|e| Error::storage(format!("Failed to serialize metadata: {e}")))?;
-                batch.put(format!("snapshot:{}", metadata.timestamp).as_bytes(), value);
+                Self::put_snapshot_record(&mut batch, metadata)?;
             }
             self.write_batch(batch, "Failed to keep the records of evicted snapshots")?;
         }
@@ -2483,9 +3291,11 @@ impl SnapshotManager {
                 continue;
             }
             batch.delete(&key);
-            // The legacy id-map records go with it, as in the age pass.
+            // The legacy id-map records go with it, as in the age pass, and its
+            // index key.
             batch.delete(format!("txn_map:{}", metadata.transaction_id).as_bytes());
             batch.delete(format!("scn_map:{}", metadata.scn).as_bytes());
+            delete_snapshot_indexes(batch, &metadata);
             staged = true;
         }
         Ok(staged)
@@ -2581,6 +3391,22 @@ impl SnapshotManager {
             usize::MAX
         };
         let mut newest: BTreeMap<u64, SnapshotMetadata> = BTreeMap::new();
+        // Review F16: a record above the index marker gets its index key here — a
+        // store an older binary wrote, and what was registered after the last GC
+        // moved the marker. Blind puts: an existing key is rewritten unchanged.
+        // A physical image cannot write: it trusts the primary's index when the
+        // primary keeps one (its marker is there), and walks the records if not.
+        let marker = self.index_marker()?;
+        let id_marker = self.read_index_marker(SNAPSHOT_ID_INDEX_MARKER)?;
+        let mut reindex = self.persist_metadata.then(WriteBatch::default);
+        let mut reindexed = 0usize;
+        let mut newest_ts = marker.unwrap_or(0);
+        // A read-only empty image must remember that its source supplied no
+        // completeness marker. It can later receive legacy snapshot records
+        // without index keys through replication; finding no records at open
+        // is not evidence that those future records will be indexed.
+        let mut unindexed = !self.persist_metadata && marker.is_none();
+        let mut ids_unindexed = !self.persist_metadata && id_marker.is_none();
         // A scan across every key prefix must be a total-order iterator. The
         // engine's store has a 5-byte prefix extractor, and a prefix-mode
         // iterator is defined only within one prefix: when it steps onto a key
@@ -2615,6 +3441,42 @@ impl SnapshotManager {
                 if key_str.starts_with("snapshot:") {
                     if let Some(metadata) = Self::decode_snapshot_record(key_str, &value, strict)? {
                         self.advance_counters(&metadata);
+                        newest_ts = newest_ts.max(metadata.timestamp);
+                        let needs_wall = marker.is_none_or(|indexed| metadata.timestamp > indexed);
+                        let needs_ids = id_marker.is_none_or(|indexed| metadata.timestamp > indexed);
+                        if needs_wall || needs_ids {
+                            match reindex.as_mut() {
+                                Some(batch) => {
+                                    if needs_wall {
+                                        batch.put(
+                                            snapshot_index_key_of(&metadata).as_bytes(),
+                                            snapshot_index_value(&metadata),
+                                        );
+                                    }
+                                    if needs_ids {
+                                        put_snapshot_id_indexes(batch, &metadata);
+                                    }
+                                    reindexed += 1;
+                                }
+                                None => {
+                                    // Entries above a valid marker were created by
+                                    // a writer which stages its index keys atomically.
+                                    unindexed |= marker.is_none();
+                                    ids_unindexed |= id_marker.is_none();
+                                }
+                            }
+                            if reindexed >= 4096 {
+                                reindexed = 0;
+                                if let Some(batch) = reindex.as_mut() {
+                                    let full = std::mem::take(batch);
+                                    if self.write_batch(full, "Failed to index snapshot records").is_err() {
+                                        reindex = None;
+                                        unindexed = true;
+                                        ids_unindexed = true;
+                                    }
+                                }
+                            }
+                        }
                         newest.insert(metadata.timestamp, metadata);
                         if newest.len() > keep {
                             if let Some((_, older)) = newest.pop_first() {
@@ -2627,11 +3489,43 @@ impl SnapshotManager {
             }
         }
 
+        if let Some(mut batch) = reindex {
+            batch.put(SNAPSHOT_INDEX_MARKER, newest_ts.to_be_bytes());
+            batch.put(SNAPSHOT_ID_INDEX_MARKER, newest_ts.to_be_bytes());
+            if self.write_batch(batch, "Failed to index snapshot records").is_err() {
+                unindexed = true;
+                ids_unindexed = true;
+            }
+        }
+        if unindexed {
+            self.evicted.unindexed.store(true, Ordering::Release);
+        }
+        if ids_unindexed {
+            self.evicted.ids_unindexed.store(true, Ordering::Release);
+        }
+
         // Oldest first, so an id several snapshots carry maps to its newest.
         for metadata in newest.into_values() {
             self.publish_snapshot_metadata(metadata);
         }
         Ok(count)
+    }
+
+    /// The index marker (`SNAPSHOT_INDEX_MARKER`), if the store has one.
+    fn index_marker(&self) -> Result<Option<u64>> {
+        self.read_index_marker(SNAPSHOT_INDEX_MARKER)
+    }
+
+    fn read_index_marker(&self, key: &[u8]) -> Result<Option<u64>> {
+        let raw = self
+            .db
+            .get(key)
+            .map_err(|e| Error::storage(format!("snapshot index marker read failed: {e}")))?;
+        Ok(raw
+            .as_deref()
+            .and_then(|bytes| bytes.get(..8))
+            .and_then(|bytes| <[u8; 8]>::try_from(bytes).ok())
+            .map(u64::from_be_bytes))
     }
 
     /// Decode one `snapshot:{ts}` record. The lenient open-time scan skips an
@@ -2669,11 +3563,19 @@ impl SnapshotManager {
     fn publish_snapshot_metadata(&self, metadata: SnapshotMetadata) {
         // Restore in-memory state
         self.snapshots.write().insert(metadata.timestamp, metadata.clone());
-        self.txn_to_timestamp
-            .write()
-            .insert(metadata.transaction_id, metadata.timestamp);
+        self.map_transaction_timestamp(metadata.transaction_id, metadata.timestamp);
         self.scn_to_timestamp.write().insert(metadata.scn, metadata.timestamp);
         self.advance_counters(&metadata);
+    }
+
+    /// Completion order need not equal timestamp order. Reused IDs always name
+    /// their newest snapshot, including before anything has left the memory maps.
+    fn map_transaction_timestamp(&self, id: TransactionId, timestamp: u64) {
+        self.txn_to_timestamp
+            .write()
+            .entry(id)
+            .and_modify(|mapped| *mapped = (*mapped).max(timestamp))
+            .or_insert(timestamp);
     }
 
     /// Advance the SCN / transaction-id counters and the newest timestamp past
@@ -3277,10 +4179,10 @@ mod tests {
             );
             // The newest, from the map.
             assert_eq!(manager.resolve_timestamp(&utc(wall(10))).unwrap(), 1000, "{when}");
-            // Before every snapshot: the error it always was, counting them all.
+            // Before every snapshot: the error it always was, naming the first.
             let err = manager.resolve_timestamp(&utc(wall(1) - 100)).unwrap_err().to_string();
             assert!(err.contains("No snapshot at or before"), "{when}: {err}");
-            assert!(err.contains("(10 snapshots)"), "{when}: {err}");
+            assert!(err.contains("earliest snapshot"), "{when}: {err}");
         };
         check(&manager, "running");
 
@@ -3344,6 +4246,10 @@ mod tests {
             assert_eq!(manager.gc_old_snapshots().unwrap(), 0);
         }
         assert_eq!(stored(), (5..=10).collect::<Vec<u64>>());
+        for i in 1..=10_usize {
+            let key = snapshot_index_key(u64::try_from(wall(i)).unwrap(), u64::try_from(i).unwrap() * 100);
+            assert_eq!(db.get(key.as_bytes()).unwrap().is_some(), i >= 5, "index key of {i}");
+        }
 
         let err = manager.resolve_timestamp(&utc(wall(2))).unwrap_err().to_string();
         assert!(err.contains("No snapshot at or before"), "{err}");
@@ -3381,6 +4287,454 @@ mod tests {
         assert_eq!(recovered.current_transaction_id(), 11);
         assert_eq!(recovered.max_snapshot_timestamp(), Some(1000));
         assert_eq!(recovered.resolve_transaction(4).unwrap(), 400);
+    }
+
+    /// Review F16: a lookup past the in-memory map reads the snapshot index, a
+    /// bounded number of entries whatever the history: one entry for a time
+    /// (`AS OF TIMESTAMP`, a `VERSIONS BETWEEN` bound) or an exact ID-ordered
+    /// seek for an SCN or a transaction id. Red before the fix: every one of
+    /// these walked all 5000 records.
+    #[test]
+    fn lookups_past_the_map_read_a_bounded_number_of_entries() {
+        use crate::sql::logical_plan::AsOfClause;
+        const RECORDS: u64 = 5000;
+        const SEARCH_BOUND: u64 = 2;
+        let (db, _temp) = create_test_db();
+        let manager = SnapshotManager::with_gc_config(
+            Arc::clone(&db),
+            WriteGate::open(),
+            GcConfig {
+                min_retention_seconds: 3600,
+                max_snapshots: 10,
+                auto_gc_enabled: false,
+            },
+        );
+        let start = Utc::now().timestamp() - 2 * i64::try_from(RECORDS).unwrap();
+        let wall = |i: u64| start + i64::try_from(i).unwrap();
+        for i in 1..=RECORDS {
+            let mut metadata = SnapshotMetadata::new(i * 10, 7_000 + i, i);
+            metadata.wall_clock_micros = wall(i) * 1_000_000;
+            manager.persist_snapshot_metadata(&metadata).unwrap();
+            manager.publish_snapshot_metadata(metadata);
+        }
+        manager.gc_old_snapshots().unwrap();
+        assert_eq!(manager.snapshot_count(), 10);
+
+        let read = |lookup: &dyn Fn() -> u64| -> (u64, u64) {
+            manager.evicted.records_read.store(0, Ordering::Relaxed);
+            let answer = lookup();
+            (answer, manager.evicted.records_read.load(Ordering::Relaxed))
+        };
+        for i in [1, 777, 2500, 4900] {
+            let at = AsOfClause::Timestamp(utc(wall(i)));
+            let cases: [(&str, &dyn Fn() -> u64, u64); 5] = [
+                ("TIMESTAMP", &|| manager.resolve_timestamp(&utc(wall(i))).unwrap(), 1),
+                ("SCN", &|| manager.resolve_scn(i).unwrap(), SEARCH_BOUND),
+                (
+                    "TRANSACTION",
+                    &|| manager.resolve_transaction(7_000 + i).unwrap(),
+                    SEARCH_BOUND,
+                ),
+                (
+                    "range start",
+                    &|| manager.resolve_timestamp_for_range(&at, true).unwrap(),
+                    1,
+                ),
+                (
+                    "range end",
+                    &|| manager.resolve_timestamp_for_range(&at, false).unwrap(),
+                    1,
+                ),
+            ];
+            for (lookup, run, bound) in cases {
+                let (timestamp, entries) = read(run);
+                assert_eq!(timestamp, i * 10, "{lookup} of snapshot {i}");
+                assert!(entries <= bound, "{lookup} of snapshot {i} read {entries} entries");
+            }
+        }
+    }
+
+    /// A store whose records have no index keys (an older binary's, or records
+    /// registered after the last marker) is indexed at open. A physical image,
+    /// which writes nothing, walks the records while its primary has never
+    /// indexed.
+    #[test]
+    fn records_without_index_keys_are_indexed_at_open_or_walked() {
+        let (db, _temp) = create_test_db();
+        let writer = SnapshotManager::new(Arc::clone(&db), WriteGate::open());
+        let walls = seed_dated_snapshots(&writer, 10);
+        let wall = |i: usize| *walls.get(i - 1).unwrap();
+        let index_key = |i: u64| {
+            let metadata = writer.get_snapshot_metadata(i * 100).unwrap();
+            snapshot_index_key_of(&metadata)
+        };
+        for i in 1..=10_u64 {
+            db.delete(index_key(i).as_bytes()).unwrap();
+        }
+        let config = || GcConfig {
+            min_retention_seconds: 3600,
+            max_snapshots: 2,
+            auto_gc_enabled: true,
+        };
+
+        let mut image = SnapshotManager::with_gc_config(Arc::clone(&db), WriteGate::open(), config());
+        image.set_persistence(false);
+        assert_eq!(image.recover_snapshots_strict().unwrap(), 10);
+        assert!(!image.index_trusted());
+        assert_eq!(image.resolve_timestamp(&utc(wall(3))).unwrap(), 300);
+        assert_eq!(image.resolve_scn(3).unwrap(), 300);
+        assert!(
+            db.get(SNAPSHOT_INDEX_MARKER).unwrap().is_none(),
+            "an image writes nothing"
+        );
+
+        let primary = SnapshotManager::with_gc_config(Arc::clone(&db), WriteGate::open(), config());
+        assert_eq!(primary.recover_snapshots().unwrap(), 10);
+        assert!(primary.index_trusted());
+        assert_eq!(primary.index_marker().unwrap(), Some(1000));
+        for i in 1..=10_u64 {
+            assert!(db.get(index_key(i).as_bytes()).unwrap().is_some(), "index key of {i}");
+        }
+        primary.evicted.records_read.store(0, Ordering::Relaxed);
+        assert_eq!(primary.resolve_timestamp(&utc(wall(3))).unwrap(), 300);
+        assert!(primary.evicted.records_read.load(Ordering::Relaxed) <= 1);
+        assert_eq!(primary.resolve_scn(3).unwrap(), 300);
+    }
+
+    /// The wall clock steps backwards while IDs and MVCC timestamps advance. Every
+    /// retained ID must still resolve after it leaves memory and after recovery.
+    /// The former wall-ordered binary search missed SCNs 1 and 1200 here.
+    #[test]
+    fn exact_snapshot_ids_survive_clock_rollback_and_memory_eviction() {
+        const RECORDS: u64 = 2000;
+        let (db, _temp) = create_test_db();
+        let config = |auto_gc_enabled| GcConfig {
+            min_retention_seconds: 3600,
+            max_snapshots: 10,
+            auto_gc_enabled,
+        };
+        let manager = SnapshotManager::with_gc_config(Arc::clone(&db), WriteGate::open(), config(false));
+        let wall = Utc::now().timestamp() - 100;
+        for i in 1..=RECORDS {
+            let mut metadata = SnapshotMetadata::new(i * 10, 7000 + i, i);
+            metadata.wall_clock_micros = (wall - if i > 1000 { 1 } else { 0 }) * 1_000_000;
+            manager.persist_snapshot_metadata(&metadata).unwrap();
+            manager.publish_snapshot_metadata(metadata);
+        }
+        manager.gc_old_snapshots().unwrap();
+        assert_eq!(manager.snapshot_count(), 10);
+        let check = |manager: &SnapshotManager| {
+            for i in 1..=RECORDS {
+                manager.evicted.records_read.store(0, Ordering::Relaxed);
+                assert_eq!(manager.resolve_scn(i).unwrap(), i * 10, "SCN {i}");
+                assert!(manager.evicted.records_read.load(Ordering::Relaxed) <= 2);
+                manager.evicted.records_read.store(0, Ordering::Relaxed);
+                assert_eq!(
+                    manager.resolve_transaction(7000 + i).unwrap(),
+                    i * 10,
+                    "transaction {}",
+                    7000 + i
+                );
+                assert!(manager.evicted.records_read.load(Ordering::Relaxed) <= 2);
+            }
+        };
+        check(&manager);
+        let recovered = SnapshotManager::with_gc_config(Arc::clone(&db), WriteGate::open(), config(true));
+        assert_eq!(
+            recovered.recover_snapshots().unwrap(),
+            usize::try_from(RECORDS).unwrap()
+        );
+        assert_eq!(recovered.snapshot_count(), 10);
+        check(&recovered);
+    }
+
+    /// The numeric wall-clock subspace ends before the ID keys. A future range
+    /// start is absent with no scan of unrelated SCN/transaction index entries.
+    #[test]
+    fn wall_clock_lookup_misses_do_not_walk_the_id_indexes() {
+        use crate::storage::keyspace::{classify, KeyClass};
+        let (db, _temp) = create_test_db();
+        let manager = SnapshotManager::new(Arc::clone(&db), WriteGate::open());
+        let walls = seed_dated_snapshots(&manager, 600);
+        for id in [SnapshotId::Scn(1), SnapshotId::Transaction(1)] {
+            assert_eq!(classify(id.key(100).as_bytes()).class, KeyClass::SnapshotMap);
+        }
+        assert_eq!(classify(SNAPSHOT_ID_INDEX_MARKER).class, KeyClass::SnapshotMap);
+        manager.evicted.records_read.store(0, Ordering::Relaxed);
+        let beyond = u64::try_from(*walls.last().unwrap() + 100).unwrap();
+        assert!(manager.index_entry_near(beyond, 0, true).unwrap().is_none());
+        assert_eq!(manager.evicted.records_read.load(Ordering::Relaxed), 0);
+    }
+
+    /// One transaction/LSN can label arbitrarily many snapshots. Publication may
+    /// finish out of timestamp order, and the exact index must find its newest
+    /// occurrence even after every occurrence has left the memory maps.
+    #[test]
+    fn reused_transaction_id_names_its_newest_snapshot_without_a_search_window() {
+        let (db, _temp) = create_test_db();
+        let manager = SnapshotManager::with_gc_config(
+            Arc::clone(&db),
+            WriteGate::open(),
+            GcConfig {
+                min_retention_seconds: 3600,
+                max_snapshots: 10,
+                auto_gc_enabled: false,
+            },
+        );
+        let wall = Utc::now().timestamp() - 100;
+        for i in (1..=1500_u64).rev() {
+            let mut metadata = SnapshotMetadata::new(i, 42, i);
+            metadata.wall_clock_micros = wall * 1_000_000;
+            manager.persist_snapshot_metadata(&metadata).unwrap();
+            manager.publish_snapshot_metadata(metadata);
+        }
+        assert_eq!(
+            manager.resolve_transaction(42).unwrap(),
+            1500,
+            "latest timestamp, not last publisher"
+        );
+        for i in 1501..=1520_u64 {
+            let mut metadata = SnapshotMetadata::new(i, 10000 + i, i);
+            metadata.wall_clock_micros = (wall + 1) * 1_000_000;
+            manager.persist_snapshot_metadata(&metadata).unwrap();
+            manager.publish_snapshot_metadata(metadata);
+        }
+        manager.gc_old_snapshots().unwrap();
+        assert!(
+            !manager.txn_to_timestamp.read().contains_key(&42),
+            "every occurrence left memory"
+        );
+        manager.evicted.records_read.store(0, Ordering::Relaxed);
+        assert_eq!(manager.resolve_transaction(42).unwrap(), 1500);
+        assert_eq!(manager.evicted.records_read.load(Ordering::Relaxed), 2);
+        let recovered = SnapshotManager::with_gc_config(
+            Arc::clone(&db),
+            WriteGate::open(),
+            GcConfig {
+                min_retention_seconds: 3600,
+                max_snapshots: 10,
+                auto_gc_enabled: true,
+            },
+        );
+        recovered.recover_snapshots().unwrap();
+        assert_eq!(recovered.resolve_transaction(42).unwrap(), 1500);
+    }
+
+    /// Upgrade a store with the earlier wall-clock index and its completeness
+    /// marker, but no ID indexes. A physical image cannot backfill; it uses exact
+    /// record fallback without touching the store until a primary adds ID keys.
+    #[test]
+    fn exact_id_indexes_backfill_even_when_the_wall_clock_index_was_complete() {
+        let (db, _temp) = create_test_db();
+        let writer = SnapshotManager::new(Arc::clone(&db), WriteGate::open());
+        seed_dated_snapshots(&writer, 10);
+        writer.gc_old_snapshots().unwrap();
+        assert!(writer.index_marker().unwrap().is_some());
+        for metadata in writer.list_snapshots().unwrap() {
+            db.delete(SnapshotId::Scn(metadata.scn).key(metadata.timestamp).as_bytes())
+                .unwrap();
+            db.delete(
+                SnapshotId::Transaction(metadata.transaction_id)
+                    .key(metadata.timestamp)
+                    .as_bytes(),
+            )
+            .unwrap();
+        }
+        db.delete(SNAPSHOT_ID_INDEX_MARKER).unwrap();
+        let config = || GcConfig {
+            min_retention_seconds: 3600,
+            max_snapshots: 2,
+            auto_gc_enabled: true,
+        };
+        let mut image = SnapshotManager::with_gc_config(Arc::clone(&db), WriteGate::open(), config());
+        image.set_persistence(false);
+        let sequence = db.latest_sequence_number();
+        image.recover_snapshots_strict().unwrap();
+        assert!(image.index_trusted(), "old wall-clock index is complete");
+        assert!(!image.id_index_trusted(), "ID marker is separate");
+        assert_eq!(image.resolve_scn(3).unwrap(), 300);
+        assert_eq!(image.resolve_transaction(3).unwrap(), 300);
+        assert_eq!(db.latest_sequence_number(), sequence, "read-only image never backfills");
+        let upgraded = SnapshotManager::with_gc_config(Arc::clone(&db), WriteGate::open(), config());
+        upgraded.recover_snapshots().unwrap();
+        assert!(upgraded.id_index_trusted());
+        assert_eq!(
+            upgraded.read_index_marker(SNAPSHOT_ID_INDEX_MARKER).unwrap(),
+            Some(1000)
+        );
+        for i in 1..=10_u64 {
+            assert!(db.get(SnapshotId::Scn(i).key(i * 100).as_bytes()).unwrap().is_some());
+            assert!(db
+                .get(SnapshotId::Transaction(i).key(i * 100).as_bytes())
+                .unwrap()
+                .is_some());
+        }
+        upgraded.evicted.records_read.store(0, Ordering::Relaxed);
+        assert_eq!(upgraded.resolve_scn(3).unwrap(), 300);
+        assert_eq!(upgraded.evicted.records_read.load(Ordering::Relaxed), 2);
+    }
+
+    /// A syntactically valid index key still has to name a real snapshot
+    /// carrying that ID. Corruption must be an explicit refusal, never a
+    /// different history or an ordinary missing-ID result.
+    #[test]
+    fn exact_id_index_hits_refuse_stale_missing_and_corrupt_records() {
+        let (db, _temp) = create_test_db();
+        let manager = SnapshotManager::with_gc_config(
+            Arc::clone(&db),
+            WriteGate::open(),
+            GcConfig {
+                min_retention_seconds: 3600,
+                max_snapshots: 2,
+                auto_gc_enabled: false,
+            },
+        );
+        seed_dated_snapshots(&manager, 10);
+        manager.gc_old_snapshots().unwrap();
+        assert!(manager.id_index_trusted());
+        assert!(!manager.scn_to_timestamp.read().contains_key(&3));
+        assert!(!manager.txn_to_timestamp.read().contains_key(&3));
+        assert_eq!(manager.resolve_scn(3).unwrap(), 300);
+        for id in [SnapshotId::Scn(3), SnapshotId::Transaction(3)] {
+            // Both timestamps and the key shape are valid, but snapshot 400
+            // belongs to ID 4. The newer stale key would win the reverse seek.
+            let stale = id.key(400);
+            db.put(stale.as_bytes(), []).unwrap();
+            let error = match id {
+                SnapshotId::Scn(value) => manager.resolve_scn(value).unwrap_err(),
+                SnapshotId::Transaction(value) => manager.resolve_transaction(value).unwrap_err(),
+            };
+            assert!(
+                error.to_string().contains("snapshot ID index identity mismatch"),
+                "{error}"
+            );
+            db.delete(stale.as_bytes()).unwrap();
+        }
+        db.delete(b"snapshot:300").unwrap();
+        for result in [manager.resolve_scn(3), manager.resolve_transaction(3)] {
+            let error = result.unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("snapshot ID index points to a missing snapshot record"),
+                "{error}"
+            );
+        }
+        db.put(b"snapshot:300", b"invalid metadata").unwrap();
+        for result in [manager.resolve_scn(3), manager.resolve_transaction(3)] {
+            let error = result.unwrap_err();
+            assert!(error.to_string().contains("malformed snapshot metadata"), "{error}");
+        }
+        // IDs still in the hot maps require no disk lookup.
+        manager.evicted.records_read.store(0, Ordering::Relaxed);
+        assert_eq!(manager.resolve_scn(10).unwrap(), 1000);
+        assert_eq!(manager.resolve_transaction(10).unwrap(), 1000);
+        assert_eq!(manager.evicted.records_read.load(Ordering::Relaxed), 0);
+    }
+
+    /// A standby bootstrapped from an empty legacy image has no index marker
+    /// and no snapshot records yet. Subsequent legacy snapshot records still
+    /// need exact record fallback after the bounded memory maps evict them.
+    #[test]
+    fn an_empty_read_only_image_keeps_legacy_streamed_snapshots_findable() {
+        let (db, _temp) = create_test_db();
+        let mut image = SnapshotManager::with_gc_config(
+            Arc::clone(&db),
+            WriteGate::open(),
+            GcConfig {
+                min_retention_seconds: 3600,
+                max_snapshots: 2,
+                auto_gc_enabled: true,
+            },
+        );
+        image.set_persistence(false);
+        let empty_sequence = db.latest_sequence_number();
+        assert_eq!(image.recover_snapshots_strict().unwrap(), 0);
+        assert!(!image.index_trusted(), "an empty legacy image has no wall-index proof");
+        assert!(!image.id_index_trusted(), "an empty legacy image has no ID-index proof");
+        assert_eq!(db.latest_sequence_number(), empty_sequence);
+
+        let wall = Utc::now().timestamp() - 100;
+        for id in 1..=20_u64 {
+            let mut metadata = SnapshotMetadata::new(id * 100, id + 1000, id);
+            metadata.wall_clock_micros = (wall + i64::try_from(id).unwrap()) * 1_000_000;
+            let key = format!("snapshot:{}", metadata.timestamp);
+            let value = bincode::serialize(&metadata).unwrap();
+            // The physical source supplies just the legacy snapshot record,
+            // without either lookup index. Publication itself must not write.
+            db.put(key.as_bytes(), &value).unwrap();
+            let applied_sequence = db.latest_sequence_number();
+            image.ingest_snapshot_record(key.as_bytes(), &value).unwrap();
+            assert_eq!(db.latest_sequence_number(), applied_sequence);
+        }
+        assert!(
+            image.has_snapshots_beyond_memory(),
+            "the test must exercise record fallback"
+        );
+        assert!(image.snapshot_count() <= 4, "the in-memory map remains bounded");
+        let sequence = db.latest_sequence_number();
+        for id in 1..=20_u64 {
+            assert_eq!(image.resolve_scn(id).unwrap(), id * 100);
+            assert_eq!(image.resolve_transaction(id + 1000).unwrap(), id * 100);
+        }
+        assert_eq!(image.resolve_timestamp(&utc(wall + 3)).unwrap(), 300);
+        assert_eq!(
+            db.latest_sequence_number(),
+            sequence,
+            "fallback never backfills the image"
+        );
+    }
+
+    /// Each occurrence owns its own ID index keys. Expiring one snapshot never
+    /// removes another snapshot that carries the same transaction ID.
+    #[test]
+    fn exact_id_indexes_follow_snapshot_gc_and_survive_a_read_only_reopen() {
+        let (db, _temp) = create_test_db();
+        let config = || GcConfig {
+            min_retention_seconds: 0,
+            max_snapshots: 2,
+            auto_gc_enabled: false,
+        };
+        let manager = SnapshotManager::with_gc_config(Arc::clone(&db), WriteGate::open(), config());
+        let wall = Utc::now().timestamp() - 100;
+        for i in 1..=12_u64 {
+            let mut metadata = SnapshotMetadata::new(i * 10, if i <= 3 { 42 } else { i }, i);
+            metadata.wall_clock_micros = wall * 1_000_000;
+            manager.persist_snapshot_metadata(&metadata).unwrap();
+            manager.publish_snapshot_metadata(metadata);
+        }
+        manager.gc_old_snapshots().unwrap();
+        manager.set_gc_low_watermark(25);
+        for _ in 0..10 {
+            manager.gc_old_snapshots().unwrap();
+        }
+        assert_eq!(manager.resolve_transaction(42).unwrap(), 30);
+        for i in 1..=12_u64 {
+            assert_eq!(
+                db.get(SnapshotId::Scn(i).key(i * 10).as_bytes()).unwrap().is_some(),
+                i >= 3
+            );
+            let id = if i <= 3 { 42 } else { i };
+            assert_eq!(
+                db.get(SnapshotId::Transaction(id).key(i * 10).as_bytes())
+                    .unwrap()
+                    .is_some(),
+                i >= 3
+            );
+        }
+        let mut image = SnapshotManager::with_gc_config(Arc::clone(&db), WriteGate::open(), config());
+        image.set_persistence(false);
+        let sequence = db.latest_sequence_number();
+        image.recover_snapshots_strict().unwrap();
+        assert_eq!(image.resolve_transaction(42).unwrap(), 30);
+        assert_eq!(db.latest_sequence_number(), sequence);
+        manager.set_gc_low_watermark(35);
+        for _ in 0..10 {
+            manager.gc_old_snapshots().unwrap();
+        }
+        assert!(manager.resolve_transaction(42).is_err());
+        assert!(manager.resolve_scn(3).is_err());
+        assert_eq!(manager.resolve_transaction(12).unwrap(), 120);
     }
 
     /// A memory-only store writes no record as it registers a snapshot; it

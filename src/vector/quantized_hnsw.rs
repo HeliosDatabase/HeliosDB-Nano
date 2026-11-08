@@ -247,6 +247,12 @@ impl QuantizedHnswIndex {
             .iter()
             .enumerate()
             .filter_map(|(idx, qv)| {
+                // Tombstones and superseded versions cannot consume a top-k
+                // slot: filter them before ranking, including equal ADC ties.
+                let row_id = id_mapping.get(idx)?;
+                if reverse_mapping.get(row_id) != Some(&idx) {
+                    return None;
+                }
                 self.pq
                     .compute_distance_with_table(&distance_table, qv)
                     .ok()
@@ -352,13 +358,7 @@ impl QuantizedHnswIndex {
 
     /// Delete a vector from the index
     pub fn delete(&self, row_id: u64) -> Result<()> {
-        let mut reverse_mapping = self.reverse_mapping.write();
-
-        if reverse_mapping.remove(&row_id).is_some() {
-            // Note: For full implementation, we'd need to:
-            // 1. Remove from graph structure
-            // 2. Update neighbor connections
-            // 3. Consider tombstoning vs actual removal
+        if self.delete_if_present(row_id) {
             Ok(())
         } else {
             Err(Error::query_execution(format!(
@@ -366,6 +366,12 @@ impl QuantizedHnswIndex {
                 row_id
             )))
         }
+    }
+
+    /// Idempotent removal for actual-state reconciliation. Public delete
+    /// retains its missing-row error contract.
+    pub(crate) fn delete_if_present(&self, row_id: u64) -> bool {
+        self.reverse_mapping.write().remove(&row_id).is_some()
     }
 
     /// Get number of vectors in the index
@@ -380,8 +386,9 @@ impl QuantizedHnswIndex {
 
     /// Serialize the index to bytes
     ///
-    /// This serializes the configuration and codebook for persistence.
-    /// The quantized vectors and graph structure are also included.
+    /// This serializes the configuration, codebook, and current live vectors
+    /// in the original byte format. Historical/deleted internal slots are
+    /// compacted while holding the same mapping guards as search and insert.
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         use bincode;
 
@@ -394,8 +401,33 @@ impl QuantizedHnswIndex {
         }
 
         let codebook = (*self.pq.codebook()).clone();
-        let quantized_vectors = self.quantized_vectors.read().clone();
-        let id_mapping = self.id_mapping.read().clone();
+        let (quantized_vectors, id_mapping) = {
+            let stored_vectors = self.quantized_vectors.read();
+            let stored_ids = self.id_mapping.read();
+            let live_ids = self.reverse_mapping.read();
+            if stored_vectors.len() != stored_ids.len() {
+                return Err(Error::query_execution(
+                    "Cannot serialize PQ index: vector/id slot lengths differ",
+                ));
+            }
+            let mut vectors = Vec::with_capacity(live_ids.len());
+            let mut ids = Vec::with_capacity(live_ids.len());
+            // Preserve surviving internal-slot order, including ADC tie order.
+            // The old codec rebuilds live membership from every serialized id,
+            // so only the newest live slot of each row may enter these bytes.
+            for (slot, (vector, row)) in stored_vectors.iter().zip(stored_ids.iter()).enumerate() {
+                if live_ids.get(row) == Some(&slot) {
+                    vectors.push(vector.clone());
+                    ids.push(*row);
+                }
+            }
+            if ids.len() != live_ids.len() {
+                return Err(Error::query_execution(
+                    "Cannot serialize PQ index: live row mapping is inconsistent",
+                ));
+            }
+            (vectors, ids)
+        };
 
         let serialized = SerializedIndex {
             config: self.config.clone(),
@@ -410,6 +442,10 @@ impl QuantizedHnswIndex {
     /// Deserialize the index from bytes
     ///
     /// This loads a previously persisted index including its trained codebook.
+    /// Both legacy and current bytes use the same format. Legacy writers saved
+    /// deleted slots without a tombstone or live-membership map; their deleted
+    /// rows cannot be identified from those bytes. Rebuild such older dumps
+    /// from authoritative rows. New writers serialize live slots only.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         use bincode;
 
@@ -562,5 +598,144 @@ mod tests {
         assert!(stats.total_size > 0);
 
         println!("{}", stats.format());
+    }
+
+    #[test]
+    fn top_k_ignores_deleted_and_superseded_points_before_adc_ties() {
+        let mut config = QuantizedHnswConfig::test_for_dimension(2).unwrap();
+        config.pq_config = ProductQuantizerConfig {
+            num_subquantizers: 1,
+            num_centroids: 2,
+            dimension: 2,
+            training_iterations: 2,
+            min_training_samples: 4,
+        };
+        // The codebook trainer requires at least subquantizers * 10 rows.
+        let training: Vec<_> = (0..16).map(|row| vec![row as f32, 0.0]).collect();
+        let index = QuantizedHnswIndex::train(config, &training).unwrap();
+        index.insert(1, &vec![0.0, 0.0]).unwrap();
+        index.delete(1).unwrap();
+        index.insert(2, &vec![0.0, 0.0]).unwrap();
+        let nearest = index.search(&vec![0.0, 0.0], 1).unwrap();
+        assert_eq!(nearest.len(), 1);
+        assert_eq!(nearest[0].0, 2);
+        assert!(nearest[0].1.is_finite());
+        // Replacing a row keeps only its newest internal id live, even if a
+        // deleted older point has an equal or smaller ADC distance.
+        index.insert(2, &vec![9.0, 0.0]).unwrap();
+        let result = index.search(&vec![0.0, 0.0], 1).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, 2);
+        assert_eq!(index.len(), 1);
+        index.delete(2).unwrap();
+        assert!(index.search(&vec![0.0, 0.0], 1).unwrap().is_empty());
+    }
+
+    #[test]
+    fn byte_roundtrip_preserves_only_live_latest_slots_and_original_codec() {
+        #[derive(Serialize, Deserialize)]
+        struct LegacyBytes {
+            config: QuantizedHnswConfig,
+            codebook: super::super::Codebook,
+            quantized_vectors: Vec<QuantizedVector>,
+            id_mapping: Vec<u64>,
+        }
+        let mut config = QuantizedHnswConfig::test_for_dimension(2).unwrap();
+        config.max_connections = 12;
+        config.ef_construction = 48;
+        config.ef_search = 31;
+        config.use_pq_storage = false;
+        config.pq_config = ProductQuantizerConfig {
+            num_subquantizers: 1,
+            num_centroids: 2,
+            dimension: 2,
+            training_iterations: 2,
+            min_training_samples: 16,
+        };
+        let training: Vec<_> = (0..16).map(|row| vec![row as f32, 0.0]).collect();
+        let index = QuantizedHnswIndex::train(config, &training).unwrap();
+        index.insert(1, &vec![0.0, 0.0]).unwrap();
+        index.insert(2, &vec![15.0, 0.0]).unwrap();
+        index.insert(3, &vec![8.0, 0.0]).unwrap();
+        index.insert(2, &vec![1.0, 0.0]).unwrap();
+        index.delete(1).unwrap();
+        index.delete(3).unwrap();
+        let expected = index.search(&vec![0.0, 0.0], 10).unwrap();
+        assert_eq!(expected.len(), 1);
+        assert_eq!(expected[0].0, 2);
+        let bytes = index.to_bytes().unwrap();
+        // Decode using the exact original field order/types, with no format tag
+        // or added live-map field. Surviving vector bytes and codebook are exact.
+        let legacy: LegacyBytes = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(legacy.id_mapping, vec![2]);
+        assert_eq!(
+            legacy.quantized_vectors,
+            vec![index.quantized_vectors.read()[3].clone()]
+        );
+        assert_eq!(
+            bincode::serialize(&legacy.config).unwrap(),
+            bincode::serialize(&index.config).unwrap()
+        );
+        assert_eq!(
+            bincode::serialize(&legacy.codebook).unwrap(),
+            bincode::serialize(&*index.pq.codebook()).unwrap()
+        );
+        let loaded = QuantizedHnswIndex::from_bytes(&bytes).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded.search(&vec![0.0, 0.0], 10).unwrap(), expected);
+        loaded.insert(4, &vec![9.0, 0.0]).unwrap();
+        loaded.delete(2).unwrap();
+        let again = QuantizedHnswIndex::from_bytes(&loaded.to_bytes().unwrap()).unwrap();
+        assert_eq!(again.len(), 1);
+        assert_eq!(again.search(&vec![0.0, 0.0], 10).unwrap()[0].0, 4);
+        again.delete(4).unwrap();
+        let empty = QuantizedHnswIndex::from_bytes(&again.to_bytes().unwrap()).unwrap();
+        assert_eq!(empty.len(), 0);
+        assert!(empty.search(&vec![0.0, 0.0], 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn legacy_codec_loads_superseded_slots_and_resaves_compact_live_membership() {
+        #[derive(Serialize)]
+        struct LegacyBytes {
+            config: QuantizedHnswConfig,
+            codebook: super::super::Codebook,
+            quantized_vectors: Vec<QuantizedVector>,
+            id_mapping: Vec<u64>,
+        }
+        let mut config = QuantizedHnswConfig::test_for_dimension(2).unwrap();
+        config.pq_config = ProductQuantizerConfig {
+            num_subquantizers: 1,
+            num_centroids: 2,
+            dimension: 2,
+            training_iterations: 2,
+            min_training_samples: 16,
+        };
+        let training: Vec<_> = (0..16).map(|row| vec![row as f32, 0.0]).collect();
+        let index = QuantizedHnswIndex::train(config, &training).unwrap();
+        index.insert(7, &vec![15.0, 0.0]).unwrap();
+        index.insert(7, &vec![0.0, 0.0]).unwrap();
+        index.insert(8, &vec![9.0, 0.0]).unwrap();
+        let legacy = LegacyBytes {
+            config: index.config.clone(),
+            codebook: (*index.pq.codebook()).clone(),
+            quantized_vectors: index.quantized_vectors.read().clone(),
+            id_mapping: index.id_mapping.read().clone(),
+        };
+        assert_eq!(legacy.id_mapping, vec![7, 7, 8]);
+        let loaded = QuantizedHnswIndex::from_bytes(&bincode::serialize(&legacy).unwrap()).unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(
+            loaded.search(&vec![0.0, 0.0], 10).unwrap(),
+            index.search(&vec![0.0, 0.0], 10).unwrap()
+        );
+        let compact = loaded.to_bytes().unwrap();
+        let reloaded = QuantizedHnswIndex::from_bytes(&compact).unwrap();
+        assert_eq!(*reloaded.id_mapping.read(), vec![7, 8]);
+        assert_eq!(reloaded.len(), 2);
+        assert_eq!(
+            reloaded.search(&vec![0.0, 0.0], 10).unwrap(),
+            loaded.search(&vec![0.0, 0.0], 10).unwrap()
+        );
     }
 }

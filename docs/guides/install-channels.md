@@ -142,7 +142,7 @@ git clone https://github.com/HeliosDatabase/HeliosDB-Nano && cd HeliosDB-Nano
 cargo build --release --features code-graph,mcp-endpoint
 ```
 
-Build prerequisites: Rust 1.85+, clang/libclang (rocksdb bindgen), and on
+Build prerequisites: Rust 1.88+ (Rust 1.92+ with `code-embed`), clang/libclang (rocksdb bindgen), and on
 Linux `pkg-config` + OpenSSL headers (`libssl-dev`).
 
 ## Verifying any download

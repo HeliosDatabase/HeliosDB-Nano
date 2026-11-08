@@ -160,6 +160,26 @@ const ROW_CACHE_SHARDS: usize = 16;
 /// One independently-locked LRU partition of the row cache.
 struct CacheShard {
     cache: RwLock<LruCache<RowCacheKey, CachedRow>>,
+    /// Spec R5.4 (review F1): every invalidation of a key of this shard, counted
+    /// under `cache`'s write lock. A reader publishes a row it read from storage
+    /// only if this has not moved since before its read
+    /// ([`RowCache::fill_ticket`]). Without it a reader that read a row's image
+    /// before a write put that image back after the write had dropped it, and the
+    /// cache then served the old image to every later reader and to the next
+    /// writer of the row, which computed from it: a lost update. Counting per
+    /// shard keeps a write from failing the fills of fifteen shards it never
+    /// touched.
+    invalidations: AtomicU64,
+}
+
+/// What a reader captures BEFORE it reads a row from storage, so that it caches
+/// the row afterwards only if nothing invalidated it in between
+/// ([`RowCache::put_if_ticket`]): neither the caller's own generation (live
+/// replay, schema changes) nor an invalidation of the row's shard (any write).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowCacheFillTicket {
+    generation: u64,
+    invalidations: u64,
 }
 
 /// High-performance row cache with LRU eviction and TTL.
@@ -216,6 +236,7 @@ impl RowCache {
         let shards = (0..num_shards)
             .map(|_| CacheShard {
                 cache: RwLock::new(LruCache::new(per_shard)),
+                invalidations: AtomicU64::new(0),
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
@@ -237,16 +258,21 @@ impl RowCache {
         }
     }
 
-    /// Route a key to its shard by an FNV-1a hash of `(table, row_id)`.
+    /// Route a key to its shard's LRU by an FNV-1a hash of `(table, row_id)`.
     fn shard_for(&self, key: &RowCacheKey) -> &RwLock<LruCache<RowCacheKey, CachedRow>> {
+        &self.shard_of(&key.table, key.row_id).cache
+    }
+
+    /// The shard `(table, row_id)` lives in, without building a key.
+    fn shard_of(&self, table: &str, row_id: u64) -> &CacheShard {
         let mut h = 0xcbf2_9ce4_8422_2325u64;
-        for b in key.table.as_bytes() {
+        for b in table.as_bytes() {
             h ^= u64::from(*b);
             h = h.wrapping_mul(0x0000_0100_0000_01b3);
         }
-        h ^= key.row_id;
+        h ^= row_id;
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
-        &self.shards[(h as usize) & self.shard_mask].cache
+        &self.shards[(h as usize) & self.shard_mask]
     }
 
     /// Current live entry count across all shards.
@@ -370,7 +396,7 @@ impl RowCache {
     /// Insert an already-shared row into the cache without a deep copy (used by
     /// the `Arc`-returning point/INLJ fetch path).
     pub fn put_arc(&self, table: &str, row_id: u64, tuple: Arc<Tuple>) {
-        self.put_arc_checked(table, row_id, tuple, None);
+        self.put_arc_checked(table, row_id, tuple, None, None);
     }
 
     /// Publish a fetched row only if its storage generation is still current.
@@ -400,7 +426,55 @@ impl RowCache {
         generation: &AtomicU64,
         expected_generation: u64,
     ) -> bool {
-        self.put_arc_checked(table, row_id, tuple, Some((generation, expected_generation)))
+        self.put_arc_checked(table, row_id, tuple, Some((generation, expected_generation)), None)
+    }
+
+    /// Spec R5.4 (review F1): what a reader captures BEFORE it reads `(table,
+    /// row_id)` from storage, to cache the row afterwards with
+    /// [`Self::put_if_ticket`]. `generation` is the caller's own (the engine's
+    /// schema generation, which live replay also advances).
+    pub fn fill_ticket(&self, table: &str, row_id: u64, generation: &AtomicU64) -> RowCacheFillTicket {
+        RowCacheFillTicket {
+            generation: generation.load(Ordering::Acquire),
+            invalidations: self.shard_of(table, row_id).invalidations.load(Ordering::Acquire),
+        }
+    }
+
+    /// Cache a row read from storage only if, since its [`Self::fill_ticket`],
+    /// neither `generation` moved nor anything invalidated a row of its shard. The
+    /// checks and the insertion share the invalidators' shard lock: a publication
+    /// before an invalidation is removed by it, one after is refused. Every
+    /// invalidation counts ([`Self::invalidate`] as much as
+    /// [`Self::invalidate_with_generation`]), so a write that drops the row after
+    /// this reader read its old image keeps that image out. Returns whether the
+    /// row was inserted.
+    pub fn put_if_ticket(
+        &self,
+        table: &str,
+        row_id: u64,
+        tuple: Tuple,
+        generation: &AtomicU64,
+        ticket: RowCacheFillTicket,
+    ) -> bool {
+        self.put_arc_if_ticket(table, row_id, Arc::new(tuple), generation, ticket)
+    }
+
+    /// Shared-tuple variant of [`Self::put_if_ticket`].
+    pub fn put_arc_if_ticket(
+        &self,
+        table: &str,
+        row_id: u64,
+        tuple: Arc<Tuple>,
+        generation: &AtomicU64,
+        ticket: RowCacheFillTicket,
+    ) -> bool {
+        self.put_arc_checked(
+            table,
+            row_id,
+            tuple,
+            Some((generation, ticket.generation)),
+            Some(ticket.invalidations),
+        )
     }
 
     fn put_arc_checked(
@@ -409,6 +483,7 @@ impl RowCache {
         row_id: u64,
         tuple: Arc<Tuple>,
         generation: Option<(&AtomicU64, u64)>,
+        invalidations: Option<u64>,
     ) -> bool {
         if !self.config.enabled {
             return false;
@@ -420,14 +495,19 @@ impl RowCache {
         let ttl = self.get_ttl_for_table(table);
 
         let per_shard_cap = (self.config.max_entries / ROW_CACHE_SHARDS).max(1);
-        let shard = self.shard_for(&key);
+        let shard = self.shard_of(table, row_id);
         let was_full = {
-            let mut cache = shard.write();
-            // Keep this load UNDER the shard lock. Checking before taking it
+            let mut cache = shard.cache.write();
+            // Keep these loads UNDER the shard lock. Checking before taking it
             // allows an invalidation to finish while an old reader waits here,
             // after which that reader could resurrect the invalidated value.
             if let Some((current, expected)) = generation {
                 if current.load(Ordering::Acquire) != expected {
+                    return false;
+                }
+            }
+            if let Some(expected) = invalidations {
+                if shard.invalidations.load(Ordering::Acquire) != expected {
                     return false;
                 }
             }
@@ -444,7 +524,8 @@ impl RowCache {
         true
     }
 
-    /// Invalidate a specific row
+    /// Invalidate a specific row. Call it AFTER the storage mutation: it also
+    /// refuses the fills of readers that read before it ([`Self::put_if_ticket`]).
     pub fn invalidate(&self, table: &str, row_id: u64) {
         self.invalidate_inner(table, row_id, None);
     }
@@ -468,11 +549,15 @@ impl RowCache {
 
         let key = RowCacheKey::new(table, row_id);
 
+        let shard = self.shard_of(table, row_id);
         let removed = {
-            let mut cache = self.shard_for(&key).write();
+            let mut cache = shard.cache.write();
             if let Some(generation) = generation {
                 generation.fetch_add(1, Ordering::Release);
             }
+            // Spec R5.4 (review F1): every invalidation fences the fills of
+            // readers that read before it (`CacheShard::invalidations`).
+            shard.invalidations.fetch_add(1, Ordering::Release);
             cache.pop(&key).is_some()
         };
         if removed {
@@ -498,6 +583,7 @@ impl RowCache {
         let mut removed_count = 0u64;
         for shard in self.shards.iter() {
             let mut cache = shard.cache.write();
+            shard.invalidations.fetch_add(1, Ordering::Release);
             let keys_to_remove: Vec<RowCacheKey> = cache
                 .iter()
                 .filter(|(k, _)| k.table == table)
@@ -518,6 +604,7 @@ impl RowCache {
         let mut count = 0u64;
         for shard in self.shards.iter() {
             let mut cache = shard.cache.write();
+            shard.invalidations.fetch_add(1, Ordering::Release);
             count += cache.len() as u64;
             cache.clear();
         }
@@ -739,6 +826,41 @@ mod tests {
         assert_eq!(generation.load(Ordering::Acquire), 3);
         assert!(!cache.put_if_generation("users", 1, make_tuple(1, "uncached"), &generation, 3));
         assert_eq!(cache.stats().inserts, 0);
+    }
+
+    /// Spec R5.4 (review F1): a reader read row 1's old image, a writer then
+    /// changed it and dropped it with the plain `invalidate` every DML path uses;
+    /// the reader's fill must not put the old image back. Before the shard count,
+    /// the fill checked only the schema generation, which a row write does not
+    /// move, and the cache served the old image until its TTL: to readers, and to
+    /// the next writer of the row, which computed its new value from it.
+    #[test]
+    fn a_plain_invalidation_refuses_the_fill_of_a_reader_that_read_before_it() {
+        let cache = RowCache::new();
+        let generation = AtomicU64::new(4);
+        let ticket = cache.fill_ticket("c", 1, &generation);
+        // ... the reader reads n = 5 from storage; the writer writes n = 6 ...
+        cache.invalidate("c", 1);
+        assert!(!cache.put_if_ticket("c", 1, make_tuple(1, "n=5"), &generation, ticket));
+        assert!(cache.get("c", 1).is_none(), "the old image must stay out");
+
+        // A reader that read after the write caches the new image.
+        let fresh = cache.fill_ticket("c", 1, &generation);
+        assert!(cache.put_if_ticket("c", 1, make_tuple(1, "n=6"), &generation, fresh));
+        assert_eq!(cache.get("c", 1), Some(make_tuple(1, "n=6")));
+
+        // A table-wide invalidation and a clear fence every shard.
+        let before_table = cache.fill_ticket("c", 2, &generation);
+        cache.invalidate_table("c");
+        assert!(!cache.put_if_ticket("c", 2, make_tuple(2, "old"), &generation, before_table));
+        let before_clear = cache.fill_ticket("d", 3, &generation);
+        cache.clear();
+        assert!(!cache.put_if_ticket("d", 3, make_tuple(3, "old"), &generation, before_clear));
+
+        // The caller's own generation still counts.
+        let before_replay = cache.fill_ticket("c", 4, &generation);
+        generation.fetch_add(1, Ordering::Release);
+        assert!(!cache.put_if_ticket("c", 4, make_tuple(4, "old"), &generation, before_replay));
     }
 
     #[test]

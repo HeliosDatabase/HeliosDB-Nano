@@ -153,6 +153,20 @@ pub fn branch_fork_key(level: u64) -> Vec<u8> {
 /// The prefix of every unfinished MERGE BRANCH's durable intent.
 pub const BRANCH_MERGE_INTENT_PREFIX: &str = "branch:merge:";
 
+/// Durable FK validation policy of one merge. The separate versioned record
+/// preserves existing MergeIntent bytes and is written/deleted with its intent.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum MergeFkPolicy {
+    #[default]
+    Enforced,
+    Audit,
+    Bypass,
+}
+
+pub(crate) fn branch_merge_fk_policy_key(source: u64) -> Vec<u8> {
+    format!("branch:merge_fk_policy:{source}").into_bytes()
+}
+
 /// `branch:merge:{source}` — the durable intent of an unfinished MERGE of the
 /// branch `source` (`MergeIntent`).
 pub fn branch_merge_intent_key(source: u64) -> Vec<u8> {
@@ -1251,14 +1265,42 @@ impl StorageEngine {
         }
     }
 
-    /// Write `intent`, synced: nothing of the merge happens before this.
-    pub(crate) fn put_branch_merge_intent(&self, intent: &MergeIntent) -> Result<()> {
+    pub(crate) fn branch_merge_fk_policy(&self, source: u64) -> Result<MergeFkPolicy> {
+        match self.get(&branch_merge_fk_policy_key(source))?.as_deref() {
+            None | Some([1, 0]) => Ok(MergeFkPolicy::Enforced),
+            Some([1, 1]) => Ok(MergeFkPolicy::Audit),
+            Some([1, 2]) => Ok(MergeFkPolicy::Bypass),
+            Some(_) => Err(Error::storage("MERGE BRANCH FK policy has an unknown version or value")),
+        }
+    }
+
+    /// Write the intent and its policy in ONE synced group. Startup and explicit
+    /// resume use the stored policy, even if this handle defaults to Enforced.
+    pub(crate) fn put_branch_merge_intent_with_fk_policy(
+        &self,
+        intent: &MergeIntent,
+        policy: MergeFkPolicy,
+    ) -> Result<()> {
         let value = intent.encode()?;
         let sealed = super::tde::seal(self.key_manager_ref(), &value)?;
         let mut batch = WriteBatch::default();
         batch.put(branch_merge_intent_key(intent.source_id), sealed.as_ref());
+        let encoded = [
+            1,
+            match policy {
+                MergeFkPolicy::Enforced => 0,
+                MergeFkPolicy::Audit => 1,
+                MergeFkPolicy::Bypass => 2,
+            },
+        ];
+        let policy_value = super::tde::seal(self.key_manager_ref(), &encoded)?;
+        batch.put(branch_merge_fk_policy_key(intent.source_id), policy_value.as_ref());
         self.write_batch_through_gate(batch)?;
         self.durable_autocommit_barrier()
+    }
+
+    pub(crate) fn put_branch_merge_intent(&self, intent: &MergeIntent) -> Result<()> {
+        self.put_branch_merge_intent_with_fk_policy(intent, MergeFkPolicy::Enforced)
     }
 
     /// `intent`, with a table's rows: in `txn`, so the two are one write.
@@ -1273,6 +1315,7 @@ impl StorageEngine {
     pub(crate) fn delete_branch_merge_intent(&self, source_id: u64) -> Result<()> {
         let mut batch = WriteBatch::default();
         batch.delete(branch_merge_intent_key(source_id));
+        batch.delete(branch_merge_fk_policy_key(source_id));
         self.write_batch_through_gate(batch)?;
         self.durable_autocommit_barrier()
     }
@@ -1329,12 +1372,31 @@ impl StorageEngine {
             &intent.tables,
             true,
         )?;
+        let dependencies = self.merge_fk_dependency_tables(
+            intent.source_id,
+            &intent.target_chain,
+            &intent.steps,
+            &intent.tables,
+            self.branch_merge_fk_policy(intent.source_id)?,
+        )?;
+        self.register_merge_exclusion(
+            intent.exclusion_level(),
+            intent.source_id,
+            &intent.source_name,
+            &intent.target_name,
+            &dependencies,
+            false,
+        )?;
+        let mut inherited = self.merge_fk_inherited_tables(&intent.target_chain, &dependencies)?;
+        inherited.extend(intent.main_tables.iter().cloned());
+        inherited.sort_unstable();
+        inherited.dedup();
         self.register_merge_exclusion(
             MERGE_TARGET_MAIN,
             intent.source_id,
             &intent.source_name,
             &intent.target_name,
-            &intent.main_tables,
+            &inherited,
             false,
         )
     }
@@ -1533,6 +1595,26 @@ impl StorageEngine {
         // An attach happens once per open: the moment to forget closed databases.
         LIVE_TRIGGER_REGISTRIES.retain(|_, weak| weak.strong_count() > 0);
         LIVE_TRIGGER_REGISTRIES.insert(self.instance_id(), Arc::downgrade(registry));
+    }
+
+    /// Spec R5.3 (review F8): `old` was renamed to `new`: its triggers follow it in
+    /// the live registry of this engine's database, as their records did in the
+    /// rename's write group. Nothing when no registry is attached (an open's WAL
+    /// replay: the registry is loaded from the records afterwards).
+    pub(crate) fn rename_live_table_triggers(&self, old: &str, new: &str) {
+        let registry = LIVE_TRIGGER_REGISTRIES
+            .get(&self.instance_id())
+            .and_then(|registry| registry.upgrade());
+        if let Some(registry) = registry {
+            if let Err(e) = registry.rename_table_triggers(old, new) {
+                tracing::warn!(
+                    "RENAME TABLE '{}' -> '{}': failed to move the live triggers: {}",
+                    old,
+                    new,
+                    e
+                );
+            }
+        }
     }
 
     /// `table` was dropped by a merge: its triggers leave the live registry.

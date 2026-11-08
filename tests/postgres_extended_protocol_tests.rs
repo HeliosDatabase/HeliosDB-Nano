@@ -27,6 +27,7 @@ fn test_prepared_statement_manager() {
         result_schema: None,
         cached_plan: None,
         cached_plan_epoch: 0,
+        cached_plan_layout: heliosdb_nano::storage::LayoutStamp::empty(),
         is_catalog: None,
         result_shape: Default::default(),
     };
@@ -90,6 +91,7 @@ fn test_capacity_limits() {
             result_schema: None,
             cached_plan: None,
             cached_plan_epoch: 0,
+            cached_plan_layout: heliosdb_nano::storage::LayoutStamp::empty(),
             is_catalog: None,
             result_shape: Default::default(),
         };
@@ -104,6 +106,7 @@ fn test_capacity_limits() {
         result_schema: None,
         cached_plan: None,
         cached_plan_epoch: 0,
+        cached_plan_layout: heliosdb_nano::storage::LayoutStamp::empty(),
         is_catalog: None,
         result_shape: Default::default(),
     };
@@ -294,6 +297,7 @@ fn test_clear_all() {
             result_schema: None,
             cached_plan: None,
             cached_plan_epoch: 0,
+            cached_plan_layout: heliosdb_nano::storage::LayoutStamp::empty(),
             is_catalog: None,
             result_shape: Default::default(),
         };
@@ -371,6 +375,7 @@ fn test_unnamed_statement_and_portal() {
         result_schema: None,
         cached_plan: None,
         cached_plan_epoch: 0,
+        cached_plan_layout: heliosdb_nano::storage::LayoutStamp::empty(),
         is_catalog: None,
         result_shape: Default::default(),
     };

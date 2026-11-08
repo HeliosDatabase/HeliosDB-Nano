@@ -4,6 +4,8 @@
 
 #![allow(deprecated)]
 
+// Spec R5.5: the storage half of one ALTER TABLE statement as one write group.
+pub(crate) mod alter_batch;
 mod branch;
 // sprinter 6bc4a4040eb7 (phase B3): the branch CATALOG overlay — a branch's own
 // definitions (and drops) of tables, `bmeta:{level}:table:{t}`, resolved
@@ -30,15 +32,19 @@ mod engine;
 mod gin_index;
 // The authoritative map of every key prefix in the default column family.
 pub mod keyspace;
+// Spec R5.6: per-table layout epochs; a statement reads its catalog and its rows
+// under one view.
+pub mod layout_epochs;
 mod lock_manager;
 mod materialized_view;
 mod mv_auto_refresh;
-mod mv_delta;
+pub(crate) mod mv_delta;
 mod mv_incremental;
 mod mv_scheduler;
 mod mv_system_views;
 mod mvcc;
 mod prefix_decode;
+pub(crate) mod vector_row;
 // Spec P5.1: the replication epoch as a stored value (`repl:epoch`), read by
 // the engine at every open in every build (`replication::epoch` re-exports it
 // for the HA code, which a build without an HA feature does not compile).
@@ -63,13 +69,18 @@ pub(crate) mod tde;
 pub mod time_travel;
 // Spec R5.1: the per-table writer lock.
 pub(crate) mod table_locks;
+// Spec R5.5: what a row version written before a table's layout changed needs to be
+// read under its definition now (`meta:table_layout:`).
+pub(crate) mod table_layout;
 mod transaction;
 mod vector_index;
 pub mod version_gc;
 mod view_catalog;
 mod wal;
+pub(crate) mod wal_recovery;
 // The one decision of whether this process may write to the RocksDB store.
 mod write_gate;
+pub(crate) mod write_outcome;
 
 // Storage-level filtering modules
 pub mod bloom_filter;
@@ -135,6 +146,7 @@ pub(crate) use engine::{ColumnarAggregateOp, ColumnarAggregateSpec};
 pub use gin_index::{GinIndex, GinIndexStats};
 pub use index_snapshot::{IndexOpenReport, IndexSnapshotPersistReport};
 pub use keyspace::{Classified, KeyClass};
+pub use layout_epochs::{LayoutEpochs, LayoutStamp, StatementScope};
 pub use lock_manager::{LockGuard, LockManager, LockState, LockType, StatementRetryPolicy};
 pub use materialized_view::{MaterializedViewCatalog, MaterializedViewMetadata};
 pub use mv_auto_refresh::{AutoRefreshConfig, AutoRefreshWorker};
@@ -165,6 +177,7 @@ pub use view_catalog::{ViewCatalog, ViewMetadata};
 pub use wal::{
     CleanupStats, ReplayStats, WalEntry, WalIntegrityReport, WalMetrics, WalOperation, WalSyncMode, WriteAheadLog,
 };
+pub use wal_recovery::WalAdoptionReport;
 pub use write_gate::{GateMode, WriteGate};
 
 // Storage-level filtering exports
@@ -266,12 +279,13 @@ pub use compression::{
 };
 pub use content_addr::{ContentAddressedStore, CAS_MIN_SIZE};
 pub use dictionary::{ColumnDictionary, DictionaryManager, DictionaryStats};
-pub use row_cache::{RowCache, RowCacheConfig, RowCacheKey, RowCacheStats};
+pub use row_cache::{RowCache, RowCacheConfig, RowCacheFillTicket, RowCacheKey, RowCacheStats};
 
 // ART Index exports
 pub use art_index::{AdaptiveRadixTree, ArtIndexError, ArtIndexStats, ArtIndexType, ArtIterator, ArtResult};
 pub use art_manager::{
-    ArtIndexManager, ArtManagerStats, EnforcedUniqueIndex, ForeignKeyInfo, RowState, SharedArtIndex, UniqueConflict,
+    ArtIndexManager, ArtManagerStats, EnforcedUniqueIndex, ForeignKeyInfo, KeyHold, RowState, SharedArtIndex,
+    UniqueConflict,
 };
 pub use art_node::{ArtNode, LeafNode, Node16, Node256, Node4, Node48, NodeHeader, RowId, MAX_PREFIX_LEN};
 

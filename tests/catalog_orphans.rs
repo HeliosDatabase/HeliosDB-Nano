@@ -85,6 +85,7 @@ fn keys_of(db: &EmbeddedDatabase, table: &str, index: &str) -> Vec<String> {
         "meta:partchild:",
         "meta:partparent:",
         "colpm:",
+        "meta:table_layout:",
     ]
     .iter()
     .map(|family| format!("{family}{table}"))
@@ -156,6 +157,9 @@ fn drop_table_leaves_no_catalog_orphan_and_its_checkpoint_hydrates() {
         "ALTER TABLE doomed ALTER COLUMN status SET STORAGE DICTIONARY",
         "INSERT INTO doomed (email, qty, pid, status) VALUES ('c@example.com', 3, 1, 'closed')",
         "ALTER TABLE doomed ADD COLUMN flag INT DEFAULT 7",
+        // Spec R5.5: a DROP COLUMN leaves the table's layout record.
+        "ALTER TABLE doomed ADD COLUMN gone INT",
+        "ALTER TABLE doomed DROP COLUMN gone",
         "GRANT SELECT ON doomed TO reader",
         "CREATE FUNCTION doomed_rewrite() RETURNS TRIGGER AS $$ BEGIN NEW.status = 'rewritten'; RETURN NEW; END $$ \
          LANGUAGE plpgsql",
@@ -172,6 +176,7 @@ fn drop_table_leaves_no_catalog_orphan_and_its_checkpoint_hydrates() {
         "meta:index:doomed_qty_idx",
         "dict:doomed:status",
         "meta:attmissing:doomed:flag",
+        "meta:table_layout:doomed",
         "meta:acl:table:doomed:reader",
         "trigger:doomed:doomed_trigger",
     ] {

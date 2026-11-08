@@ -2256,7 +2256,6 @@ fn assert_same_answers(dir: &Path, db: &EmbeddedDatabase, sql: &str) {
 /// their pre-ALTER image when the logical WAL is replayed at open, and a volatile
 /// column has no missing value to fall back on: a completed ALTER's values read NULL.
 #[test]
-#[ignore = "R5: crash replay at open (decision 14)"]
 fn a_crash_after_a_volatile_add_column_keeps_its_values() {
     if let Ok(dir) = std::env::var(CRASH_DIR_ENV) {
         let db = crash_open(Path::new(&dir));
@@ -2280,7 +2279,6 @@ fn a_crash_after_a_volatile_add_column_keeps_its_values() {
 /// Review F1, with a sequence: its values are consumed, so they cannot come back any
 /// other way than from what the ALTER wrote.
 #[test]
-#[ignore = "R5: crash replay at open (decision 14)"]
 fn a_crash_after_a_nextval_add_column_keeps_its_values() {
     if let Ok(dir) = std::env::var(CRASH_DIR_ENV) {
         let db = crash_open(Path::new(&dir));
@@ -2302,7 +2300,6 @@ fn a_crash_after_a_nextval_add_column_keeps_its_values() {
 /// of the INSERT's images undoes them. (Under `true` they are logged, and this
 /// passes.)
 #[test]
-#[ignore = "R5: crash replay at open (decision 14)"]
 fn a_crash_keeps_committed_primary_key_updates_and_deletes() {
     if let Ok(dir) = std::env::var(CRASH_DIR_ENV) {
         let db = crash_open(Path::new(&dir));
@@ -2327,8 +2324,14 @@ fn a_crash_keeps_committed_primary_key_updates_and_deletes() {
 /// Review P3, the crash half. `DROP COLUMN` of a middle column rewrites the rows,
 /// and the replay of the images logged before it put the dropped column's values
 /// back under the next column's name.
+///
+/// Spec R5.5 made the DROP one write group (schema, every row's new image and its
+/// version, `tests/statement_atomicity_alter.rs`), so no crash falls inside it. What
+/// is left is the replay at open: the INSERT above the checkpoint is logged with its
+/// three-column images, which the replay puts back over the DROP's narrow rows, and
+/// nothing in the log narrows them again. That is decision 14's (spec R5.7: open adopts,
+/// never redoes), so this stays ignored until then.
 #[test]
-#[ignore = "R5: crash replay at open (decision 14)"]
 fn a_crash_after_drop_column_keeps_the_other_columns_values() {
     if let Ok(dir) = std::env::var(CRASH_DIR_ENV) {
         let db = crash_open(Path::new(&dir));
@@ -2351,8 +2354,11 @@ fn a_crash_after_drop_column_keeps_the_other_columns_values() {
 
 /// Review P3, the crash half, with a column dropped and added again under its name
 /// and another one dropped after it: the last definition's missing value answers.
+///
+/// Ignored for the same reason as the test above: each statement is one group since
+/// spec R5.5, and the replay of the logged INSERT images at open (spec R5.7) is what
+/// still undoes them.
 #[test]
-#[ignore = "R5: crash replay at open (decision 14)"]
 fn a_crash_after_a_drop_and_readd_keeps_the_last_definition() {
     if let Ok(dir) = std::env::var(CRASH_DIR_ENV) {
         let db = crash_open(Path::new(&dir));

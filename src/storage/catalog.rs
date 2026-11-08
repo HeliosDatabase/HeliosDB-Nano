@@ -214,7 +214,18 @@ pub(crate) fn teardown_index_structures(
             // indexes, so a drop/recreate cycle accumulated dead `vecsnap:` blobs
             // and `.hnsw.graph` / `.hnsw.data` files forever. Best effort and
             // after the drop, never a reason to fail it.
-            storage.remove_vector_index_snapshot(index_name);
+            let snapshot_already_purged = recorded_type == Some("persistent_hnsw")
+                && storage
+                    .db
+                    .get(super::index_snapshot::vec_snapshot_key(index_name))?
+                    .is_none()
+                && storage
+                    .db
+                    .get(super::index_snapshot::vec_snapshot_marker_key(index_name))?
+                    .is_none();
+            if !snapshot_already_purged {
+                storage.remove_vector_index_snapshot(index_name);
+            }
         }
         Some(IndexFamily::DdlOnly) => {
             // DDL-only by construction — `handle_create_index` persists the
@@ -628,7 +639,7 @@ impl<'a> Catalog<'a> {
             .collect()
     }
 
-    fn physical_snapshot_index_definitions(&self) -> Result<Vec<(String, PersistedIndexDefinition)>> {
+    pub(crate) fn index_definitions_strict(&self) -> Result<Vec<(String, PersistedIndexDefinition)>> {
         let mut definitions = Vec::new();
         for (name, bytes) in self.storage.meta_blobs_with_prefix_strict("meta:index:")? {
             let fail = |e: String| Error::storage(format!("physical snapshot index '{name}': {e}"));
@@ -724,7 +735,7 @@ impl<'a> Catalog<'a> {
                 .map_err(|e| Error::storage(format!("physical snapshot constraints '{table}': {e}")))?;
             self.storage.cache_table_constraints(&table, constraints);
         }
-        let definitions = self.physical_snapshot_index_definitions()?;
+        let definitions = self.index_definitions_strict()?;
         let validate_columns = |table: &str, columns: &[String]| -> Result<()> {
             let schema = tables
                 .get(table)
@@ -1152,6 +1163,12 @@ impl<'a> Catalog<'a> {
         let incarnation_value = bincode::serialize(&incarnation)
             .map_err(|e| Error::storage(format!("Failed to serialize a table incarnation: {}", e)))?;
         ddl.put(Self::table_metadata_key(table_name), &value)?;
+        ddl.watch_catalog_change(
+            table_name,
+            Self::table_metadata_key(table_name),
+            None,
+            Some(value.clone()),
+        );
         ddl.put(Self::table_counter_key(table_name), &counter_value)?;
         ddl.put(Self::table_incarnation_key(table_name), &incarnation_value)?;
         // Sprinter 6bc4a4040eb7 (B4 fix pass): this table's row ids start over, so
@@ -1762,10 +1779,16 @@ impl<'a> Catalog<'a> {
     /// cached in the name-keyed `schema_cache` (it is not main's); a table no
     /// level has an entry for resolves exactly as on main, caches included.
     pub fn get_table_schema(&self, table_name: &str) -> Result<Schema> {
+        self.storage.check_table_readable(table_name)?;
         // The temp-table visibility rule applies whatever branch the session
         // is on (and a branch refuses CREATE TEMPORARY TABLE, so no level has
         // an entry for a temp key).
         self.refuse_invisible_temp_table(table_name)?;
+        // Sample BEFORE branch resolution, so a concurrent freeze/main change
+        // cannot land between an Inherited decision and the main schema load.
+        // Record it only if this read actually depends on main: a branch's own
+        // or frozen definition remains its fork view while main keeps changing.
+        let main_layout = super::layout_epochs::defer_table(self.storage.layout_epochs(), table_name);
         if let Some(resolution) = self.storage.session_branch_table(table_name)? {
             match resolution {
                 super::branch_catalog::BranchTableResolution::Inherited => {}
@@ -1787,6 +1810,7 @@ impl<'a> Catalog<'a> {
                 }
             }
         }
+        main_layout.record();
         self.main_table_schema(table_name)
     }
 
@@ -1808,6 +1832,7 @@ impl<'a> Catalog<'a> {
     /// (phase B3): what a branch's first `ADD COLUMN` starts from and what
     /// MERGE compares and changes.
     pub(crate) fn main_table_schema(&self, table_name: &str) -> Result<Schema> {
+        self.storage.check_table_readable(table_name)?;
         // sprinter 1703dba8e82d: a session-private (`pg_temp_*`) relation
         // resolves ONLY for the backend that owns it.
         //
@@ -1831,6 +1856,10 @@ impl<'a> Catalog<'a> {
         // One relaxed atomic load on every deployment that never creates a temp
         // table, which is the only cost on the default path.
         self.refuse_invisible_temp_table(table_name)?;
+        // Spec R5.6 (decision 2(b)): the layout epoch BEFORE the cache lookup.
+        // `get_table_schema` recorded it already; a second record of one value is a
+        // comparison, and a different value says the layout moved in between.
+        super::layout_epochs::note_table(self.storage.layout_epochs(), table_name);
         // Resolve the raw schema (in-memory cache -> on-disk metadata -> materialized view).
         let mut schema = if let Some(schema) = self.storage.get_cached_schema(table_name) {
             schema
@@ -1854,10 +1883,23 @@ impl<'a> Catalog<'a> {
                     let mv_catalog = self.storage.mv_catalog();
                     if mv_catalog.view_exists(table_name)? {
                         let mv_metadata = mv_catalog.get_view(table_name)?;
-                        // Cache MV schema too
-                        self.storage
-                            .cache_schema_if_current(table_name, mv_metadata.schema.clone(), generation);
-                        mv_metadata.schema
+                        // The definition describes the SQL result at creation,
+                        // but ALTER on its backing table may change how those
+                        // values are stored. Resolve that table before decoding
+                        // or planning, recording its epoch before its cache.
+                        // Never cache an MV alias as an ordinary table: such an
+                        // entry loses this backing-table dependency and survives
+                        // a storage-mode ALTER of the backing table.
+                        let backing = super::MaterializedViewCatalog::mv_data_table_name(table_name);
+                        let mut schema = if self.main_table_exists(&backing)? {
+                            self.main_table_schema(&backing)?
+                        } else {
+                            mv_metadata.schema
+                        };
+                        for column in &mut schema.columns {
+                            column.source_table_name = Some(table_name.to_string());
+                        }
+                        schema
                     } else {
                         return Err(Error::query_execution(format!("Table '{}' does not exist", table_name)));
                     }
@@ -1954,20 +1996,26 @@ impl<'a> Catalog<'a> {
     /// A rename's records; see [`TableShapeChange`]. The MV swap's renames replace a
     /// view's rows under its stable name: the view was refreshed, and nothing was renamed,
     /// so no later table takes the old name (the replay of one looks like a rename but for
-    /// its names).
+    /// its names). `changed_at` is the rename's timestamp.
     fn stage_rename_shape_records(
         &self,
         old_name: &str,
         new_name: &str,
         move_side_records: bool,
         highest_row: u64,
+        changed_at: u64,
         batch: &mut rocksdb::WriteBatch,
     ) -> Result<()> {
+        use super::table_layout::{HistoryCut, TableLayout};
         let is_temp = crate::sql::temp_tables::is_temp_key;
         let swap = !move_side_records || new_name.starts_with("__mv_");
-        let changed_at = self.storage.next_timestamp();
+        // Spec R5.5: the layout records follow the shape records. The old name's
+        // history goes with it, so whatever table takes the name next has nothing
+        // before the rename to read there (a cut, as a branch anchor is refused); the
+        // new name's history starts at the rename, and its rows came without theirs.
         if swap || is_temp(old_name) {
             batch.delete(Self::table_shape_key(old_name));
+            batch.delete(TableLayout::key(old_name));
         } else {
             self.stage_table_shape_record(
                 old_name,
@@ -1978,11 +2026,23 @@ impl<'a> Catalog<'a> {
                 },
                 batch,
             )?;
+            let mut layout = TableLayout::default();
+            layout.cut(changed_at, HistoryCut::Renamed, None);
+            self.stage_table_layout(old_name, &layout, batch)?;
         }
         if is_temp(new_name) {
             batch.delete(Self::table_shape_key(new_name));
+            batch.delete(TableLayout::key(new_name));
             return Ok(());
         }
+        let mut layout = TableLayout::default();
+        let cause = if swap {
+            HistoryCut::Refreshed
+        } else {
+            HistoryCut::Renamed
+        };
+        layout.cut(changed_at, cause, Some(highest_row));
+        self.stage_table_layout(new_name, &layout, batch)?;
         self.stage_table_shape_record(
             new_name,
             &TableShapeChange {
@@ -1998,27 +2058,90 @@ impl<'a> Catalog<'a> {
         )
     }
 
+    /// Spec R5.5: `table_name`'s layout record as main's store holds it (`None` for
+    /// none), past the cache.
+    pub(crate) fn durable_table_layout(&self, table_name: &str) -> Result<Option<super::table_layout::TableLayout>> {
+        match self.storage.get(&super::table_layout::TableLayout::key(table_name))? {
+            Some(bytes) => super::table_layout::TableLayout::decode(table_name, &bytes).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Spec R5.5: stage `layout` as `table_name`'s layout record, sealed as every
+    /// `meta:` value is. Published by the schema change that rides with it (the
+    /// loaded records are forgotten with the missing values).
+    pub(crate) fn stage_table_layout(
+        &self,
+        table_name: &str,
+        layout: &super::table_layout::TableLayout,
+        batch: &mut rocksdb::WriteBatch,
+    ) -> Result<()> {
+        let value = layout.encode()?;
+        let key_manager = self.storage.key_manager_arc();
+        batch.put(
+            super::table_layout::TableLayout::key(table_name),
+            super::tde::seal(key_manager.as_deref(), &value)?.as_ref(),
+        );
+        Ok(())
+    }
+
     /// A materialized view's rows were replaced in place: a `REFRESH` that dropped and
     /// recreated its data table `data_table`, which took the last record with it.
     pub(crate) fn record_materialized_view_refresh(&self, data_table: &str) -> Result<()> {
         let mut batch = rocksdb::WriteBatch::default();
+        let changed_at = self.storage.next_timestamp();
         self.stage_table_shape_record(
             data_table,
             &TableShapeChange {
-                changed_at: self.storage.next_timestamp(),
+                changed_at,
                 kind: TableShapeChangeKind::Refreshed,
                 renamed_through_row: None,
             },
             &mut batch,
         )?;
+        // Spec R5.5: and `AS OF` before it, which would read the new rows' history
+        // only (the view empty), is refused.
+        let mut layout = super::table_layout::TableLayout::default();
+        layout.cut(changed_at, super::table_layout::HistoryCut::Refreshed, None);
+        self.stage_table_layout(data_table, &layout, &mut batch)?;
+        // With its own `snapshot:` record, as a rename's: a time after a refresh that
+        // inserted nothing reads at it, not at a snapshot before it (refused).
+        let snapshot = if self.storage.time_travel_enabled() {
+            Some(
+                self.storage
+                    .snapshot_manager()
+                    .stage_rewrite_snapshot(&mut batch, changed_at)?,
+            )
+        } else {
+            None
+        };
         self.storage
             .write_batch_through_gate(batch)
-            .map_err(|e| Error::storage(format!("Shape record write failed: {}", e)))
+            .map_err(|e| Error::storage(format!("Shape record write failed: {}", e)))?;
+        self.storage.invalidate_missing_values(data_table);
+        if let Some(snapshot) = snapshot {
+            self.storage
+                .snapshot_manager()
+                .publish_rewrite_snapshot(data_table, snapshot);
+        }
+        Ok(())
     }
 
     /// Into the batch that changes `table_name`'s columns: the record of that. What
     /// the last rename said stays true.
     fn stage_table_shape_change(&self, table_name: &str, batch: &mut rocksdb::WriteBatch) -> Result<()> {
+        self.stage_table_shape_change_at(table_name, self.storage.next_timestamp(), batch)
+    }
+
+    /// [`Self::stage_table_shape_change`] at `changed_at`. Spec R5.5: a statement that
+    /// writes every row's new image with a version at one timestamp records the change
+    /// at that timestamp, so its own versions are not older than the change it made.
+    fn stage_table_shape_change_at(
+        &self,
+        table_name: &str,
+        changed_at: u64,
+        batch: &mut rocksdb::WriteBatch,
+    ) -> Result<()> {
         if crate::sql::temp_tables::is_temp_key(table_name) {
             return Ok(());
         }
@@ -2028,7 +2151,7 @@ impl<'a> Catalog<'a> {
         self.stage_table_shape_record(
             table_name,
             &TableShapeChange {
-                changed_at: self.storage.next_timestamp(),
+                changed_at,
                 kind: TableShapeChangeKind::Columns,
                 renamed_through_row,
             },
@@ -2155,6 +2278,12 @@ impl<'a> Catalog<'a> {
         }
         // Sprinter 6bc4a4040eb7 (B4): the table's shape changes, in the same group.
         self.stage_table_shape_change(table_name, ddl.batch_mut())?;
+        // Spec R5.3 (review F8): the column's dictionary, columnar side data and
+        // `meta:col_storage:` record, keyed by its name, in the same group; their
+        // caches follow before the schema is published. This takes the zone-stats
+        // lock until the write, so it is the last thing this function stages (the
+        // statement's constraint records, read and staged after it, take no lock).
+        self.stage_column_side_storage_move(table_name, table_name, Some((old, new)), ddl)?;
         let catalog = Catalog::new(self.storage);
         let table = table_name.to_string();
         let published = schema.clone();
@@ -2223,10 +2352,10 @@ impl<'a> Catalog<'a> {
         }
 
         let mut batch = rocksdb::WriteBatch::default();
-        let (rewritten, rewrite_snapshot) = if columns
+        let rewrites = columns
             .iter()
-            .any(|(_, _, _, fill)| matches!(fill, ColumnFill::PerRow(_)))
-        {
+            .any(|(_, _, _, fill)| matches!(fill, ColumnFill::PerRow(_)));
+        let (rewritten, rewrite_snapshot, frozen_copy_bytes) = if rewrites {
             let staged = self.storage.stage_added_column_rows(
                 table_name,
                 old_width,
@@ -2234,9 +2363,9 @@ impl<'a> Catalog<'a> {
                 self.storage.config().storage.max_atomic_rewrite_bytes,
                 &mut batch,
             )?;
-            (staged.rows, staged.snapshot)
+            (staged.rows, staged.snapshot, staged.frozen_copy_bytes)
         } else {
-            (0, None)
+            (0, None, 0)
         };
 
         let value =
@@ -2269,6 +2398,13 @@ impl<'a> Catalog<'a> {
                 value: Some(bytes),
             });
         }
+        let measured = (batch.size_in_bytes() as u64).saturating_add(frozen_copy_bytes);
+        let max_bytes = self.storage.config().storage.max_atomic_rewrite_bytes;
+        if rewrites && measured > max_bytes {
+            return Err(Error::atomic_rewrite_too_large(table_name, measured, max_bytes));
+        }
+        // Spec R5.6: the table's layout change ends after the publication below.
+        let publication = super::layout_epochs::PublicationScope::enter();
         let written = self
             .storage
             .write_ddl_batch_ops(operations, batch)
@@ -2283,49 +2419,217 @@ impl<'a> Catalog<'a> {
         // After the bump: a fill that read the old bytes was stamped with the old
         // generation and is refused, so this sweep cannot be undone.
         self.storage.row_cache().invalidate_table(table_name);
+        drop(publication);
         written.wait_replicated();
         Ok(rewritten)
     }
 
-    /// `ALTER TABLE … DROP COLUMN`'s catalog change on main as ONE write group:
-    /// `schema` (without `column`) and the removal of the column's missing value,
-    /// so a later `ADD COLUMN` of the name can never read the old one.
-    pub(crate) fn drop_column_from_schema(&self, table_name: &str, schema: &Schema, column: &str) -> Result<()> {
-        let _ddl = self.storage.main_catalog_write(&[table_name], "ALTER TABLE")?;
-        if !self.main_table_exists(table_name)? {
-            return Err(Error::query_execution(format!("Table '{}' does not exist", table_name)));
+    /// Spec R5.5: an `ALTER TABLE` statement's change of main's table catalog, staged
+    /// into its one `ddl` batch: the schema it leaves, the missing values it changed
+    /// (a dropped column's goes, a renamed column's moves, an added column's stable
+    /// default is written), every `meta:index:` definition its renames name (applied
+    /// in order), the table's shape record (`TableShapeChange`) when a clause dropped
+    /// or renamed a column, and its layout record (`storage::table_layout`) with one
+    /// step per `DROP COLUMN` at the statement's timestamp; each with its logical-WAL
+    /// entry. The schema's publication is queued after the write (callers queue
+    /// what reads the new schema after this). The constraint, identity and columnar
+    /// records are the caller's to stage (`stage_table_constraints`,
+    /// `stage_identity_columns`).
+    pub(crate) fn stage_altered_table<'d>(
+        &self,
+        change: &super::alter_batch::AlteredTable,
+        ddl: &mut super::DdlBatch<'d>,
+    ) -> Result<()>
+    where
+        'a: 'd,
+    {
+        let table = change.table.as_str();
+        if !self.main_table_exists(table)? {
+            return Err(Error::query_execution(format!("Table '{}' does not exist", table)));
         }
-        let value =
-            bincode::serialize(schema).map_err(|e| Error::storage(format!("Failed to serialize schema: {}", e)))?;
-        let key_manager = self.storage.key_manager_arc();
-        let mut batch = rocksdb::WriteBatch::default();
-        batch.put(
-            Self::table_metadata_key(table_name),
-            super::tde::seal(key_manager.as_deref(), &value)?.as_ref(),
-        );
-        let mut operations = vec![super::WalOperation::AlterTableSchema {
-            table: table_name.to_string(),
-            schema: value,
-        }];
-        let missing_key = Self::attmissing_key(table_name, column);
-        if self.storage.get(&missing_key)?.is_some() {
-            batch.delete(&missing_key);
-            operations.push(super::WalOperation::SetColumnMissing {
-                table: table_name.to_string(),
-                column: column.to_string(),
+        // A statement of constraint clauses alone leaves the schema as it was: no
+        // record, no entry, nothing for a standby to re-derive.
+        let schema_changed = change.schema != change.base;
+        if schema_changed {
+            let value = bincode::serialize(&change.schema)
+                .map_err(|e| Error::storage(format!("Failed to serialize schema: {}", e)))?;
+            ddl.put(Self::table_metadata_key(table), &value)?;
+            ddl.log(super::WalOperation::AlterTableSchema {
+                table: table.to_string(),
+                schema: value,
+            });
+        }
+
+        // The missing values, in name order so the log is the same every time.
+        let mut gone: Vec<&String> = change
+            .base_missing
+            .keys()
+            .filter(|column| !change.missing.contains_key(*column))
+            .collect();
+        gone.sort();
+        for column in gone {
+            ddl.delete(Self::attmissing_key(table, column));
+            ddl.log(super::WalOperation::SetColumnMissing {
+                table: table.to_string(),
+                column: column.clone(),
                 value: None,
             });
         }
-        // Sprinter 6bc4a4040eb7 (B4): a version written before this has a column the
-        // table no longer has, and is read by position: the table's shape changes, in
-        // the same group (`update_table_schema`, which this bypasses, does the same).
-        self.stage_table_shape_change(table_name, &mut batch)?;
-        let written = self
-            .storage
-            .write_ddl_batch_ops(operations, batch)
-            .map_err(|e| Error::storage(format!("DROP COLUMN batch write failed: {}", e)))?;
-        self.publish_schema_change(table_name, schema);
-        written.wait_replicated();
+        let mut written: Vec<(&String, &crate::Value)> = change
+            .missing
+            .iter()
+            .filter(|(column, value)| change.base_missing.get(*column) != Some(*value))
+            .collect();
+        written.sort_by(|a, b| a.0.cmp(b.0));
+        for (column, missing) in written {
+            let bytes = bincode::serialize(missing)
+                .map_err(|e| Error::storage(format!("Failed to serialize a missing value: {}", e)))?;
+            ddl.put(Self::attmissing_key(table, column), &bytes)?;
+            ddl.log(super::WalOperation::SetColumnMissing {
+                table: table.to_string(),
+                column: column.clone(),
+                value: Some(bytes),
+            });
+        }
+
+        // The index definitions that name a renamed column (spec P1.1b: a definition
+        // left on the old name registered its index over a column that no longer
+        // exists at the next open).
+        if !change.column_renames.is_empty() {
+            for (index_name, mut definition) in self.table_index_definitions(table)? {
+                let mut renamed = false;
+                for (old, new) in &change.column_renames {
+                    renamed |= Self::rename_index_definition_column(&mut definition, old, new);
+                }
+                if renamed {
+                    let encoded = Self::encode_index_definition(&definition)?;
+                    ddl.put(Self::index_metadata_key(&index_name), &encoded)?;
+                }
+            }
+        }
+
+        // Sprinter 6bc4a4040eb7 (B4): a version written before this is read by position
+        // under another definition: what a branch anchored before it is refused for.
+        if change.shape_changed {
+            self.stage_table_shape_change_at(table, change.at, ddl.batch_mut())?;
+        }
+        // And what main's own reads of such a version take it through, or are refused
+        // at. Written for every change of the shape, a rename of a column too (no step:
+        // positions stay): a table that has one is read by it, by `AS OF` and by a
+        // branch's anchor alike, and one with only a shape record (an earlier build's)
+        // by the shape record's rule.
+        if change.shape_changed || !change.drops.is_empty() || change.cut.is_some() {
+            let mut layout = self.durable_table_layout(table)?.unwrap_or_default();
+            for (width, position) in &change.drops {
+                layout.dropped_column(change.at, *width, *position)?;
+            }
+            if let Some(cause) = change.cut {
+                layout.cut(change.at, cause, None);
+            }
+            self.stage_table_layout(table, &layout, ddl.batch_mut())?;
+        }
+
+        if schema_changed || change.missing != change.base_missing || !change.drops.is_empty() || change.cut.is_some() {
+            let catalog = Catalog::new(self.storage);
+            let name = table.to_string();
+            let published = change.schema.clone();
+            ddl.on_commit(move || catalog.publish_schema_change(&name, &published));
+        }
+        Ok(())
+    }
+
+    /// Identify this group's application from a unique shape stamp or a changed
+    /// dependent metadata record. Reading an unchanged final schema is NOT proof.
+    /// The caller holds all affected catalog locks through this reconciliation.
+    pub(crate) fn stage_alter_application_witness<'d>(
+        &self,
+        change: &super::alter_batch::AlteredTable,
+        constraints: Option<&crate::sql::TableConstraints>,
+        identity: Option<&Vec<String>>,
+        rewritten_row: Option<(Vec<u8>, Vec<u8>)>,
+        other_tables: Vec<String>,
+        ddl: &mut super::DdlBatch<'d>,
+    ) -> Result<()>
+    where
+        'a: 'd,
+    {
+        let mut candidates = Vec::new();
+        if change.shape_changed && !crate::sql::temp_tables::is_temp_key(&change.table) {
+            let before = self.main_table_shape_change(&change.table)?;
+            let after = TableShapeChange {
+                changed_at: change.at,
+                kind: TableShapeChangeKind::Columns,
+                renamed_through_row: before.and_then(|shape| shape.renamed_through_row),
+            };
+            candidates.push((
+                Self::table_shape_key(&change.table),
+                bincode::serialize(&after).map(Some),
+            ));
+        }
+        candidates.push((
+            Self::table_metadata_key(&change.table),
+            bincode::serialize(&change.schema).map(Some),
+        ));
+        if let Some(constraints) = constraints {
+            candidates.push((
+                Self::table_constraints_key(&change.table),
+                bincode::serialize(constraints).map(Some),
+            ));
+        }
+        if let Some(identity) = identity {
+            candidates.push((
+                Self::identity_key(&change.table),
+                if identity.is_empty() {
+                    Ok(None)
+                } else {
+                    bincode::serialize(identity).map(Some)
+                },
+            ));
+        }
+        if let Some((key, after)) = rewritten_row {
+            candidates.push((key, Ok(Some(after))));
+        }
+        for (key, after) in candidates {
+            let after = after.map_err(|error| Error::storage(format!("Cannot encode ALTER witness: {error}")))?;
+            let before = self.storage.get(&key)?;
+            if before == after {
+                continue;
+            }
+            let storage: &'a StorageEngine = self.storage;
+            let table = change.table.clone();
+            ddl.on_write_error(move || {
+                let observed = storage.get(&key);
+                match observed {
+                    Ok(value) if value == after => Ok(true),
+                    Ok(value) if value == before => Ok(false),
+                    outcome => {
+                        let reason = match outcome {
+                            Ok(_) => "ALTER witness is neither its BEFORE nor AFTER value".to_string(),
+                            Err(error) => format!("Cannot read ALTER witness: {error}"),
+                        };
+                        // Never publish an authoritative partial tree or allow a
+                        // duplicate-accepting write after unreadable metadata.
+                        for target in std::iter::once(&table).chain(other_tables.iter()) {
+                            storage.layout_epochs().quarantine(target);
+                            storage.write_gate().quarantine_table(target, &reason);
+                            if let Err(error) = storage.art_indexes().drop_table_indexes(target) {
+                                tracing::error!("Cannot retire unresolved ALTER indexes of {target}: {error}");
+                            }
+                            storage.vector_indexes().retire_table_indexes(target, &reason);
+                            storage.invalidate_schema_cache(target);
+                            storage.invalidate_missing_values(target);
+                            storage.invalidate_table_constraints_cache(target);
+                            storage.forget_table_dictionaries(target);
+                            storage.row_cache().invalidate_table(target);
+                        }
+                        Err(Error::storage(reason))
+                    }
+                }
+            });
+            return Ok(());
+        }
+        // All dependent records are identical to BEFORE: a net no-op has no
+        // changed durable state whose derived publication needs retaining.
         Ok(())
     }
 
@@ -2367,18 +2671,12 @@ impl<'a> Catalog<'a> {
         changed
     }
 
-    /// What a schema replacement written without its logical-WAL entry does once
-    /// its record is durable ([`Self::update_table_schema`]): the entry, then
-    /// [`Self::publish_schema_change`]. `value` is the serialized `schema` that
-    /// was stored.
+    /// Legacy standalone schema-history publisher, with no current internal
+    /// caller. Normal schema replacements stage their operation and catalog
+    /// writes in DdlBatch, then call publish_schema_change after commit.
     fn publish_table_schema(&self, table_name: &str, schema: &Schema, value: &[u8]) {
-        // GH#36: represent the schema replacement in the logical WAL. Every
-        // column-shape ALTER (ADD/DROP/RENAME COLUMN, ALTER COLUMN … DROP NOT
-        // NULL) funnels through here on BOTH executor families — including the
-        // text family's inlined arms, which never reach
-        // `EmbeddedDatabase::execute_alter_table_op` — so this one emitter
-        // covers them all. The blob is the complete new Schema, so replay is
-        // idempotent; `is_replaying` keeps the replay arm from re-emitting.
+        // This legacy helper emits explicit history only. It must not be
+        // reintroduced as a detached append around an internal catalog write.
         if let Err(e) = self.storage.log_alter_table_schema(table_name, value) {
             tracing::warn!("Failed to log schema change for '{}' to WAL: {}", table_name, e);
         }
@@ -2514,7 +2812,8 @@ impl<'a> Catalog<'a> {
                 Vec::new()
             }
         };
-        for (index_name, _) in &definitions {
+        for (index_name, definition) in &definitions {
+            Self::stage_persistent_index_retirement(index_name, definition, ddl)?;
             ddl.delete(Self::index_metadata_key(index_name));
         }
         let children = self.stage_table_records_drop(table_name, dropping, ddl.batch_mut())?;
@@ -2684,6 +2983,8 @@ impl<'a> Catalog<'a> {
         // another table, with another id.
         batch.delete(Self::table_incarnation_key(table_name));
         batch.delete(Self::table_shape_key(table_name));
+        // Spec R5.5: a later CREATE of the name starts a history of its own.
+        batch.delete(super::table_layout::TableLayout::key(table_name));
         batch.delete(Self::table_counter_key(table_name));
         batch.delete(Self::compression_config_key(table_name));
         batch.delete(Self::compression_stats_key(table_name));
@@ -3003,6 +3304,69 @@ impl<'a> Catalog<'a> {
         Ok(())
     }
 
+    /// Replace an MV backing table whose logical result shape changed, in its
+    /// population's existing group. Unlike `stage_create_table`, this deliberately
+    /// replaces a still-present name; it must not purge history or register new
+    /// indexes before the write. Its caller validates the new schema-owned keys
+    /// and publishes them after the old table's queued teardown.
+    ///
+    /// Integration dependency: R5.5's `table_layout` module and
+    /// `stage_table_layout` accompany this helper in the combined candidate.
+    pub(crate) fn stage_materialized_view_replacement<'d>(
+        &self,
+        table_name: &str,
+        schema: &Schema,
+        changed_at: u64,
+        ddl: &mut super::DdlBatch<'d>,
+    ) -> Result<()>
+    where
+        'a: 'd,
+    {
+        self.stage_drop_table(table_name, &[], ddl)?;
+        // This name remains a table in the same group. A deferred purge under
+        // its name would remove the replacement rows' newly staged history.
+        ddl.delete(Self::history_purge_key(table_name));
+        let definition =
+            bincode::serialize(schema).map_err(|e| Error::storage(format!("MV replacement schema: {e}")))?;
+        ddl.put(Self::table_metadata_key(table_name), &definition)?;
+        ddl.put(
+            Self::table_counter_key(table_name),
+            &bincode::serialize(&0u64).map_err(|e| Error::storage(format!("MV replacement counter: {e}")))?,
+        )?;
+        ddl.put(
+            Self::table_incarnation_key(table_name),
+            &bincode::serialize(&super::branch_catalog::fresh_table_incarnation())
+                .map_err(|e| Error::storage(format!("MV replacement incarnation: {e}")))?,
+        )?;
+        self.stage_table_shape_record(
+            table_name,
+            &TableShapeChange {
+                changed_at,
+                kind: TableShapeChangeKind::Refreshed,
+                renamed_through_row: None,
+            },
+            ddl.batch_mut(),
+        )?;
+        let mut layout = super::table_layout::TableLayout::default();
+        layout.cut(changed_at, super::table_layout::HistoryCut::Refreshed, None);
+        self.stage_table_layout(table_name, &layout, ddl.batch_mut())?;
+        ddl.log(super::WalOperation::CreateTable {
+            table: table_name.to_string(),
+            schema: definition,
+        });
+        // The population stages the group's one snapshot at changed_at, even
+        // for an empty result. Publish this schema after the old drop hooks.
+        let storage = self.storage;
+        let table = table_name.to_string();
+        let schema = schema.clone();
+        ddl.on_commit(move || {
+            storage.bump_schema_generation();
+            storage.invalidate_missing_values(&table);
+            storage.cache_schema(&table, schema);
+        });
+        Ok(())
+    }
+
     /// Stage into `batch` a delete of every key under `prefix`; returns how
     /// many. A total-order iterator seeked to the prefix (the scan
     /// [`Self::delete_keys_with_prefix`] uses), so the walk is exact whatever
@@ -3266,7 +3630,30 @@ impl<'a> Catalog<'a> {
         let guard = self.storage.enter_main_ddl(&[definition.table_name.as_str()])?;
         ddl.hold_until_published(guard);
         let value = Self::encode_index_definition(definition)?;
-        ddl.put(Self::index_metadata_key(index_name), &value)
+        let key = Self::index_metadata_key(index_name);
+        let before = self.storage.get(&key)?;
+        ddl.put(&key, &value)?;
+        ddl.watch_catalog_change(&definition.table_name, key, before, Some(value));
+        Ok(())
+    }
+
+    /// An actual retirement, never a rename/redefinition: the persistent
+    /// graph leaves in the same group as its definition. All purge leases are
+    /// settled before DdlBatch enters ordinary registry callbacks.
+    pub(crate) fn stage_persistent_index_retirement(
+        index: &str,
+        definition: &PersistedIndexDefinition,
+        ddl: &mut super::DdlBatch<'_>,
+    ) -> Result<()> {
+        if definition.index_type.as_deref() == Some("persistent_hnsw") {
+            ddl.delete(super::index_snapshot::vec_snapshot_key(index));
+            ddl.delete(super::index_snapshot::vec_snapshot_marker_key(index));
+            let storage = ddl.engine();
+            storage
+                .vector_indexes()
+                .stage_persistent_index_purge(index, storage.db(), ddl)?;
+        }
+        Ok(())
     }
 
     /// Spec R5.3: [`Self::drop_index_definition`], staged into the statement's batch.
@@ -3293,7 +3680,7 @@ impl<'a> Catalog<'a> {
     /// or unknown-version record instead of erroring, so a single bad record
     /// degrades to a scan for *that* index rather than aborting the rebuild of
     /// every other index in the database.
-    fn decode_persisted_index_definition(index_name: &str, value: &[u8]) -> Option<PersistedIndexDefinition> {
+    pub fn decode_persisted_index_definition(index_name: &str, value: &[u8]) -> Option<PersistedIndexDefinition> {
         // Current tagged format: magic + version byte + bincode(definition).
         if value.len() > INDEX_DEF_MAGIC.len() && value.starts_with(INDEX_DEF_MAGIC) {
             let version = value[INDEX_DEF_MAGIC.len()];
@@ -4145,6 +4532,15 @@ impl<'a> Catalog<'a> {
                 continue;
             }
 
+            // A previous failed persistent reopen can fence this table. Never
+            // register another usable graph over the same unavailable rows.
+            if let Err(error) = self.storage.check_table_readable(&definition.table_name) {
+                self.storage
+                    .vector_indexes()
+                    .mark_degraded(index_name, error.to_string());
+                report.vector_degraded += 1;
+                continue;
+            }
             let schema = match self.get_table_schema(&definition.table_name) {
                 Ok(schema) => schema,
                 Err(e) => {
@@ -4187,33 +4583,44 @@ impl<'a> Catalog<'a> {
             // R4.2 / R5.V2: reopen RocksDB-backed persistent indexes in place
             // instead of downgrading them to a rebuilt in-memory Standard
             // index (the catalog downgrade flagged by the fastest-HTAP audit).
-            #[cfg(feature = "vector-persist")]
             if matches!(definition.index_type.as_deref(), Some("persistent_hnsw")) {
-                let metric = vector_distance_metric(&definition.options);
-                let config = super::vector_index::PersistentVectorConfig {
-                    dimension: *dimension,
-                    distance_metric: metric,
-                    pq_enabled: false,
-                    rerank_precision: "f32".to_string(),
+                #[cfg(feature = "vector-persist")]
+                let reopened = {
+                    let metric = vector_distance_metric(&definition.options);
+                    let config = super::vector_index::PersistentVectorConfig {
+                        dimension: *dimension,
+                        distance_metric: metric,
+                        pq_enabled: false,
+                        rerank_precision: "f32".to_string(),
+                    };
+                    vector_indexes.reopen_persistent_index(
+                        index_name,
+                        &definition.table_name,
+                        &definition.column_name,
+                        config,
+                        std::sync::Arc::clone(&self.storage.db),
+                        std::sync::Arc::clone(self.storage.write_gate()),
+                    )
                 };
-                match vector_indexes.reopen_persistent_index(
-                    index_name,
-                    &definition.table_name,
-                    &definition.column_name,
-                    config,
-                    std::sync::Arc::clone(&self.storage.db),
-                    std::sync::Arc::clone(self.storage.write_gate()),
-                ) {
+                #[cfg(not(feature = "vector-persist"))]
+                let reopened: Result<()> = Err(Error::storage(
+                    "persistent vector reopen requires the vector-persist feature",
+                ));
+                match reopened {
                     Ok(()) => {
                         report.vector_reopened_persistent += 1;
                         continue;
                     }
                     Err(e) => {
-                        tracing::warn!(
-                            "Vector index rebuild: persistent reopen of '{}' failed: {} — rebuilding in memory",
-                            index_name,
-                            e
-                        );
+                        let reason = format!("persistent index '{index_name}' reopen failed: {e}");
+                        tracing::warn!("{reason}; fencing its table instead of changing the backend");
+                        // No graph mutation/repair writes on this failure path.
+                        // Missing registration would otherwise let later writes
+                        // omit this persistent index's authoritative row images.
+                        let _ = self.storage.quarantine_generic_indexes(&definition.table_name, &reason);
+                        vector_indexes.mark_degraded(index_name, reason);
+                        report.vector_degraded += 1;
+                        continue;
                     }
                 }
             }
@@ -4588,7 +4995,21 @@ impl<'a> Catalog<'a> {
         self.purge_version_history_locked(new_name)?;
         batch.delete(Self::history_purge_key(new_name));
         self.stage_history_purge_intent(old_name, batch)?;
-        self.stage_rename_shape_records(old_name, new_name, move_side_records, highest_row, batch)?;
+        let changed_at = self.storage.next_timestamp();
+        self.stage_rename_shape_records(old_name, new_name, move_side_records, highest_row, changed_at, batch)?;
+        // Spec R5.5: the rename's own `snapshot:` record, in its batch. `AS OF TIMESTAMP`
+        // reads at the newest snapshot at or before the time, and a rename wrote none: a
+        // time after it, with nothing committed since, read at a snapshot before it and
+        // was refused as a read from before the rename.
+        let rename_snapshot = if self.storage.time_travel_enabled() {
+            Some(
+                self.storage
+                    .snapshot_manager()
+                    .stage_rewrite_snapshot(batch, changed_at)?,
+            )
+        } else {
+            None
+        };
         // B4 fix pass (R1): the side records in this same batch, so no crash leaves the
         // table renamed without its CHECK constraints (the purge after it widened what
         // was a separate write's window to the whole purge). Read now, staged here.
@@ -4622,6 +5043,11 @@ impl<'a> Catalog<'a> {
             );
         }
 
+        // Spec R5.3 (review F8): the dictionaries, the columnar side data and the
+        // `meta:col_storage:` records, keyed by the table's name, in this batch too.
+        // Last before the write: it takes the zone-stats lock and holds it until then.
+        self.stage_column_side_storage_move(old_name, new_name, None, &mut ddl)?;
+
         // Spec R1 §4 (sprinter e21903322db7): the rename and its logical-WAL
         // `RenameTable` entry are ONE write group (as `drop_table`'s) — no
         // entry during replay. A crash between a separate entry and the rename
@@ -4644,6 +5070,13 @@ impl<'a> Catalog<'a> {
         // overwrite a pre-existing row (and strand its PK-index key, inflating the
         // COUNT(*) fast path).
         self.storage.rename_row_counter(old_name, new_name);
+
+        // Spec R5.3 (review F8): the live trigger registry follows the records the
+        // batch moved. Left keyed by the old name, the renamed table's triggers
+        // stopped firing, `DROP TRIGGER … ON <new>` found nothing, and `DROP TRIGGER
+        // … ON <old>` dropped only the live entry: the record, under the new name,
+        // brought the trigger back at the next open.
+        self.storage.rename_live_table_triggers(old_name, new_name);
 
         // Rename compression manager resources (no-op - compression handled by RocksDB LZ4)
         super::CompressionManager::new().rename_table(old_name, new_name)?;
@@ -4684,6 +5117,12 @@ impl<'a> Catalog<'a> {
         self.storage.invalidate_missing_values(new_name);
         self.storage.invalidate_schema_cache(old_name);
         self.storage.cache_schema(new_name, schema);
+        // `AS OF` resolves to the rename once the names answer as it left them.
+        if let Some(snapshot) = rename_snapshot {
+            self.storage
+                .snapshot_manager()
+                .publish_rewrite_snapshot(new_name, snapshot);
+        }
 
         // The per-table SIDE records — `table_constraints:{t}` (every CHECK,
         // FOREIGN KEY and table-level UNIQUE the table owns), the IDENTITY
@@ -4836,6 +5275,83 @@ impl<'a> Catalog<'a> {
         Ok(moved)
     }
 
+    /// Spec R5.3 (review F8): stage into `ddl` the move of the side storage a rename
+    /// carries that is keyed by table and column NAME — every column's of `table` to
+    /// `new_table` for `RENAME TO` (`renamed` is `None`), column `old`'s to `new` for
+    /// `RENAME COLUMN` (`Some((old, new))`): its dictionary (`dict:`), its columnar
+    /// batches and zone stats (`col:`, `colz:`, `colzm:`), the table's live-row
+    /// presence (`colp:`, `colpm:`, `RENAME TO` only) and its `meta:col_storage:`
+    /// record. None of it moved before: a renamed table's DICTIONARY column failed
+    /// every read and `TRUNCATE` (`Invalid dict_id 0`), a renamed COLUMNAR column read
+    /// as empty (`WHERE v < 50` gave 0 rows), and a value inserted between a
+    /// `RENAME COLUMN` and its reverse was encoded in a second dictionary, so a row
+    /// read another row's value afterwards.
+    ///
+    /// The dictionary cache lets go of both sides after the write (the next use loads
+    /// the moved dictionary; an unwritten batch re-marks what it had marked written),
+    /// and the table's bloom filters and zone maps, keyed by its name, are dropped
+    /// then (they are rebuilt; absent, they prune nothing). Takes the zone-stats write
+    /// lock after the dictionaries and holds it until the batch is written, as a
+    /// DROP's sidecar purge does (decision 9): call it last, or nearly, before the
+    /// commit. Nothing for an identical name.
+    pub(crate) fn stage_column_side_storage_move<'d>(
+        &self,
+        table: &str,
+        new_table: &str,
+        renamed: Option<(&str, &str)>,
+        ddl: &mut super::DdlBatch<'d>,
+    ) -> Result<()>
+    where
+        'a: 'd,
+    {
+        let identical = match renamed {
+            None => table == new_table,
+            Some((old, new)) => table == new_table && old == new,
+        };
+        if identical {
+            return Ok(());
+        }
+        let storage: &'a StorageEngine = self.storage;
+        let dictionaries = storage.dictionary_manager();
+        let were_dirty = dictionaries.stage_move(&storage.db, table, new_table, renamed, ddl.batch_mut())?;
+        if !were_dirty.is_empty() {
+            let table = table.to_string();
+            ddl.on_abort(move || dictionaries.mark_dirty(&table, &were_dirty));
+        }
+
+        let stats = super::columnar::stats_write_lock();
+        super::ColumnarStore::stage_sidecar_move(&storage.db, table, new_table, renamed, ddl.batch_mut())?;
+        ddl.hold_until_written(stats);
+
+        // `meta:col_storage:{table}:{column}`, decoded by the scan and sealed again
+        // for its new key.
+        let prefix = format!("meta:col_storage:{}:", table);
+        let records = storage.meta_blobs_with_prefix(&prefix)?;
+        if let Some((_, new)) = renamed {
+            ddl.delete(format!("meta:col_storage:{}:{}", new_table, new));
+        }
+        for (column, value) in records {
+            let new_column = match renamed {
+                None => column.clone(),
+                Some((old, new)) if column == old => new.to_string(),
+                Some(_) => continue,
+            };
+            ddl.put(format!("meta:col_storage:{}:{}", new_table, new_column), &value)?;
+            ddl.delete(format!("{}{}", prefix, column));
+        }
+
+        let table = table.to_string();
+        let new_table = new_table.to_string();
+        let renamed = renamed.map(|(old, new)| (old.to_string(), new.to_string()));
+        ddl.on_commit(move || {
+            let renamed = renamed.as_ref().map(|(old, new)| (old.as_str(), new.as_str()));
+            dictionaries.forget_moved(&table, &new_table, renamed);
+            storage.predicate_pushdown().remove_table(&table);
+            storage.predicate_pushdown().remove_table(&new_table);
+        });
+        Ok(())
+    }
+
     /// Stage the move of `old_name`'s `meta:attmissing:` keys to `new_name`.
     fn stage_missing_values_move(&self, old_name: &str, new_name: &str, batch: &mut rocksdb::WriteBatch) -> Result<()> {
         let prefix = Self::attmissing_prefix(old_name);
@@ -4850,6 +5366,71 @@ impl<'a> Catalog<'a> {
             };
             batch.put(Self::attmissing_key(new_name, &String::from_utf8_lossy(column)), &value);
             batch.delete(&key);
+        }
+        Ok(())
+    }
+
+    /// Stage a statement's net column permutation and columnar removals together.
+    /// Sources are read before any destination is overwritten; one stats guard
+    /// covers every move/purge. Dictionary writers stay serialized through durable
+    /// application; the table owner protects cache settlement before publication.
+    pub(crate) fn stage_altered_column_side_storage<'d>(
+        &self,
+        table: &str,
+        renames: &[(String, String)],
+        columnar_dropped: &[String],
+        has_columnar: bool,
+        ddl: &mut super::DdlBatch<'d>,
+    ) -> Result<()>
+    where
+        'a: 'd,
+    {
+        if renames.is_empty() && columnar_dropped.is_empty() {
+            return Ok(());
+        }
+        let storage: &'a StorageEngine = self.storage;
+        if !renames.is_empty() {
+            let dictionaries = storage.dictionary_manager();
+            let writer = dictionaries.writer_lock();
+            let dirty = dictionaries.stage_column_renames(&storage.db, table, renames, ddl.batch_mut())?;
+            // The retained table owner protects these endpoints after releasing
+            // global writer serialization. Settle the cache from the batch's
+            // strict application proof, before the schema/index callbacks.
+            ddl.after_write_before_publication(move |_| drop(writer));
+            let unwritten = table.to_string();
+            ddl.on_abort(move || dictionaries.mark_dirty(&unwritten, &dirty));
+            let published = table.to_string();
+            let renamed = renames.to_vec();
+            ddl.on_commit(move || {
+                dictionaries.forget_column_renames(&published, &renamed);
+                storage.predicate_pushdown().remove_table(&published);
+            });
+        }
+
+        let stats = super::columnar::stats_write_lock();
+        // A dropped destination must be purged before another column takes its
+        // name. The bulk mover reads the original database, not pending deletes.
+        for column in columnar_dropped {
+            super::ColumnarStore::stage_column_purge(&storage.db, table, column, ddl.batch_mut())?;
+        }
+        if !columnar_dropped.is_empty() && !has_columnar {
+            super::ColumnarStore::stage_presence_purge(&storage.db, table, ddl.batch_mut())?;
+        }
+        super::ColumnarStore::stage_sidecar_renames(&storage.db, table, renames, ddl.batch_mut())?;
+        ddl.hold_until_written(stats);
+
+        let records: std::collections::HashMap<_, _> = storage
+            .meta_blobs_with_prefix(&format!("meta:col_storage:{table}:"))?
+            .into_iter()
+            .collect();
+        for (old, new) in renames {
+            ddl.delete(format!("meta:col_storage:{table}:{old}"));
+            ddl.delete(format!("meta:col_storage:{table}:{new}"));
+        }
+        for (old, new) in renames {
+            if let Some(value) = records.get(old) {
+                ddl.put(format!("meta:col_storage:{table}:{new}"), value)?;
+            }
         }
         Ok(())
     }
@@ -5213,6 +5794,17 @@ impl<'a> Catalog<'a> {
     /// constraint that quietly stops being enforced is not.
     pub fn validate_rename_column_constraints(&self, table: &str, old: &str) -> Result<()> {
         let constraints = self.load_table_constraints(table)?;
+        Self::validate_rename_column_in(table, old, &constraints)
+    }
+
+    /// Spec R5.5: [`Self::validate_rename_column_constraints`] against `constraints`,
+    /// the record as the statement has it so far (an `ALTER TABLE` of several clauses
+    /// writes it once, at its end).
+    pub(crate) fn validate_rename_column_in(
+        table: &str,
+        old: &str,
+        constraints: &crate::sql::TableConstraints,
+    ) -> Result<()> {
         for cc in &constraints.check_constraints {
             if Self::check_body_is_serialized(&cc.expression) {
                 let parsed: serde_json::Value = match serde_json::from_str(&cc.expression) {
@@ -5292,26 +5884,58 @@ impl<'a> Catalog<'a> {
         if old.eq_ignore_ascii_case(new) {
             return Ok(());
         }
-        let rename_list = |cols: &mut Vec<String>, changed: &mut bool| {
-            for col in cols.iter_mut() {
-                if col.eq_ignore_ascii_case(old) {
-                    *col = new.to_string();
-                    *changed = true;
-                }
-            }
-        };
 
         // --- this table's own record -------------------------------------
         let mut constraints = self.load_table_constraints(table)?;
+        if Self::rename_column_in_constraint_set(table, old, new, &mut constraints)? {
+            self.stage_table_constraints(table, &constraints, ddl)?;
+        }
+
+        // --- every other table's PARENT-side reference -------------------
+        for other in self.list_tables()? {
+            if other == table {
+                continue;
+            }
+            let mut other_constraints = self.load_table_constraints(&other)?;
+            if Self::rename_referenced_column(table, old, new, &mut other_constraints) {
+                self.stage_table_constraints(&other, &other_constraints, ddl)?;
+            }
+        }
+
+        // --- IDENTITY side record ----------------------------------------
+        let mut identity = self.list_identity_columns(table)?;
+        if identity.iter().any(|c| c.eq_ignore_ascii_case(old)) {
+            for col in identity.iter_mut() {
+                if col.eq_ignore_ascii_case(old) {
+                    *col = new.to_string();
+                }
+            }
+            self.stage_identity_columns(table, &identity, ddl)?;
+        }
+
+        Ok(())
+    }
+
+    /// Spec R5.5: the rename of column `old` of `table` to `new` in `constraints`,
+    /// `table`'s own record: its UNIQUE / PRIMARY KEY column lists, its foreign keys'
+    /// referencing lists (and a self-reference's referenced list), its CHECK bodies.
+    /// `true` when anything changed. Validate first
+    /// ([`Self::validate_rename_column_in`]).
+    pub(crate) fn rename_column_in_constraint_set(
+        table: &str,
+        old: &str,
+        new: &str,
+        constraints: &mut crate::sql::TableConstraints,
+    ) -> Result<bool> {
         let mut changed = false;
         for uc in constraints.unique_constraints.iter_mut() {
-            rename_list(&mut uc.columns, &mut changed);
+            Self::rename_in_column_list(&mut uc.columns, old, new, &mut changed);
         }
         for fk in constraints.foreign_keys.iter_mut() {
-            rename_list(&mut fk.columns, &mut changed);
+            Self::rename_in_column_list(&mut fk.columns, old, new, &mut changed);
             // A self-referencing FK has BOTH ends on this table.
             if fk.references_table == table {
-                rename_list(&mut fk.references_columns, &mut changed);
+                Self::rename_in_column_list(&mut fk.references_columns, old, new, &mut changed);
             }
         }
         for cc in constraints.check_constraints.iter_mut() {
@@ -5343,102 +5967,50 @@ impl<'a> Catalog<'a> {
                 }
             }
         }
-        if changed {
-            self.stage_table_constraints(table, &constraints, ddl)?;
-        }
-
-        // --- every other table's PARENT-side reference -------------------
-        for other in self.list_tables()? {
-            if other == table {
-                continue;
-            }
-            let mut other_constraints = self.load_table_constraints(&other)?;
-            let mut other_changed = false;
-            for fk in other_constraints.foreign_keys.iter_mut() {
-                if fk.references_table == table {
-                    rename_list(&mut fk.references_columns, &mut other_changed);
-                }
-            }
-            if other_changed {
-                self.stage_table_constraints(&other, &other_constraints, ddl)?;
-            }
-        }
-
-        // --- IDENTITY side record ----------------------------------------
-        let mut identity = self.list_identity_columns(table)?;
-        if identity.iter().any(|c| c.eq_ignore_ascii_case(old)) {
-            for col in identity.iter_mut() {
-                if col.eq_ignore_ascii_case(old) {
-                    *col = new.to_string();
-                }
-            }
-            self.stage_identity_columns(table, &identity, ddl)?;
-        }
-
-        Ok(())
+        Ok(changed)
     }
 
-    /// REFUSE-or-proceed check for `ALTER TABLE <table> DROP COLUMN
-    /// <column>`, run BEFORE the schema is touched.
-    ///
-    /// PostgreSQL drops a column's OWN table constraints automatically and
-    /// refuses only when another object depends on the column. The one such
-    /// dependency Nano records is another table's FOREIGN KEY pointing at
-    /// this column, and dropping the column silently would leave that child's
-    /// FK naming a parent column that no longer exists — enforced by nothing,
-    /// exactly the failure this item is about. Refused without `CASCADE`,
-    /// which is both PostgreSQL's rule and the fail-closed one.
-    pub fn validate_drop_column_constraints(&self, table: &str, column: &str, cascade: bool) -> Result<()> {
-        if cascade {
-            return Ok(());
-        }
-        let mut dependents: Vec<String> = Vec::new();
-        for other in self.list_tables()? {
-            if other == table {
-                continue;
-            }
-            let constraints = self.load_table_constraints(&other)?;
-            for fk in &constraints.foreign_keys {
-                if fk.references_table == table && fk.references_columns.iter().any(|c| c.eq_ignore_ascii_case(column))
-                {
-                    dependents.push(format!("constraint {} on table {}", fk.name, other));
-                }
+    /// Spec R5.5: in `other`, another table's record, the foreign keys that reference
+    /// `table`.`old` reference `table`.`new`. `true` when one did.
+    pub(crate) fn rename_referenced_column(
+        table: &str,
+        old: &str,
+        new: &str,
+        other: &mut crate::sql::TableConstraints,
+    ) -> bool {
+        let mut changed = false;
+        for fk in other.foreign_keys.iter_mut() {
+            if fk.references_table == table {
+                Self::rename_in_column_list(&mut fk.references_columns, old, new, &mut changed);
             }
         }
-        if dependents.is_empty() {
-            return Ok(());
-        }
-        Err(Error::query_execution(format!(
-            "cannot drop column \"{}\" of relation \"{}\" because other objects depend on it: {}. \
-             Use DROP COLUMN … CASCADE, or drop those constraints first.",
-            column,
-            table,
-            dependents.join(", ")
-        )))
+        changed
     }
 
-    /// Retire every persisted record that names `table`.`column`, and the
-    /// constraint-owned indexes behind them.
-    ///
-    /// PostgreSQL semantics: "indexes and table constraints involving the
-    /// column will be automatically dropped". A COMPOSITE constraint goes in
-    /// full — `UNIQUE (a, b)` with `b` dropped is not `UNIQUE (a)`, and
-    /// narrowing it would INVENT a rule the user never declared — and each
-    /// removal is logged at INFO so an operator can see what the DDL took
-    /// with it.
-    ///
-    /// The live indexes must go too, and not merely to reclaim memory: a
-    /// constraint tree whose column no longer resolves is inert *until*
-    /// someone runs `ADD COLUMN` with the old name, at which point every
-    /// probe starts resolving again and the resurrected tree rejects
-    /// duplicates on behalf of a constraint that was dropped. A user
-    /// `CREATE [UNIQUE] INDEX` is left alone: it is a relation the user owns
-    /// and `DROP INDEX` names, and its durable `meta:index:` record would
-    /// bring it back at the next open anyway.
-    pub fn drop_column_from_constraints(&self, table: &str, column: &str) -> Result<()> {
+    fn rename_in_column_list(columns: &mut [String], old: &str, new: &str, changed: &mut bool) {
+        for column in columns.iter_mut() {
+            if column.eq_ignore_ascii_case(old) {
+                *column = new.to_string();
+                *changed = true;
+            }
+        }
+    }
+
+    /// Spec R5.5: `ALTER TABLE … DROP COLUMN`'s change of `table`'s own constraint
+    /// record: every UNIQUE / PRIMARY KEY, FOREIGN KEY and CHECK naming `column`
+    /// retired from `constraints`. PostgreSQL semantics: "indexes and table
+    /// constraints involving the column will be automatically dropped". A COMPOSITE
+    /// constraint goes in full — `UNIQUE (a, b)` with `b` dropped is not `UNIQUE
+    /// (a)`, and narrowing it would INVENT a rule the user never declared — and each
+    /// removal is logged at INFO so an operator can see what the DDL took with it.
+    /// Returns whether anything changed and the retired UNIQUE / PRIMARY KEY
+    /// constraints, whose indexes go after the write.
+    pub(crate) fn retire_column_constraints(
+        table: &str,
+        column: &str,
+        constraints: &mut crate::sql::TableConstraints,
+    ) -> Result<(bool, Vec<crate::sql::UniqueConstraint>)> {
         let names_column = |cols: &[String]| cols.iter().any(|c| c.eq_ignore_ascii_case(column));
-
-        let mut constraints = self.load_table_constraints(table)?;
         let mut changed = false;
         let mut removed_uniques: Vec<crate::sql::UniqueConstraint> = Vec::new();
 
@@ -5514,69 +6086,60 @@ impl<'a> Catalog<'a> {
         if let Some(e) = check_err {
             return Err(e);
         }
-        if changed {
-            self.save_table_constraints(table, &constraints)?;
-        }
-        if !removed_uniques.is_empty() {
-            self.drop_unique_constraint_indexes(table, &removed_uniques);
-        }
+        Ok((changed, removed_uniques))
+    }
 
-        // Every OTHER table's parent-side reference. Reaching here means
-        // either nothing references the column or the caller passed CASCADE
-        // (`validate_drop_column_constraints` refuses otherwise), so these
-        // FKs are dropped exactly as PostgreSQL's CASCADE drops them.
+    /// Spec R5.5: in `other`, another table's record, the foreign keys that reference
+    /// `table`.`column` retired (`DROP COLUMN … CASCADE`). How many went.
+    pub(crate) fn retire_inbound_references(
+        table: &str,
+        column: &str,
+        other: &mut crate::sql::TableConstraints,
+    ) -> usize {
+        let before = other.foreign_keys.len();
+        other.foreign_keys.retain(|fk| {
+            !(fk.references_table == table && fk.references_columns.iter().any(|c| c.eq_ignore_ascii_case(column)))
+        });
+        before - other.foreign_keys.len()
+    }
+
+    /// REFUSE-or-proceed check for `ALTER TABLE <table> DROP COLUMN
+    /// <column>`, run BEFORE the schema is touched.
+    ///
+    /// PostgreSQL drops a column's OWN table constraints automatically and
+    /// refuses only when another object depends on the column. The one such
+    /// dependency Nano records is another table's FOREIGN KEY pointing at
+    /// this column, and dropping the column silently would leave that child's
+    /// FK naming a parent column that no longer exists — enforced by nothing,
+    /// exactly the failure this item is about. Refused without `CASCADE`,
+    /// which is both PostgreSQL's rule and the fail-closed one.
+    pub fn validate_drop_column_constraints(&self, table: &str, column: &str, cascade: bool) -> Result<()> {
+        if cascade {
+            return Ok(());
+        }
+        let mut dependents: Vec<String> = Vec::new();
         for other in self.list_tables()? {
             if other == table {
                 continue;
             }
-            let mut other_constraints = self.load_table_constraints(&other)?;
-            let before = other_constraints.foreign_keys.len();
-            other_constraints
-                .foreign_keys
-                .retain(|fk| !(fk.references_table == table && names_column(&fk.references_columns)));
-            if other_constraints.foreign_keys.len() != before {
-                tracing::info!(
-                    "DROP COLUMN {}.{} CASCADE: retiring {} foreign key(s) on table '{}'",
-                    table,
-                    column,
-                    before - other_constraints.foreign_keys.len(),
-                    other
-                );
-                self.save_table_constraints(&other, &other_constraints)?;
+            let constraints = self.load_table_constraints(&other)?;
+            for fk in &constraints.foreign_keys {
+                if fk.references_table == table && fk.references_columns.iter().any(|c| c.eq_ignore_ascii_case(column))
+                {
+                    dependents.push(format!("constraint {} on table {}", fk.name, other));
+                }
             }
         }
-
-        // Constraint-owned live indexes over the column.
-        let art = self.storage.art_indexes();
-        for (name, _kind, cols) in art.list_table_indexes(table) {
-            if !cols.iter().any(|c| c.eq_ignore_ascii_case(column)) {
-                continue;
-            }
-            if self.index_definition_exists(&name).unwrap_or(false) {
-                continue;
-            }
-            if let Err(e) = art.drop_index(&name) {
-                tracing::warn!(
-                    "DROP COLUMN {}.{}: could not drop the constraint index '{}': {}",
-                    table,
-                    column,
-                    name,
-                    e
-                );
-            }
+        if dependents.is_empty() {
+            return Ok(());
         }
-
-        // IDENTITY side record.
-        let identity = self.list_identity_columns(table)?;
-        if identity.iter().any(|c| c.eq_ignore_ascii_case(column)) {
-            let kept: Vec<String> = identity
-                .into_iter()
-                .filter(|c| !c.eq_ignore_ascii_case(column))
-                .collect();
-            self.register_identity_columns(table, &kept)?;
-        }
-
-        Ok(())
+        Err(Error::query_execution(format!(
+            "cannot drop column \"{}\" of relation \"{}\" because other objects depend on it: {}. \
+             Use DROP COLUMN … CASCADE, or drop those constraints first.",
+            column,
+            table,
+            dependents.join(", ")
+        )))
     }
 
     /// Build metadata key for table schema
@@ -6227,9 +6790,10 @@ impl<'a> Catalog<'a> {
         Ok(value)
     }
 
-    /// GH#36: emit the logical-WAL entry for a sequence-definition change.
-    /// `alter` distinguishes ALTER SEQUENCE from CREATE SEQUENCE; replay treats
-    /// both as an idempotent definition write.
+    /// Emit explicit sequence-definition history without writing its catalog
+    /// record. No current internal caller uses this standalone helper; normal
+    /// CREATE/ALTER uses stage_sequence in the owning DdlBatch. Explicit replay
+    /// is separate from startup, which never redoes this history.
     pub fn log_sequence_definition(&self, def: &PersistedSequence, alter: bool) -> Result<()> {
         let frame = Self::encode_sequence_def(def)?;
         if alter {
@@ -6385,7 +6949,20 @@ impl<'a> Catalog<'a> {
     }
 
     /// The tagged frame [`Self::save_sequence_state`] persists.
-    fn encode_sequence_state(st: &PersistedSeqState) -> Result<Vec<u8>> {
+    /// Same state metadata put/sealing/options as the public raw setter, with
+    /// a borrowed observer for setval's owning native group only.
+    pub(crate) fn save_sequence_state_observed(
+        &self,
+        name: &str,
+        st: &PersistedSeqState,
+        attempt: &super::write_outcome::WriteAttempt,
+    ) -> Result<()> {
+        let key = Self::sequence_state_key(name);
+        let value = Self::encode_sequence_state(st)?;
+        self.storage.put_observed(&key, &value, attempt)
+    }
+
+    pub(crate) fn encode_sequence_state(st: &PersistedSeqState) -> Result<Vec<u8>> {
         let body =
             bincode::serialize(st).map_err(|e| Error::storage(format!("Failed to serialize sequence state: {}", e)))?;
         let mut value = Vec::with_capacity(SEQ_STATE_MAGIC.len() + 1 + body.len());
@@ -6406,14 +6983,17 @@ impl<'a> Catalog<'a> {
         state: Option<&PersistedSeqState>,
         ddl: &mut super::DdlBatch<'_>,
     ) -> Result<()> {
+        let before = Self::sequence_ddl_image(self.storage, &def.name)?;
         let frame = Self::encode_sequence_def(def)?;
+        let mut after = before.clone();
+        after[0] = Some(frame.clone());
         ddl.put(Self::sequence_def_key(&def.name), &frame)?;
         if let Some(state) = state {
-            ddl.put(
-                Self::sequence_state_key(&def.name),
-                &Self::encode_sequence_state(state)?,
-            )?;
+            let frame = Self::encode_sequence_state(state)?;
+            ddl.put(Self::sequence_state_key(&def.name), &frame)?;
+            after[1] = Some(frame);
         }
+        Self::stage_sequence_cache_outcome(&def.name, before, after, ddl);
         ddl.log(if alter {
             super::WalOperation::AlterSequence {
                 name: def.name.clone(),
@@ -6430,10 +7010,67 @@ impl<'a> Catalog<'a> {
 
     /// Spec R5.3: a `DROP SEQUENCE`'s two deletes and its logical-WAL entry, staged
     /// into the statement's batch.
-    pub(crate) fn stage_sequence_drop(name: &str, ddl: &mut super::DdlBatch<'_>) {
+    pub(crate) fn stage_sequence_drop(name: &str, ddl: &mut super::DdlBatch<'_>) -> Result<()> {
+        let before = Self::sequence_ddl_image(ddl.engine(), name)?;
         ddl.delete(Self::sequence_def_key(name));
         ddl.delete(Self::sequence_state_key(name));
+        Self::stage_sequence_cache_outcome(name, before, [None, None], ddl);
         ddl.log(super::WalOperation::DropSequence { name: name.to_string() });
+        Ok(())
+    }
+
+    /// One atomic read cut of the authoritative definition and reservation,
+    /// unsealed exactly as StorageEngine::get unseals each catalog value.
+    fn sequence_ddl_image(storage: &StorageEngine, name: &str) -> Result<[Option<Vec<u8>>; 2]> {
+        let db = storage.db();
+        let snapshot = db.snapshot();
+        let mut image = [None, None];
+        for (slot, key) in image
+            .iter_mut()
+            .zip([Self::sequence_def_key(name), Self::sequence_state_key(name)])
+        {
+            *slot = snapshot
+                .get(&key)
+                .map_err(|error| Error::storage(format!("Cannot read sequence DDL witness: {error}")))?
+                .map(|raw| super::tde::open_ref(storage.key_manager_ref(), &key, &raw).map(|plain| plain.into_owned()))
+                .transpose()?;
+        }
+        Ok(image)
+    }
+
+    /// Cached windows are published with their owning DDL outcome. A native
+    /// error alone never discards a proven old window or retains a stale new one.
+    fn stage_sequence_cache_outcome(
+        name: &str,
+        before: [Option<Vec<u8>>; 2],
+        after: [Option<Vec<u8>>; 2],
+        ddl: &mut super::DdlBatch<'_>,
+    ) {
+        let storage = ddl.engine();
+        let published = name.to_string();
+        ddl.on_commit(move || crate::sql::sequences::invalidate_cache_on(storage, &published));
+        let name = name.to_string();
+        ddl.on_write_error(move || match Self::sequence_ddl_image(storage, &name) {
+            Ok(actual) if before == after && actual == after => {
+                // An exact metadata no-op cannot witness group application.
+                // Eviction is safe for either outcome and prevents a runtime
+                // published by an intervening ALTER from surviving this write.
+                // Do not report a false BEFORE/AFTER application proof.
+                crate::sql::sequences::invalidate_cache_on(storage, &name);
+                Err(Error::storage(
+                    "sequence DDL application is indistinguishable; its cached window was invalidated",
+                ))
+            }
+            Ok(actual) if actual == after => Ok(true),
+            Ok(actual) if actual == before => Ok(false),
+            actual => {
+                let reason = match actual {
+                    Ok(_) => "sequence witness is neither its BEFORE nor AFTER definition/state".to_string(),
+                    Err(error) => format!("Cannot read sequence witness: {error}"),
+                };
+                Err(crate::sql::sequences::quarantine_cache_on(storage, &name, &reason))
+            }
+        });
     }
 
     // -------------------------------------------------------------------
@@ -7401,7 +8038,7 @@ impl<'a> Catalog<'a> {
     /// zero matches. CREATE INDEX backfills the same way. Best effort, as before:
     /// the constraint is enforced through the parent's key index whatever happens
     /// here.
-    fn register_foreign_key_index(&self, fk: &crate::sql::ForeignKeyConstraint) {
+    pub(crate) fn register_foreign_key_index(&self, fk: &crate::sql::ForeignKeyConstraint) {
         let art_manager = self.storage.art_indexes();
         // The name `create_fk_index` registers under (the constraint's own, as
         // passed below), hidden before it exists.
@@ -7648,6 +8285,314 @@ impl TriggerPersistence for Catalog<'_> {
 mod tests {
     use super::*;
     use crate::{Column, Config, DataType};
+
+    #[cfg(all(feature = "vector-search", not(feature = "vector-persist")))]
+    #[test]
+    fn persistent_definition_without_feature_fences_only_its_table_without_downgrade() {
+        use crate::EmbeddedDatabase;
+
+        let root = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.storage.path = Some(root.path().to_path_buf());
+        cfg.storage.memory_only = false;
+        cfg.storage.flush_on_close = false;
+        cfg.storage.wal_checkpoint_on_close = false;
+        cfg.storage.version_gc_interval_secs = Some(0);
+        let seed = EmbeddedDatabase::with_config(cfg.clone()).unwrap();
+        seed.storage.set_index_snapshots_on_close(false);
+        seed.storage.set_row_counter_flush_on_close(false);
+        for sql in [
+            "CREATE TABLE needs_feature (id INT PRIMARY KEY, v VECTOR(2))",
+            "CREATE TABLE unaffected (id INT PRIMARY KEY, v VECTOR(2))",
+            "INSERT INTO needs_feature VALUES (1,'[1,0]')",
+            "INSERT INTO unaffected VALUES (7,'[0,1]')",
+            "CREATE INDEX a_recorded_persistent ON needs_feature USING hnsw(v)",
+            "CREATE INDEX z_same_table ON needs_feature USING hnsw(v)",
+            "CREATE INDEX b_unaffected ON unaffected USING hnsw(v)",
+        ] {
+            seed.execute(sql).unwrap();
+        }
+        // Complete ordinary healthy startup before changing the recorded family.
+        // Counter-floor housekeeping is not an unsupported-backend repair write.
+        drop(seed);
+        let seed = EmbeddedDatabase::with_config(cfg.clone()).unwrap();
+        seed.storage.set_index_snapshots_on_close(false);
+        seed.storage.set_row_counter_flush_on_close(false);
+        assert_eq!(
+            seed.query("SELECT id FROM needs_feature", &[]).unwrap()[0].values,
+            vec![Value::Int4(1)]
+        );
+        assert_eq!(
+            seed.query("SELECT id FROM unaffected", &[]).unwrap()[0].values,
+            vec![Value::Int4(7)]
+        );
+        assert!(seed.storage.vector_indexes().index_exists("a_recorded_persistent"));
+        assert!(seed.storage.vector_indexes().index_exists("b_unaffected"));
+        {
+            let catalog = seed.storage.catalog();
+            let mut recorded = catalog.get_index_definition("a_recorded_persistent").unwrap().unwrap();
+            // This build cannot create or validate a real persistent graph.
+            // Plant only its recorded family through the actual catalog writer
+            // to exercise unsupported-definition admission on the next open.
+            recorded.index_type = Some("persistent_hnsw".into());
+            catalog
+                .save_index_definition("a_recorded_persistent", &recorded)
+                .unwrap();
+        }
+        drop(seed);
+
+        let image = |engine: &StorageEngine| {
+            let mut options = rocksdb::ReadOptions::default();
+            options.set_total_order_seek(true);
+            engine
+                .db()
+                .iterator_opt(rocksdb::IteratorMode::Start, options)
+                .map(|entry| {
+                    let (key, value) = entry.unwrap();
+                    (key.to_vec(), value.to_vec())
+                })
+                .collect::<Vec<_>>()
+        };
+        for readonly in [true, false] {
+            let engine = if readonly {
+                StorageEngine::open_read_only(root.path(), &cfg).unwrap()
+            } else {
+                StorageEngine::open(root.path(), &cfg).unwrap()
+            };
+            let before = image(&engine);
+            let sequence = engine.db().latest_sequence_number();
+            engine.catalog().rebuild_all_indexes().unwrap();
+            assert_eq!(
+                image(&engine),
+                before,
+                "unsupported family handling performs no repair writes"
+            );
+            assert_eq!(engine.db().latest_sequence_number(), sequence);
+            assert_eq!(engine.write_gate().refusals(), 0, "no attempted closed-gate repair");
+            let manager = engine.vector_indexes();
+            assert!(!manager.index_exists("a_recorded_persistent"), "no Standard fallback");
+            assert!(manager.get_metadata("a_recorded_persistent").is_err());
+            assert!(manager.find_indexes("needs_feature", "v").is_empty());
+            assert!(
+                !manager.index_exists("z_same_table"),
+                "later graph cannot resurrect the fenced table"
+            );
+            assert!(manager.degraded_indexes().iter().any(|(name, reason)| {
+                name == "a_recorded_persistent" && reason.contains("requires the vector-persist feature")
+            }));
+            let error = engine.check_table_readable("needs_feature").unwrap_err();
+            assert!(error.to_string().contains("unavailable"), "{error}");
+            assert!(engine.write_gate().check_table_available("needs_feature").is_err());
+            assert!(engine
+                .art_indexes()
+                .list_indexes()
+                .iter()
+                .all(|(_, table, _, _)| table != "needs_feature"));
+            assert!(manager.index_exists("b_unaffected"));
+            assert!(engine.check_table_readable("unaffected").is_ok());
+            let schema = engine.catalog().get_table_schema("unaffected").unwrap();
+            let rows = engine.scan_table_with_schema("unaffected", &schema).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].values[0], Value::Int4(7));
+        }
+
+        let primary = EmbeddedDatabase::with_config(cfg).unwrap();
+        primary.storage.set_index_snapshots_on_close(false);
+        primary.storage.set_row_counter_flush_on_close(false);
+        assert!(primary
+            .storage
+            .vector_indexes()
+            .degraded_indexes()
+            .iter()
+            .any(|(name, reason)| {
+                name == "a_recorded_persistent" && reason.contains("requires the vector-persist feature")
+            }));
+        for sql in [
+            "SELECT id FROM needs_feature",
+            "SELECT id FROM needs_feature ORDER BY v <-> '[1,0]' LIMIT 1",
+        ] {
+            let error = primary.query(sql, &[]).unwrap_err();
+            assert!(
+                error.to_string().contains("table 'needs_feature' is unavailable"),
+                "{error}"
+            );
+        }
+        let before = image(&primary.storage);
+        let sequence = primary.storage.db().latest_sequence_number();
+        for params in [false, true] {
+            let sql = "INSERT INTO needs_feature VALUES (2,'[0,1]')";
+            let error = if params {
+                primary.execute_params(sql, &[])
+            } else {
+                primary.execute(sql)
+            }
+            .unwrap_err();
+            assert!(error.to_string().contains("unavailable"), "{error}");
+            assert_eq!(primary.storage.db().latest_sequence_number(), sequence);
+            assert_eq!(
+                image(&primary.storage),
+                before,
+                "refused table write changes no native key"
+            );
+        }
+        assert!(primary
+            .storage
+            .vector_indexes()
+            .find_indexes("needs_feature", "v")
+            .is_empty());
+        assert_eq!(
+            primary.query("SELECT id FROM unaffected", &[]).unwrap()[0].values,
+            vec![Value::Int4(7)]
+        );
+        primary
+            .execute_params("INSERT INTO unaffected VALUES (8,'[1,0]')", &[])
+            .unwrap();
+        let rows = primary.query("SELECT id FROM unaffected ORDER BY id", &[]).unwrap();
+        assert_eq!(
+            rows.iter().map(|row| row.values.clone()).collect::<Vec<_>>(),
+            vec![vec![Value::Int4(7)], vec![Value::Int4(8)]]
+        );
+        assert!(primary.storage.vector_indexes().index_exists("b_unaffected"));
+        eprintln!("persistent-feature-off-receipt raw_modes=2 public_modes=1 refused_write_families=2 healthy_rows=2");
+    }
+
+    #[cfg(feature = "vector-persist")]
+    #[test]
+    fn mismatched_persistent_reopen_fences_only_its_table_without_downgrade_or_repair_writes() {
+        use crate::EmbeddedDatabase;
+        let root = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.storage.path = Some(root.path().to_path_buf());
+        cfg.storage.memory_only = false;
+        cfg.storage.flush_on_close = false;
+        cfg.storage.wal_checkpoint_on_close = false;
+        cfg.storage.version_gc_interval_secs = Some(0);
+        let seed = EmbeddedDatabase::with_config(cfg.clone()).unwrap();
+        seed.storage.set_index_snapshots_on_close(false);
+        seed.storage.set_row_counter_flush_on_close(false);
+        for sql in [
+            "CREATE TABLE bad_rows (id INT PRIMARY KEY, v VECTOR(2))",
+            "CREATE TABLE healthy_rows (id INT PRIMARY KEY, v VECTOR(2))",
+            "INSERT INTO bad_rows VALUES (1,'[1,0]')",
+            "INSERT INTO healthy_rows VALUES (7,'[0,1]')",
+            "CREATE INDEX a_persistent_bad ON bad_rows USING hnsw(v) WITH (persistent=true)",
+            "CREATE INDEX z_later_same_table ON bad_rows USING hnsw(v)",
+            "CREATE INDEX b_healthy ON healthy_rows USING hnsw(v)",
+        ] {
+            seed.execute(sql).unwrap();
+        }
+        // Establish normal successful startup housekeeping while all definitions
+        // are still healthy. Scan-fallback rebuild may legitimately persist the
+        // row-counter floor; that is separate from failed graph reopen handling.
+        drop(seed);
+        let seed = EmbeddedDatabase::with_config(cfg.clone()).unwrap();
+        seed.storage.set_index_snapshots_on_close(false);
+        seed.storage.set_row_counter_flush_on_close(false);
+        assert_eq!(
+            seed.query("SELECT id FROM bad_rows", &[]).unwrap()[0].values,
+            vec![Value::Int4(1)]
+        );
+        assert_eq!(
+            seed.query("SELECT id FROM healthy_rows", &[]).unwrap()[0].values,
+            vec![Value::Int4(7)]
+        );
+        assert!(seed.storage.vector_indexes().index_exists("a_persistent_bad"));
+        assert!(seed.storage.vector_indexes().index_exists("b_healthy"));
+        let catalog = seed.storage.catalog();
+        let mut mismatch = catalog.get_index_definition("a_persistent_bad").unwrap().unwrap();
+        mismatch
+            .options
+            .retain(|option| !matches!(option, crate::sql::logical_plan::IndexOption::DistanceMetric(_)));
+        mismatch
+            .options
+            .push(crate::sql::logical_plan::IndexOption::DistanceMetric("cosine".into()));
+        // Actual supported metadata writer plants a catalog/backend disagreement;
+        // the persistent backend remains durably L2 with its original rows.
+        catalog.save_index_definition("a_persistent_bad", &mismatch).unwrap();
+        drop(seed);
+        let image = |engine: &StorageEngine| {
+            let mut options = rocksdb::ReadOptions::default();
+            options.set_total_order_seek(true);
+            engine
+                .db()
+                .iterator_opt(rocksdb::IteratorMode::Start, options)
+                .map(|entry| {
+                    let (key, value) = entry.unwrap();
+                    (key.to_vec(), value.to_vec())
+                })
+                .collect::<Vec<_>>()
+        };
+        // Both raw ordinary modes use the same rebuild. Measure its complete
+        // error path separately from legitimate open-time housekeeping.
+        for readonly in [true, false] {
+            let engine = if readonly {
+                StorageEngine::open_read_only(root.path(), &cfg).unwrap()
+            } else {
+                StorageEngine::open(root.path(), &cfg).unwrap()
+            };
+            let before = image(&engine);
+            let sequence = engine.db().latest_sequence_number();
+            engine.catalog().rebuild_all_indexes().unwrap();
+            assert_eq!(
+                image(&engine),
+                before,
+                "no failure-path graph/marker/metadata repair writes"
+            );
+            assert_eq!(engine.db().latest_sequence_number(), sequence);
+            assert_eq!(engine.write_gate().refusals(), 0, "no attempted read-only repairs");
+            let manager = engine.vector_indexes();
+            assert!(!manager.index_exists("a_persistent_bad"));
+            assert!(
+                !manager.index_exists("z_later_same_table"),
+                "later definition cannot resurrect a quarantined table graph"
+            );
+            assert!(manager.index_exists("b_healthy"));
+            assert!(manager
+                .degraded_indexes()
+                .iter()
+                .any(|(name, why)| name == "a_persistent_bad" && why.contains("does not match durable graph")));
+            assert!(engine.check_table_readable("bad_rows").is_err());
+            assert!(engine.write_gate().check_table_available("bad_rows").is_err());
+            assert!(engine
+                .art_indexes()
+                .list_indexes()
+                .iter()
+                .all(|(_, table, _, _)| table != "bad_rows"));
+            assert!(engine.check_table_readable("healthy_rows").is_ok());
+            let schema = engine.catalog().get_table_schema("healthy_rows").unwrap();
+            assert_eq!(engine.scan_table_with_schema("healthy_rows", &schema).unwrap().len(), 1);
+        }
+        // The actual public primary opener keeps the healthy table available,
+        // exposes the degraded cause, and refuses every read/write of bad_rows.
+        let primary = EmbeddedDatabase::with_config(cfg).unwrap();
+        primary.storage.set_index_snapshots_on_close(false);
+        primary.storage.set_row_counter_flush_on_close(false);
+        for sql in [
+            "SELECT id FROM bad_rows",
+            "SELECT id FROM bad_rows ORDER BY v <-> '[1,0]' LIMIT 1",
+        ] {
+            let error = primary.query(sql, &[]).unwrap_err();
+            assert!(error.to_string().contains("table 'bad_rows' is unavailable"), "{error}");
+        }
+        let before = primary.storage.db().latest_sequence_number();
+        let error = primary.execute("INSERT INTO bad_rows VALUES (2,'[0,1]')").unwrap_err();
+        assert!(error.to_string().contains("unavailable"), "{error}");
+        assert_eq!(primary.storage.db().latest_sequence_number(), before);
+        assert_eq!(
+            primary.query("SELECT id FROM healthy_rows", &[]).unwrap()[0].values,
+            vec![Value::Int4(7)]
+        );
+        primary.execute("INSERT INTO healthy_rows VALUES (8,'[1,0]')").unwrap();
+        assert_eq!(
+            primary
+                .query("SELECT id FROM healthy_rows ORDER BY id", &[])
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(!primary.storage.vector_indexes().index_exists("a_persistent_bad"));
+        assert!(!primary.storage.vector_indexes().index_exists("z_later_same_table"));
+    }
 
     /// Every tag any writer persists into a `meta:index:` record must be
     /// classifiable, and must classify into the family whose manager actually

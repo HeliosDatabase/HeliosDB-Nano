@@ -12,7 +12,7 @@ use parking_lot::Mutex;
 use rocksdb::{WriteBatch, WriteOptions, DB};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -269,7 +269,10 @@ pub enum WalSyncMode {
 /// Pending write for group commit
 struct PendingWrite {
     entry: WalEntry,
-    result_tx: crossbeam::channel::Sender<Result<u64>>,
+    // Only the durable row-counter allocator may attach a sealed counter put.
+    // It lands only if this entry seals successfully, in the same write group.
+    counter_put: Option<(Vec<u8>, Vec<u8>)>,
+    result_tx: crossbeam::channel::Sender<Result<(u64, Option<u64>)>>,
 }
 
 /// WAL integrity report
@@ -538,8 +541,9 @@ pub struct StagedWal {
 
 /// Write-Ahead Log
 ///
-/// Provides durability through write-ahead logging. All modifications are
-/// logged before being applied to the main database.
+/// Logical operation history stored beside data in RocksDB. Owning writers
+/// stage entries with their data in one atomic group; standalone append APIs
+/// record explicit history without committing unrelated data.
 ///
 /// The WAL uses RocksDB's built-in WAL support with WriteBatch for atomic
 /// operations. Each entry is assigned a monotonically increasing LSN.
@@ -550,10 +554,10 @@ pub struct StagedWal {
 /// 10-100x throughput improvement while maintaining durability with
 /// bounded latency increase.
 ///
-/// Recovery process:
-/// 1. On startup, check for incomplete WAL entries
-/// 2. Replay entries that aren't reflected in the main database
-/// 3. Continue normal operation
+/// Engine startup adopts current-format atomic data groups without redo.
+/// Bare append operations record explicit logical history; their caller owns
+/// any corresponding data work. Replay APIs are explicit operations and are
+/// separate from normal startup and physical replication.
 pub struct WriteAheadLog {
     /// RocksDB instance (shares the same DB as the storage engine). Written
     /// only through `gate`.
@@ -572,6 +576,8 @@ pub struct WriteAheadLog {
     commit_queue: Option<Arc<Mutex<VecDeque<PendingWrite>>>>,
     /// Background commit thread handle (None if not in GroupCommit mode)
     commit_thread: Option<Arc<Mutex<Option<JoinHandle<()>>>>>,
+    /// The final WAL owner stops and joins its worker, releasing the DB handle.
+    group_commit_stop: Arc<AtomicBool>,
     /// Batch timeout for group commit (default: 10ms)
     batch_timeout: Duration,
     /// The storage boundary's key manager, or `None` when encryption is
@@ -664,6 +670,7 @@ impl WriteAheadLog {
             write_opts,
             commit_queue: commit_queue.clone(),
             commit_thread: commit_thread.clone(),
+            group_commit_stop: Arc::new(AtomicBool::new(false)),
             batch_timeout,
             key_manager,
             // GH#35 (A3) is OFF until the engine installs its policy below;
@@ -683,6 +690,7 @@ impl WriteAheadLog {
                 let publisher_clone = Arc::clone(&wal.publisher);
                 let batch_timeout = wal.batch_timeout;
                 let key_manager_clone = wal.key_manager.clone();
+                let stop_clone = Arc::clone(&wal.group_commit_stop);
 
                 let handle = thread::spawn(move || {
                     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -693,6 +701,7 @@ impl WriteAheadLog {
                             publisher_clone,
                             batch_timeout,
                             key_manager_clone,
+                            stop_clone,
                         );
                     })) {
                         Ok(()) => {}
@@ -780,28 +789,50 @@ impl WriteAheadLog {
         }
     }
 
-    /// Recover the last LSN from the database
+    /// Recover the allocation high-water mark. Writers may reserve in one
+    /// order and land in another, so last_lsn alone can name an older group.
+    /// Checkpointed/pruned entries and retained history must never be reused.
     fn recover_last_lsn(db: &DB) -> Result<u64> {
-        // Check if we have a stored LSN marker
-        match db.get(b"wal:last_lsn") {
-            Ok(Some(data)) => {
-                let lsn = u64::from_le_bytes(
-                    data.as_slice()
-                        .try_into()
-                        .map_err(|_| Error::storage("Invalid LSN format"))?,
-                );
-                debug!("Recovered last LSN: {}", lsn);
-                Ok(lsn)
-            }
-            Ok(None) => {
-                debug!("No previous LSN found, starting from 0");
-                Ok(0)
-            }
-            Err(e) => {
-                warn!("Failed to recover LSN: {}, starting from 0", e);
-                Ok(0)
+        let mut highest = 0;
+        for key in [
+            b"wal:last_lsn".as_slice(),
+            Self::CHECKPOINT_KEY,
+            Self::PRUNED_THROUGH_KEY,
+        ] {
+            if let Some(bytes) = db
+                .get(key)
+                .map_err(|error| Error::storage(format!("Failed to recover WAL high-water mark: {error}")))?
+            {
+                let value: [u8; 8] = bytes
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| Error::storage("Invalid WAL high-water mark format"))?;
+                highest = highest.max(u64::from_le_bytes(value));
             }
         }
+        let mut read = super::time_travel::bounded_read_options(Self::ENTRY_PREFIX);
+        read.set_iterate_lower_bound(Self::ENTRY_PREFIX.to_vec());
+        let mut entries = db.raw_iterator_opt(read);
+        entries.seek_to_last();
+        if let Some(key) = entries.key() {
+            let digits = key
+                .strip_prefix(Self::ENTRY_PREFIX)
+                .ok_or_else(|| Error::storage("WAL high-water iterator escaped its bounds"))?;
+            if digits.len() != 20 || !digits.iter().all(u8::is_ascii_digit) {
+                return Err(Error::storage("Invalid retained WAL entry key"));
+            }
+            let retained =
+                Self::lsn_from_entry_key(key).ok_or_else(|| Error::storage("Invalid retained WAL entry LSN"))?;
+            highest = highest.max(retained);
+        }
+        entries
+            .status()
+            .map_err(|error| Error::storage(format!("Failed to recover retained WAL high-water mark: {error}")))?;
+        if highest == u64::MAX {
+            return Err(Error::storage("WAL sequence exhausted"));
+        }
+        debug!("Recovered WAL allocation high-water mark: {highest}");
+        Ok(highest)
     }
 
     /// Reserve `count` contiguous LSNs with the publisher.
@@ -912,6 +943,9 @@ impl WriteAheadLog {
     /// Returns the LSN of the appended entry.
     ///
     /// The entry is written to RocksDB with a special WAL prefix.
+    /// Record explicit logical history, or capture it for the owning staged
+    /// transaction. A bare append owns no data batch and is never automatic
+    /// startup redo; explicit replay APIs remain available to their callers.
     /// If sync_mode is Sync, the write is fsynced immediately.
     /// If sync_mode is GroupCommit, the write is queued and batched.
     #[track_caller]
@@ -970,8 +1004,47 @@ impl WriteAheadLog {
         Ok(lsn)
     }
 
-    /// Append a WAL entry without fsync (for DDL operations where metadata
-    /// is already crash-safe in RocksDB). Saves ~1ms per DDL operation.
+    /// The durable row-counter allocator's value and its logical record in one
+    /// group, bypassing statement capture because the counter is durable now.
+    /// The operation and key are constructed here so an arbitrary write cannot
+    /// be attached to this narrow GroupCommit path. `stored_value` is already
+    /// sealed by the engine's normal counter codec.
+    #[track_caller]
+    pub(crate) fn append_counter_with_value(
+        &self,
+        table_name: &str,
+        new_value: u64,
+        stored_value: &[u8],
+    ) -> Result<(u64, Option<u64>)> {
+        super::ddl_batch::check_wal_append(&self.gate, std::panic::Location::caller());
+        let operation = WalOperation::UpdateCounter {
+            table_name: table_name.to_owned(),
+            new_value,
+        };
+        let counter_put = (format!("counter:{table_name}").into_bytes(), stored_value.to_vec());
+        if self.sync_mode == WalSyncMode::GroupCommit {
+            return self.append_group_commit_with_counter(operation, Some(counter_put));
+        }
+        let mut batch = WriteBatch::default();
+        batch.put(&counter_put.0, &counter_put.1);
+        let staged = self.stage(vec![operation], &mut batch)?;
+        if let Err(error) = self.gate.write(&self.db, batch, Some(&self.write_opts)) {
+            if let Some(staged) = staged {
+                self.abandon_staged(staged);
+            }
+            return Err(Error::storage(format!(
+                "Failed to append row counter with WAL entry: {error}"
+            )));
+        }
+        let barrier = self.replication_barrier();
+        let lsn = staged.map_or(0, |staged| self.publish_staged(staged));
+        self.maybe_advance_checkpoint();
+        Ok((lsn, barrier))
+    }
+
+    /// Append explicit logical history without a local fsync, or capture it
+    /// for the owning staged transaction. A standalone call never requests
+    /// automatic startup redo of corresponding data.
     #[track_caller]
     pub fn append_nosync(&self, operation: WalOperation) -> Result<u64> {
         // Spec R5.3: a schema statement logs through its DdlBatch.
@@ -1067,9 +1140,9 @@ impl WriteAheadLog {
         Ok(lsns)
     }
 
-    /// Append `operation` together with the caller's data `batch` in ONE write, so
-    /// the entry exists exactly when the data does. Inside a statement-capture frame
-    /// the data is written now and the entry is deferred to the transaction commit.
+    /// Append `operation` with the caller's data `batch` in ONE write. This
+    /// directly durable batch never participates in statement capture: its entry
+    /// must exist exactly when its supplied data does, even if a frame is open.
     #[track_caller]
     pub fn append_with_batch(
         &self,
@@ -1084,10 +1157,6 @@ impl WriteAheadLog {
                 .write(&self.db, batch, options)
                 .map_err(|e| Error::storage(format!("Failed to write data with WAL entry: {}", e)))
         };
-        let Some(operation) = statement_capture::offer(self.capture_id(), operation, false) else {
-            write(batch)?;
-            return Ok(0);
-        };
         let Some(staged) = self.stage(vec![operation], &mut batch)? else {
             write(batch)?;
             return Ok(0);
@@ -1098,12 +1167,26 @@ impl WriteAheadLog {
         }
         let barrier = self.replication_barrier();
         let lsn = self.publish_staged(staged);
-        Self::wait_replicated_sequence(barrier);
+        if !super::table_locks::defer_replication_wait(barrier)
+            && !super::table_locks::defer_commit_replication_wait(barrier)
+        {
+            Self::wait_replicated_sequence(barrier);
+        }
         Ok(lsn)
     }
 
     /// Append entry using group commit
     fn append_group_commit(&self, operation: WalOperation) -> Result<u64> {
+        let (lsn, barrier) = self.append_group_commit_with_counter(operation, None)?;
+        Self::wait_replicated_sequence(barrier);
+        Ok(lsn)
+    }
+
+    fn append_group_commit_with_counter(
+        &self,
+        operation: WalOperation,
+        counter_put: Option<(Vec<u8>, Vec<u8>)>,
+    ) -> Result<(u64, Option<u64>)> {
         let lsn = self.reserve(1);
         let entry = WalEntry::new(lsn, operation);
 
@@ -1112,7 +1195,11 @@ impl WriteAheadLog {
 
         // Queue the write
         if let Some(queue) = &self.commit_queue {
-            let pending = PendingWrite { entry, result_tx: tx };
+            let pending = PendingWrite {
+                entry,
+                counter_put,
+                result_tx: tx,
+            };
             queue.lock().push_back(pending);
         } else {
             self.skip([lsn]);
@@ -1124,16 +1211,13 @@ impl WriteAheadLog {
             Ok(result) => result,
             Err(e) => Err(Error::storage(format!("Group commit failed: {}", e))),
         };
-        if result.is_ok() {
-            // Read after the group's write completed (it covers this entry),
-            // and waited for HERE, on the committer's own thread, so an
-            // unconfirmed commit is reported to the request that made it.
-            let barrier = self.replication_barrier();
-            // GH#35 (A3): periodic checkpoint advancement.
+        result.map(|(lsn, barrier)| {
+            // The worker captured this group's sequence immediately after its
+            // write. Wait on the requesting thread so an unconfirmed commit
+            // reaches that client's report scope.
             self.maybe_advance_checkpoint();
-            Self::wait_replicated_sequence(barrier);
-        }
-        result
+            (lsn, barrier)
+        })
     }
 
     /// Flush WAL to disk
@@ -1547,6 +1631,7 @@ impl WriteAheadLog {
         publisher: Arc<Publisher>,
         batch_timeout: Duration,
         key_manager: Option<Arc<KeyManager>>,
+        stop: Arc<AtomicBool>,
     ) {
         info!("Group commit thread started (batch timeout: {:?})", batch_timeout);
 
@@ -1557,13 +1642,13 @@ impl WriteAheadLog {
             // Drain queue
             let pending: Vec<PendingWrite> = {
                 let mut q = queue.lock();
-                if q.is_empty() {
-                    continue;
-                }
                 q.drain(..).collect()
             };
 
             if pending.is_empty() {
+                if stop.load(Ordering::Acquire) {
+                    break;
+                }
                 continue;
             }
 
@@ -1585,6 +1670,9 @@ impl WriteAheadLog {
                     Ok(data) => {
                         let key = format!("wal:entries:{:020}", lsn);
                         batch.put(key.as_bytes(), &data);
+                        if let Some((key, value)) = &write.counter_put {
+                            batch.put(key, value);
+                        }
                     }
                     Err(e) => {
                         // Send error to waiter
@@ -1604,20 +1692,24 @@ impl WriteAheadLog {
 
             match gate.write(&db, batch, Some(&write_opts)) {
                 Ok(()) => {
+                    let barrier = replication_wait::barrier(&db);
                     // Resolve in LSN order. Each committer waits for the
                     // standbys itself, after this reply (`append_group_commit`).
                     let mut items = Vec::with_capacity(pending.len());
                     let mut waiters = Vec::with_capacity(pending.len());
                     for write in pending {
                         let lsn = write.entry.lsn;
-                        items.push((lsn, !sealing_failed.contains(&lsn)));
-                        waiters.push((write.result_tx, lsn));
+                        let accepted = !sealing_failed.contains(&lsn);
+                        items.push((lsn, accepted));
+                        if accepted {
+                            waiters.push((write.result_tx, lsn));
+                        }
                     }
                     publisher.resolve(items);
 
                     // Notify all waiters of success
                     for (result_tx, lsn) in waiters {
-                        let _ = result_tx.send(Ok(lsn));
+                        let _ = result_tx.send(Ok((lsn, barrier)));
                     }
                     debug!("Group commit: successfully flushed {} writes", last_lsn);
                 }
@@ -1627,7 +1719,9 @@ impl WriteAheadLog {
                     publisher.resolve(pending.iter().map(|write| (write.entry.lsn, false)));
                     // Notify all waiters of failure
                     for write in pending {
-                        let _ = write.result_tx.send(Err(Error::storage(err_msg.clone())));
+                        if !sealing_failed.contains(&write.entry.lsn) {
+                            let _ = write.result_tx.send(Err(Error::storage(err_msg.clone())));
+                        }
                     }
                     error!("Group commit failed: {}", e);
                 }
@@ -1979,6 +2073,23 @@ impl WriteAheadLog {
     }
 }
 
+impl Drop for WriteAheadLog {
+    fn drop(&mut self) {
+        // No safe caller can still be appending through this final owner. Let
+        // the worker finish anything already queued, then relinquish its DB.
+        self.group_commit_stop.store(true, Ordering::Release);
+        if let Some(handle) = self.commit_thread.as_ref().and_then(|slot| slot.lock().take()) {
+            // Defensive: never join the current thread, even if ownership of
+            // the WAL is changed to include its worker in the future.
+            if handle.thread().id() != thread::current().id() {
+                if handle.join().is_err() {
+                    error!("WAL group commit worker panicked during shutdown");
+                }
+            }
+        }
+    }
+}
+
 // Legacy compatibility - keeping old enum for backward compatibility
 /// WAL entry type (legacy)
 #[derive(Debug, Clone)]
@@ -2016,6 +2127,126 @@ mod tests {
             key: format!("data:t:{n}").into_bytes(),
             tuple: vec![n],
         }
+    }
+
+    #[test]
+    fn group_commit_drop_releases_the_database_and_keeps_completed_counter_groups() {
+        let (temp, db) = create_test_db();
+        let wal = WriteAheadLog::open(Arc::clone(&db), WriteGate::open(), WalSyncMode::GroupCommit).unwrap();
+        let value = bincode::serialize(&7_u64).unwrap();
+        let (lsn, _) = wal.append_counter_with_value("lifetime", 7, &value).unwrap();
+        assert!(lsn > 0);
+        drop(wal);
+        assert_eq!(Arc::strong_count(&db), 1, "the joined worker released its DB");
+        drop(db);
+        let reopened = DB::open_default(temp.path()).unwrap();
+        assert_eq!(reopened.get(b"counter:lifetime").unwrap(), Some(value));
+        assert!(reopened.get(format!("wal:entries:{lsn:020}")).unwrap().is_some());
+    }
+
+    #[test]
+    fn reopen_never_reuses_a_grouped_lsn_after_an_older_direct_batch_lands() {
+        let (temp, db) = create_test_db();
+        let wal = WriteAheadLog::open(Arc::clone(&db), WriteGate::open(), WalSyncMode::GroupCommit).unwrap();
+        let mut older = WriteBatch::default();
+        let staged = wal.stage(vec![insert_op(1)], &mut older).unwrap().unwrap();
+        let (newer, _) = wal
+            .append_counter_with_value("late", 8, &bincode::serialize(&8_u64).unwrap())
+            .unwrap();
+        assert_eq!(newer, 2);
+        let newer_key = format!("wal:entries:{newer:020}");
+        let newer_bytes = db.get(newer_key.as_bytes()).unwrap().unwrap();
+        db.write(older).unwrap();
+        wal.publish_staged(staged);
+        assert_eq!(db.get(b"wal:last_lsn").unwrap().unwrap(), 1_u64.to_le_bytes());
+        drop(wal);
+        drop(db);
+        let db = Arc::new(DB::open_default(temp.path()).unwrap());
+        let recovered = WriteAheadLog::open(Arc::clone(&db), WriteGate::open(), WalSyncMode::Sync).unwrap();
+        assert_eq!(recovered.current_lsn(), newer);
+        assert_eq!(recovered.append(insert_op(3)).unwrap(), 3);
+        assert_eq!(db.get(newer_key.as_bytes()).unwrap().unwrap(), newer_bytes);
+    }
+
+    #[test]
+    fn wal_allocation_recovers_checkpoint_and_pruned_high_water_without_retained_entries() {
+        let (_temp, db) = create_test_db();
+        db.put(b"wal:last_lsn", 3_u64.to_le_bytes()).unwrap();
+        db.put(WriteAheadLog::CHECKPOINT_KEY, 100_u64.to_le_bytes()).unwrap();
+        db.put(WriteAheadLog::PRUNED_THROUGH_KEY, 101_u64.to_le_bytes())
+            .unwrap();
+        let wal = WriteAheadLog::open(Arc::clone(&db), WriteGate::open(), WalSyncMode::Sync).unwrap();
+        assert_eq!(wal.current_lsn(), 101);
+        assert_eq!(wal.append(insert_op(1)).unwrap(), 102);
+    }
+
+    #[test]
+    fn corrupt_wal_high_water_markers_refuse_open_instead_of_reusing_lsns() {
+        for key in [
+            b"wal:last_lsn".as_slice(),
+            WriteAheadLog::CHECKPOINT_KEY,
+            WriteAheadLog::PRUNED_THROUGH_KEY,
+        ] {
+            let (_temp, db) = create_test_db();
+            db.put(key, [1_u8; 9]).unwrap();
+            let error = match WriteAheadLog::open(Arc::clone(&db), WriteGate::open(), WalSyncMode::Sync) {
+                Ok(_) => panic!("a malformed high-water marker was accepted"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains("Invalid WAL high-water mark format"),
+                "{error}"
+            );
+        }
+        let (_temp, db) = create_test_db();
+        db.put(b"wal:last_lsn", u64::MAX.to_le_bytes()).unwrap();
+        let error = match WriteAheadLog::open(Arc::clone(&db), WriteGate::open(), WalSyncMode::Sync) {
+            Ok(_) => panic!("an exhausted LSN was accepted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("WAL sequence exhausted"), "{error}");
+    }
+
+    #[test]
+    fn group_commit_shutdown_drains_counter_puts_and_ordinary_entries_already_queued() {
+        let (_temp, db) = create_test_db();
+        let wal = WriteAheadLog::open(Arc::clone(&db), WriteGate::open(), WalSyncMode::GroupCommit).unwrap();
+        let publisher = Arc::clone(&wal.publisher);
+        let first = wal.reserve(2);
+        let (first_tx, first_rx) = crossbeam::channel::bounded(1);
+        let (second_tx, second_rx) = crossbeam::channel::bounded(1);
+        let value = bincode::serialize(&9_u64).unwrap();
+        {
+            let mut queue = wal.commit_queue.as_ref().unwrap().lock();
+            queue.push_back(PendingWrite {
+                entry: WalEntry::new(
+                    first,
+                    WalOperation::UpdateCounter {
+                        table_name: "drained".into(),
+                        new_value: 9,
+                    },
+                ),
+                counter_put: Some((b"counter:drained".to_vec(), value.clone())),
+                result_tx: first_tx,
+            });
+            queue.push_back(PendingWrite {
+                entry: WalEntry::new(first + 1, insert_op(1)),
+                counter_put: None,
+                result_tx: second_tx,
+            });
+        }
+        drop(wal);
+        assert_eq!(first_rx.recv_timeout(Duration::from_secs(1)).unwrap().unwrap().0, first);
+        assert_eq!(
+            second_rx.recv_timeout(Duration::from_secs(1)).unwrap().unwrap().0,
+            first + 1
+        );
+        assert_eq!(publisher.published.load(Ordering::SeqCst), first + 1);
+        assert_eq!(db.get(b"counter:drained").unwrap(), Some(value));
+        for lsn in [first, first + 1] {
+            assert!(db.get(format!("wal:entries:{lsn:020}")).unwrap().is_some());
+        }
+        assert_eq!(Arc::strong_count(&db), 1);
     }
 
     /// A staged batch whose write FAILED must leave no history: nothing persisted,
@@ -2190,6 +2421,26 @@ mod tests {
     }
 
     /// Data and its history entry are one write: a failed combined write leaves neither.
+    #[test]
+    fn append_with_batch_never_defers_history_to_an_unrelated_capture() {
+        let (_temp, db) = create_test_db();
+        let wal = WriteAheadLog::open(Arc::clone(&db), WriteGate::open(), WalSyncMode::Sync).unwrap();
+        let before = db.latest_sequence_number();
+        let capture = wal.begin_statement_capture(77);
+        let mut batch = WriteBatch::default();
+        batch.put(b"data:t:1", b"durable row");
+        assert_eq!(wal.append_with_batch(insert_op(1), batch, None).unwrap(), 1);
+        drop(capture); // Aborting this unrelated transaction must discard neither.
+        assert_eq!(db.get(b"data:t:1").unwrap().as_deref(), Some(b"durable row".as_slice()));
+        assert_eq!(wal.replay().unwrap().len(), 1);
+        let mut updates = db.get_updates_since(before).unwrap();
+        let (first, batch) = updates.next().unwrap().unwrap();
+        assert_eq!(first, before + 1);
+        assert_eq!(batch.len(), 3, "data, entry, last-LSN share the one group");
+        assert!(updates.next().is_none());
+        updates.status().unwrap();
+    }
+
     #[test]
     fn append_with_batch_writes_data_and_entry_together() {
         let (_temp, db) = create_test_db();

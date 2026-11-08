@@ -9,7 +9,7 @@ use crate::sql::LogicalPlan;
 use crate::{Error, Result, Schema, Tuple};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// Metadata for a materialized view
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -147,6 +147,8 @@ impl<'a> MaterializedViewCatalog<'a> {
     /// Create a new materialized view in the catalog
     pub fn create_view(&self, metadata: MaterializedViewMetadata) -> Result<()> {
         tracing::info!("Creating materialized view '{}' in catalog", metadata.view_name);
+        let table = Self::mv_data_table_name(&metadata.view_name);
+        let _guard = self.storage.main_catalog_write(&[&table], "CREATE MATERIALIZED VIEW")?;
 
         // Check if view already exists
         if self.view_exists(&metadata.view_name)? {
@@ -161,22 +163,16 @@ impl<'a> MaterializedViewCatalog<'a> {
         let value = bincode::serialize(&metadata)
             .map_err(|e| Error::storage(format!("Failed to serialize MV metadata: {}", e)))?;
 
-        self.storage.put(&key, &value)?;
-
-        // GH#36: represent the view in the logical WAL. Without this the log
-        // held only `CreateTable(__mv_<name>)` for the backing table, so a
-        // replica held an orphan table and no materialized view.
-        if let Err(e) = self.storage.log_create_materialized_view(&metadata.view_name, &value) {
-            tracing::warn!(
-                "Failed to log CREATE MATERIALIZED VIEW '{}' to WAL: {}",
-                metadata.view_name,
-                e
-            );
-        }
-
-        // W1.3: this name now resolves as a materialized view; bump so the
-        // existence cache reclassifies it (fast paths must bail on it).
-        self.storage.bump_schema_generation();
+        let mut ddl = super::DdlBatch::new(self.storage);
+        ddl.put(&key, &value)?;
+        ddl.log(super::WalOperation::CreateMaterializedView {
+            name: metadata.view_name.clone(),
+            definition: value,
+        });
+        ddl.on_commit(|| {
+            self.storage.bump_schema_generation();
+        });
+        ddl.commit()?.wait_replicated();
 
         tracing::info!("Successfully created materialized view '{}'", metadata.view_name);
         Ok(())
@@ -212,6 +208,66 @@ impl<'a> MaterializedViewCatalog<'a> {
             .map_err(|e| Error::storage(format!("Failed to serialize MV metadata: {}", e)))?;
 
         self.storage.put(&key, &value)
+    }
+
+    /// A no-row refresh still makes its refreshed record and logical entry
+    /// durable together; a surrounding WAL-capture frame is not its commit.
+    pub(crate) fn refresh_metadata_in_one_group(
+        &self,
+        metadata: &MaterializedViewMetadata,
+        concurrent: bool,
+        incremental: bool,
+    ) -> Result<()> {
+        let mut ddl = super::DdlBatch::new(self.storage);
+        let bytes = bincode::serialize(metadata).map_err(|e| Error::storage(format!("MV refresh metadata: {e}")))?;
+        ddl.put(Self::mv_metadata_key(&metadata.view_name), &bytes)?;
+        ddl.log(super::WalOperation::RefreshMaterializedView {
+            name: metadata.view_name.clone(),
+            concurrent,
+            incremental,
+        });
+        self.stage_applied_delta_cleanup(metadata, &mut ddl)?;
+        ddl.on_commit(
+            self.storage
+                .data_write_attempt_publication(Self::mv_data_table_name(&metadata.view_name)),
+        );
+        ddl.on_abort(
+            self.storage
+                .data_write_attempt_publication(Self::mv_data_table_name(&metadata.view_name)),
+        );
+        ddl.commit()?.wait_replicated();
+        Ok(())
+    }
+
+    fn stage_applied_delta_cleanup(
+        &self,
+        metadata: &MaterializedViewMetadata,
+        ddl: &mut super::DdlBatch<'_>,
+    ) -> Result<()> {
+        let Some(refreshed_at) = metadata.last_refresh else {
+            return Ok(());
+        };
+        let cutoff: std::time::SystemTime = refreshed_at.into();
+        let prefix = b"delta:";
+        let mut opts = rocksdb::ReadOptions::default();
+        opts.set_total_order_seek(true);
+        for item in self
+            .storage
+            .db
+            .iterator_opt(rocksdb::IteratorMode::From(prefix, rocksdb::Direction::Forward), opts)
+        {
+            let (key, value) = item.map_err(|e| Error::storage(format!("MV delta cleanup scan: {e}")))?;
+            if !key.starts_with(prefix) {
+                break;
+            }
+            let plain = super::tde::open_ref(self.storage.key_manager_ref(), &key, &value)?;
+            let delta: super::mv_delta::Delta =
+                bincode::deserialize(&plain).map_err(|e| Error::storage(format!("MV delta cleanup record: {e}")))?;
+            if delta.timestamp < cutoff {
+                ddl.delete(&key);
+            }
+        }
+        Ok(())
     }
 
     /// GH#36: restore a materialized view definition from a replicated WAL
@@ -325,97 +381,68 @@ impl<'a> MaterializedViewCatalog<'a> {
         Ok(views)
     }
 
-    /// Store materialized view data
-    ///
-    /// Stores the query results in a regular table format for easy querying.
-    /// The table name is prefixed with "__mv_" to distinguish it from user tables.
-    pub fn store_view_data(&self, view_name: &str, tuples: Vec<Tuple>, schema: &Schema) -> Result<u64> {
-        // sprinter 6bc4a4040eb7 (B2 fix pass): the view's data table is main's
-        // (dropped, purged and recreated in main's catalog below) — a branch
-        // statement would empty main's view and refill it on the branch.
-        self.storage.refuse_statement_on_branch("REFRESH MATERIALIZED VIEW")?;
-        tracing::info!(
-            "Storing data for materialized view '{}' ({} rows)",
-            view_name,
-            tuples.len()
-        );
-
-        let data_table = Self::mv_data_table_name(view_name);
-        let catalog = self.storage.catalog();
-        // Spec R5.1: the data table's rows are rewritten whole, by a statement or by
-        // the scheduler's worker, which both come through here: they serialize on this
-        // lock, as does whatever else writes the table.
-        let _table_lock = self.storage.lock_tables_exclusive(
-            super::table_locks::MAIN_LEVEL,
-            &[data_table.as_str()],
-            "REFRESH MATERIALIZED VIEW",
-        )?;
-
-        // Create or recreate the data table. Drop catalog metadata if present, then
-        // UNCONDITIONALLY purge any data rows: a prior run may have removed the
-        // data-table metadata while leaving `data:__mv_*` rows behind (issue #2 —
-        // those orphaned rows were read back instead of the freshly materialized
-        // value, so a COUNT(DISTINCT) view returned a stale slice's count). Purging
-        // by key range guarantees the re-populated view contains only new rows.
-        let replaced = catalog.table_exists(&data_table)?;
-        if replaced {
-            catalog.drop_table(&data_table)?;
+    /// Create the definition and its populated backing table in the same group.
+    pub(crate) fn create_view_with_data(
+        &self,
+        mut metadata: MaterializedViewMetadata,
+        tuples: &[Tuple],
+    ) -> Result<u64> {
+        self.storage.refuse_statement_on_branch("CREATE MATERIALIZED VIEW")?;
+        let table = Self::mv_data_table_name(&metadata.view_name);
+        let _guard = self.storage.main_catalog_write(&[&table], "CREATE MATERIALIZED VIEW")?;
+        if self.view_exists(&metadata.view_name)? {
+            return Err(Error::query_execution(format!(
+                "Materialized view '{}' already exists",
+                metadata.view_name
+            )));
         }
-        self.storage.purge_table_data(&data_table)?;
-        catalog.create_table(&data_table, schema.clone())?;
-        // Sprinter 6bc4a4040eb7 (B4 fix pass): a branch anchored before this cannot be
-        // given the rows it replaced: they have no history left, and it is refused.
-        if replaced {
-            catalog.record_materialized_view_refresh(&data_table)?;
-        }
-
-        // Insert all tuples
-        let row_count = tuples.len() as u64;
-        for tuple in tuples {
-            self.storage.insert_tuple(&data_table, tuple)?;
-        }
-
-        // Bump AFTER the rows are in place. Readers use `schema_generation` as the
-        // "something changed outside my handle" signal for their result caches
-        // (`EmbeddedDatabase::reconcile_result_cache_with_storage`); the create/drop
-        // above bump it BEFORE the rows land, so without this trailing bump a reader
-        // could reconcile against the mid-refresh generation, cache the half-written
-        // view, and never invalidate again.
-        self.storage.bump_schema_generation();
-
-        tracing::info!(
-            "Successfully stored {} rows for materialized view '{}'",
-            row_count,
-            view_name
-        );
-        Ok(row_count)
+        metadata.mark_refreshed(tuples.len() as u64);
+        let schema = metadata.schema.clone();
+        self.write_view_data_group(&metadata.view_name, tuples, &schema, Some(&metadata), None, true)
     }
 
-    /// Spec R5.3: a refresh of `view_name` as ONE write group — every current row
-    /// of its data table deleted, every new row inserted under a fresh row id (never
-    /// one reused), the refreshed `meta:mv:` record (`refreshed`, which the caller
-    /// marked) and the logical-WAL entries (each row's, then `refresh`), all in one
-    /// autocommit transaction's commit, whose versions and delete events keep `AS
-    /// OF` and snapshot reads of the view right. A reader sees the old rows or the
-    /// new ones, never an empty or a partial view, and a crash keeps one or the
-    /// other. It used to drop the data table, purge it, create it again and insert
-    /// row by row (each row its own groups, its own `snapshot:` record), so a
-    /// killed refresh left a partial view, and of a refresh of more than 1000 rows
-    /// only the last 1000 snapshot records survived a restart. `CONCURRENTLY`, the
-    /// auto-refresh worker and the scheduler take the same path.
-    ///
-    /// No `Refreshed` shape record (`Catalog::record_materialized_view_refresh`): the
-    /// replaced rows keep their versions and get delete events, and the new rows are
-    /// versioned at the refresh, so a branch anchored before it reads the view as it
-    /// was at the anchor (`StorageEngine::materialize_branch_anchor`). Only the paths
-    /// that still replace the data table write the record and refuse such an anchor.
-    ///
-    /// `Ok(None)` when the data table is one this cannot rewrite in place, and the
-    /// caller refreshes it as before ([`Self::store_view_data`]): it does not exist,
-    /// its row layout is not the refresh's, a column has a storage mode (its rows
-    /// are encoded through it), or it has an index (whose keys a refresh would have
-    /// to judge row by row). A view's data table has none of these after `CREATE
-    /// MATERIALIZED VIEW` of a query with a projection or an aggregate.
+    /// Replace the materialized rows atomically, preserving a compatible backing
+    /// table's indexes, storage modes, row-id sequence and version history.
+    pub fn store_view_data(&self, view_name: &str, tuples: Vec<Tuple>, schema: &Schema) -> Result<u64> {
+        self.store_view_data_mode(view_name, &tuples, schema, false)
+    }
+
+    fn store_view_data_mode(
+        &self,
+        view_name: &str,
+        tuples: &[Tuple],
+        schema: &Schema,
+        concurrent: bool,
+    ) -> Result<u64> {
+        let table = Self::mv_data_table_name(view_name);
+        let _guard = self
+            .storage
+            .main_catalog_write(&[&table], "MATERIALIZED VIEW population")?;
+        let refreshed = if self.view_exists(view_name)? {
+            let mut metadata = self.get_view(view_name)?;
+            metadata.mark_refreshed(tuples.len() as u64);
+            Some(metadata)
+        } else {
+            None
+        };
+        self.write_view_data_group(
+            view_name,
+            tuples,
+            schema,
+            refreshed.as_ref(),
+            refreshed
+                .as_ref()
+                .map(|_| super::WalOperation::RefreshMaterializedView {
+                    name: view_name.to_string(),
+                    concurrent,
+                    incremental: false,
+                }),
+            false,
+        )
+    }
+
+    /// SQL, the scheduler and both storage APIs share the same atomic replacement.
+    /// There is no indexed/storage-mode fallback that writes outside the group.
     pub fn refresh_view_in_one_group(
         &self,
         view_name: &str,
@@ -424,269 +451,672 @@ impl<'a> MaterializedViewCatalog<'a> {
         refreshed: &MaterializedViewMetadata,
         refresh: super::WalOperation,
     ) -> Result<Option<u64>> {
-        self.storage.refuse_statement_on_branch("REFRESH MATERIALIZED VIEW")?;
-        let data_table = Self::mv_data_table_name(view_name);
-        // Spec R5.1: the data table's rows are rewritten whole, by a statement or by
-        // the scheduler's worker, which both come through here: they serialize on this
-        // lock, as does whatever else writes the table.
-        let _table_lock = self.storage.lock_tables_exclusive(
-            super::table_locks::MAIN_LEVEL,
-            &[data_table.as_str()],
-            "REFRESH MATERIALIZED VIEW",
-        )?;
-        let catalog = self.storage.catalog();
-        if !catalog.main_table_exists(&data_table)? {
-            return Ok(None);
-        }
-        let current = catalog.main_table_schema(&data_table)?;
-        let same_layout = current.columns.len() == schema.columns.len()
-            && current.columns.iter().zip(schema.columns.iter()).all(|(have, want)| {
-                have.name == want.name
-                    && have.data_type == want.data_type
-                    && have.storage_mode == crate::ColumnStorageMode::Default
-                    && want.storage_mode == crate::ColumnStorageMode::Default
-            });
-        if !same_layout
-            || !self.storage.art_indexes().list_table_indexes(&data_table).is_empty()
-            || self.storage.vector_indexes().table_has_indexes(&data_table)
-        {
-            return Ok(None);
-        }
+        self.write_view_data_group(view_name, tuples, schema, Some(refreshed), Some(refresh), false)
+            .map(Some)
+    }
 
-        let txn = self.storage.begin_autocommit_transaction()?;
-        let prefix = format!("data:{}:", data_table);
-        let mut read_opts = rocksdb::ReadOptions::default();
-        read_opts.set_total_order_seek(true);
-        let iter = self.storage.db.iterator_opt(
+    /// CONCURRENTLY has the same old-or-new visibility guarantee as plain refresh.
+    pub fn store_view_data_concurrent(&self, view_name: &str, tuples: Vec<Tuple>, schema: &Schema) -> Result<u64> {
+        self.store_view_data_mode(view_name, &tuples, schema, true)
+    }
+
+    fn write_view_data_group(
+        &self,
+        view_name: &str,
+        tuples: &[Tuple],
+        requested: &Schema,
+        metadata: Option<&MaterializedViewMetadata>,
+        refresh: Option<super::WalOperation>,
+        create: bool,
+    ) -> Result<u64> {
+        use super::art_manager::{ArtIndexManager, MergedKeysOutcome, MergedRowChange};
+        use super::columnar::{BatchPresence, BatchStats, ColumnBatch, ColumnarStore, BATCH_SIZE};
+
+        self.storage.refuse_statement_on_branch("REFRESH MATERIALIZED VIEW")?;
+        super::Catalog::refuse_unstorable_table_name(view_name)?;
+        let table = Self::mv_data_table_name(view_name);
+        // Freeze main for existing branch children before the first catalog/row
+        // read. The guard also excludes every competing writer until publication.
+        let _guard = self
+            .storage
+            .main_catalog_write(&[&table], "MATERIALIZED VIEW population")?;
+        let catalog = self.storage.catalog();
+        let exists = catalog.main_table_exists(&table)?;
+        let current = if exists {
+            Some(catalog.main_table_schema(&table)?)
+        } else {
+            None
+        };
+        let compatible = current.as_ref().is_some_and(|have| {
+            have.columns.len() == requested.columns.len()
+                && have
+                    .columns
+                    .iter()
+                    .zip(&requested.columns)
+                    .all(|(have, want)| have.name == want.name && have.data_type == want.data_type)
+        });
+        let schema = if compatible {
+            current.as_ref().unwrap()
+        } else {
+            requested
+        };
+        for tuple in tuples {
+            if tuple.values.len() != schema.columns.len() {
+                return Err(Error::storage("materialized view row does not match its result schema"));
+            }
+        }
+        let old = match &current {
+            Some(schema) => self.storage.scan_table_with_schema(&table, schema)?,
+            None => Vec::new(),
+        };
+        let rows: Vec<(u64, Tuple)> = tuples
+            .iter()
+            .map(|tuple| {
+                let id = self.storage.next_row_id_volatile(&table);
+                (id, Tuple::with_row_id(tuple.values.clone(), id))
+            })
+            .collect();
+
+        // Keep index fast paths on scans throughout an eager key claim and its
+        // publication/undo, even though this is a DDL batch rather than DML.
+        let census = self.storage.begin_transaction()?;
+        census.note_index_key_removal(&table);
+        // A logical-shape replacement drops the old index definitions. Validate
+        // its new schema-owned keys using the same index implementation BEFORE
+        // the write; publish the validated trees only after the catalog flip.
+        let replacement_indexes = if exists && !compatible {
+            let indexes = ArtIndexManager::new();
+            Self::register_schema_indexes(&indexes, &table, schema)?;
+            indexes
+                .on_insert_tuples(&table, schema, &rows)
+                .map_err(|e| Error::query_execution(format!("materialized view keys: {e}")))?;
+            Some(indexes)
+        } else {
+            None
+        };
+
+        // Vector hooks have not run before commit. Preserve that known-good
+        // state on a refused group by proving the actual schema, definitions
+        // and logical rows are unchanged; no inference from error text.
+        let prior_vector_state = if self.storage.vector_indexes().table_has_indexes(&table) {
+            let raw_schema = self.storage.get(&format!("meta:table:{table}").into_bytes())?;
+            let definitions: Vec<_> = catalog
+                .index_definitions_strict()?
+                .into_iter()
+                .filter(|(_, definition)| definition.table_name == table)
+                .collect();
+            Some((
+                raw_schema,
+                bincode::serialize(&definitions)
+                    .map_err(|error| Error::storage(format!("MV prior index definitions: {error}")))?,
+            ))
+        } else {
+            None
+        };
+
+        let mut ddl = super::DdlBatch::new(self.storage);
+        if !exists {
+            catalog.stage_create_table(&table, schema.clone(), &mut ddl)?;
+        }
+        // Hold an in-flight commit slot until the group is durable and published,
+        // so a snapshot allocated after this timestamp cannot scan before it lands.
+        struct Inflight {
+            registry: std::sync::Arc<super::conflict::WriteConflictRegistry>,
+            timestamp: u64,
+        }
+        impl Drop for Inflight {
+            fn drop(&mut self) {
+                self.registry.end_commit(self.timestamp);
+            }
+        }
+        let timestamp = self.storage.next_commit_timestamp(true);
+        let _inflight = Inflight {
+            registry: self.storage.conflict_registry(),
+            timestamp,
+        };
+        if exists && !compatible {
+            catalog.stage_materialized_view_replacement(&table, schema, timestamp, &mut ddl)?;
+        }
+        // Clear even orphan data rows of a missing table, while preserving the
+        // monotonically allocated ids so a current row never reuses an old id.
+        let prefix = format!("data:{table}:");
+        let mut opts = rocksdb::ReadOptions::default();
+        opts.set_total_order_seek(true);
+        for item in self.storage.db.iterator_opt(
             rocksdb::IteratorMode::From(prefix.as_bytes(), rocksdb::Direction::Forward),
-            read_opts,
-        );
-        for item in iter {
-            let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+            opts,
+        ) {
+            let (key, _) = item.map_err(|e| Error::storage(format!("MV row scan: {e}")))?;
             if !key.starts_with(prefix.as_bytes()) {
                 break;
             }
-            if StorageEngine::parse_row_id_after_prefix(&key, prefix.len()).is_none() {
+            let Some(id) = StorageEngine::parse_row_id_after_prefix(&key, prefix.len()) else {
                 continue;
+            };
+            ddl.delete(&key);
+            if exists && self.storage.time_travel_enabled() {
+                self.storage.snapshot_manager().stage_row_change_history(
+                    ddl.batch_mut(),
+                    &table,
+                    id,
+                    timestamp,
+                    None,
+                )?;
             }
-            let key = key.to_vec();
-            txn.log_on_commit(super::WalOperation::Delete {
-                table: data_table.clone(),
-                key: key.clone(),
+            ddl.log(super::WalOperation::Delete {
+                table: table.clone(),
+                key: key.to_vec(),
             });
-            txn.delete(key)?;
-        }
-        let row_count = tuples.len() as u64;
-        for tuple in tuples {
-            let row_id = self.storage.next_row_id_volatile(&data_table);
-            let key = format!("data:{}:{}", data_table, row_id).into_bytes();
-            let value =
-                bincode::serialize(tuple).map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
-            txn.log_on_commit(super::WalOperation::Insert {
-                table: data_table.clone(),
-                key: key.clone(),
-                tuple: value.clone(),
-            });
-            txn.put(key, value)?;
-            txn.stage_row_counter(&data_table, row_id)?;
-        }
-        // The `meta:mv:` record, sealed as `StorageEngine::put` seals it (the commit
-        // writes a staged `meta:` value verbatim).
-        let metadata = bincode::serialize(refreshed)
-            .map_err(|e| Error::storage(format!("Failed to serialize MV metadata: {}", e)))?;
-        let sealed = super::tde::seal(self.storage.key_manager_ref(), &metadata)?.into_owned();
-        txn.put(Self::mv_metadata_key(view_name), sealed)?;
-        txn.log_on_commit(refresh);
-        txn.commit()?;
-
-        // Readers use `schema_generation` as the "something changed outside my
-        // handle" signal for their result caches
-        // (`EmbeddedDatabase::reconcile_result_cache_with_storage`); bumped once the
-        // new rows are in place.
-        self.storage.bump_schema_generation();
-        tracing::info!(
-            "Refreshed materialized view '{}' with {} rows in one write group",
-            view_name,
-            row_count
-        );
-        Ok(Some(row_count))
-    }
-
-    /// Store materialized view data concurrently (zero downtime refresh)
-    ///
-    /// This method implements true CONCURRENT refresh using a temporary table
-    /// and atomic swap pattern:
-    /// 1. Create a temporary table with unique name
-    /// 2. Populate the temporary table with new data
-    /// 3. Atomically rename: old -> backup, temp -> current
-    /// 4. Drop the backup table
-    ///
-    /// This ensures that queries can continue reading from the old data
-    /// during the refresh operation with zero downtime.
-    ///
-    /// Error handling:
-    /// - If any error occurs before the rename, the temporary table is cleaned up
-    /// - If rename fails partway through, we attempt to restore the original state
-    /// - Cleanup errors are logged but don't fail the operation
-    pub fn store_view_data_concurrent(&self, view_name: &str, tuples: Vec<Tuple>, schema: &Schema) -> Result<u64> {
-        use chrono::Utc;
-        // sprinter 6bc4a4040eb7 (B2 fix pass): see `store_view_data`.
-        self.storage.refuse_statement_on_branch("REFRESH MATERIALIZED VIEW")?;
-
-        tracing::info!(
-            "Storing data for materialized view '{}' CONCURRENTLY ({} rows)",
-            view_name,
-            tuples.len()
-        );
-
-        let data_table = Self::mv_data_table_name(view_name);
-        let catalog = self.storage.catalog();
-
-        // Generate unique temporary table name using timestamp
-        let timestamp = Utc::now().timestamp_nanos_opt().unwrap_or(0);
-        let temp_table = format!("{}__temp_{}", data_table, timestamp);
-        let backup_table = format!("{}__old_{}", data_table, timestamp);
-        // Spec R5.1: see `store_view_data`. The swap writes all three.
-        let _table_lock = self.storage.lock_tables_exclusive(
-            super::table_locks::MAIN_LEVEL,
-            &[data_table.as_str(), temp_table.as_str(), backup_table.as_str()],
-            "REFRESH MATERIALIZED VIEW",
-        )?;
-
-        tracing::debug!("Using temporary table '{}' for concurrent refresh", temp_table);
-
-        // Step 1: Create temporary table with the new data
-        if let Err(e) = catalog.create_table(&temp_table, schema.clone()) {
-            tracing::error!("Failed to create temporary table '{}': {}", temp_table, e);
-            return Err(e);
         }
 
-        // Step 2: Populate temporary table
-        let row_count = tuples.len() as u64;
-        for (idx, tuple) in tuples.into_iter().enumerate() {
-            if let Err(e) = self.storage.insert_tuple(&temp_table, tuple) {
-                tracing::error!(
-                    "Failed to insert tuple {} into temporary table '{}': {}",
-                    idx,
-                    temp_table,
-                    e
-                );
-
-                // Cleanup: drop temporary table
-                if let Err(cleanup_err) = catalog.drop_table(&temp_table) {
-                    tracing::warn!(
-                        "Failed to cleanup temporary table '{}' after insert error: {}",
-                        temp_table,
-                        cleanup_err
-                    );
+        let changes: Vec<MergedRowChange<'_>> = old
+            .iter()
+            .filter_map(|tuple| {
+                tuple.row_id.map(|row_id| MergedRowChange {
+                    row_id,
+                    old: Some(tuple),
+                    new: None,
+                })
+            })
+            .chain(rows.iter().map(|(row_id, tuple)| MergedRowChange {
+                row_id: *row_id,
+                old: None,
+                new: Some(tuple),
+            }))
+            .collect();
+        let claim = if replacement_indexes.is_none() {
+            match self
+                .storage
+                .art_indexes()
+                .claim_merged_table_keys(&table, schema, &changes)
+                .map_err(|e| Error::query_execution(format!("materialized view keys: {e}")))?
+            {
+                MergedKeysOutcome::Claimed(claim) => Some(claim),
+                MergedKeysOutcome::HeldBy { constraint, .. } => {
+                    return Err(Error::query_execution(format!(
+                        "duplicate key value violates unique constraint \"{constraint}\""
+                    )));
                 }
-
-                return Err(e);
             }
-        }
-
-        tracing::debug!("Populated temporary table '{}' with {} rows", temp_table, row_count);
-
-        // Step 3: Atomic swap using rename operations
-        // This is the critical section where we swap the tables
-
-        // Check if the main table exists
-        let table_exists = match catalog.table_exists(&data_table) {
-            Ok(exists) => exists,
-            Err(e) => {
-                tracing::error!("Failed to check if table '{}' exists: {}", data_table, e);
-
-                // Cleanup temporary table
-                if let Err(cleanup_err) = catalog.drop_table(&temp_table) {
-                    tracing::warn!("Failed to cleanup temporary table '{}': {}", temp_table, cleanup_err);
-                }
-
-                return Err(e);
-            }
+        } else {
+            None
         };
 
-        if table_exists {
-            // Rename: old table -> backup table.
-            //
-            // `rename_table_data_swap`, not `rename_table`: these three renames
-            // move a ROW SET under a stable name, they do not rename a relation.
-            // The user-visible rename carries the per-table side records
-            // (`table_constraints:{t}`, IDENTITY, partition links) with the key,
-            // which here would walk whatever `__mv_<view>` owns onto the backup
-            // table and drop it with the backup — once per refresh, silently.
-            if let Err(e) = catalog.rename_table_data_swap(&data_table, &backup_table) {
-                tracing::error!("Failed to rename '{}' to '{}': {}", data_table, backup_table, e);
-
-                // Cleanup temporary table
-                if let Err(cleanup_err) = catalog.drop_table(&temp_table) {
-                    tracing::warn!("Failed to cleanup temporary table '{}': {}", temp_table, cleanup_err);
+        for (id, tuple) in &rows {
+            let logical = bincode::serialize(tuple).map_err(|e| Error::storage(format!("MV tuple: {e}")))?;
+            // As in transaction DML, dictionary/CAS columns may hold inline
+            // logical values. COLUMNAR requires side data; its row marker and
+            // batches are staged here, and history always keeps full values.
+            let mut stored_tuple = tuple.clone();
+            for (index, column) in schema.columns.iter().enumerate() {
+                if column.storage_mode == crate::ColumnStorageMode::Columnar {
+                    stored_tuple.values[index] = crate::Value::ColumnarRef;
                 }
-
-                return Err(e);
             }
-            tracing::debug!("Renamed '{}' to '{}'", data_table, backup_table);
+            let stored = bincode::serialize(&stored_tuple).map_err(|e| Error::storage(format!("MV tuple: {e}")))?;
+            let key = format!("data:{table}:{id}");
+            ddl.put(&key, &stored)?;
+            if self.storage.time_travel_enabled() {
+                let sealed = super::tde::seal(self.storage.key_manager_ref(), &logical)?;
+                self.storage.snapshot_manager().stage_rewritten_row_version(
+                    ddl.batch_mut(),
+                    &table,
+                    *id,
+                    timestamp,
+                    sealed.as_ref(),
+                )?;
+            }
+            ddl.log(super::WalOperation::Insert {
+                table: table.clone(),
+                key: key.into_bytes(),
+                tuple: logical,
+            });
+        }
+        if let Some(highest) = self.storage.row_counter_high_water(&table) {
+            ddl.put(
+                format!("counter:{table}"),
+                &bincode::serialize(&highest).map_err(|e| Error::storage(format!("MV row counter: {e}")))?,
+            )?;
+        }
+        if let Some(metadata) = metadata {
+            let mut metadata = metadata.clone();
+            metadata.schema = schema.clone();
+            let bytes = bincode::serialize(&metadata).map_err(|e| Error::storage(format!("MV metadata: {e}")))?;
+            ddl.put(Self::mv_metadata_key(view_name), &bytes)?;
+            if !create {
+                self.stage_applied_delta_cleanup(&metadata, &mut ddl)?;
+            }
+            if create {
+                ddl.log(super::WalOperation::CreateMaterializedView {
+                    name: view_name.to_string(),
+                    definition: bytes,
+                });
+            }
+        }
+        if let Some(refresh) = refresh {
+            ddl.log(refresh);
+        }
+        if self.storage.time_travel_enabled() {
+            let snapshot = self
+                .storage
+                .snapshot_manager()
+                .stage_snapshot_record(ddl.batch_mut(), timestamp, None)?;
+            let storage = self.storage;
+            let table = table.clone();
+            ddl.on_commit(move || storage.snapshot_manager().publish_rewrite_snapshot(&table, snapshot));
         }
 
-        // Rename: temp table -> main table (data swap; see above).
-        if let Err(e) = catalog.rename_table_data_swap(&temp_table, &data_table) {
-            tracing::error!("CRITICAL: Failed to rename '{}' to '{}': {}", temp_table, data_table, e);
+        // A population can reach storage before its vector hooks run. Keep
+        // old dumped graphs from being resurrected after that uncertain edge:
+        // invalidation rides the SAME group, and a refused group preserves it.
+        for (name, _) in self.storage.vector_indexes().indexes_on_table(&table) {
+            ddl.delete(super::index_snapshot::vec_snapshot_marker_key(&name));
+        }
 
-            // Attempt to restore original state if old table was renamed
-            if table_exists {
-                tracing::info!(
-                    "Attempting to restore original table by renaming '{}' back to '{}'",
-                    backup_table,
-                    data_table
-                );
+        // Persistent HNSW is a database graph: stage its full replacement in
+        // this same row group. DdlBatch settles all its owned graph leases
+        // before any registry publication callback or ACK.
+        let replaced_persistent = if compatible {
+            self.storage
+                .vector_indexes()
+                .stage_persistent_table_replacement(&table, schema, &rows, &mut ddl)?
+        } else {
+            Vec::new()
+        };
 
-                if let Err(restore_err) = catalog.rename_table_data_swap(&backup_table, &data_table) {
-                    tracing::error!(
-                        "CRITICAL: Failed to restore original table '{}': {}. Manual intervention may be required.",
-                        data_table,
-                        restore_err
+        // Last before commit: the process-global zone-stats lock must not cover
+        // query execution, key claims or unrelated catalog work.
+        let uses_columnar = schema
+            .columns
+            .iter()
+            .any(|c| c.storage_mode == crate::ColumnStorageMode::Columnar);
+        if uses_columnar || !compatible {
+            let stats = super::columnar::stats_write_lock();
+            if !compatible {
+                ColumnarStore::stage_table_sidecar_purge(&self.storage.db, &table, ddl.batch_mut())?;
+            }
+            let mut presence: BTreeMap<u64, (Vec<u64>, Vec<u64>)> = BTreeMap::new();
+            for tuple in &old {
+                if let Some(id) = tuple.row_id {
+                    presence.entry(id / BATCH_SIZE as u64).or_default().1.push(id);
+                }
+            }
+            for (id, _) in &rows {
+                presence.entry(*id / BATCH_SIZE as u64).or_default().0.push(*id);
+            }
+            for (index, column) in schema.columns.iter().enumerate() {
+                if column.storage_mode != crate::ColumnStorageMode::Columnar {
+                    continue;
+                }
+                let mut batches: BTreeMap<u64, Vec<(u64, crate::Value)>> = BTreeMap::new();
+                for (id, tuple) in &rows {
+                    batches
+                        .entry(*id / BATCH_SIZE as u64)
+                        .or_default()
+                        .push((*id, tuple.values[index].clone()));
+                }
+                for (batch_id, values) in batches {
+                    if compatible {
+                        ColumnarStore::apply_batch_values(
+                            &self.storage.db,
+                            ddl.batch_mut(),
+                            &table,
+                            &column.name,
+                            batch_id,
+                            &values,
+                        )?;
+                    } else {
+                        let mut batch = ColumnBatch::new(&column.name, batch_id * BATCH_SIZE as u64);
+                        for (id, value) in values {
+                            batch.set(id, value);
+                        }
+                        let stats = BatchStats::from_batch(&batch);
+                        let bytes = super::typed_batch::encode_column_batch(&batch, &stats)?;
+                        ddl.batch_mut()
+                            .put(format!("col:{table}:{}:{batch_id}", column.name), bytes);
+                        ddl.batch_mut().put(
+                            format!("colz:{table}:{}:{batch_id}", column.name),
+                            bincode::serialize(&stats)
+                                .map_err(|e| Error::storage(format!("MV columnar stats: {e}")))?,
+                        );
+                    }
+                }
+            }
+            if uses_columnar {
+                for (batch_id, (set, clear)) in presence {
+                    if compatible {
+                        ColumnarStore::apply_presence_updates(
+                            &self.storage.db,
+                            ddl.batch_mut(),
+                            &table,
+                            batch_id,
+                            &set,
+                            &clear,
+                        )?;
+                    } else {
+                        // The purge is staged, so an RMW against the raw store
+                        // would still inherit orphan bits from the old table.
+                        let mut present = BatchPresence::new();
+                        for id in set {
+                            present.set((id % BATCH_SIZE as u64) as usize);
+                        }
+                        ddl.batch_mut().put(
+                            format!("colp:{table}:{batch_id}"),
+                            bincode::serialize(&present).map_err(|e| Error::storage(format!("MV presence: {e}")))?,
+                        );
+                    }
+                }
+                ddl.batch_mut().put(format!("colpm:{table}"), [1u8]);
+            }
+            ddl.hold_until_written(stats);
+        }
+        self.storage.note_committed_write(&table, timestamp);
+        let storage = self.storage;
+        let published_table = table.clone();
+        // Both successful and possibly-applied failed writes fence data caches
+        // while the in-flight commit slot is held. Catalog/layout publication
+        // alone advances schema generation on actual create/shape replacement.
+        ddl.on_commit(storage.data_write_attempt_publication(table.clone()));
+        ddl.on_abort(storage.data_write_attempt_publication(table.clone()));
+        ddl.on_commit(move || {
+            storage.row_locks().note_rows_changed(&published_table);
+        });
+        ddl.exit_after_write(if create { "create_mv" } else { "refresh_mv" }, view_name);
+        // A native write error does not prove that the batch was rejected.
+        // Never let claim Drop blindly restore the old memberships after an
+        // uncertain result. The exclusive guard, census and in-flight slot
+        // remain held until actual storage has been reconciled or quarantined.
+        ddl.reconcile_unknown_in_caller();
+        let written = match ddl.commit() {
+            Ok(written) => written,
+            Err(error) => {
+                // DdlBatch has settled every graph lease before reconciliation
+                // enters manager registries.
+                if let Some(claim) = claim {
+                    claim.disarm_for_reconciliation();
+                }
+                self.reconcile_failed_population(view_name, &table, timestamp, &old, prior_vector_state.as_ref())?;
+                return Err(error);
+            }
+        };
+        let publication = (|| -> Result<()> {
+            if let Some(claim) = claim {
+                claim
+                    .finish()
+                    .map_err(|error| Error::storage(format!("MV key publication: {error}")))?;
+            }
+            if replacement_indexes.is_some() {
+                Self::register_schema_indexes(self.storage.art_indexes(), &table, schema)?;
+                self.storage
+                    .art_indexes()
+                    .on_insert_tuples(&table, schema, &rows)
+                    .map_err(|e| Error::storage(format!("MV index publication: {e}")))?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = publication {
+            self.reconcile_failed_population(view_name, &table, timestamp, &old, prior_vector_state.as_ref())?;
+            return Err(error);
+        }
+        self.storage
+            .vector_indexes()
+            .forget_replaced_row_records(&replaced_persistent, &old);
+        if compatible && self.storage.vector_indexes().table_has_indexes(&table) {
+            for tuple in &old {
+                if let Some(id) = tuple.row_id {
+                    self.storage.vector_indexes().on_row_delete_excluding(
+                        &table,
+                        id,
+                        Some(schema),
+                        Some(tuple),
+                        &replaced_persistent,
                     );
+                }
+            }
+            for (id, tuple) in &rows {
+                self.storage
+                    .vector_indexes()
+                    .on_row_insert_excluding(&table, *id, schema, tuple, &replaced_persistent);
+            }
+        }
+        drop(census);
+        drop(_inflight);
+        written.wait_replicated();
+        Ok(rows.len() as u64)
+    }
+
+    /// Rebuild from actual durable state, never the requested result or an old
+    /// schema/row cache. The caller keeps its exclusive table ownership, full
+    /// write census and in-flight timestamp through this entire operation.
+    fn reconcile_failed_population(
+        &self,
+        view: &str,
+        table: &str,
+        timestamp: u64,
+        prior_rows: &[Tuple],
+        prior_vector_state: Option<&(Option<Vec<u8>>, Vec<u8>)>,
+    ) -> Result<()> {
+        let storage = self.storage;
+        storage.data_write_attempt_publication(table.to_string())();
+        storage.invalidate_schema_cache(table);
+        storage.invalidate_schema_cache(view);
+        storage.invalidate_missing_values(table);
+        storage.invalidate_table_constraints_cache(table);
+        storage.forget_table_dictionaries(table);
+        storage.snapshot_manager().invalidate_cached_versions(table);
+        let reconciled = (|| -> Result<()> {
+            let catalog = storage.catalog();
+            let definition = storage.get(&format!("meta:table:{table}").into_bytes())?;
+            let definitions: Vec<_> = catalog
+                .index_definitions_strict()?
+                .into_iter()
+                .filter(|(_, definition)| definition.table_name == table)
+                .collect();
+            let Some(definition) = definition else {
+                if !definitions.is_empty() {
+                    return Err(Error::storage("MV indexes reference an absent backing table"));
+                }
+                storage
+                    .art_indexes()
+                    .drop_table_indexes(table)
+                    .map_err(|error| Error::storage(format!("MV absent-table indexes: {error}")))?;
+                if storage.vector_indexes().table_has_indexes(table) {
+                    return Err(Error::storage(
+                        "MV backing table disappeared while vector indexes remain",
+                    ));
+                }
+                return Ok(());
+            };
+            let schema: Schema = bincode::deserialize(&definition)
+                .map_err(|error| Error::storage(format!("MV actual schema: {error}")))?;
+            let mut columns = std::collections::HashSet::new();
+            for column in &schema.columns {
+                if !columns.insert(column.name.as_str()) {
+                    return Err(Error::storage("MV actual schema has duplicate columns"));
+                }
+            }
+            let validate_columns = |names: &[String]| -> Result<()> {
+                if names.is_empty() || names.iter().any(|name| schema.get_column(name).is_none()) {
+                    return Err(Error::storage(format!(
+                        "MV actual index has invalid columns: {names:?}"
+                    )));
+                }
+                Ok(())
+            };
+            // Decoding resolves CURRENT dictionary/CAS/columnar side data only
+            // after layout and dictionary caches have been discarded above.
+            let shape = storage.row_shape(table, schema.columns.len())?;
+            let prefix = format!("data:{table}:");
+            let mut options = rocksdb::ReadOptions::default();
+            options.set_total_order_seek(true);
+            let mut rows = Vec::new();
+            for entry in storage.db.iterator_opt(
+                rocksdb::IteratorMode::From(prefix.as_bytes(), rocksdb::Direction::Forward),
+                options,
+            ) {
+                let (key, raw) = entry.map_err(|error| Error::storage(format!("MV actual row scan: {error}")))?;
+                if !key.starts_with(prefix.as_bytes()) {
+                    break;
+                }
+                let Some(id) = StorageEngine::parse_row_id_after_prefix(&key, prefix.len()) else {
+                    continue;
+                };
+                let plain = super::tde::open_ref(storage.key_manager_ref(), &key, &raw)?;
+                let logical = storage
+                    .snapshot_manager()
+                    .logical_current_row_for_history(table, id, &plain, None)?;
+                let mut tuple: Tuple = bincode::deserialize(&logical)
+                    .map_err(|error| Error::storage(format!("MV actual row: {error}")))?;
+                if tuple.values.len() > schema.columns.len() {
+                    return Err(Error::storage("MV actual row is wider than its durable schema"));
+                }
+                shape.apply(&mut tuple);
+                tuple.row_id = Some(id);
+                rows.push((id, tuple));
+            }
+            let constraints = catalog.main_table_constraints(table)?;
+            // Vector reconciliation must not emit persistent-HNSW writes on
+            // an uncertain DDL result. Retire/fence the table if a vector
+            // manager is involved; reopen rebuilds from the surviving defs.
+            if storage.vector_indexes().table_has_indexes(table)
+                || definitions.iter().any(|(_, definition)| {
+                    super::catalog::index_family(definition.index_type.as_deref())
+                        == Some(super::catalog::IndexFamily::Vector)
+                })
+            {
+                let unchanged = if let Some((prior_schema, prior_definitions)) = prior_vector_state {
+                    let prior_rows: BTreeMap<_, _> = prior_rows
+                        .iter()
+                        .map(|tuple| {
+                            let id = tuple.row_id.ok_or_else(|| Error::storage("MV prior row lacks an id"))?;
+                            Ok((
+                                id,
+                                bincode::serialize(tuple)
+                                    .map_err(|error| Error::storage(format!("MV prior row: {error}")))?,
+                            ))
+                        })
+                        .collect::<Result<_>>()?;
+                    let actual_rows: BTreeMap<_, _> = rows
+                        .iter()
+                        .map(|(id, tuple)| {
+                            Ok((
+                                *id,
+                                bincode::serialize(tuple)
+                                    .map_err(|error| Error::storage(format!("MV actual row: {error}")))?,
+                            ))
+                        })
+                        .collect::<Result<_>>()?;
+                    prior_schema.as_deref() == Some(definition.as_slice())
+                        && *prior_definitions
+                            == bincode::serialize(&definitions)
+                                .map_err(|error| Error::storage(format!("MV actual index definitions: {error}")))?
+                        && prior_rows == actual_rows
                 } else {
-                    tracing::info!("Successfully restored original table '{}'", data_table);
+                    false
+                };
+                if !unchanged {
+                    return Err(Error::storage(
+                        "MV vector state requires a fresh rebuild after an uncertain population",
+                    ));
                 }
             }
-
-            // Try to cleanup temporary table if it still exists
-            if catalog.table_exists(&temp_table).unwrap_or(false) {
-                if let Err(cleanup_err) = catalog.drop_table(&temp_table) {
-                    tracing::warn!("Failed to cleanup temporary table '{}': {}", temp_table, cleanup_err);
+            let art = storage.art_indexes();
+            art.drop_table_indexes(table)
+                .map_err(|error| Error::storage(format!("MV index retirement: {error}")))?;
+            // Durable user names precede generated constraint names, exactly
+            // as on reopen. No best-effort decoder/registration is used here.
+            for (name, definition) in &definitions {
+                validate_columns(std::slice::from_ref(&definition.column_name))?;
+                match super::catalog::index_family(definition.index_type.as_deref()) {
+                    Some(super::catalog::IndexFamily::Art) => {
+                        if let Some(columns) = crate::sql::executor::ddl::unique_index_columns(
+                            &definition.options,
+                            &definition.column_name,
+                        ) {
+                            validate_columns(&columns)?;
+                            art.create_unique_index(table, &columns, Some(name))
+                                .map_err(|error| Error::storage(format!("MV actual unique index '{name}': {error}")))?;
+                        } else {
+                            art.create_manual_index(name, table, std::slice::from_ref(&definition.column_name))
+                                .map_err(|error| Error::storage(format!("MV actual index '{name}': {error}")))?;
+                        }
+                    }
+                    Some(super::catalog::IndexFamily::DdlOnly) => {}
+                    // The vector state above proved schema/definitions/rows
+                    // unchanged; its preserved manager needs no ART structure.
+                    Some(super::catalog::IndexFamily::Vector) => {}
+                    _ => {
+                        return Err(Error::storage(format!(
+                            "MV actual index '{name}' has an unsupported family"
+                        )))
+                    }
                 }
             }
-
-            return Err(e);
-        }
-        tracing::debug!("Renamed '{}' to '{}'", temp_table, data_table);
-
-        // Step 4: Clean up the backup table
-        if table_exists {
-            if let Err(e) = catalog.drop_table(&backup_table) {
-                // Log but don't fail - the refresh succeeded, cleanup is just housekeeping
-                tracing::warn!(
-                    "Warning: Failed to drop backup table '{}': {}. This may be cleaned up manually.",
-                    backup_table,
-                    e
-                );
-            } else {
-                tracing::debug!("Dropped backup table '{}'", backup_table);
+            Self::register_schema_indexes(art, table, &schema)?;
+            for unique in &constraints.unique_constraints {
+                validate_columns(&unique.columns)?;
             }
+            catalog.register_unique_constraint_indexes(table, &constraints)?;
+            for foreign in &constraints.foreign_keys {
+                validate_columns(&foreign.columns)?;
+                if foreign.table_name != table || foreign.columns.len() != foreign.references_columns.len() {
+                    return Err(Error::storage("MV actual foreign key has inconsistent owner/arity"));
+                }
+                art.create_fk_index(
+                    table,
+                    &foreign.columns,
+                    &foreign.references_table,
+                    &foreign.references_columns,
+                    Some(&foreign.name),
+                )
+                .map_err(|error| Error::storage(format!("MV actual foreign-key index: {error}")))?;
+            }
+            art.on_insert_tuples(table, &schema, &rows)
+                .map_err(|error| Error::storage(format!("MV actual index backfill: {error}")))?;
+            // Applied-then-error skipped the ordinary snapshot publication.
+            // Only publish the exact record if it actually survived the group.
+            let key = format!("snapshot:{timestamp}");
+            if let Some(raw) = storage.db.get(key.as_bytes())? {
+                storage
+                    .snapshot_manager()
+                    .ingest_snapshot_record(key.as_bytes(), &raw)?;
+            }
+            storage.row_locks().note_rows_changed(table);
+            Ok(())
+        })();
+        if let Err(error) = reconciled {
+            let quarantined = storage.quarantine_materialized_view(view, table, &error.to_string());
+            if let Err(retire) = storage.art_indexes().drop_table_indexes(table) {
+                tracing::error!("MV quarantined index retirement for {table}: {retire}");
+            }
+            storage.vector_indexes().retire_table_indexes(table, &error.to_string());
+            return Err(quarantined);
         }
+        Ok(())
+    }
 
-        // See the trailing bump in `store_view_data`: the LAST generation bump of a
-        // refresh must follow the row swap so out-of-handle readers reconcile against
-        // a generation that already reflects the new data.
-        self.storage.bump_schema_generation();
-
-        tracing::info!(
-            "Successfully stored {} rows for materialized view '{}' (CONCURRENT mode)",
-            row_count,
-            view_name
-        );
-
-        Ok(row_count)
+    fn register_schema_indexes(
+        indexes: &super::art_manager::ArtIndexManager,
+        table: &str,
+        schema: &Schema,
+    ) -> Result<()> {
+        let primary: Vec<String> = schema
+            .columns
+            .iter()
+            .filter(|c| c.primary_key)
+            .map(|c| c.name.clone())
+            .collect();
+        if !primary.is_empty() {
+            indexes
+                .create_pk_index(table, &primary)
+                .map_err(|e| Error::storage(format!("MV primary key: {e}")))?;
+        }
+        for column in schema.columns.iter().filter(|c| c.unique && !c.primary_key) {
+            indexes
+                .create_constraint_unique_index(table, &[column.name.clone()], None)
+                .map_err(|e| Error::storage(format!("MV unique key: {e}")))?;
+        }
+        Ok(())
     }
 
     /// Read materialized view data

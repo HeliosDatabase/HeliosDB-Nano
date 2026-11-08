@@ -72,21 +72,26 @@ open deletes what it wrote. It needs `time_travel_enabled`, an anchor inside the
 main as the parent: a branch keeps no history. Definitions are the CURRENT ones: a column added since the
 anchor shows on the branch, a table dropped since is gone, a table created since is there and empty.
 
-**An anchor is refused (`0A000`, naming the table or view and why) when a row as it was cannot be read now.** A
-version is positional and nothing rewrites it, and a rename deletes it. So: an anchor before a `DROP
-COLUMN`, `RENAME COLUMN`, `ALTER COLUMN … SET STORAGE` or `RENAME TO` of a table, or a `REFRESH` of a materialized
-view whose data table has an index or a column storage mode (that refresh still replaces the table); and a later anchor, if a row's last version at it is from before that statement and the row has changed
-since (a row not changed since is what it is now). The statement records this in its own write,
-`meta:table_shape:{t}`. A rename records it on the old name too, so a table that takes that name refuses an anchor
-from before the rename, whatever becomes of the renamed table. A `DROP TABLE` takes the table's own record, and its
-version history. Any other `REFRESH MATERIALIZED VIEW` (4.42.0+) replaces the view's rows in place, in one write that
-keeps their history, so a branch anchored before it reads the view as it was at the anchor. **Such a statement run before 4.42.0 left no record**: nothing refuses an anchor before it, and its
-rows read by position, wrongly.
+**An anchor is refused (`0A000`, naming the table or view and why) when a row as it was cannot be read now**, where
+`SELECT … AS OF` the same time is refused too: the two read by the same record and give the same answer. A rename
+deletes a table's history. So: an anchor before a `RENAME TO` of a table, before a `REFRESH` of a materialized view
+whose data table has an index or a column storage mode (that refresh still replaces the table), or before an `ALTER
+COLUMN … SET STORAGE` that moved a column out of dictionary, content-addressed or columnar storage (the old versions
+hold references the column no longer resolves); and a later anchor, past such a rename or refresh, if a row it moved
+has no version at the anchor and has changed since (a row not changed since is what it is now). An anchor before a
+`DROP COLUMN`, `RENAME COLUMN` or `SET STORAGE` into a storage mode is not refused (4.42.0+): each value reads under
+its own column, the dropped one left out. The statement records all of this in its own write group,
+`meta:table_layout:{t}` (and `meta:table_shape:{t}`). A rename records it on the old name too, so a table that takes
+that name refuses an anchor from before the rename, whatever becomes of the renamed table. A `DROP TABLE` takes the
+table's own records, and its version history. Any other `REFRESH MATERIALIZED VIEW` (4.42.0+) replaces the view's rows
+in place, in one write that keeps their history, so a branch anchored before it reads the view as it was at the
+anchor. **Such a statement run before 4.42.0 left no record**: nothing refuses an anchor before it, and its rows read
+by position, wrongly.
 
 Two consequences to expect. **One table's change refuses the branch as a whole**, whichever table you care
-about: a branch holds every table at its anchor or none. And **it goes on for later anchors**: until each row last
-versioned before the statement is written again (a transaction's `UPDATE` of it is enough), an anchor is refused
-once such a row has changed after it. `AS OF NOW` always works, and so does a time after the last such change.
+about: a branch holds every table at its anchor or none. And **a rename goes on refusing later anchors**: until each
+row it moved is written again (a transaction's `UPDATE` of it is enough), an anchor is refused once such a row has
+changed after it. `AS OF NOW` always works, and so does a time after the last such change.
 
 **What `AS OF` can see.** Version history. A row deleted before 4.42.0 has no delete event: it is absent at every
 time, as it always was. Since 4.42.0 every `UPDATE` and `DELETE` is versioned, the autocommit primary-key fast path

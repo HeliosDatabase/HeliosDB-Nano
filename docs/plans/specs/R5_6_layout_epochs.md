@@ -49,3 +49,34 @@ ADD COLUMN, DROP COLUMN, RENAME, CREATE/DROP INDEX, REFRESH) on the primary and 
 physical standby, asserting no torn read; retry then 40001 under a DDL storm; no retry for a
 statement with nextval; the pinned-plan path. Un-ignore the main and paced tests of
 `tests/physical_ddl_window.rs` if they pass; otherwise report what they still see.
+
+## As built
+
+- Root cause of the standby reads (merged-tree review M3): a plan built before the column existed
+  was used after the new schema was readable. The planner does not resolve an aggregate's argument
+  (`count(u)` plans against `(id, a)` and is cached before it fails 42703 at execution). On the
+  standby, `publish_meta_tables` made the new schema readable but the plan caches were cleared only
+  by `publish_listener`, after `stage_rows` over every row of the run. The stale plan's scan
+  re-resolved the new schema, decoded none of its columns (empty decode hints are vacuously
+  columnar) and returned every row with `u` NULL; the result cache then replayed it. The store
+  was never torn, and time travel played no part.
+- `storage::layout_epochs`: one epoch per table name (low 16 bits count changes in flight), a
+  thread-local read set per client statement (`StatementScope`; nested executions join it), plan
+  stamps (`LayoutStamp`, collected while planning), `PublicationScope` (a schema statement's change
+  ends when its publication does), and the retry driver `EmbeddedDatabase::run_layout_statement`.
+- Writers: `WriteGate::write` / `put` / `delete` validate the read set before the first durable
+  write and bump every table a key of `LAYOUT_PREFIXES` names (`meta:table_layout:` included). The
+  physical applier marks a run's layout tables in flight before its write and ends the change after
+  `publish_meta_tables`, `publish_index_deletes`, `drop_layout_caches` and the listener's
+  `on_layout_change`, before any row is staged; a run is split at a layout batch.
+- Readers: `Catalog::get_table_schema` / `main_table_schema` record the epoch before any cache.
+  Cached plans (text, parameterized, normalized), fast-select specs and extended-protocol pins are
+  served only while their stamp is current. The scan and the aggregate pushdowns refuse a plan
+  whose table schema differs from the table's now (40001).
+- SQL `PREPARE`: the statement's text is kept on both paths (`LogicalPlan::Prepare::source_sql` for
+  the parser's), and an `EXECUTE` whose stored plan the scan refuses is planned again from it; a
+  changed result type is refused 0A000, as PostgreSQL refuses it.
+- Not retried: explicit transactions (40001 at once, the statement fails inside its boundary),
+  statements that took a sequence value, an advisory lock or ran `CALL`, and statements past their
+  first durable write. A sequence's high-water write is `outside_statement`.
+- Kept separate from `storage::row_locks`' R5.4 row-change epochs (1024 striped slots).

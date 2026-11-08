@@ -81,6 +81,27 @@ impl ContentAddressedStore {
         Ok(Value::CasRef { hash })
     }
 
+    /// Spec R5.5: [`Self::store`] for a statement that writes ONE group: the CasRef,
+    /// and the payload put to stage in that group, when the store does not hold it
+    /// yet (the caller stages each key once; a payload is the same bytes whoever
+    /// writes it). Nothing is written here.
+    pub fn plan_store(db: &DB, value: &Value) -> Result<(Value, Option<(Vec<u8>, Vec<u8>)>)> {
+        let bytes = match value {
+            Value::String(s) => s.as_bytes(),
+            Value::Bytes(b) => b.as_slice(),
+            Value::Null => return Ok((value.clone(), None)),
+            _ => return Err(Error::storage("CAS only supports String and Bytes types")),
+        };
+        let hash: [u8; 32] = blake3::hash(bytes).into();
+        let key = Self::cas_key(&hash);
+        let exists = db
+            .get(&key)
+            .map_err(|e| Error::storage(format!("CAS lookup failed: {}", e)))?
+            .is_some();
+        let put = (!exists).then(|| (key, bytes.to_vec()));
+        Ok((Value::CasRef { hash }, put))
+    }
+
     /// Store a value unconditionally (for migration), returning the CasRef
     ///
     /// Unlike `maybe_store`, this always stores the value regardless of size.

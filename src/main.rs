@@ -1202,6 +1202,14 @@ enum Commands {
     /// stop short, 3 when a full copy is needed but was not applied
     /// (--no-full-copy, or an occupied directory without --replace).
     Recover(RecoverArgs),
+    /// Adopt a stopped database's complete local state without logical redo.
+    RecoverWal {
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// Explicitly keep local data/catalog/branches/history as authoritative.
+        #[arg(long, required = true)]
+        adopt_local_state: bool,
+    },
     /// Promote a STOPPED physical standby to the primary of its dataset at
     /// the next epoch (spec P5.1; Oracle: SWITCHOVER / FAILOVER TO;
     /// PostgreSQL: pg_ctl promote). The old primary is fenced first over its
@@ -2065,6 +2073,20 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Commands::Resync(args) => run_physical_resync(args).await,
         Commands::Recover(args) => run_recover(args).await,
+        Commands::RecoverWal {
+            data_dir,
+            adopt_local_state,
+        } => {
+            if !adopt_local_state {
+                return Err(Error::config("recover-wal requires --adopt-local-state"));
+            }
+            let report = heliosdb_nano::StorageEngine::adopt_local_wal_state(&data_dir)?;
+            println!(
+                "Adopted local state through WAL LSN {}; retained entries unchanged (history floor {}).",
+                report.adopted_through, report.history_floor
+            );
+            Ok(())
+        }
         Commands::Promote(args) => run_promote(args).await,
         Commands::Standby(args) => run_standby_command(args).await,
         Commands::Archive(args) => run_archive_command(args),

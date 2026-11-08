@@ -34,15 +34,10 @@
 //!
 //! # How the "retained entries, no checkpoint" state is reached
 //!
-//! Naturally, and without any special-casing: the first open of a store finds
-//! an empty log, so nothing is replayed and nothing is truncated, so no
-//! `wal:checkpoint` key is ever written. Entries appended during that session
-//! are still there at the next open, and that next open is the one that used to
-//! re-execute them. The crafted-entry tests below reach the same state by
-//! appending through the ordinary `WriteAheadLog` API against a closed store —
-//! chosen over driving DDL through SQL because it pins the EXACT operation from
-//! the production evidence (`DropTable` for a table that exists now) instead of
-//! whichever subset of DDL the current engine happens to log.
+//! The legacy fixtures explicitly remove the current atomic-group marker,
+//! checkpoint and history floor on a closed store before planting old entries.
+//! Current writers stamp their format before their first application write;
+//! their post-checkpoint groups are adopted without replay on every open.
 
 use heliosdb_nano::{
     storage::{WalOperation, WalSyncMode, WriteAheadLog},
@@ -118,6 +113,14 @@ fn retained_entry_count(db: &DB) -> usize {
         .count()
 }
 
+/// Construct the legacy provenance explicitly: current writers mark their
+/// atomic groups before the first application write.
+fn legacy_without_checkpoint(db: &DB) {
+    db.delete(b"wal:atomic_groups").expect("remove current format marker");
+    db.delete(CHECKPOINT_KEY).expect("remove current checkpoint");
+    db.delete(b"wal:pruned_through").expect("remove current history floor");
+}
+
 fn checkpoint_of(db: &DB) -> Option<u64> {
     db.get(CHECKPOINT_KEY)
         .expect("read checkpoint")
@@ -172,6 +175,7 @@ fn a_stale_drop_table_in_an_uncheckpointed_log_must_not_destroy_the_live_table()
     // Plant the historical entry, exactly as an older build would have left it.
     {
         let raw = open_raw(dir);
+        legacy_without_checkpoint(&raw);
         let wal = WriteAheadLog::open(
             Arc::clone(&raw),
             heliosdb_nano::storage::WriteGate::open(),
@@ -234,6 +238,7 @@ fn a_stale_truncate_in_an_uncheckpointed_log_must_not_empty_the_live_table() {
 
     {
         let raw = open_raw(dir);
+        legacy_without_checkpoint(&raw);
         let wal = WriteAheadLog::open(
             Arc::clone(&raw),
             heliosdb_nano::storage::WriteGate::open(),
@@ -279,6 +284,7 @@ fn the_legacy_upgrade_records_a_checkpoint_and_reclaims_the_log() {
 
     let planted_lsn = {
         let raw = open_raw(dir);
+        legacy_without_checkpoint(&raw);
         let wal = WriteAheadLog::open(
             Arc::clone(&raw),
             heliosdb_nano::storage::WriteGate::open(),
@@ -327,6 +333,7 @@ fn reopening_repeatedly_is_stable() {
 
     {
         let raw = open_raw(dir);
+        legacy_without_checkpoint(&raw);
         let wal = WriteAheadLog::open(
             Arc::clone(&raw),
             heliosdb_nano::storage::WriteGate::open(),
@@ -352,19 +359,13 @@ fn reopening_repeatedly_is_stable() {
 }
 
 // ---------------------------------------------------------------------------
-// 3. Recovery is still recovery. This is the pair that stops the fix from
-//    being "disable replay".
+// 3. Current-format local state stays authoritative on either side of a checkpoint.
 // ---------------------------------------------------------------------------
 
-/// Simulates the ONE window logical redo genuinely covers: the WAL entry
-/// landed, the corresponding data write did not.
-///
-/// The data key is removed from RocksDB directly and the checkpoint is planted
-/// just BELOW that entry's LSN, so the entry is unambiguously post-checkpoint.
-/// Reopening must put the row back. If this test ever fails, the fix has turned
-/// crash recovery into a no-op.
+/// Current-format groups are already applied history. Even with a lagging
+/// checkpoint, a newer raw deletion stays authoritative and is never redone.
 #[test]
-fn an_entry_past_the_checkpoint_is_still_replayed() {
+fn a_current_format_entry_past_the_checkpoint_is_adopted_without_redo() {
     let temp = TempDir::new().unwrap();
     let dir = temp.path();
 
@@ -427,8 +428,8 @@ fn an_entry_past_the_checkpoint_is_still_replayed() {
         let db = open_db_logging_dml(dir);
         assert_eq!(
             text_column(&db, "SELECT id, v FROM t ORDER BY id", 1),
-            vec!["alpha".to_string(), "beta".to_string()],
-            "an entry past the checkpoint was NOT replayed — crash recovery has become a no-op"
+            vec!["alpha".to_string()],
+            "current-format history must never overwrite a newer local deletion"
         );
     }
 }
@@ -495,21 +496,13 @@ fn an_entry_at_or_below_the_checkpoint_is_not_replayed() {
 }
 
 // ---------------------------------------------------------------------------
-// 4. A fresh store is untouched.
+// 4. A fresh store publishes the atomic-group format before application writes.
 // ---------------------------------------------------------------------------
 
-/// An empty store must open, close and reopen with no recovery activity at all,
-/// and must NOT be stamped with a checkpoint.
-///
-/// The second half is a deliberate design choice, pinned here so it cannot be
-/// "tidied up" later: `wal:checkpoint = N` is a claim that entries up to `N`
-/// are applied. Stamping it over an empty log is vacuously true, but it
-/// reclassifies the store from "never checkpointed" (unknown provenance,
-/// handled conservatively) to "checkpointed" (trusted, replayed) with no
-/// evidence gathered — which would put the very first reopen of any new store
-/// back on the destructive path.
+/// A fresh store stamps the atomic-group version before its first write,
+/// so every later crash can adopt its local state without replaying history.
 #[test]
-fn a_fresh_store_is_unaffected_and_is_not_stamped_with_a_checkpoint() {
+fn a_fresh_store_marks_atomic_groups_before_its_first_application_writes() {
     let temp = TempDir::new().unwrap();
     let dir = temp.path();
 
@@ -522,8 +515,12 @@ fn a_fresh_store_is_unaffected_and_is_not_stamped_with_a_checkpoint() {
         assert_eq!(retained_entry_count(&raw), 0, "a fresh store retains no WAL entries");
         assert_eq!(
             checkpoint_of(&raw),
-            None,
-            "an empty log must not be stamped with a checkpoint"
+            Some(0),
+            "a new store establishes the current atomic-group format before application writes"
+        );
+        assert_eq!(
+            raw.get(b"wal:atomic_groups").unwrap().as_deref(),
+            Some([1_u8].as_slice())
         );
     }
 

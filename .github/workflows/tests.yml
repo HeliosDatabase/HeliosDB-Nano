@@ -53,6 +53,33 @@ env:
   CARGO_PROFILE_TEST_DEBUG: 0
 
 jobs:
+  # Check the supported compiler floors independently of the stable regression
+  # jobs below. These compile checks do not replace any runtime acceptance tier.
+  minimum-compiler:
+    name: minimum compiler (${{ matrix.surface }}, Rust ${{ matrix.toolchain }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - surface: default
+            toolchain: '1.88.0'
+            features: ''
+          - surface: code-embed
+            toolchain: '1.92.0'
+            features: '--features code-embed'
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: msrv-${{ matrix.surface }}-${{ matrix.toolchain }}
+      - name: Check supported source build
+        run: cargo +${{ matrix.toolchain }} check --locked --lib --bins ${{ matrix.features }}
+
   # ---------------------------------------------------------------------------
   # Tier 1 — blocking on every PR. A curated subset covering the defect CLASSES
   # this project has actually shipped: encryption at rest, index durability across

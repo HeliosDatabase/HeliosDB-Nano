@@ -17,7 +17,7 @@ use super::index_snapshot::ArtIndexSnapshot;
 use crate::{DataType, Schema, Tuple, Value};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock, RwLockReadGuard};
 
 /// Shared handle to a single ART index tree.
@@ -157,6 +157,14 @@ struct IndexEntry {
     constraint_label: Option<String>,
     /// The actual tree, individually locked.
     tree: SharedArtIndex,
+    /// Spec R5.4 (review F3): the keys of this (PRIMARY KEY / UNIQUE) index that an
+    /// open transaction took out — its DELETE, or its UPDATE that moved the value —
+    /// with the transaction and the row that held them ([`KeyHold`]). Read and
+    /// written only under `tree`'s WRITE lock, so a claim of a key and its removal
+    /// or restore are one step each. Empty for every other index.
+    holds: Arc<parking_lot::Mutex<HashMap<Vec<u8>, (u64, RowId)>>>,
+    /// How many keys `holds` has: a claim's one load while nobody holds a key.
+    hold_count: Arc<AtomicUsize>,
 }
 
 impl IndexEntry {
@@ -171,8 +179,82 @@ impl IndexEntry {
             index_type: tree.index_type(),
             constraint_label,
             tree: Arc::new(RwLock::new(tree)),
+            holds: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            hold_count: Arc::new(AtomicUsize::new(0)),
         }
     }
+
+    /// Spec R5.4 (review F3): the hold of `key`, taken under `tree`'s write lock.
+    /// `rule` decides what an insert of `key` for `row_id` does about it: a hold of
+    /// this same row is lifted (the key is restored, or the row is written back
+    /// with it); one of another row refuses a claim by any other transaction
+    /// ([`HoldRule::Claim`]) and is left in place by maintenance of a stored row
+    /// ([`HoldRule::Maintain`], which inserts as it always did). `Err` carries the
+    /// hold that refused.
+    fn settle_hold(&self, name: &str, key: &[u8], row_id: RowId, rule: HoldRule) -> Result<(), KeyHold> {
+        if self.hold_count.load(Ordering::Acquire) == 0 {
+            return Ok(());
+        }
+        let mut holds = self.holds.lock();
+        let Some(&(owner, held_row)) = holds.get(key) else {
+            return Ok(());
+        };
+        let lifted = held_row == row_id || matches!(rule, HoldRule::Claim(Some(claimant)) if claimant == owner);
+        if lifted {
+            holds.remove(key);
+            self.hold_count.fetch_sub(1, Ordering::AcqRel);
+            return Ok(());
+        }
+        match rule {
+            HoldRule::Maintain => Ok(()),
+            HoldRule::Claim(_) => Err(KeyHold {
+                index: name.to_string(),
+                key: key.to_vec(),
+                owner,
+                row_id: held_row,
+            }),
+        }
+    }
+
+    /// Spec R5.4 (review F3): `owner` took `key` of row `row_id` out. Under `tree`'s
+    /// write lock, with the removal.
+    fn hold(&self, key: Vec<u8>, owner: u64, row_id: RowId) {
+        if self.holds.lock().insert(key, (owner, row_id)).is_none() {
+            self.hold_count.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+}
+
+/// Spec R5.4 (review F3): a PRIMARY KEY / UNIQUE key an open transaction took out of
+/// its index — its DELETE, or its UPDATE that moved the value — which it will put
+/// back if it rolls back. Until that transaction ends the key is not free for any
+/// other writer: an INSERT that claimed it went ahead at once, and after the
+/// remover's ROLLBACK two rows shared one primary key; an UPDATE or DELETE that
+/// probed it found nothing and lost its change. A claim of a held key is refused
+/// with the hold; the claimant waits for the row's write lock, which the remover
+/// holds until it ends (`StorageEngine::wait_out_key_hold`), and claims again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyHold {
+    /// The index whose key is held.
+    pub index: String,
+    /// The encoded key.
+    pub key: Vec<u8>,
+    /// The transaction that took it out.
+    pub owner: u64,
+    /// The row that had it.
+    pub row_id: RowId,
+}
+
+/// Spec R5.4 (review F3): what an insert into an enforcing index does about a held
+/// key ([`IndexEntry::settle_hold`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HoldRule {
+    /// Maintenance of a row that is stored, or is written whatever the index says
+    /// (an UPDATE's new key, a restore): another row's hold stays, the key goes in.
+    Maintain,
+    /// A claim for a row not yet written, by this transaction (`None`: no
+    /// transaction): another transaction's hold refuses it.
+    Claim(Option<u64>),
 }
 
 /// Whether the row whose index entries are being maintained is ALREADY STORED
@@ -256,6 +338,11 @@ pub(crate) struct MergedKeysClaim {
 }
 
 impl MergedKeysClaim {
+    /// A failed write may have applied. The caller will reconcile every affected
+    /// membership from committed storage; dropping must not blindly undo it.
+    pub(crate) fn disarm_for_reconciliation(mut self) {
+        self.settled = true;
+    }
     /// The rows are committed: the keys only their old images held go.
     pub(crate) fn finish(mut self) -> ArtResult<()> {
         self.settled = true;
@@ -2302,6 +2389,10 @@ impl ArtIndexManager {
     /// Neither arm ever fires for a NULL: NULLs are DISTINCT in PostgreSQL, so a
     /// NULL-bearing PK/UNIQUE key is skipped before it is ever offered to a tree
     /// ([`Self::key_is_null_distinct`]) and can never be refused.
+    ///
+    /// `hold_rule` / `held`: spec R5.4 (review F3). A key another open transaction
+    /// took out refuses a [`HoldRule::Claim`] all-or-nothing (as a duplicate does,
+    /// for a `NotStored` row), and the hold that refused is left in `held`.
     #[allow(clippy::too_many_arguments)]
     fn insert_row_indexes(
         indexes: &HashMap<String, IndexEntry>,
@@ -2312,6 +2403,8 @@ impl ArtIndexManager {
         frag_cache: &mut Vec<(usize, bool, Vec<u8>)>,
         wv: bool,
         row_state: RowState,
+        hold_rule: HoldRule,
+        held: &mut Option<KeyHold>,
     ) -> ArtResult<()> {
         // Encode-once only pays off when >1 index may share a column; a
         // single-index table takes the original direct encode (zero overhead).
@@ -2373,6 +2466,18 @@ impl ArtIndexManager {
             }
             let enforces = matches!(entry.index_type, ArtIndexType::PrimaryKey | ArtIndexType::Unique);
             let mut index = entry.tree.write().unwrap_or_else(|e| e.into_inner());
+            if enforces {
+                if let Err(hold) = entry.settle_hold(name, &key, row_id, hold_rule) {
+                    drop(index);
+                    Self::undo_row_index_entries(&inserted, row_id);
+                    let refusal = ArtIndexError::DuplicateKey(format!(
+                        "a key of \"{}\" was removed by a transaction that has not ended",
+                        Self::violation_name(entry, name)
+                    ));
+                    *held = Some(hold);
+                    return Err(refusal);
+                }
+            }
             // Bound to a `let` (not matched inline) so the `&key` borrow ends
             // here and the key can be MOVED into the undo log below.
             let outcome = index.insert(&key, row_id);
@@ -3341,6 +3446,10 @@ impl ArtIndexManager {
                 let mut index = entry.tree.write().unwrap_or_else(|e| e.into_inner());
                 match entry.index_type {
                     ArtIndexType::PrimaryKey | ArtIndexType::Unique => {
+                        // Spec R5.4 (review F3): a restore (or this row's own
+                        // re-insert) lifts the row's hold of the key; maintenance
+                        // never refuses on one.
+                        let _ = entry.settle_hold(name, &key, row_id, HoldRule::Maintain);
                         // Already checked, just insert
                         match index.insert(&key, row_id) {
                             Ok(()) => {
@@ -3422,6 +3531,8 @@ impl ArtIndexManager {
             &mut frag_cache,
             wv,
             RowState::Stored,
+            HoldRule::Maintain,
+            &mut None,
         )
     }
 
@@ -3463,18 +3574,42 @@ impl ArtIndexManager {
     /// the earlier ones are removed again before the refusal is returned, so a
     /// rejected row never leaves a phantom key behind.
     pub fn reserve_insert_tuple(&self, table: &str, row_id: RowId, schema: &Schema, tuple: &Tuple) -> ArtResult<()> {
+        match self.reserve_insert_tuple_as(table, row_id, schema, tuple, None)? {
+            None => Ok(()),
+            Some(hold) => Err(ArtIndexError::DuplicateKey(format!(
+                "a key of \"{}\" was removed by a transaction that has not ended",
+                hold.index
+            ))),
+        }
+    }
+
+    /// Spec R5.4 (review F3): [`Self::reserve_insert_tuple`] by `claimant` (the
+    /// claiming transaction; `None` for none), which a key another open transaction
+    /// took out does not admit: `Ok(Some(hold))`, with nothing claimed, says which.
+    /// The caller waits for the hold's row and claims again
+    /// (`StorageEngine::wait_out_key_hold`). A hold of `claimant`'s own (its DELETE,
+    /// then its INSERT of the same key) is lifted by the claim.
+    pub fn reserve_insert_tuple_as(
+        &self,
+        table: &str,
+        row_id: RowId,
+        schema: &Schema,
+        tuple: &Tuple,
+        claimant: Option<u64>,
+    ) -> ArtResult<Option<KeyHold>> {
         self.note_mutation();
         let wv = crate::write_volume::enabled();
         let names = {
             let table_indexes = self.table_indexes.read().unwrap_or_else(|e| e.into_inner());
             match table_indexes.get(table) {
                 Some(list) if !list.is_empty() => list.clone(),
-                _ => return Ok(()),
+                _ => return Ok(None),
             }
         };
         let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
         let mut frag_cache: Vec<(usize, bool, Vec<u8>)> = Vec::new();
-        Self::insert_row_indexes(
+        let mut held = None;
+        let outcome = Self::insert_row_indexes(
             &indexes,
             &names,
             row_id,
@@ -3483,7 +3618,14 @@ impl ArtIndexManager {
             &mut frag_cache,
             wv,
             RowState::NotStored,
-        )
+            HoldRule::Claim(claimant),
+            &mut held,
+        );
+        match (outcome, held) {
+            (Ok(()), _) => Ok(None),
+            (Err(_), Some(hold)) => Ok(Some(hold)),
+            (Err(refusal), None) => Err(refusal),
+        }
     }
 
     /// W3.4 §3.2/§3.3: batch INSERT index maintenance for the COPY funnel.
@@ -3544,6 +3686,8 @@ impl ArtIndexManager {
                 &mut frag_cache,
                 wv,
                 RowState::Stored,
+                HoldRule::Maintain,
+                &mut None,
             ) {
                 tracing::error!(
                     "ART index maintenance refused a committed row of table '{}': {} — the row stays in \
@@ -3601,6 +3745,51 @@ impl ArtIndexManager {
         schema: &Schema,
         tuple: &Tuple,
         row_state: RowState,
+    ) -> ArtResult<HashMap<String, Value>> {
+        let rule = match row_state {
+            RowState::NotStored => HoldRule::Claim(None),
+            RowState::Stored => HoldRule::Maintain,
+        };
+        let mut held = None;
+        self.collect_index_values_inner(table, row_id, schema, tuple, row_state, rule, &mut held)
+    }
+
+    /// Spec R5.4 (review F3): [`Self::on_insert_tuple_collect_index_values`] by
+    /// transaction `claimant`. A `NotStored` row's claim of a key another open
+    /// transaction took out is refused all-or-nothing: `Ok(Err(hold))`, nothing
+    /// claimed, says which ([`Self::reserve_insert_tuple_as`]).
+    pub fn on_insert_tuple_collect_index_values_as(
+        &self,
+        table: &str,
+        row_id: RowId,
+        schema: &Schema,
+        tuple: &Tuple,
+        row_state: RowState,
+        claimant: Option<u64>,
+    ) -> ArtResult<std::result::Result<HashMap<String, Value>, KeyHold>> {
+        let rule = match row_state {
+            RowState::NotStored => HoldRule::Claim(claimant),
+            RowState::Stored => HoldRule::Maintain,
+        };
+        let mut held = None;
+        let outcome = self.collect_index_values_inner(table, row_id, schema, tuple, row_state, rule, &mut held);
+        match (outcome, held) {
+            (Ok(values), _) => Ok(Ok(values)),
+            (Err(_), Some(hold)) => Ok(Err(hold)),
+            (Err(refusal), None) => Err(refusal),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn collect_index_values_inner(
+        &self,
+        table: &str,
+        row_id: RowId,
+        schema: &Schema,
+        tuple: &Tuple,
+        row_state: RowState,
+        hold_rule: HoldRule,
+        held: &mut Option<KeyHold>,
     ) -> ArtResult<HashMap<String, Value>> {
         self.note_mutation();
         // W3.2: census fast-out for the buffered/txn insert index path.
@@ -3669,6 +3858,18 @@ impl ArtIndexManager {
                 }
                 let enforces = matches!(entry.index_type, ArtIndexType::PrimaryKey | ArtIndexType::Unique);
                 let mut index = entry.tree.write().unwrap_or_else(|e| e.into_inner());
+                if enforces {
+                    if let Err(hold) = entry.settle_hold(name, &key, row_id, hold_rule) {
+                        drop(index);
+                        Self::undo_row_index_entries(&inserted, row_id);
+                        let refusal = ArtIndexError::DuplicateKey(format!(
+                            "a key of \"{}\" was removed by a transaction that has not ended",
+                            Self::violation_name(entry, name)
+                        ));
+                        *held = Some(hold);
+                        return Err(refusal);
+                    }
+                }
                 // `let`-bound so the `&key` borrow ends before the move below.
                 let outcome = index.insert(&key, row_id);
                 match outcome {
@@ -3731,6 +3932,31 @@ impl ArtIndexManager {
     ///
     /// Global map lock as READ + per-tree WRITE locks one at a time.
     pub fn on_delete(&self, table: &str, row_id: RowId, column_values: &HashMap<String, Value>) -> ArtResult<()> {
+        self.on_delete_inner(table, row_id, column_values, None)
+    }
+
+    /// Spec R5.4 (review F3): [`Self::on_delete`] by open transaction `owner`, which
+    /// may still roll back: every PRIMARY KEY / UNIQUE key it takes out of row
+    /// `row_id` is held for it ([`KeyHold`]) in the same step, until the restore of
+    /// its rollback or [`Self::release_holds_of`] at its commit. The key looks
+    /// absent to a reader, as before; a writer that claims it waits for `owner`.
+    pub fn on_delete_holding(
+        &self,
+        table: &str,
+        row_id: RowId,
+        column_values: &HashMap<String, Value>,
+        owner: u64,
+    ) -> ArtResult<()> {
+        self.on_delete_inner(table, row_id, column_values, Some(owner))
+    }
+
+    fn on_delete_inner(
+        &self,
+        table: &str,
+        row_id: RowId,
+        column_values: &HashMap<String, Value>,
+        holder: Option<u64>,
+    ) -> ArtResult<()> {
         self.note_mutation();
         // W3.4 §3.2: resolve the table's own indexes (leaf lock, cloned+released).
         let names = {
@@ -3768,6 +3994,11 @@ impl ArtIndexManager {
                         // Unique indexes: remove entire key entry
                         match index.remove(&key) {
                             Ok(previous) => {
+                                if let (Some(owner), Some(previous_row)) = (holder, previous) {
+                                    if previous_row == row_id {
+                                        entry.hold(key.clone(), owner, row_id);
+                                    }
+                                }
                                 if previous.is_some()
                                     && entry.index_type == ArtIndexType::PrimaryKey
                                     && values.len() == 1
@@ -4055,6 +4286,112 @@ impl ArtIndexManager {
         deleted.and(inserted)
     }
 
+    /// Spec R5.4 (review F3): `owner` ended with its commit: the keys it took out are
+    /// free now. Run before its row locks go, so a writer that waited for one of its
+    /// rows finds the key free, not held.
+    pub fn release_holds_of(&self, owner: u64) {
+        let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
+        for entry in indexes.values() {
+            if entry.hold_count.load(Ordering::Acquire) == 0 {
+                continue;
+            }
+            let _tree = entry.tree.write().unwrap_or_else(|e| e.into_inner());
+            let mut holds = entry.holds.lock();
+            let before = holds.len();
+            holds.retain(|_, (holder, _)| *holder != owner);
+            let released = before - holds.len();
+            if released > 0 {
+                entry.hold_count.fetch_sub(released, Ordering::AcqRel);
+            }
+        }
+    }
+
+    /// Spec R5.4 (review F3): lift `hold` if it is still there, unchanged: its owner
+    /// ended without lifting it (its row lock is free, or another's). A committed
+    /// removal leaves the key free; a rolled-back one has restored it.
+    pub fn clear_stale_hold(&self, hold: &KeyHold) {
+        let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
+        let Some(entry) = indexes.get(&hold.index) else {
+            return;
+        };
+        let _tree = entry.tree.write().unwrap_or_else(|e| e.into_inner());
+        let mut holds = entry.holds.lock();
+        if holds.get(&hold.key) == Some(&(hold.owner, hold.row_id)) {
+            holds.remove(&hold.key);
+            entry.hold_count.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    /// Spec R5.4 (review F3): the hold of `table`'s PRIMARY KEY `key`, if an open
+    /// transaction took it out: the row a writer of that key must wait for.
+    pub fn pk_hold(&self, table: &str, key: &[u8]) -> Option<KeyHold> {
+        let name = self.pk_indexes_read().get(table).cloned()?;
+        let indexes = self.indexes_read();
+        let entry = indexes.get(&name)?;
+        if entry.hold_count.load(Ordering::Acquire) == 0 {
+            return None;
+        }
+        let _tree = entry.tree.read().unwrap_or_else(|e| e.into_inner());
+        let (owner, row_id) = *entry.holds.lock().get(key)?;
+        Some(KeyHold {
+            index: name,
+            key: key.to_vec(),
+            owner,
+            row_id,
+        })
+    }
+
+    /// Spec R5.4 (review F3): a hold, by a transaction other than `except`, of a key
+    /// this row would take on the PRIMARY KEY / UNIQUE indexes `arbiter` names (all
+    /// of them with no arbiter). An `ON CONFLICT` statement waits it out before it
+    /// decides between its insert and its update. NULL-bearing keys are skipped.
+    pub fn held_key_for(
+        &self,
+        table: &str,
+        column_values: &HashMap<String, Value>,
+        arbiter: Option<&[String]>,
+        except: u64,
+    ) -> Option<KeyHold> {
+        let names = self.unique_index_names(table);
+        let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
+        for name in &names {
+            let Some(entry) = indexes.get(name) else {
+                continue;
+            };
+            if entry.hold_count.load(Ordering::Acquire) == 0 {
+                continue;
+            }
+            if let Some(arbiter) = arbiter {
+                if !Self::column_sets_match(&entry.columns, arbiter) {
+                    continue;
+                }
+            }
+            let mut values = Vec::with_capacity(entry.columns.len());
+            for column in &entry.columns {
+                match column_values.get(column) {
+                    Some(Value::Null) | None => break,
+                    Some(v) => values.push(v),
+                }
+            }
+            if values.len() != entry.columns.len() {
+                continue;
+            }
+            let key = Self::encode_key_from_values(values.into_iter());
+            let _tree = entry.tree.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(&(owner, row_id)) = entry.holds.lock().get(&key) {
+                if owner != except {
+                    return Some(KeyHold {
+                        index: name.clone(),
+                        key,
+                        owner,
+                        row_id,
+                    });
+                }
+            }
+        }
+        None
+    }
+
     /// Return true if a tuple update changes any column covered by an ART index.
     ///
     /// Most OLTP updates mutate payload columns while the PK/unique/manual index
@@ -4303,6 +4640,65 @@ impl ArtIndexManager {
             }
         }
         Ok(MergedKeysOutcome::Claimed(claim))
+    }
+
+    /// Reconcile a cold generic mutation after an uncertain write. Its caller
+    /// holds the table exclusively and the full write/removal census. Remove the
+    /// old, proposed and actual memberships of affected rows first, then install
+    /// actual rows, so unique-key swaps are repaired without a transient conflict.
+    pub(crate) fn reconcile_mutated_rows(
+        &self,
+        table: &str,
+        schema: &Schema,
+        proposed: &[MergedRowChange<'_>],
+        actual: &[MergedRowChange<'_>],
+    ) -> ArtResult<()> {
+        self.note_mutation();
+        let entries: Vec<IndexEntry> = self
+            .indexes
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .filter(|entry| entry.table == table)
+            .cloned()
+            .collect();
+        for entry in entries {
+            let mut candidates = HashMap::new();
+            for change in proposed.iter().chain(actual) {
+                for tuple in change.old.iter().chain(change.new.iter()) {
+                    if let Some(key) = Self::entry_row_key(&entry, schema, tuple) {
+                        candidates.insert((key, change.row_id), Self::entry_dense_int(&entry, schema, tuple));
+                    }
+                }
+            }
+            let mut tree = entry.tree.write().unwrap_or_else(|e| e.into_inner());
+            let enforcing = matches!(entry.index_type, ArtIndexType::PrimaryKey | ArtIndexType::Unique);
+            for ((key, row), dense) in candidates {
+                let removed = if enforcing {
+                    if tree.get(&key) != Some(row) {
+                        continue;
+                    }
+                    tree.remove(&key)?.is_some()
+                } else {
+                    tree.remove_value(&key, row)?
+                };
+                if removed {
+                    if let Some((value, _)) = dense {
+                        tree.record_dense_int_delete(value);
+                    }
+                }
+            }
+            for change in actual {
+                let Some(tuple) = change.new else { continue };
+                if let Some(key) = Self::entry_row_key(&entry, schema, tuple) {
+                    tree.insert(&key, change.row_id)?;
+                    if let Some((value, width)) = Self::entry_dense_int(&entry, schema, tuple) {
+                        tree.record_dense_int_insert(width, value);
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     fn int_value_width(value: &Value) -> Option<(i64, usize)> {
@@ -5143,6 +5539,11 @@ mod tests {
             &mut frag_cache,
             false,
             row_state,
+            match row_state {
+                RowState::NotStored => HoldRule::Claim(None),
+                RowState::Stored => HoldRule::Maintain,
+            },
+            &mut None,
         )
     }
 

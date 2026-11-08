@@ -1469,8 +1469,7 @@ impl Parser {
     ///
     /// Syntax: ALTER TABLE `<table>` ALTER COLUMN `<column>` SET STORAGE `<mode>`
     pub fn is_alter_column_storage(sql: &str) -> bool {
-        let upper = sql.trim().to_uppercase();
-        upper.starts_with("ALTER TABLE") && upper.contains("ALTER COLUMN") && upper.contains("SET STORAGE")
+        matches!(Self::try_parse_alter_column_storage(sql), Ok(Some(_)))
     }
 
     /// Parse ALTER TABLE ALTER COLUMN SET STORAGE statement
@@ -1483,60 +1482,50 @@ impl Parser {
     /// - CONTENT_ADDRESSED: Hash-based deduplication for large values
     /// - COLUMNAR: Column-grouped storage for analytics workloads
     pub fn parse_alter_column_storage(sql: &str) -> Result<(String, String, ColumnStorageMode)> {
-        let cleaned = sql.trim();
+        let (table, column, mode) = Self::try_parse_alter_column_storage(sql)?
+            .ok_or_else(|| Error::sql_parse("Expected ALTER TABLE … ALTER COLUMN … SET STORAGE"))?;
+        Ok((table.to_string(), super::Planner::normalize_ident(&column), mode))
+    }
 
-        // Skip "ALTER TABLE"
-        let after_alter = cleaned
-            .get(11..)
-            .ok_or_else(|| Error::query_execution("Invalid ALTER TABLE statement"))?
-            .trim_start();
+    /// sqlparser 0.53 has no SET STORAGE operation. Read that grammar with its
+    /// tokenizer and identifier parser, retaining quoting for catalog resolution.
+    /// Consume the whole statement before returning a plan: a trailing clause or
+    /// second statement must never run after a separately committed rewrite.
+    pub(crate) fn try_parse_alter_column_storage(
+        sql: &str,
+    ) -> Result<Option<(sqlparser::ast::ObjectName, sqlparser::ast::Ident, ColumnStorageMode)>> {
+        use sqlparser::keywords::Keyword;
+        use sqlparser::tokenizer::Token;
 
-        // Extract table name (ends at ALTER)
-        let upper_after = after_alter.to_uppercase();
-        let alter_pos = upper_after
-            .find(" ALTER ")
-            .ok_or_else(|| Error::query_execution("ALTER TABLE requires ALTER COLUMN clause"))?;
-
-        let table_name = after_alter[..alter_pos].trim().to_string();
-        if table_name.is_empty() {
-            return Err(Error::query_execution("ALTER TABLE requires a table name"));
+        let head = sql.trim_start();
+        if !head.get(..5).is_some_and(|prefix| prefix.eq_ignore_ascii_case("ALTER"))
+            && !head.starts_with("--")
+            && !head.starts_with("/*")
+        {
+            return Ok(None);
         }
-
-        // Skip " ALTER COLUMN "
-        let after_column = after_alter
-            .get(alter_pos + 7..)
-            .ok_or_else(|| Error::query_execution("Invalid ALTER COLUMN clause"))?
-            .trim_start();
-
-        let upper_column = after_column.to_uppercase();
-        if !upper_column.starts_with("COLUMN ") {
-            return Err(Error::query_execution("Expected COLUMN keyword after ALTER"));
+        let dialect = PostgreSqlDialect {};
+        let mut parser = SqlParser::new(&dialect).try_with_sql(sql)?;
+        if !parser.parse_keywords(&[Keyword::ALTER, Keyword::TABLE]) {
+            return Ok(None);
         }
-
-        let after_col_keyword = after_column
-            .get(7..)
-            .ok_or_else(|| Error::query_execution("Invalid ALTER COLUMN clause"))?
-            .trim_start();
-
-        // Find SET STORAGE
-        let upper_rest = after_col_keyword.to_uppercase();
-        let set_pos = upper_rest
-            .find(" SET STORAGE")
-            .ok_or_else(|| Error::query_execution("ALTER COLUMN requires SET STORAGE clause"))?;
-
-        let column_name = after_col_keyword[..set_pos].trim().to_string();
-        if column_name.is_empty() {
-            return Err(Error::query_execution("ALTER COLUMN requires a column name"));
+        let table = parser.parse_object_name(false)?;
+        if !parser.parse_keywords(&[Keyword::ALTER, Keyword::COLUMN]) {
+            return Ok(None);
         }
-
-        // Extract storage mode (after " SET STORAGE ")
-        let after_storage = after_col_keyword
-            .get(set_pos + 12..)
-            .ok_or_else(|| Error::query_execution("Invalid SET STORAGE clause"))?
-            .trim_start();
-
-        let mode_str = after_storage.trim_end_matches(';').trim().to_uppercase();
-
+        let column = parser.parse_identifier(false)?;
+        if !parser.parse_keyword(Keyword::SET) {
+            return Ok(None);
+        }
+        // STORAGE is a non-keyword Word in sqlparser 0.53.
+        match parser.next_token().token {
+            Token::Word(word) if word.quote_style.is_none() && word.value.eq_ignore_ascii_case("STORAGE") => {}
+            _ => return Ok(None),
+        }
+        let mode_str = match parser.next_token().token {
+            Token::Word(word) if word.quote_style.is_none() => word.value.to_ascii_uppercase(),
+            token => return Err(Error::sql_parse(format!("Expected storage mode, found: {token}"))),
+        };
         let storage_mode = match mode_str.as_str() {
             "DEFAULT" => ColumnStorageMode::Default,
             "DICTIONARY" => ColumnStorageMode::Dictionary,
@@ -1550,7 +1539,17 @@ impl Parser {
             }
         };
 
-        Ok((table_name, column_name, storage_mode))
+        if parser.peek_token().token == Token::Comma {
+            return Err(Error::query_execution(format!(
+                "SET STORAGE together with other ALTER TABLE clauses {}: run the storage rewrite as a statement of its own",
+                crate::error::UNSUPPORTED_STATEMENT_KIND_MARKER
+            )));
+        }
+        let _ = parser.consume_token(&Token::SemiColon);
+        if parser.peek_token().token != Token::EOF {
+            return Err(Error::sql_parse("Unexpected trailing input after SET STORAGE mode"));
+        }
+        Ok(Some((table, column, storage_mode)))
     }
 
     /// Does this SQL look like `ALTER TABLE … SET SCHEMA …`?

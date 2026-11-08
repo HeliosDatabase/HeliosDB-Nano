@@ -11,6 +11,12 @@ allowed-tools: Bash(cargo *), Bash(heliosdb-nano *), Bash(rustc *), Read
 - They need a feature that's not in the default build (MCP, code-graph, FIPS, HA tier 2+).
 - They want to know what `heliosdb-nano --version` returns or which features were compiled in.
 
+## Compiler requirements
+
+The default source build requires Rust 1.88 or newer. Enabling `code-embed`
+requires Rust 1.92 or newer because fastembed 7.5 pins ort/ort-sys 2.0.0-rc.15.
+Prebuilt release binaries require no Rust toolchain.
+
 ## Verbs
 
 | Verb | Surface | One-liner |

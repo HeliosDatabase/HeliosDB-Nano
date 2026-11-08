@@ -1,6 +1,9 @@
 # Nano concurrency & write-locking — findings, Option 1 (shipped), Option 2 (planned)
 
-Status: Option 1 shipped in v3.60.7. Option 2 is the recommended follow-up.
+Historical investigation: the sections through BUG B describe v3.60.x and its then-proposed
+options. They are not instructions to remove the row/key ownership used by 4.42.0. The R5 sections
+below describe the current release-candidate implementation; final correctness, physical and
+performance acceptance remains pending.
 
 Context: found via Any2HeliosDB (a2h) Pagila/Oracle → Nano on 3.60.4. Reported as
 BUG A (concurrent write txns block instead of erroring) and BUG B (DROP of an
@@ -101,11 +104,18 @@ Separate from the row-level `LockManager` above, and what writers see during DDL
 `docs/plans/specs/R5_1_writer_lock.md`.
 
 - A statement or transaction that writes a table holds it **shared**, from before it reads the rows it will
-  change until the statement ends (autocommit) or the transaction does (`BEGIN`). Writers do not block each other.
+  change until the statement ends (autocommit) or the transaction does (`BEGIN`). Shared table
+  ownership allows ordinary writers to coexist; row/key locks still order conflicting writes.
 - `ALTER TABLE` (every form), `DROP TABLE`, `RENAME`, `TRUNCATE`, `CREATE INDEX`, `DROP INDEX`, `CREATE`/`DROP TRIGGER`,
   `REFRESH MATERIALIZED VIEW` of the view's data table, and `MERGE BRANCH` on every table it changes hold it
   **exclusively**. Foreign-key DDL also holds the table on the other end.
-- **Readers never wait.** `SELECT` takes nothing.
+- **Ordinary readers take no table writer lock.** `SELECT` does not acquire these table locks.
+  An index-snapshot checkpoint is a separate maintenance operation: it takes sorted exclusive MAIN
+  table owners before exporting ART/HNSW caches, and skips before any cache write if it already
+  has a statement table owner or an active write census. After waiting it checks publication and
+  schema state again. Locks cover export and marker publication; vector-manager publication checks
+  also detect callers which mutate a graph without a table owner. Raw KV/ART callers retain their
+  own synchronization/index-maintenance contract.
 - **Writers wait.** During a long `ALTER TABLE … ADD COLUMN … DEFAULT` or a merge, a writer of that table waits and
   then runs against what the statement left, with no error. Other tables, and the same table on another branch, are not
   affected.
@@ -122,8 +132,8 @@ Separate from the row-level `LockManager` above, and what writers see during DDL
   inside a transaction that rolls back is not undone (no session setting here is); `SET LOCAL` is.
 - **A wait also ends at `statement_timeout`, and at a cancel** (PostgreSQL's CancelRequest, which psql's Ctrl-C and every
   driver's cancel send): SQLSTATE **57014**, and the statement does not run when the lock comes free. It looks every 50 ms.
-  Each wait counts its `statement_timeout` from where it starts, so a statement that waits for several tables can overrun
-  it by that. A cancel request is served even with every connection slot taken, also one that asks for TLS first, as
+  Row and table waits count `statement_timeout` from the start of the statement, including time
+  already spent before a later wait. A cancel request is served even with every connection slot taken, also one that asks for TLS first, as
   `sslmode=prefer` does; there is no cancel for a REST request or on the MySQL wire. **A client that vanishes during a
   wait is not noticed**: nothing reads its socket while its statement runs, so the statement waits on and runs when the
   lock comes free, unless one of these timeouts ends it first. Set a `statement_timeout` or a short `lock_timeout` where
@@ -144,14 +154,24 @@ Separate from the row-level `LockManager` above, and what writers see during DDL
   writing function after the transaction's `ALTER` does not wait for it (its writes still commit by themselves).
 - **On the MySQL wire, DDL commits the open transaction first** and runs as a statement of its own, as MySQL does
   (`CREATE`, `ALTER`, `DROP`, `RENAME`, `TRUNCATE`, but not on a `TEMPORARY` table): nothing is held after it. The
-  PostgreSQL wire and the embedded API keep transactional DDL.
-- **A DELETE takes every table its foreign keys make it write** (`ON DELETE CASCADE` and `SET NULL`) up front, in sorted
-  order, so its 55P03 means no child has lost a row.
+  PostgreSQL wire and the embedded API keep their explicit transaction's lock ownership. This
+  does not make DDL rollbackable: a completed schema statement commits separately from the block's
+  staged DML and can survive its ROLLBACK.
+- **A parent key UPDATE or DELETE with inbound foreign keys prelocks its relationship graph**, in
+  sorted order, before scanning child references. This includes recursive CASCADE, SET NULL and
+  SET DEFAULT targets and excludes a concurrent child INSERT while the parent key changes. It
+  then locks changed child rows and reads their staged/current images. Ordinary tables without
+  inbound foreign keys keep the shared-table path. Constraint timing and Off/Proxy/Audit policy
+  remain separate from lock acquisition (`src/fk_update.rs`).
 - **Getting out.** Whoever holds a table is named by kind in the 55P03, not by session: end the transaction that holds it
   (`pg_stat_activity` lists the sessions), or let `idle_in_transaction_session_timeout` end it, which releases the lock.
-- **No lock is held through a standby's acknowledgement** on `COMMIT` or an autocommit statement: a table is free again when
-  the write is durable here. Two exceptions: a `MERGE BRANCH` landing, and a schema statement inside an explicit transaction,
-  which keeps its table until the transaction ends.
+- **Table ownership is released before a COMMIT or autocommit ACK wait.** Local data/index
+  publication finishes first. A transaction releases its table owners explicitly; statement owners
+  and explicit exclusive guards defer the wait until their table owners drop, including direct
+  TRUNCATE and a MERGE landing. This statement concerns table ownership, not every index-key or
+  row guard in the commit stack. A schema statement inside an explicit transaction still retains
+  that transaction's table ownership until the transaction ends; its statement cannot defer an
+  ACK wait to a future COMMIT.
 - A READ COMMITTED or autocommit statement that waited reads what the DDL left. A REPEATABLE READ transaction keeps its
   snapshot, and if a merge changed a row it wrote, its COMMIT gets 40001.
 
@@ -166,37 +186,103 @@ applies the primary's write groups one by one), a branch fork and a crash all se
 
 - **Converted** (one group, both executor families where the statement parses on both): `CREATE TABLE` (schema, counter,
   incarnation, constraints, identity, partition link), `DROP TABLE` with the partition children it cascades to,
-  `ALTER TABLE … RENAME TO` (with its index definitions and triggers), `RENAME COLUMN` (with the constraint records that
-  name the column, other tables' foreign keys included), `CREATE [UNIQUE] INDEX` (every kind), `DROP INDEX`, `ADD CONSTRAINT …
+  `ALTER TABLE … RENAME TO` (with its index definitions, triggers and column side storage), `RENAME COLUMN` (with the
+  constraint records that name the column, other tables' foreign keys included, and its side storage),
+  `CREATE [UNIQUE] INDEX` (every kind), `DROP INDEX`, `ADD CONSTRAINT …
   UNIQUE | FOREIGN KEY`, `DROP CONSTRAINT`, `ALTER COLUMN … DROP NOT NULL`, `CREATE`/`DROP VIEW`, `CREATE`/`DROP FUNCTION`, `CREATE`/`DROP PROCEDURE`, `CREATE`/`DROP TRIGGER`,
-  `CREATE`/`ALTER`/`DROP SEQUENCE`, `REFRESH MATERIALIZED VIEW` (plain, `CONCURRENTLY`, and the auto-refresh worker's),
-  `DROP MATERIALIZED VIEW`.
-- **Publication after the write.** The in-memory state a statement changes (schema and constraint caches, the function,
-  trigger and index registries) is published after its group is durable, in the order the statement queued it; a write
-  that fails publishes nothing and takes back what the statement registered while it ran.
+  `CREATE`/`ALTER`/`DROP SEQUENCE`, `CREATE MATERIALIZED VIEW`, `REFRESH MATERIALIZED VIEW` (plain,
+  `CONCURRENTLY`, `INCREMENTALLY` and the auto-refresh worker), `DROP MATERIALIZED VIEW`.
+- **Publication follows the owning write.** Schema/constraint caches and function/trigger/index
+  registries publish in the batch's resource/commit phases. A proven pre-write refusal undoes eager
+  registration. Native errors can have applied: actual-state reconciliation or table quarantine
+  occurs before ownership drops. Known-applied work is never undone as if its group were refused.
+  See the outcome/recovery section below.
 - **A new index is hidden while it is built.** `CREATE INDEX` and `ADD CONSTRAINT … UNIQUE` register the index hidden:
   writers maintain it (they are kept out by the writer lock anyway), the read path's index choice skips it, and it becomes
   visible after its group. A reader used to take it while its backfill ran and get no rows.
-- **TRUNCATE** clears the table's index trees once its commit has written the deletes, not before.
-- **`REFRESH MATERIALIZED VIEW`** deletes every row and inserts the new ones in one transaction with the refreshed record:
-  readers see the old rows or the new ones, never an empty or a partial view, and a refresh of any size writes one
-  `snapshot:` record. A data table that has an index, a column storage mode, or a layout that is not the refresh's is
-  still refreshed the old way (several groups).
+- **TRUNCATE** stages data deletes, columnar presence, history and its logical operation in the
+  owning transaction. Eager index key holds and inverse actions survive until settlement and are
+  savepoint-aware; it does not defer a full-tree clear that would erase keys inserted later in the
+  same transaction. Rollback reconstructs actual durable rows using the current schema while its
+  index/census/table owners remain alive. Vector reconciliation is RAM-only; it issues no graph
+  repair writes from a rollback/error callback. Direct borrowed-Executor TRUNCATE shares this path.
+- **Side storage keyed by name moves with a rename.** A `DICTIONARY` column's dictionary (`dict:`) and a `COLUMNAR`
+  column's batches, zone statistics and live-row presence (`col:`, `colz:`, `colzm:`, `colp:`, `colpm:`) are keyed by
+  the table's and the column's name: `RENAME TO` and `RENAME COLUMN` move them in their group, under the zone-stats
+  lock from the scan to the write (a columnar read's lazy backfill writes under it), and the dictionary cache lets go of
+  both names after the write (the next use loads the moved dictionary). A dropped column's dictionary is not deleted, so `RENAME COLUMN` deletes whatever is stored under
+  the target name first. The live trigger registry follows a `RENAME TO` after its write too.
+- **`pg_indexes`** reads the user indexes from their durable definitions (which change in the same group as the
+  table), not from the in-memory registry a `RENAME TO` or `DROP TABLE` changes after its group, and is built again
+  until two builds agree: a reader sees a table's index set whole or not at all.
+- **Materialized-view creation/population** uses one DdlBatch for metadata, backing definition,
+  replacement rows/side storage, logical operations and its one `snapshot:` record. Indexed and
+  non-default-storage backing tables use this path too. A compatible refresh keeps existing index
+  and storage definitions and retains history; a true shape replacement stages drop/purge/create
+  and a Refreshed layout cut in that same group. Persistent graph replacement is an owned DDL
+  resource, settled before ordinary publication callbacks. A refused group preserves the old view;
+  an ambiguous native result is reconciled or quarantined instead of acknowledged as unchanged.
+  `INCREMENTALLY` can rematerialize the full query; its syntax is not proof of delta application.
 - **The ceiling.** A write group above what a standby can receive (`MAX_BATCH_BYTES`, about 4 GiB) is refused before it
   is written, SQLSTATE 54000, whatever made it: a schema statement, a transaction's commit, a branch freeze.
-- **Still more than one group** (and why): `CREATE TABLE … AS`, `CREATE MATERIALIZED VIEW` (the catalog half and the rows
-  half; one group needs the DDL batch to ride the statement's transaction commit, which comes with the DML step), `CREATE
-  SCHEMA` with elements (each element is a statement of its own), a multi-clause `ALTER TABLE` (each clause is one group),
-  `ADD`/`DROP COLUMN` (spec R5.2: one group for the schema; a volatile default's rewrite in the same group), `DROP
-  CONSTRAINT` of a single-column `UNIQUE` that also set the column's flag (the flag's schema rewrite is a second group),
-  `DROP TABLE a, b` (one group per table), `ALTER COLUMN … SET STORAGE` (its row migration), `CREATE`/`DROP ROLE`, `GRANT`/`REVOKE` over several objects, `CREATE DATABASE
-  BRANCH`. A persistent HNSW index keeps its own writes before its definition, and a dropped one's keyspace is purged after
-  (a dangling id is filtered on read).
+- **Still more than one group** (and why): `CREATE TABLE … AS`, `CREATE SCHEMA` with elements (each
+  element is its own statement), `DROP TABLE a, b` (one group per table), `CREATE`/`DROP ROLE`,
+  `GRANT`/`REVOKE` over several objects, `CREATE DATABASE BRANCH`. Every `ALTER TABLE` is one group
+  since R5.5 (below). Persistent graph construction can precede publication of its hidden index
+  definition; actual retirement stages the graph-key purge with the owning DDL group and settles
+  its lease before registry publication. MV replacement no longer relies on a later graph purge.
 - **The detector.** While a batch is open on a thread, a write of the same store that is not its commit is a finding:
   test builds panic naming the writer, release builds count it and warn once per site. What may write apart, and why: the
   index-snapshot invalidation (derived markers), a dropped name's version-history purge (a name that is no table), a
-  branch's frozen copy of a definition it already reads, a columnar read's lazy backfill (derived side data), and a
-  persistent HNSW graph (above).
+  branch's frozen copy of a definition it already reads, and a columnar read's lazy backfill (derived
+  side data). Persistent row graph hooks may still update derived graph records separately; their
+  authoritative latest-row images and dump-marker invalidation ride the owning row group, not that
+  later hook. Data/catalog mutations and their logical operations cannot use a derived-write
+  exception to split their commit.
+
+## One write group per ALTER TABLE (R5.5)
+
+Spec: `docs/plans/specs/R5_5_drop_column_and_multi_alter.md`. `AGENTS.md` promises "Multi-op `ALTER TABLE` is atomic per
+statement"; it is.
+
+- **Every clause of one statement in one group** (`src/alter_table.rs`, both executor families): the statement is the
+  table as its clauses leave it, in memory; each clause is asked against that (a `CHECK` sees the column an earlier clause
+  added, with its value in every row) and refuses before anything is written. Then one `DdlBatch`: the rows' new images
+  when a clause rewrites rows, the schema, the missing values, the index definitions a rename names, the constraint,
+  identity and columnar records, the shape record (B4) and the layout record (below), with their logical-WAL entries. A
+  refusal by any clause leaves nothing; a crash leaves the statement whole or not at all. Indexes a clause registers are
+  hidden until the write and taken back if it fails. `RENAME TO` combined with other clauses is refused `0A000`.
+- **`DROP COLUMN` and `SET STORAGE` rewrite every row in that group**, each with a version at the statement's one
+  timestamp (as spec R5.2's volatile `ADD COLUMN` does), up to `[storage] max_atomic_rewrite_bytes` with the live branches'
+  copies counted; above it `54000`, nothing written. They used to write the schema, then a group per row, then the
+  constraints and the column-storage side data: a crash or a reader in between saw a schema without the column over rows
+  that still had it, every later value under the wrong column.
+- **Reads older than a layout change.** A row version keeps the layout it was written with. `meta:table_layout:{t}`
+  (`storage::table_layout`) records, in the change's group, every `DROP COLUMN` (width and position) and every cut of the
+  table's history (`RENAME TO`, a refresh that swapped a view's data table). `SET STORAGE` preserves logical versions;
+  its legacy layout record remains readable and is not a table-wide history cut. `AS OF`, a transaction's snapshot
+  scan and its point reads, and `VERSIONS BETWEEN` take a version
+  through the drops made after it, so each value reads under its own column; a read from before a cut is refused `0A000`
+  (the marker of a branch anchor refused for the same reason), except by the transaction whose own `RENAME TO` made it.
+  Past a rename, a row it moved with no version at the snapshot and a change since is refused too (B4's rule). A rename
+  and a refresh that replaced a view's data table write their own `snapshot:` record, so `AS OF` a time after them
+  resolves after them. `CREATE BRANCH … AS OF` reads a table that has the record by it (`materialize_branch_anchor`), so
+  an anchor and `AS OF` give the same answer for the same time; B4's `meta:table_shape:` rule is the fallback for a
+  table without one.
+  Every new version and every writer-materialized preimage stores logical values, including dictionary, CAS and
+  columnar columns. Legacy versions are mapped into today's layout first; retained dictionary IDs and CAS hashes use
+  their immutable payloads when present. A remaining ColumnarRef or a missing immutable payload is refused with the
+  same typed history marker; a historical ColumnarRef never reads today's mutable slot. Other logical versions remain
+  readable. Raw `SnapshotManager` byte APIs preserve the original stored layout; the decoded SQL, transaction, scan
+  and past-branch funnels apply these rules before exposing row values.
+  `RENAME COLUMN` and `ADD COLUMN` need no record. The loaded records are forgotten with a table's missing values, on the
+  primary and through a standby's applier.
+- **Layout epochs (R5.6)** validate the schema used to plan against the rows exposed, including
+  prepared plans, warm result-cache hits and vector/index scans on a primary or standby. A safe
+  read can replan within the bounded retry policy. Writes and executed sequence/procedure/advisory
+  effects are not replayed. A stale layout is `40001`; a prepared result-shape change is `0A000`
+  before execution. An already-applied publication error retains its system-error classification,
+  even when its nested derived cause mentions a layout race.
 
 ## The row write lock (R5.4)
 
@@ -206,20 +292,37 @@ times that their increment committed and the counter ended at 426: each read the
 the other's commit. R5.1's table lock does not order them, since every writer holds a table shared.
 
 - **Every UPDATE, DELETE and `ON CONFLICT DO UPDATE` locks each row it changes**, before it computes the new image, on
-  both executor families, on the primary-key fast paths and in transactions. A transaction holds its row locks until its
-  commit is applied (or it ends); an autocommit statement until its one write group is applied. Inserts lock nothing:
-  their rows are new.
+  both executor families, on the primary-key fast paths, in transactions, on a branch (a branch's rows are locked by
+  level and row) and in the children an `ON DELETE CASCADE` / `SET NULL` reaches. A transaction holds its row locks
+  until its commit is applied (or it ends); an autocommit statement until its one write group is applied; a
+  `ROLLBACK TO SAVEPOINT` lets go of the rows locked after the savepoint. Inserts lock nothing: their rows are new.
+- **A writer reads the row from storage, never from the row cache**, and every write fences the cache's fills: a
+  reader that read a row's old image before a write can no longer put it back afterwards. (A point reader refilling
+  the cache with the old image made the next PK increment compute from it: 7-15 lost in ~25k.)
+- **A key an open transaction took out is not free.** A transaction's DELETE (or its UPDATE that moves a PRIMARY KEY /
+  UNIQUE value) takes the old key out of the index at once, so the transaction itself sees it gone; until it ends the
+  key is **held** for it. Another writer of that key waits for the transaction, as in PostgreSQL: an INSERT then
+  succeeds after a commit and fails 23505 after a rollback (it used to go ahead, and the rollback left two rows with one
+  primary key), and a PK UPDATE / DELETE finds the row and waits for its lock (it used to find nothing and lose its
+  change). Readers see the key gone, as before.
+- **`INSERT … ON CONFLICT` is PostgreSQL's speculative insertion.** It holds the value it arbitrates on until its
+  transaction ends, so a second upsert of the same new key waits for the first and then takes its DO UPDATE (or inserts
+  after the first rolled back) instead of failing 23505 or 40001; a conflicting row deleted meanwhile makes it insert.
+  A plain INSERT does not take that hold, so an upsert racing a plain INSERT of the same new key can still get 23505.
 - **A second writer of the row waits** and then, at READ COMMITTED and in autocommit, changes the row **as the first one
   committed it**: it evaluates its `WHERE` clause again over the committed row and computes its assignments from it,
   as PostgreSQL's READ COMMITTED does. A row that no longer matches is not changed; a row deleted meanwhile is not
-  changed either (and an `ON CONFLICT DO UPDATE` whose conflicting row was deleted meanwhile fails 40001: PostgreSQL
-  retries the insert there, Nano does not yet).
+  changed either.
 - **REPEATABLE READ and SERIALIZABLE do not re-evaluate**: a row changed by a commit after the transaction's snapshot is
   a serialization failure, SQLSTATE **40001**, at the statement or at COMMIT. Never a silent overwrite.
 - **A wait is bounded like a table-lock wait**: `lock_timeout` (55P03, "could not obtain lock on row in relation"),
-  `statement_timeout` and a cancel (57014). A wait that would close a cycle of waiters fails at once with **40P01**
+  `statement_timeout`, counted from the start of the statement (a row or table lock wait that begins late in a statement
+  has only what is left), and a cancel (57014). A wait that would close a cycle of waiters fails at once with **40P01**
   (deadlock detected) in the waiter that closes it. A cycle through a table lock and a row lock (a transaction upgrading
-  its table lock for DDL while another statement waits for one of its rows) is not detected: the timeouts end it.
+  its table lock for DDL, e.g. `TRUNCATE`, while another statement holding the table shared waits for one of its rows)
+  is not detected: the waiter's `lock_timeout` ends it (the review measured 8 s at `lock_timeout_ms = 8000`), and the
+  DDL then proceeds. Detecting it would mean one wait graph over table locks and row locks, whose owners are different
+  objects today.
 - **A wait that could never end is refused at once.** The embedded handle's own transaction (`BEGIN` on the handle) can
   only be committed by the thread that opened it; a statement on that thread (a session's, say) that wants one of its
   rows fails at once with 40001 instead of waiting out `lock_timeout`. A session's or a `begin_transaction()` handle's
@@ -229,3 +332,47 @@ the other's commit. R5.1's table lock does not order them, since every writer ho
   no concurrent writer of the table, a row lock is one uncontended mutex and a map insert, and a release the same.
 - A commit that holds row locks takes a fresh commit timestamp (an autocommit statement otherwise commits at its
   snapshot's), so its version sorts after the commit it waited for.
+- **The ceiling, early.** A statement or transaction whose staged rows can no longer fit one write group is refused
+  (54000) while it stages them, not after its whole batch was built: a group holds each row up to three times (the row,
+  its version with time travel on, its logical-WAL operation), so the effective limit is about 1.33 GiB of row data
+  (keys and serialized rows) per statement or transaction with the defaults, 2 GiB with time travel off. An autocommit
+  `INSERT … SELECT` past it fails in seconds and frees what it staged; v4.41.1 wrote such a statement row by row.
+- **Foreign-key actions** share `src/fk_update.rs` across ordinary UPDATE/upsert and recursive
+  DELETE. NO ACTION/RESTRICT/CASCADE/SET NULL/SET DEFAULT check the proposed/final relationship,
+  including composites and self-references. Only deferrable NO ACTION waits until SET IMMEDIATE
+  or COMMIT; immutable touched-row/old-parent-key obligations and timing overrides roll back with
+  savepoints. Named timing is restricted to supported unqualified public FK names; unsupported
+  schema selections refuse before overrides change. MERGE validates the final target schema and
+  rows before intent and on resume with its durable policy; a pending intent does not itself
+  exclude valid target DML between attempts.
+
+
+## Commit outcome and local startup recovery (R5.7)
+
+`storage::write_outcome::WriteAttempt` distinguishes NotWritten, Applied and Unknown without a
+new durable transaction record. The gate marks Unknown immediately before the owning native write
+and Applied on native success, before later fsync/ACK/publication failures. High-level settlement
+runs with transaction/index/census owners alive: undo only NotWritten; keep applied index ownership;
+fence all affected tables before waiting for retirement on Unknown. No error callback writes a
+persistent graph repair. The original native error remains the operation's error.
+
+A successful native row group whose derived vector publication fails is a different case: required
+committed callbacks still run, then the table is fenced before the snapshot barrier drops and the
+client receives PostgreSQL 58000 / MySQL 1105 (HY000), with “row changes were already applied”. The
+nested cause may describe a refused derived group. Reopen and inspect durable rows before retrying;
+this error must not become a generic layout retry or a “nothing was written” promise.
+
+Current-format primary startup adopts already-committed data groups and advances/prunes logical
+history; it never redoes old logical row images over them. Physical standby/archive application
+uses its own complete-group/cursor recovery path. Ambiguous legacy retained log above its existing
+checkpoint refuses writable open and names the stopped-directory, exclusive-lock command
+`heliosdb-nano recover-wal --data-dir /path/to/data --adopt-local-state`. That command changes only
+recovery metadata and preserves local rows/catalogs/branches/history/log bytes; it does not
+reconstruct missing older writes. The parseable wal_replay_destructive_ddl setting cannot enable
+automatic startup redo. See `docs/plans/specs/R5_7_crash_replay.md` and the migration note in CHANGELOG.
+
+Managed persistent row-image overlays are part of the owning heap group; read-only open/application
+can reconcile unfinished graph publication in RAM without changing database bytes or sequence.
+Default HNSW dump validity is invalidated in the row group too. Full graph encryption is separate:
+new row_image values use the enabled engine key, while legacy opt-in persistent graph values remain
+unsealed. These source contracts do not constitute final runtime or release acceptance.

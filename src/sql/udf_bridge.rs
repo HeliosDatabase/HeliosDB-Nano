@@ -18,9 +18,10 @@
 //!
 //! # Hot-path contract (READ BEFORE MOVING THIS CALL)
 //!
-//! [`resolve`] is consulted from ONE place: the TERMINAL `_` arm of
-//! `Evaluator::evaluate_scalar_function`, i.e. only after every built-in
-//! function name has already failed to match. A built-in call never touches this
+//! [`resolve_owned`] is consulted by the TERMINAL `_` arm of
+//! `Evaluator::evaluate_scalar_function`, only after every built-in function
+//! name has already failed to match (and by UDF default stability analysis).
+//! A built-in call never touches this
 //! module — no lock, no upgrade, no map lookup. Moving the lookup ahead of the
 //! built-in dispatch would put a mutex + `Weak::upgrade` + `RwLock` read on the
 //! single hottest expression path in the engine; the perf gate
@@ -50,19 +51,16 @@
 //! resolution from a query still running against database A — a flaky "Unknown
 //! scalar function" for a function that plainly exists.
 //!
-//! So this module keeps a pruned list of installed bridges and resolves BY
-//! FUNCTION NAME, newest first: [`resolve`] hands back the most recently
-//! installed live bridge whose registry actually contains the name. A database
-//! that never defined the function is skipped, so a name unknown everywhere
-//! still produces the ordinary "Unknown scalar function" error.
+//! A database-installed bridge records the engine's unique instance ID. SQL
+//! dispatch uses the calling database already bound by `sequences::EngineScope`:
+//! a healthy same-name routine belongs to that registry, and a quarantined
+//! negative lookup must return Storage before another database/body or a once
+//! subquery fallback can run. No new per-statement scope or built-in dispatch
+//! cost is needed. Registry availability is checked only for a missing name.
 //!
-//! Residual, documented: if TWO live databases in one process define the same
-//! function name, the more recently opened one wins, and the body then runs
-//! against THAT database. `sequences` closed its version of this by having the
-//! executor publish the calling database on a per-statement thread-local
-//! (`sequences::EngineScope`) — the same trick would work here, and is the
-//! obvious follow-up; resolving per calling handle from a database reference
-//! inside `Evaluator` remains the invasive change this design exists to avoid.
+//! Public contextless `install`/`resolve` retain the legacy newest-live-name
+//! resolution when no engine context is installed. A current engine without
+//! an installed bridge has no user functions; it never borrows a foreign body.
 
 use std::cell::Cell;
 use std::sync::{Arc, OnceLock, Weak};
@@ -95,9 +93,14 @@ pub struct UdfBridge {
 /// Every installed bridge, oldest first. `Weak`, so an entry never keeps a
 /// database (and therefore a `StorageEngine`, and therefore a data-dir lock)
 /// alive; dead entries are pruned on the next install.
-static BRIDGES: OnceLock<Mutex<Vec<Weak<UdfBridge>>>> = OnceLock::new();
+struct InstalledBridge {
+    engine: Option<u64>,
+    bridge: Weak<UdfBridge>,
+}
 
-fn bridges() -> &'static Mutex<Vec<Weak<UdfBridge>>> {
+static BRIDGES: OnceLock<Mutex<Vec<InstalledBridge>>> = OnceLock::new();
+
+fn bridges() -> &'static Mutex<Vec<InstalledBridge>> {
     BRIDGES.get_or_init(|| Mutex::new(Vec::new()))
 }
 
@@ -105,26 +108,69 @@ fn bridges() -> &'static Mutex<Vec<Weak<UdfBridge>>> {
 /// next to `sequences::install_persistence`. Takes `&Arc` and downgrades, so the
 /// caller keeps the only strong reference.
 pub fn install(bridge: &Arc<UdfBridge>) {
+    install_owned(None, bridge);
+}
+
+/// Bind a managed database's bridge without changing public contextless APIs.
+/// Only the stable ID is retained; this adds no engine/bridge ownership cycle.
+pub(crate) fn install_on(engine: &crate::storage::StorageEngine, bridge: &Arc<UdfBridge>) {
+    install_owned(Some(engine.instance_id()), bridge);
+}
+
+fn install_owned(engine: Option<u64>, bridge: &Arc<UdfBridge>) {
     let mut guard = bridges().lock();
-    guard.retain(|w| w.strong_count() > 0);
-    guard.push(Arc::downgrade(bridge));
+    guard.retain(|entry| entry.bridge.strong_count() > 0);
+    guard.push(InstalledBridge {
+        engine,
+        bridge: Arc::downgrade(bridge),
+    });
 }
 
 /// The most recently installed live bridge whose registry defines `name`.
 ///
 /// `None` means no open database in this process has such a function — the
-/// caller then reports its ordinary "unknown function" error. Called ONLY from
-/// the terminal arm of scalar dispatch; see the module header.
+/// caller then reports its ordinary "unknown function" error. This public
+/// contextless API retains legacy lookup; SQL dispatch uses `resolve_owned`.
 pub fn resolve(name: &str) -> Option<Arc<UdfBridge>> {
-    let guard = bridges().lock();
-    for weak in guard.iter().rev() {
-        if let Some(bridge) = weak.upgrade() {
+    resolve_contextless(&bridges().lock(), name)
+}
+
+fn resolve_contextless(installed: &[InstalledBridge], name: &str) -> Option<Arc<UdfBridge>> {
+    for entry in installed.iter().rev() {
+        if let Some(bridge) = entry.bridge.upgrade() {
             if bridge.registry.function_exists(name) {
                 return Some(bridge);
             }
         }
     }
     None
+}
+
+/// SQL invocation lookup. An installed calling owner is authoritative even
+/// when its name is absent: never invoke a different database's routine body.
+/// Only a missing engine context permits the legacy contextless lookup.
+pub(crate) fn resolve_owned(name: &str) -> Result<Option<Arc<UdfBridge>>> {
+    if let Some(engine) = super::sequences::current_engine_id() {
+        let owned = {
+            let guard = bridges().lock();
+            guard
+                .iter()
+                .rev()
+                .filter(|entry| entry.engine == Some(engine))
+                .find_map(|entry| entry.bridge.upgrade())
+        };
+        if let Some(bridge) = owned {
+            // Routine DDL retains this map's write guard through native IO.
+            // Keep only its stable Arc while waiting, so unrelated databases'
+            // managed UDF calls do not wait behind the global bridge mutex.
+            let exists = bridge.registry.function_exists_checked(name)?;
+            return Ok(exists.then_some(bridge));
+        }
+        // A SQL engine without an installed routine registry does not define
+        // this function; its scope cannot borrow a different database's body.
+        return Ok(None);
+    }
+    Ok(resolve(name))
 }
 
 thread_local! {
@@ -291,3 +337,7 @@ mod tests {
         assert!(err.contains("does not exist"), "got: {err}");
     }
 }
+
+#[cfg(test)]
+#[path = "routine_uninstalled_owner_tests.rs"]
+mod routine_uninstalled_owner_tests;

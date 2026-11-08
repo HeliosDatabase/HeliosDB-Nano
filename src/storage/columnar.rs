@@ -539,7 +539,7 @@ impl ColumnarStore {
     /// Presence manifest marker key: present iff the `colp:` sidecar fully
     /// describes the table's live rows (written by `backfill_presence`,
     /// maintained by every subsequent insert/delete).
-    fn presence_marker_key(table: &str) -> Vec<u8> {
+    pub(crate) fn presence_marker_key(table: &str) -> Vec<u8> {
         format!("colpm:{}", table).into_bytes()
     }
 
@@ -547,6 +547,76 @@ impl ColumnarStore {
     /// live rows.
     pub fn presence_manifest_complete(db: &DB, table: &str) -> bool {
         db.get(Self::presence_marker_key(table)).ok().flatten().is_some()
+    }
+
+    /// Complete a transaction's cold presence manifest in its owning batch.
+    /// The caller holds `stats_write_lock` until the batch is applied: scan the
+    /// CURRENT committed rows, then apply this transaction's final row changes.
+    /// Staging an early full image instead would lose rows committed meanwhile.
+    pub(crate) fn stage_complete_presence_for_transaction(
+        db: &DB,
+        batch: &mut rocksdb::WriteBatch,
+        table: &str,
+        row_changes: &[(u64, bool)],
+        pending_presence_keys: &[Vec<u8>],
+    ) -> Result<()> {
+        let prefix = format!("data:{table}:").into_bytes();
+        let mut options = rocksdb::ReadOptions::default();
+        options.set_total_order_seek(true);
+        let mut rows = std::collections::BTreeSet::new();
+        for item in db.iterator_opt(
+            rocksdb::IteratorMode::From(&prefix, rocksdb::Direction::Forward),
+            options,
+        ) {
+            let (key, _) = item.map_err(|error| Error::storage(format!("Presence row scan failed: {error}")))?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            if let Some(row_id) = key
+                .get(prefix.len()..)
+                .and_then(|digits| std::str::from_utf8(digits).ok())
+                .and_then(|digits| digits.parse::<u64>().ok())
+            {
+                rows.insert(row_id);
+            }
+        }
+        for &(row_id, present) in row_changes {
+            if present {
+                rows.insert(row_id);
+            } else {
+                rows.remove(&row_id);
+            }
+        }
+        // Discard stale/orphan bits as well as partial images staged earlier in
+        // this transaction. The manifest promises completeness after this batch.
+        let prefix = Self::presence_prefix(table);
+        let mut options = rocksdb::ReadOptions::default();
+        options.set_total_order_seek(true);
+        for item in db.iterator_opt(
+            rocksdb::IteratorMode::From(&prefix, rocksdb::Direction::Forward),
+            options,
+        ) {
+            let (key, _) = item.map_err(|error| Error::storage(format!("Presence sidecar scan failed: {error}")))?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            batch.delete(&key);
+        }
+        for key in pending_presence_keys {
+            batch.delete(key);
+        }
+        let mut built: std::collections::BTreeMap<u64, BatchPresence> = std::collections::BTreeMap::new();
+        for row_id in rows {
+            let (batch_id, offset) = Self::batch_location(row_id);
+            built.entry(batch_id).or_default().set(offset);
+        }
+        for (batch_id, presence) in built {
+            let value = bincode::serialize(&presence)
+                .map_err(|error| Error::storage(format!("Presence serialization failed: {error}")))?;
+            batch.put(Self::presence_key(table, batch_id), value);
+        }
+        batch.put(Self::presence_marker_key(table), [1u8]);
+        Ok(())
     }
 
     /// Load one batch's presence record from the transaction overlay, then the
@@ -676,7 +746,9 @@ impl ColumnarStore {
         // can reach: derived data that describes the rows already there, and that
         // no reader's answer depends on (a missing record re-backfills).
         let _derived = super::ddl_batch::allow_side_write(super::ddl_batch::COLUMNAR_LAZY_BACKFILL);
-        gate.write(db, write_batch, None)
+        // A SELECT's derived backfill is not its durable row effect. The reader
+        // must still validate its layout before returning rows.
+        super::layout_epochs::outside_statement(|| gate.write(db, write_batch, None))
             .map_err(|e| Error::storage(format!("Columnar presence backfill failed: {}", e)))?;
         Ok(built)
     }
@@ -749,6 +821,239 @@ impl ColumnarStore {
         }
         write_batch.delete(Self::presence_marker_key(table));
         Ok(())
+    }
+
+    /// Spec R5.3 (review F8): stage into `write_batch` the move of `table`'s columnar
+    /// side data to `new_table`: for `RENAME TO` (`renamed` is `None`) every column's
+    /// batches (`col:`), zone stats (`colz:`) and markers (`colzm:`) and the table's
+    /// live-row presence (`colp:`, `colpm:`); for `RENAME COLUMN` (`Some((old, new))`)
+    /// the first three of column `old`, to `new`. All of it is keyed by table and
+    /// column NAME, so a rename that left it behind read the column as empty: a range
+    /// scan pruned every row (`WHERE v < 50` gave 0 rows). For `RENAME COLUMN`,
+    /// whatever is still stored under the target column's name is deleted first, so
+    /// the moves win. Verbatim: none of these families is sealed. The caller holds
+    /// [`stats_write_lock`] from this call until the batch is written, as
+    /// [`Self::stage_table_sidecar_purge`]'s callers do. `table` and `new_table`, or
+    /// `old` and `new`, differ.
+    pub(crate) fn stage_sidecar_move(
+        db: &DB,
+        table: &str,
+        new_table: &str,
+        renamed: Option<(&str, &str)>,
+        write_batch: &mut rocksdb::WriteBatch,
+    ) -> Result<()> {
+        let column_of = |column: &str| match renamed {
+            None => Some(column.to_string()),
+            Some((old, new)) if column == old => Some(new.to_string()),
+            Some(_) => None,
+        };
+        // Read everything first: a refused scan stages nothing.
+        let mut moves: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = Vec::new();
+        // `{family}:{table}:{column}:{batch_id}`: every column's under the table's
+        // prefix, or only the renamed column's under its own (a column named
+        // `{old}:…` shares it, and its keys do not end in a bare batch id there).
+        for family in ["col", "colz"] {
+            let prefix = match renamed {
+                None => format!("{family}:{table}:"),
+                Some((old, _)) => format!("{family}:{table}:{old}:"),
+            };
+            for (key, value) in Self::entries_under(db, prefix.as_bytes())? {
+                let Some(rest) = key.get(prefix.len()..) else {
+                    continue;
+                };
+                let rest = String::from_utf8_lossy(rest).into_owned();
+                let (column, batch_id) = match renamed {
+                    None => match rest.rsplit_once(':') {
+                        Some(split) => split,
+                        None => continue,
+                    },
+                    Some((old, _)) => (old, rest.as_str()),
+                };
+                if batch_id.parse::<u64>().is_err() {
+                    continue;
+                }
+                if let Some(new_column) = column_of(column) {
+                    let moved = format!("{family}:{new_table}:{new_column}:{batch_id}").into_bytes();
+                    moves.push((key, moved, value));
+                }
+            }
+        }
+        // `colzm:{table}:{column}`
+        let prefix = format!("colzm:{table}:");
+        for (key, value) in Self::entries_under(db, prefix.as_bytes())? {
+            let Some(column) = key.get(prefix.len()..) else {
+                continue;
+            };
+            let column = String::from_utf8_lossy(column).into_owned();
+            if let Some(new_column) = column_of(&column) {
+                moves.push((key, Self::stats_marker_key(new_table, &new_column), value));
+            }
+        }
+        let mut stale: Vec<Vec<u8>> = Vec::new();
+        match renamed {
+            None => {
+                // `colp:{table}:{batch_id}` and `colpm:{table}`
+                let prefix = Self::presence_prefix(table);
+                for (key, value) in Self::entries_under(db, &prefix)? {
+                    let Some(rest) = key.get(prefix.len()..) else {
+                        continue;
+                    };
+                    let mut moved = Self::presence_prefix(new_table);
+                    moved.extend_from_slice(rest);
+                    moves.push((key, moved, value));
+                }
+                let marker = db
+                    .get(Self::presence_marker_key(table))
+                    .map_err(|e| Error::storage(format!("Columnar presence marker load failed: {}", e)))?;
+                if let Some(marker) = marker {
+                    moves.push((
+                        Self::presence_marker_key(table),
+                        Self::presence_marker_key(new_table),
+                        marker,
+                    ));
+                }
+                // No purge of the target table's name: a dropped table's sidecars
+                // went with it, and the moves overwrite, as the rows' do.
+            }
+            Some((_, new)) => {
+                // Only the batches of `new` itself: `col:{table}:{new}:` also prefixes
+                // a column named `{new}:…`, whose keys do not end in a bare batch id.
+                for prefix in [Self::column_prefix(new_table, new), Self::stats_prefix(new_table, new)] {
+                    for (key, _) in Self::entries_under(db, &prefix)? {
+                        if Self::parse_batch_id(&key, prefix.len()).is_some() {
+                            stale.push(key);
+                        }
+                    }
+                }
+                stale.push(Self::stats_marker_key(new_table, new));
+            }
+        }
+
+        for key in &stale {
+            write_batch.delete(key);
+        }
+        for (key, moved, value) in &moves {
+            write_batch.put(moved, value);
+            write_batch.delete(key);
+        }
+        Ok(())
+    }
+
+    /// Move a whole rename permutation after reading all sources. The caller
+    /// holds the stats lock through this batch's write. Delete every old/stale
+    /// endpoint before putting any destination, so chains and swaps are exact.
+    pub(crate) fn stage_sidecar_renames(
+        db: &DB,
+        table: &str,
+        renames: &[(String, String)],
+        batch: &mut rocksdb::WriteBatch,
+    ) -> Result<()> {
+        let mut removed = std::collections::BTreeSet::new();
+        let mut moved = Vec::new();
+        for (old, new) in renames {
+            for family in ["col", "colz"] {
+                let old_prefix = format!("{family}:{table}:{old}:");
+                let new_prefix = format!("{family}:{table}:{new}:");
+                for (key, value) in Self::entries_under(db, old_prefix.as_bytes())? {
+                    if Self::parse_batch_id(&key, old_prefix.len()).is_none() {
+                        continue;
+                    }
+                    let mut destination = new_prefix.as_bytes().to_vec();
+                    destination.extend_from_slice(&key[old_prefix.len()..]);
+                    removed.insert(key);
+                    moved.push((destination, value));
+                }
+                for (key, _) in Self::entries_under(db, new_prefix.as_bytes())? {
+                    if Self::parse_batch_id(&key, new_prefix.len()).is_some() {
+                        removed.insert(key);
+                    }
+                }
+            }
+            let old_marker = Self::stats_marker_key(table, old);
+            let new_marker = Self::stats_marker_key(table, new);
+            if let Some(value) = db.get(&old_marker)? {
+                moved.push((new_marker.clone(), value));
+            }
+            removed.insert(old_marker);
+            removed.insert(new_marker);
+        }
+        for key in removed {
+            batch.delete(key);
+        }
+        for (key, value) in moved {
+            batch.put(key, value);
+        }
+        Ok(())
+    }
+
+    /// Every key and value under `prefix`, read with a total-order seek.
+    fn entries_under(db: &DB, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let mut read_opts = rocksdb::ReadOptions::default();
+        read_opts.set_total_order_seek(true);
+        let iter = db.iterator_opt(
+            rocksdb::IteratorMode::From(prefix, rocksdb::Direction::Forward),
+            read_opts,
+        );
+        let mut out = Vec::new();
+        for item in iter {
+            let (key, value) = item.map_err(|e| Error::storage(format!("Columnar iterator error: {}", e)))?;
+            if !key.starts_with(prefix) {
+                break;
+            }
+            out.push((key.to_vec(), value.to_vec()));
+        }
+        Ok(out)
+    }
+
+    /// Spec R5.5: [`Self::purge_presence`]'s deletes staged into `write_batch`, for a
+    /// schema statement that writes one group. The caller holds [`stats_write_lock`]
+    /// from this call until the batch is written.
+    pub(crate) fn stage_presence_purge(db: &DB, table: &str, write_batch: &mut rocksdb::WriteBatch) -> Result<()> {
+        let prefix = Self::presence_prefix(table);
+        for item in db.prefix_iterator(&prefix) {
+            let (key, _) = item.map_err(|e| Error::storage(format!("Columnar presence iterator error: {}", e)))?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            write_batch.delete(&key);
+        }
+        write_batch.delete(Self::presence_marker_key(table));
+        Ok(())
+    }
+
+    /// Spec R5.5: [`Self::drop_column`]'s deletes staged into `write_batch` (the
+    /// column's batches, zone stats and stats marker), for `ALTER TABLE … DROP
+    /// COLUMN`'s one group. The caller holds [`stats_write_lock`] from this call until
+    /// the batch is written. Returns the batches staged.
+    pub(crate) fn stage_column_purge(
+        db: &DB,
+        table: &str,
+        column: &str,
+        write_batch: &mut rocksdb::WriteBatch,
+    ) -> Result<usize> {
+        let mut batches = 0;
+        for (prefix, counted) in [
+            (Self::column_prefix(table, column), true),
+            (Self::stats_prefix(table, column), false),
+        ] {
+            for item in db.prefix_iterator(&prefix) {
+                let (key, _) = item.map_err(|e| Error::storage(format!("Columnar iterator error: {}", e)))?;
+                if !key.starts_with(&prefix) {
+                    break;
+                }
+                // A quoted column named `c:other` shares c's prefix. Only a
+                // bare batch-id suffix belongs to the column being dropped.
+                if Self::parse_batch_id(&key, prefix.len()).is_none() {
+                    continue;
+                }
+                write_batch.delete(&key);
+                if counted {
+                    batches += 1;
+                }
+            }
+        }
+        write_batch.delete(Self::stats_marker_key(table, column));
+        Ok(batches)
     }
 
     /// R3.3 grouped write: apply `values` (in order — later entries win) to ONE
@@ -1008,7 +1313,7 @@ impl ColumnarStore {
                         // Spec R5.3: see `backfill_presence_locked`: the same batch,
                         // re-encoded.
                         let _derived = super::ddl_batch::allow_side_write(super::ddl_batch::COLUMNAR_LAZY_BACKFILL);
-                        if let Err(e) = gate.put(db, &key, encoded, None) {
+                        if let Err(e) = super::layout_epochs::outside_statement(|| gate.put(db, &key, encoded, None)) {
                             tracing::warn!(table, column, batch_id, error = %e, "Batch v2 migration write failed");
                         }
                     }
@@ -1244,7 +1549,9 @@ impl ColumnarStore {
             let _guard = stats_write_lock();
             // Spec R5.3: see `backfill_presence_locked`.
             let _derived = super::ddl_batch::allow_side_write(super::ddl_batch::COLUMNAR_LAZY_BACKFILL);
-            if let Err(e) = gate.put(db, Self::stats_marker_key(table, column), [1u8], None) {
+            if let Err(e) = super::layout_epochs::outside_statement(|| {
+                gate.put(db, Self::stats_marker_key(table, column), [1u8], None)
+            }) {
                 tracing::warn!(table = table, column = column, error = %e, "Zone-stats marker write failed");
             }
         }
@@ -1278,7 +1585,7 @@ impl ColumnarStore {
             .map_err(|e| Error::storage(format!("Columnar stats serialize failed: {}", e)))?;
         // Spec R5.3: see `backfill_presence_locked`.
         let _derived = super::ddl_batch::allow_side_write(super::ddl_batch::COLUMNAR_LAZY_BACKFILL);
-        gate.put(db, &stats_key, &stats_data, None)
+        super::layout_epochs::outside_statement(|| gate.put(db, &stats_key, &stats_data, None))
             .map_err(|e| Error::storage(format!("Columnar stats store failed: {}", e)))
     }
 
@@ -1563,6 +1870,103 @@ mod tests {
         assert_eq!(stats.max, None);
         assert_eq!(stats.null_count, BATCH_SIZE as u32);
         assert_eq!(stats.row_count, BATCH_SIZE as u32);
+    }
+
+    /// All four writes a read may make are derived bookkeeping, so none may
+    /// suppress the statement's final catalog validation. Run the migration arm
+    /// in a fresh process: its opt-in flags are intentionally cached globally.
+    #[test]
+    fn derived_read_writes_do_not_end_layout_validation() {
+        const CHILD: &str = "HELIOS_R56_DERIVED_READ_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "storage::columnar::tests::derived_read_writes_do_not_end_layout_validation",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("HELIOS_BATCH_V2_MIGRATE", "1")
+                .env_remove("HELIOS_BATCH_V2_OFF")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "derived read child failed: {:?}\n{}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        use crate::storage::layout_epochs::{self, LayoutEpochs, StatementScope};
+        use std::sync::Arc;
+
+        for case in ["presence", "stats", "manifest", "migration"] {
+            let (_dir, db) = test_db();
+            let gate = WriteGate::open();
+            let mut batch = ColumnBatch::new("v", 0);
+            batch.set(0, Value::Int4(7));
+            let legacy = bincode::serialize(&batch).unwrap();
+            let key = ColumnarStore::batch_key("t", "v", 0);
+            let stats = BatchStats::from_batch(&batch);
+            let stored = if case == "manifest" {
+                super::super::typed_batch::encode_column_batch(&batch, &stats).unwrap()
+            } else {
+                legacy.clone()
+            };
+            db.put(&key, &stored).unwrap();
+            db.put(b"data:t:0", b"row").unwrap();
+            if case == "manifest" {
+                db.put(
+                    ColumnarStore::stats_key("t", "v", 0),
+                    bincode::serialize(&stats).unwrap(),
+                )
+                .unwrap();
+            }
+
+            let epochs = Arc::new(LayoutEpochs::new());
+            let scope = StatementScope::enter();
+            layout_epochs::note_table(&epochs, "t");
+            match case {
+                "presence" => {
+                    let presence = ColumnarStore::presence_scan_map(&db, &gate, "t").unwrap();
+                    assert_eq!(presence.len(), 1);
+                    assert!(ColumnarStore::presence_manifest_complete(&db, "t"));
+                }
+                "stats" => {
+                    ColumnarStore::backfill_batch_stats(&db, &gate, "t", "v", 0).unwrap();
+                    assert_eq!(ColumnarStore::load_stats_map(&db, "t", "v").unwrap().len(), 1);
+                }
+                "manifest" => {
+                    let batches =
+                        ColumnarStore::scan_column_batches_pruned(&db, &gate, "t", "v", &HashSet::new()).unwrap();
+                    assert_eq!(batches.len(), 1);
+                    assert!(ColumnarStore::stats_manifest_complete(&db, "t", "v"));
+                }
+                "migration" => {
+                    ColumnarStore::maybe_migrate_v1_batch(&db, &gate, "t", "v", 0, &legacy, &batch);
+                    let migrated = db.get(&key).unwrap().unwrap();
+                    assert!(migrated.starts_with(&super::super::typed_batch::BATCH_V2_MAGIC));
+                }
+                _ => unreachable!(),
+            }
+            assert!(scope.retriable(), "{case}: no durable SQL row effect occurred");
+            let other = Arc::clone(&epochs);
+            std::thread::spawn(move || drop(other.debug_begin_change(&["t"])))
+                .join()
+                .unwrap();
+            let error = scope.finish().unwrap_err();
+            assert!(layout_epochs::is_layout_changed(&error), "{case}: {error}");
+        }
+
+        // The exemption is confined to those read paths: a real row write still
+        // records a durable effect and cannot be retried.
+        let (_dir, db) = test_db();
+        let gate = WriteGate::open();
+        let scope = StatementScope::enter();
+        gate.put(&db, b"data:t:1", b"row", None).unwrap();
+        assert!(!scope.retriable(), "ordinary writes still end retries");
     }
 
     #[test]

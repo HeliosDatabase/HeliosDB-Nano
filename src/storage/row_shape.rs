@@ -106,6 +106,9 @@ pub struct StagedRewrite {
     /// The rewrite's snapshot, to publish once the batch is durable. `None` with
     /// time travel off.
     pub(crate) snapshot: Option<super::time_travel::SnapshotMetadata>,
+    /// Logical B4 copies counted by staging. Retained so callers also include
+    /// later schema/sidecar bytes in their final configured rewrite-cap check.
+    pub(crate) frozen_copy_bytes: u64,
 }
 
 /// One table's missing values, by position in main's schema.
@@ -288,11 +291,15 @@ impl StorageEngine {
     /// and the generation bump (see the module docs).
     pub(crate) fn invalidate_missing_values(&self, table: &str) {
         self.missing_values_cache.remove(table);
+        // Spec R5.5: the layout record follows the same positions, and every change
+        // of them reaches here, on the primary and through a standby's applier.
+        self.snapshot_manager().invalidate_table_layout(table);
     }
 
     /// Forget every table's loaded missing values.
     pub(crate) fn clear_missing_values(&self) {
         self.missing_values_cache.clear();
+        self.snapshot_manager().clear_table_layouts();
     }
 
     /// The funnel for a reader that takes `width` columns of `table`, for a
@@ -415,6 +422,7 @@ impl StorageEngine {
         };
         let prefix = format!("data:{table}:");
         let shape = self.row_shape(table, old_width)?;
+        let old_schema = self.catalog().get_table_schema(table)?;
         // Sprinter 6bc4a4040eb7 (B4): each live branch that reads the table through
         // main takes a copy of every row this rewrites, from the same write, at the
         // size of the image it replaces: counted too, so a dry run refuses what the
@@ -436,30 +444,56 @@ impl StorageEngine {
             let mut tuple: Tuple = bincode::deserialize(&stored)
                 .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {e}")))?;
             shape.apply(&mut tuple);
+            let row_id = Self::parse_row_id_after_prefix(&key, prefix.len())
+                .ok_or_else(|| Error::storage("malformed row key in ADD COLUMN rewrite"))?;
+            let mut logical = tuple.clone();
+            self.resolve_column_storage_refs(table, &old_schema, row_id, &mut logical)?;
+            if logical
+                .values
+                .iter()
+                .any(|value| matches!(value, Value::DictRef { .. } | Value::CasRef { .. } | Value::ColumnarRef))
+            {
+                return Err(Error::storage(format!(
+                    "cannot resolve side storage before rewriting table '{table}' row {row_id}"
+                )));
+            }
+            let old_logical = if version.is_some() || copying > 0 {
+                let image = bincode::serialize(&logical)
+                    .map_err(|e| Error::storage(format!("Failed to serialize logical pre-image: {e}")))?;
+                Some(super::tde::seal_row_value(self.key_manager_ref(), &key, &image)?.into_owned())
+            } else {
+                None
+            };
+            let frozen_bytes = old_logical.as_ref().map_or(0, |image| {
+                super::alter_batch::frozen_row_copy_bytes(table, row_id, image.len())
+            });
             for (column, data_type, not_null, fill) in fills {
                 let value = fill.next_value(data_type)?;
                 if *not_null && matches!(value, Value::Null) {
                     return Err(Error::add_column_null_on_existing_rows(table, column));
                 }
-                tuple.values.push(value);
+                tuple.values.push(value.clone());
+                logical.values.push(value);
             }
             let image =
                 bincode::serialize(&tuple).map_err(|e| Error::storage(format!("Failed to serialize tuple: {e}")))?;
             let sealed = super::tde::seal_row_value(self.key_manager_ref(), &key, &image)?;
-            if let Some((timestamp, _)) = &version {
-                if let Some(row_id) = Self::parse_row_id_after_prefix(&key, prefix.len()) {
-                    self.snapshot_manager().stage_rewritten_row_version(
-                        batch,
-                        table,
-                        row_id,
-                        *timestamp,
-                        sealed.as_ref(),
-                    )?;
-                }
+            if let (Some((timestamp, _)), Some(old_logical)) = (&version, old_logical) {
+                let image = bincode::serialize(&logical)
+                    .map_err(|e| Error::storage(format!("Failed to serialize logical rewrite: {e}")))?;
+                let logical_sealed = super::tde::seal_row_value(self.key_manager_ref(), &key, &image)?;
+                self.snapshot_manager().stage_logical_rewritten_row_version(
+                    batch,
+                    table,
+                    row_id,
+                    *timestamp,
+                    logical_sealed.as_ref(),
+                    &old_logical,
+                )?;
             }
             batch.put(&key, sealed.as_ref());
             rows += 1;
-            copy_bytes = copy_bytes.saturating_add(((key.len() + raw.len()) as u64).saturating_mul(copying));
+            copy_bytes = copy_bytes.saturating_add(frozen_bytes.saturating_mul(copying));
             let bytes = (batch.size_in_bytes() as u64).saturating_add(copy_bytes);
             if bytes > max_bytes {
                 return Err(Error::atomic_rewrite_too_large(table, bytes, max_bytes));
@@ -468,6 +502,7 @@ impl StorageEngine {
         Ok(StagedRewrite {
             rows,
             snapshot: version.map(|(_, metadata)| metadata),
+            frozen_copy_bytes: copy_bytes,
         })
     }
 }

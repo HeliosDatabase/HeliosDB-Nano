@@ -2967,15 +2967,9 @@ where
                     return Ok(());
                 }
             } else if EmbeddedDatabase::is_set_constraints_statement(trimmed) {
-                // `SET CONSTRAINTS { ALL | names } { DEFERRED | IMMEDIATE }` arms
-                // transaction-scoped FK deferral. The generic ack below would drop
-                // it (a silent no-op), so a wire client's deferred FK never armed
-                // and a valid "insert child, then parent, then COMMIT" sequence
-                // spuriously failed. Route through `execute()` so
-                // `try_handle_set_constraints` runs; the process-wide
-                // `constraints_all_deferred` switch it flips is honored on the
-                // session/wire FK path too. The command tag stays "SET" (below).
-                if let Err(e) = self.database.execute(trimmed) {
+                // Keep timing and deferred validation on this session's
+                // transaction, as the extended protocol does.
+                if let Err(e) = self.database.execute_for_session(self.session_id, trimmed) {
                     self.send_error("ERROR", "22023", &e.to_string(), None, None).await?;
                     return Ok(());
                 }
@@ -6561,6 +6555,12 @@ mod b1_startup_options_tests {
 pub(crate) fn sqlstate_for_error(error: &Error) -> &'static str {
     use crate::network::protocol::sqlstate;
 
+    // Derived publication can fail after rows applied. Its nested cap or
+    // serialization cause must not advertise a safe pre-write refusal/retry.
+    if error.is_applied_publication_failure() {
+        return sqlstate::SYSTEM_ERROR; // 58000
+    }
+
     match error {
         Error::ConstraintViolation(message) => {
             let lower = message.to_ascii_lowercase();
@@ -6853,6 +6853,10 @@ fn message_names_a_column(lower: &str) -> bool {
 fn sqlstate_for_query_execution_message(message: &str) -> &'static str {
     use crate::network::protocol::sqlstate;
 
+    if message.contains(crate::error::APPLIED_PUBLICATION_FAILURE_MARKER) {
+        return sqlstate::SYSTEM_ERROR; // 58000, before nested cause markers
+    }
+
     let lower = message.to_ascii_lowercase();
     let not_found = lower.contains("not found") || lower.contains("does not exist") || lower.contains("doesn't exist");
 
@@ -6865,6 +6869,11 @@ fn sqlstate_for_query_execution_message(message: &str) -> &'static str {
         return sqlstate::CANT_CHANGE_RUNTIME_PARAM; // 55P02
     }
     if lower.starts_with("invalid value for parameter") {
+        return sqlstate::INVALID_PARAMETER_VALUE; // 22023
+    }
+    // Spec R5.3 (review F17): a sequence parameter out of range, anchored on the
+    // emitter's const (`Error::sequence_parameter_invalid`).
+    if message.contains(crate::error::SEQUENCE_PARAMETER_INVALID_MARKER) {
         return sqlstate::INVALID_PARAMETER_VALUE; // 22023
     }
     // sprinter 6dc0cc115db9: `lastval()` before any `nextval()` in this session.
@@ -7523,6 +7532,46 @@ mod failed_transaction_state_tests {
     }
 
     #[tokio::test]
+    async fn applied_publication_error_frames_use_58000_for_simple_and_extended() {
+        use tokio::io::AsyncReadExt;
+        for wait_for_sync in [false, true] {
+            let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+            let (mut handler, mut client) = test_handler(db);
+            let cause = Error::write_group_too_large(1024, 64);
+            let original = cause.to_string();
+            let applied = Error::applied_publication_failure(cause);
+            handler.send_error_for_query(&applied, wait_for_sync).await.unwrap();
+            drop(handler);
+            let mut wire = Vec::new();
+            client.read_to_end(&mut wire).await.unwrap();
+            assert_eq!(wire[0], b'E');
+            let frame_len = u32::from_be_bytes(wire[1..5].try_into().unwrap()) as usize;
+            let fields = wire[5..1 + frame_len].split(|byte| *byte == 0).collect::<Vec<_>>();
+            assert!(
+                fields.contains(&b"C58000".as_slice()),
+                "wire SQLSTATE must be a system error"
+            );
+            let message = fields.iter().find(|field| field.first() == Some(&b'M')).unwrap();
+            let message = std::str::from_utf8(&message[1..]).unwrap();
+            assert!(message.contains(crate::error::APPLIED_PUBLICATION_FAILURE_MARKER));
+            assert!(message.contains("do not retry these row changes"));
+            assert!(
+                message.contains(&original),
+                "wire retains original derived cap cause: {message}"
+            );
+            if wait_for_sync {
+                assert!(wire[1 + frame_len..].is_empty(), "extended error awaits Sync");
+            } else {
+                assert_eq!(
+                    &wire[1 + frame_len..],
+                    b"Z\0\0\0\x05I",
+                    "simple error sends ReadyForQuery"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn query_error_marks_open_transaction_failed_and_reenables_ready() {
         let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
         db.begin().expect("begin");
@@ -7956,6 +8005,28 @@ mod sqlstate_mapping_unit_tests {
                 .contains("retry"),
             "hint must suggest retrying; got {hint:?}"
         );
+    }
+
+    #[test]
+    fn applied_publication_errors_are_system_errors_before_nested_cause_classification() {
+        assert_eq!(sqlstate_for_error(&Error::write_group_too_large(1024, 64)), "54000");
+        for cause in [
+            Error::write_group_too_large(1024, 64),
+            Error::transaction("serialization failure: persistent row image changed during graph publication"),
+            Error::constraint_violation("duplicate key after derived publication"),
+        ] {
+            let applied = Error::applied_publication_failure(cause);
+            let message = applied.to_string();
+            for wrapped in [
+                applied,
+                Error::transaction(format!("Commit failed: {message}")),
+                Error::query_execution(message.clone()),
+                Error::Generic(message.clone()),
+            ] {
+                assert_eq!(sqlstate_for_error(&wrapped), "58000", "{wrapped}");
+            }
+            assert_eq!(super::sqlstate_for_query_execution_message(&message), "58000");
+        }
     }
 
     #[test]

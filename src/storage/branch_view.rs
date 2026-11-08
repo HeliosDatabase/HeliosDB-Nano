@@ -832,6 +832,15 @@ impl BranchStagedWrites {
         !self.stale || self.fresh.contains(key)
     }
 
+    /// Spec R5.4 (review F5): every (level, table) this transaction staged a write
+    /// for, whose row-lock change epochs its commit moves.
+    pub(crate) fn touched_tables(&self) -> Vec<(u64, String)> {
+        self.touched
+            .iter()
+            .map(|(_, level, table)| (*level, table.clone()))
+            .collect()
+    }
+
     /// The transaction's commit batch is applied: bump the write generation of
     /// every (level, table) it wrote — BEFORE its claims are released — and
     /// apply its rows to the cached committed overlays that were current.
@@ -1038,7 +1047,16 @@ enum MainCandidates {
     /// Row ids from main's index, to be verified against main's rows.
     Ids(Vec<u64>),
     /// Main's committed rows with the key (already verified).
-    Rows(Vec<Tuple>),
+    Rows(MainScan),
+}
+
+/// A frozen view can already replace a main row whose side-storage names main
+/// has since moved. Defer that row's decode error until the nearer levels have
+/// been read; an error in an undecided main row must still reach the caller.
+#[derive(Default)]
+struct MainScan {
+    rows: Vec<Tuple>,
+    failures: std::collections::BTreeMap<u64, Error>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1359,10 +1377,39 @@ impl<'a> BranchView<'a> {
     /// Main's committed rows of `table`, decoded as main's scan decodes them and shaped
     /// by this view's funnel (phase B4 with spec R5.2: a frozen record's missing values,
     /// not main's current ones, which may have moved or gone since).
-    fn scan_main(&self, table: &str, schema: &Schema) -> Result<Vec<Tuple>> {
+    fn scan_main(&self, table: &str, schema: &Schema) -> Result<MainScan> {
         let missing = self.missing_values(table)?;
-        self.engine
+        match self
+            .engine
             .scan_table_with_schema_shaped_by(table, schema, missing.as_deref())
+        {
+            Ok(rows) => Ok(MainScan {
+                rows,
+                ..MainScan::default()
+            }),
+            Err(_) => {
+                // Keep the healthy bulk/parallel scan unchanged. On failure,
+                // attach decode errors to exact row IDs so only a proven nearer
+                // image/tombstone can supersede them. Main is still read BEFORE
+                // the overlay, preserving the atomic parent-write/copy protocol.
+                self.engine.check_table_readable(table)?;
+                let prefix = format!("data:{table}:");
+                let mut scan = MainScan::default();
+                self.for_each_with_prefix(prefix.as_bytes(), |key, raw| {
+                    let Some(row_id) = StorageEngine::parse_row_id_after_prefix(key, prefix.len()) else {
+                        return Ok(());
+                    };
+                    match self.decode_main_row(table, key, raw, row_id, schema) {
+                        Ok(tuple) => scan.rows.push(tuple),
+                        Err(error) => {
+                            scan.failures.insert(row_id, error);
+                        }
+                    }
+                    Ok(())
+                })?;
+                Ok(scan)
+            }
+        }
     }
 
     /// [`Self::row_shape`] for one row: one length comparison when it fits.
@@ -1743,8 +1790,8 @@ impl<'a> BranchView<'a> {
         schema: &Schema,
         first_level: usize,
     ) -> Result<Option<Tuple>> {
-        let row = self.main_row(table, row_id, schema)?;
-        if self.engine.branch_reads_may_race() {
+        let row = self.main_row(table, row_id, schema);
+        if self.engine.branch_reads_may_race() || row.is_err() {
             let width = schema.columns.len();
             for &level in self.chain.iter().skip(first_level).rev() {
                 if let Some(entry) = self.committed_entry(level, table, row_id, width)? {
@@ -1752,7 +1799,7 @@ impl<'a> BranchView<'a> {
                 }
             }
         }
-        Ok(row)
+        row
     }
 
     /// Every row of `table` the branch sees, ordered by row id, with `txn`'s
@@ -1767,8 +1814,11 @@ impl<'a> BranchView<'a> {
             return Ok(Vec::new());
         }
         let mut rows: HashMap<u64, Tuple> = HashMap::new();
+        let mut failures = std::collections::BTreeMap::new();
         if scope.include_main {
-            for mut tuple in self.scan_main(table, schema)? {
+            let main = self.scan_main(table, schema)?;
+            failures = main.failures;
+            for mut tuple in main.rows {
                 if let Some(row_id) = tuple.row_id {
                     tuple.branch_id = None;
                     rows.insert(row_id, tuple);
@@ -1780,6 +1830,7 @@ impl<'a> BranchView<'a> {
         {
             let overlay = committed.lock();
             for (row_id, state) in &overlay.set.rows {
+                failures.remove(row_id);
                 match state {
                     Some(tuple) => {
                         rows.insert(*row_id, padded(tuple, &shape));
@@ -1798,6 +1849,7 @@ impl<'a> BranchView<'a> {
                     .collect()
             })?;
             for (row_id, state) in staged {
+                failures.remove(&row_id);
                 match state {
                     Some(tuple) => {
                         rows.insert(row_id, tuple);
@@ -1807,6 +1859,9 @@ impl<'a> BranchView<'a> {
                     }
                 }
             }
+        }
+        if let Some((_, error)) = failures.into_iter().next() {
+            return Err(error);
         }
         let mut out: Vec<Tuple> = rows.into_values().collect();
         out.sort_by_key(|tuple| tuple.row_id.unwrap_or(0));
@@ -1824,7 +1879,7 @@ impl<'a> BranchView<'a> {
         sorted_positions: &[usize],
         encoded: &[u8],
         key: &[Value],
-    ) -> Result<Vec<Tuple>> {
+    ) -> Result<MainScan> {
         let memo_key = MainMemoKey {
             engine: self.engine_id(),
             table: table.to_string(),
@@ -1839,10 +1894,26 @@ impl<'a> BranchView<'a> {
             })
         });
         match memoised {
-            Some(Some(rows)) => Ok(rows),
+            Some(Some(rows)) => Ok(MainScan {
+                rows,
+                ..MainScan::default()
+            }),
             Some(None) => {
+                let scanned = self.scan_main(table, schema)?;
+                if !scanned.failures.is_empty() {
+                    // Error records cannot be shared with another key probe.
+                    // Its own overlay decision must be checked before returning.
+                    return Ok(MainScan {
+                        rows: scanned
+                            .rows
+                            .into_iter()
+                            .filter(|tuple| row_matches(tuple, positions, key))
+                            .collect(),
+                        failures: scanned.failures,
+                    });
+                }
                 let mut by_key: HashMap<Vec<u8>, Vec<Tuple>> = HashMap::new();
-                for tuple in self.scan_main(table, schema)? {
+                for tuple in scanned.rows {
                     if let Some(encoded_key) = encode_positions(&tuple, sorted_positions) {
                         by_key.entry(encoded_key).or_default().push(tuple);
                     }
@@ -1853,13 +1924,22 @@ impl<'a> BranchView<'a> {
                         memo.insert(memo_key, by_key);
                     }
                 });
-                Ok(rows)
+                Ok(MainScan {
+                    rows,
+                    ..MainScan::default()
+                })
             }
-            None => Ok(self
-                .scan_main(table, schema)?
-                .into_iter()
-                .filter(|tuple| row_matches(tuple, positions, key))
-                .collect()),
+            None => {
+                let scanned = self.scan_main(table, schema)?;
+                Ok(MainScan {
+                    rows: scanned
+                        .rows
+                        .into_iter()
+                        .filter(|tuple| row_matches(tuple, positions, key))
+                        .collect(),
+                    failures: scanned.failures,
+                })
+            }
         }
     }
 
@@ -1964,13 +2044,13 @@ impl<'a> BranchView<'a> {
         let main = if scope.include_main {
             self.main_candidates(table, schema, columns, key, &positions, &sorted_positions, &encoded)?
         } else {
-            MainCandidates::Rows(Vec::new())
+            MainCandidates::Rows(MainScan::default())
         };
         let committed = self.committed_overlay(table, width, scope.first_level)?;
         let shape = self.row_shape(table, width)?;
 
         // Lock order: the transaction's staged rows, then the committed copy.
-        let collect = |staged: Option<&mut RowSet>| -> (Vec<Tuple>, Vec<u64>, Vec<Tuple>) {
+        let collect = |staged: Option<&mut RowSet>| -> Result<(Vec<Tuple>, Vec<u64>, Vec<Tuple>)> {
             let mut overlay = committed.lock();
             let mut out: Vec<Tuple> = Vec::new();
             let staged: Option<&RowSet> = match staged {
@@ -1996,19 +2076,25 @@ impl<'a> BranchView<'a> {
             out.extend(committed_matches);
             let decided = |row_id: u64| staged_decides(row_id) || overlay.set.decides(row_id);
             match main {
-                MainCandidates::Ids(ids) => (out, ids.into_iter().filter(|id| !decided(*id)).collect(), Vec::new()),
-                MainCandidates::Rows(rows) => {
-                    let rows = rows
+                MainCandidates::Ids(ids) => Ok((out, ids.into_iter().filter(|id| !decided(*id)).collect(), Vec::new())),
+                MainCandidates::Rows(scanned) => {
+                    for (row_id, error) in scanned.failures {
+                        if !decided(row_id) {
+                            return Err(error);
+                        }
+                    }
+                    let rows = scanned
+                        .rows
                         .into_iter()
                         .filter(|tuple| tuple.row_id.is_some_and(|row_id| !decided(row_id)))
                         .collect();
-                    (out, Vec::new(), rows)
+                    Ok((out, Vec::new(), rows))
                 }
             }
         };
         let (mut out, undecided_ids, undecided_rows) = match txn {
-            Some(txn) => self.with_staged(txn, table, |staged| collect(Some(staged)))?,
-            None => collect(None),
+            Some(txn) => self.with_staged(txn, table, |staged| collect(Some(staged)))??,
+            None => collect(None)?,
         };
 
         let mut seen: HashSet<u64> = out.iter().filter_map(|tuple| tuple.row_id).collect();
@@ -2278,6 +2364,25 @@ impl<'a> BranchView<'a> {
         Ok(())
     }
 
+    /// A native error can mean the atomic row/key/tombstone group applied. Do
+    /// not fast-forward the requested image on that path: invalidate the level
+    /// before its caller releases claims/locks, so the next probe reloads the
+    /// actual store. A refusal before the owning native call changes nothing.
+    fn write_direct_batch(&self, table: &str, batch: WriteBatch) -> Result<()> {
+        use super::write_outcome::{WriteAttempt, WriteOutcome};
+
+        let attempt = WriteAttempt::default();
+        match self.engine.write_batch_through_gate_observed(batch, &attempt) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                if attempt.outcome() != WriteOutcome::NotWritten {
+                    bump_write_generation(self.engine_id(), self.branch_id, table);
+                }
+                Err(error)
+            }
+        }
+    }
+
     fn write(
         &self,
         txn: Option<&Transaction>,
@@ -2359,7 +2464,7 @@ impl<'a> BranchView<'a> {
                 for entry in &key_puts {
                     batch.put(entry, b"");
                 }
-                self.engine.write_batch_through_gate(batch)?;
+                self.write_direct_batch(table, batch)?;
                 self.after_direct_write(table, std::iter::once((row_id, image)))
             }
         }
@@ -2522,7 +2627,7 @@ impl<'a> BranchView<'a> {
                     batch.delete(entry);
                     Ok(())
                 })?;
-                self.engine.write_batch_through_gate(batch)?;
+                self.write_direct_batch(table, batch)?;
                 self.after_direct_write(table, targets.iter().map(|row_id| (*row_id, None)))?;
             }
         }
@@ -3191,6 +3296,68 @@ mod tests {
         assert_eq!(read.map(|tuple| tuple.values), Some(row(1, "old").values));
     }
 
+    /// The parent can move a referenced column after the first own-entry probe.
+    /// Its old logical copy must win even if decoding current main now errors.
+    #[test]
+    fn a_point_read_rechecks_its_frozen_copy_after_a_racing_sidecar_move_error() {
+        let engine = Arc::new(engine());
+        let mut before = schema();
+        before.columns[1].storage_mode = crate::ColumnStorageMode::Dictionary;
+        engine.catalog().create_table("t", before.clone()).unwrap();
+        assert_eq!(engine.insert_tuple_versioned("t", row(1, "old")).unwrap(), 1);
+        let raw = engine.db().get(b"data:t:1").unwrap().unwrap();
+        let physical: Tuple = bincode::deserialize(&raw).unwrap();
+        assert!(
+            matches!(physical.values[1], Value::DictRef { .. }),
+            "physical reference precondition"
+        );
+        let level = engine.create_branch("child", Some("main"), Default::default()).unwrap();
+        let writer = Arc::clone(&engine);
+        let mut after = before.clone();
+        after.columns[1].name = "moved".into();
+        AFTER_OWN_ENTRY.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let dictionary = writer
+                    .db()
+                    .get(b"dict:t:v")
+                    .unwrap()
+                    .expect("original dictionary is durable");
+                let mut batch = WriteBatch::default();
+                batch.put(b"data:t:1", raw);
+                batch.put(b"meta:table:t", bincode::serialize(&after).unwrap());
+                batch.delete(b"dict:t:v");
+                batch.put(b"dict:t:moved", dictionary);
+                writer.write_batch_through_gate(batch).unwrap();
+                writer
+                    .dictionary_manager()
+                    .forget_column_renames("t", &[("v".into(), "moved".into())]);
+            }));
+        });
+        let child = BranchView::for_chain(&engine, "child", vec![level]).unwrap();
+        let found = child
+            .get(None, "t", 1, &before)
+            .unwrap()
+            .expect("the copied row exists");
+        assert_eq!(found.values, row(1, "old").values);
+        let copied = engine.get(&branch_row_key(level, "t", 1)).unwrap().unwrap();
+        let copied: Tuple = bincode::deserialize(&copied).unwrap();
+        assert_eq!(copied.values, row(1, "old").values);
+
+        let _memo = OverlayCacheScope::enter();
+        let key = ["v".to_string()];
+        let found = child
+            .rows_with_key(None, "t", &before, &key, &[Value::String("old".into())])
+            .unwrap();
+        assert_eq!(ids(&found), vec![1]);
+        // A failed main scan must never admit an authoritative partial memo.
+        // This bypass models a second, undecided unreadable row after the first
+        // key probe; its failure must still surface on the next probe.
+        engine.db().put(b"data:t:2", b"corrupt undecided row").unwrap();
+        assert!(child
+            .rows_with_key(None, "t", &before, &key, &[Value::String("absent".into())])
+            .is_err());
+    }
+
     /// `rows_with_key` with no index over the columns falls back to scanning
     /// main, and filters every row the overlay decides.
     #[test]
@@ -3336,3 +3503,7 @@ mod tests {
         assert_eq!(cache.rows, 0);
     }
 }
+
+#[cfg(test)]
+#[path = "branch_direct_outcome_tests.rs"]
+mod direct_outcome_tests;

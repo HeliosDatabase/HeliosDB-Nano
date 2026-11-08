@@ -923,6 +923,8 @@ fn run_blocking<T>(f: impl FnOnce() -> T) -> T {
 /// Reporting "acquired" for a lock nobody owns is exactly the failure an ORM's
 /// migration serialiser cannot survive, so both cases raise instead.
 pub fn evaluate(function: &str, args: &[Value]) -> Result<Value> {
+    // Spec R5.6 (decision 2(f)): a lock taken or let go is not undone by a retry.
+    crate::storage::layout_epochs::note_side_effect("an advisory lock was taken or released");
     let Some(ctx) = current_context() else {
         return Err(unscoped_advisory_error(function));
     };

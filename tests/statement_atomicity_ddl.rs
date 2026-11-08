@@ -12,7 +12,8 @@
 //! * `snapshot:{ts}` — the record a text-family statement's implicit transaction
 //!   registers at its (empty) commit after a pure DDL statement. Read only by `AS OF
 //!   TRANSACTION/SCN` resolution and snapshot GC, for a transaction no client has been
-//!   told of (design §7: "1 + snap"). R5.4 folds it into non-empty commits.
+//!   told of (design §7: "1 + snap"). Its `scn_map:@` lookup index is written
+//!   in that same bookkeeping group. R5.4 folds it into non-empty commits.
 //! * `wal:checkpoint` — the logical WAL's checkpoint (off in [`config`] anyway).
 //! * `idxsnap*:` / `vecsnap*:` — derived index-snapshot artefacts.
 //! * `v:` / `v_idx:` / `vmeta:` / `meta:history_purge:` alone — a dropped or renamed-away
@@ -126,6 +127,7 @@ fn write_groups_since(db: &EmbeddedDatabase, after: u64) -> Vec<Group> {
 /// A key no reader's answer depends on (see the module documentation).
 fn invisible(key: &str) -> bool {
     key.starts_with("snapshot:")
+        || key.starts_with("scn_map:@")
         || key.starts_with("wal:checkpoint")
         || key.starts_with("idxsnap")
         || key.starts_with("vecsnap")
@@ -187,6 +189,33 @@ fn count(db: &EmbeddedDatabase, sql: &str) -> i64 {
         Some(Value::Int4(n)) => i64::from(*n),
         other => panic!("{sql}: a count of {other:?}"),
     }
+}
+
+fn text(db: &EmbeddedDatabase, sql: &str) -> String {
+    let rows = db.query(sql, &[]).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    match rows.first().and_then(|row| row.values.first()) {
+        Some(Value::String(s)) => s.clone(),
+        other => panic!("{sql}: a text of {other:?}"),
+    }
+}
+
+/// Every stored key under `prefix`.
+fn stored_keys(db: &EmbeddedDatabase, prefix: &str) -> Vec<String> {
+    let raw = db.storage.db();
+    let mut options = rocksdb::ReadOptions::default();
+    options.set_total_order_seek(true);
+    let mut keys = Vec::new();
+    for item in raw.iterator_opt(
+        rocksdb::IteratorMode::From(prefix.as_bytes(), rocksdb::Direction::Forward),
+        options,
+    ) {
+        let (key, _) = item.expect("read a key");
+        if !key.starts_with(prefix.as_bytes()) {
+            break;
+        }
+        keys.push(String::from_utf8_lossy(&key).into_owned());
+    }
+    keys
 }
 
 #[test]
@@ -308,6 +337,275 @@ fn rename_column_is_one_write_group_and_keeps_unique_enforced() {
     }
 }
 
+/// Review F8: the side storage keyed by the table's name — a DICTIONARY column's
+/// dictionary, a COLUMNAR column's batches, zone stats and live-row presence — moves
+/// with `RENAME TO`, in its write group. Red before: every read of the renamed
+/// DICTIONARY column failed (`Invalid dict_id 0`), and so did its `TRUNCATE`; the
+/// renamed COLUMNAR column read as empty (`WHERE v < 50` gave 0 rows, not 49).
+#[test]
+fn rename_table_carries_its_dictionary_and_columnar_side_storage() {
+    fn reads_back(db: &EmbeddedDatabase, table: &str, when: &str) {
+        assert_eq!(
+            count(db, &format!("SELECT COUNT(*) FROM {table} WHERE v < 50")),
+            49,
+            "{when}: the COLUMNAR column"
+        );
+        assert_eq!(
+            count(db, &format!("SELECT v FROM {table} WHERE id = 101")),
+            101,
+            "{when}"
+        );
+        assert_eq!(text(db, &format!("SELECT s FROM {table} WHERE id = 7")), "s2", "{when}");
+        assert_eq!(
+            text(db, &format!("SELECT s FROM {table} WHERE id = 101")),
+            "new",
+            "{when}"
+        );
+        assert_eq!(
+            count(db, &format!("SELECT COUNT(*) FROM {table} WHERE s = 's3'")),
+            20,
+            "{when}: the DICTIONARY column"
+        );
+    }
+    for family in FAMILIES {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let db = open(dir.path());
+            db.execute("CREATE TABLE sd (id INT PRIMARY KEY, v INT, s TEXT)")
+                .unwrap();
+            db.execute("INSERT INTO sd SELECT x, x, 's' || CAST(x % 5 AS TEXT) FROM generate_series(1, 100) x")
+                .unwrap();
+            db.execute("ALTER TABLE sd ALTER COLUMN s SET STORAGE DICTIONARY")
+                .unwrap();
+            db.execute("ALTER TABLE sd ALTER COLUMN v SET STORAGE COLUMNAR")
+                .unwrap();
+            db.execute("INSERT INTO sd VALUES (101, 101, 'new')").unwrap();
+            reads_back(&db, "sd", "before the rename");
+            for prefix in ["dict:sd:s", "col:sd:v:"] {
+                assert!(
+                    !stored_keys(&db, prefix).is_empty(),
+                    "vacuity: {prefix} is stored before the rename"
+                );
+            }
+            // Each family stored under the old name, by its prefix under the new one.
+            let moving: Vec<String> = ["dict:sd:", "col:sd:", "colz:sd:", "colzm:sd:", "colp:sd:"]
+                .into_iter()
+                .filter(|prefix| !stored_keys(&db, prefix).is_empty())
+                .map(|prefix| prefix.replace(":sd:", ":sd_r:"))
+                .collect();
+
+            let before = latest(&db);
+            run(&db, family, "ALTER TABLE sd RENAME TO sd_r");
+            let groups = write_groups_since(&db, before);
+            let rename = groups
+                .iter()
+                .find(|group| group.has("meta:table:sd_r"))
+                .unwrap_or_else(|| panic!("{family:?}: no group wrote meta:table:sd_r: {groups:#?}"));
+            for key in &moving {
+                assert!(
+                    rename.has(key),
+                    "{family:?}: the rename's group lacks {key}: {rename:#?}"
+                );
+            }
+            reads_back(&db, "sd_r", &format!("{family:?}: after the rename"));
+        }
+        let db = open(dir.path());
+        reads_back(&db, "sd_r", &format!("{family:?}: after a reopen"));
+        for prefix in ["dict:sd:", "col:sd:", "colz:sd:", "colzm:sd:", "colp:sd:"] {
+            assert_eq!(
+                stored_keys(&db, prefix),
+                Vec::<String>::new(),
+                "{family:?}: left under the old name"
+            );
+        }
+        db.execute("TRUNCATE sd_r").unwrap();
+        assert_eq!(count(&db, "SELECT COUNT(*) FROM sd_r"), 0);
+    }
+}
+
+/// Review F8: `RENAME COLUMN` moves the column's dictionary and columnar side data
+/// with it. Red before: the renamed DICTIONARY column read nothing back, a value
+/// inserted under the new name went into a second dictionary, and after the rename
+/// back that row read another value; the renamed COLUMNAR column read as empty.
+#[test]
+fn rename_column_carries_its_dictionary_and_columnar_side_storage() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let db = open(dir.path());
+        db.execute("CREATE TABLE dc (id INT PRIMARY KEY, s TEXT, v INT)")
+            .unwrap();
+        db.execute("INSERT INTO dc SELECT x, 's' || CAST(x % 5 AS TEXT), x FROM generate_series(1, 100) x")
+            .unwrap();
+        db.execute("ALTER TABLE dc ALTER COLUMN s SET STORAGE DICTIONARY")
+            .unwrap();
+        db.execute("ALTER TABLE dc ALTER COLUMN v SET STORAGE COLUMNAR")
+            .unwrap();
+        for (n, family) in FAMILIES.into_iter().enumerate() {
+            run(&db, family, "ALTER TABLE dc RENAME COLUMN s TO s2");
+            run(&db, family, "ALTER TABLE dc RENAME COLUMN v TO v2");
+            assert_eq!(text(&db, "SELECT s2 FROM dc WHERE id = 1"), "s1", "{family:?}");
+            assert_eq!(count(&db, "SELECT COUNT(*) FROM dc WHERE v2 < 50"), 49, "{family:?}");
+            let id = 1000 + n;
+            db.execute(&format!("INSERT INTO dc VALUES ({id}, 'brandnew{n}', {id})"))
+                .unwrap();
+            assert_eq!(
+                text(&db, &format!("SELECT s2 FROM dc WHERE id = {id}")),
+                format!("brandnew{n}"),
+                "{family:?}"
+            );
+
+            run(&db, family, "ALTER TABLE dc RENAME COLUMN s2 TO s");
+            run(&db, family, "ALTER TABLE dc RENAME COLUMN v2 TO v");
+            assert_eq!(text(&db, "SELECT s FROM dc WHERE id = 1"), "s1", "{family:?}");
+            assert_eq!(
+                text(&db, &format!("SELECT s FROM dc WHERE id = {id}")),
+                format!("brandnew{n}"),
+                "{family:?}: a value inserted between the renames reads back after the rename back"
+            );
+            assert_eq!(count(&db, "SELECT COUNT(*) FROM dc WHERE v < 50"), 49, "{family:?}");
+            assert_eq!(
+                count(&db, &format!("SELECT v FROM dc WHERE id = {id}")),
+                id as i64,
+                "{family:?}"
+            );
+            for prefix in ["dict:dc:s2", "col:dc:v2:", "colz:dc:v2:", "colzm:dc:v2"] {
+                assert_eq!(
+                    stored_keys(&db, prefix),
+                    Vec::<String>::new(),
+                    "{family:?}: left under s2/v2"
+                );
+            }
+        }
+    }
+    let db = open(dir.path());
+    assert_eq!(text(&db, "SELECT s FROM dc WHERE id = 1"), "s1");
+    assert_eq!(text(&db, "SELECT s FROM dc WHERE id = 1000"), "brandnew0");
+    assert_eq!(text(&db, "SELECT s FROM dc WHERE id = 1001"), "brandnew1");
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM dc WHERE s = 's3'"), 20);
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM dc WHERE v < 50"), 49);
+}
+
+/// Review F8: a renamed table's trigger fires and drops under its new name, and a
+/// drop sticks. Red before: the live registry kept the trigger under the old name,
+/// so it stopped firing, `DROP TRIGGER … ON <new>` failed, and `DROP TRIGGER … ON
+/// <old>` succeeded without touching the record, which brought the trigger back at
+/// the next open.
+#[test]
+fn a_renamed_tables_trigger_fires_and_drops_under_the_new_name() {
+    for family in FAMILIES {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let db = open(dir.path());
+            db.execute("CREATE TABLE tg (id INT PRIMARY KEY, v INT)").unwrap();
+            db.execute(
+                "CREATE FUNCTION tf() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN NEW.v = NEW.v * 10; \
+                 RETURN NEW; END $$",
+            )
+            .unwrap();
+            db.execute("CREATE TRIGGER tt BEFORE INSERT ON tg FOR EACH ROW EXECUTE FUNCTION tf()")
+                .unwrap();
+            db.execute("INSERT INTO tg VALUES (1, 1)").unwrap();
+            assert_eq!(
+                count(&db, "SELECT v FROM tg WHERE id = 1"),
+                10,
+                "vacuity: the trigger fires"
+            );
+
+            run(&db, family, "ALTER TABLE tg RENAME TO tg2");
+            db.execute("INSERT INTO tg2 VALUES (2, 2)").unwrap();
+            assert_eq!(
+                count(&db, "SELECT v FROM tg2 WHERE id = 2"),
+                20,
+                "{family:?}: the trigger fires under the new name"
+            );
+            assert!(
+                db.execute("DROP TRIGGER tt ON tg").is_err(),
+                "{family:?}: no trigger is left under the old name"
+            );
+            run(&db, family, "DROP TRIGGER tt ON tg2");
+            db.execute("INSERT INTO tg2 VALUES (3, 3)").unwrap();
+            assert_eq!(count(&db, "SELECT v FROM tg2 WHERE id = 3"), 3, "{family:?}: dropped");
+        }
+        let db = open(dir.path());
+        db.execute("INSERT INTO tg2 VALUES (4, 4)").unwrap();
+        assert_eq!(
+            count(&db, "SELECT v FROM tg2 WHERE id = 4"),
+            4,
+            "{family:?}: the dropped trigger stays dropped after a reopen"
+        );
+        assert_eq!(stored_keys(&db, "trigger:tg"), Vec::<String>::new(), "{family:?}");
+    }
+}
+
+/// Review F11: `pg_indexes` never shows part of a table's index set while a `RENAME
+/// TO` or a `DROP TABLE` publishes. The user indexes came from the in-memory registry,
+/// which those statements change after their durable group, one index at a time.
+#[test]
+fn pg_indexes_never_shows_part_of_a_tables_index_set() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    fn index_names(db: &EmbeddedDatabase, sql: &str) -> Vec<String> {
+        let rows = db.query(sql, &[]).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        rows.iter()
+            .map(|row| match row.values.first() {
+                Some(Value::String(name)) => name.clone(),
+                other => panic!("{sql}: an index name of {other:?}"),
+            })
+            .collect()
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path());
+    db.execute("CREATE TABLE pi (id INT PRIMARY KEY, a INT, b INT, c INT)")
+        .unwrap();
+    for column in ["a", "b", "c"] {
+        db.execute(&format!("CREATE INDEX pi_{column} ON pi ({column})"))
+            .unwrap();
+    }
+    let done = AtomicBool::new(false);
+    // Odd: `pd` was complete when it was set, and the DROP TABLE of it may be running.
+    let phase = AtomicU64::new(0);
+    std::thread::scope(|scope| {
+        let reader = scope.spawn(|| {
+            let mut n = 0u64;
+            while !done.load(Ordering::Acquire) {
+                n += 1;
+                // Distinct texts, so no answer comes from the result cache.
+                let names = index_names(
+                    &db,
+                    &format!("SELECT indexname FROM pg_indexes WHERE tablename IN ('pi', 'pj') AND {n} > 0"),
+                );
+                assert_eq!(names.len(), 4, "part of a renamed table's index set: {names:?}");
+                let before = phase.load(Ordering::Acquire);
+                let names = index_names(
+                    &db,
+                    &format!("SELECT indexname FROM pg_indexes WHERE tablename = 'pd' AND {n} > 0"),
+                );
+                if before % 2 == 1 && phase.load(Ordering::Acquire) == before {
+                    assert!(
+                        names.is_empty() || names.len() == 4,
+                        "part of a dropped table's index set: {names:?}"
+                    );
+                }
+            }
+            n
+        });
+        for n in 0..20u64 {
+            db.execute("ALTER TABLE pi RENAME TO pj").unwrap();
+            db.execute("ALTER TABLE pj RENAME TO pi").unwrap();
+            db.execute("CREATE TABLE pd (id INT PRIMARY KEY, a INT, b INT, c INT)")
+                .unwrap();
+            for column in ["a", "b", "c"] {
+                db.execute(&format!("CREATE INDEX pd_{column}_{n} ON pd ({column})"))
+                    .unwrap();
+            }
+            phase.store(2 * n + 1, Ordering::Release);
+            db.execute("DROP TABLE pd").unwrap();
+            phase.store(2 * n + 2, Ordering::Release);
+        }
+        done.store(true, Ordering::Release);
+        assert!(reader.join().unwrap() > 0, "the reader read");
+    });
+}
+
 #[test]
 fn create_and_drop_index_are_one_write_group_each() {
     let dir = tempfile::tempdir().unwrap();
@@ -416,7 +714,11 @@ fn alter_sequence_restart_out_of_bounds_changes_nothing() {
     let db = open(dir.path());
     db.execute("CREATE SEQUENCE sb MINVALUE 1 MAXVALUE 10").unwrap();
     let before = latest(&db);
-    assert!(db.execute("ALTER SEQUENCE sb MAXVALUE 20 RESTART WITH 50").is_err());
+    let refused = db
+        .execute("ALTER SEQUENCE sb MAXVALUE 20 RESTART WITH 50")
+        .expect_err("RESTART past MAXVALUE");
+    // Review F17: classified as an invalid parameter (22023 on the wire), not XX000.
+    assert!(refused.to_string().contains("invalid sequence parameter"), "{refused}");
     assert!(
         visible_groups(write_groups_since(&db, before)).is_empty(),
         "a refused ALTER SEQUENCE wrote nothing"
@@ -727,5 +1029,34 @@ mod internal {
         db.execute("INSERT INTO ct VALUES (1, 'a', 1)").unwrap();
         assert!(db.execute("INSERT INTO ct VALUES (2, 'a', 1)").is_err(), "UNIQUE");
         assert!(db.execute("INSERT INTO ct VALUES (3, 'b', 0)").is_err(), "CHECK");
+    }
+
+    /// Review F8: a rename whose group is not written leaves the dictionaries where
+    /// they were, with the values not yet written among them (the move marks them
+    /// written; the unwritten group marks them back), and the retry carries them.
+    #[test]
+    fn an_unwritten_rename_keeps_the_dictionaries_where_they_were() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let db = open(dir.path());
+            db.execute("CREATE TABLE ud (id INT PRIMARY KEY, s TEXT)").unwrap();
+            db.execute("INSERT INTO ud VALUES (1, 'a'), (2, 'b')").unwrap();
+            db.execute("ALTER TABLE ud ALTER COLUMN s SET STORAGE DICTIONARY")
+                .unwrap();
+            db.execute("INSERT INTO ud VALUES (3, 'later')").unwrap();
+
+            debug_fail_next_commit();
+            assert!(db.execute("ALTER TABLE ud RENAME TO ud2").is_err());
+            assert_eq!(text(&db, "SELECT s FROM ud WHERE id = 3"), "later");
+            debug_fail_next_commit();
+            assert!(db.execute("ALTER TABLE ud RENAME COLUMN s TO s2").is_err());
+            assert_eq!(text(&db, "SELECT s FROM ud WHERE id = 3"), "later");
+
+            db.execute("ALTER TABLE ud RENAME TO ud2").unwrap();
+            assert_eq!(text(&db, "SELECT s FROM ud2 WHERE id = 3"), "later");
+        }
+        let db = open(dir.path());
+        assert_eq!(text(&db, "SELECT s FROM ud2 WHERE id = 1"), "a");
+        assert_eq!(text(&db, "SELECT s FROM ud2 WHERE id = 3"), "later");
     }
 }

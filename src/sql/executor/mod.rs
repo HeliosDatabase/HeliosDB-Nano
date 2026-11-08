@@ -1217,12 +1217,16 @@ impl<'a> Executor<'a> {
             upper,
         } = spec;
 
+        let source_name = alias.as_ref().unwrap_or(table_name);
+        let actual_schema = Arc::new(scan::schema_with_source(schema.as_ref(), source_name, table_name));
+        if predicate.is_some_and(|predicate| self.expr_has_correlated_subquery(predicate, &actual_schema)) {
+            // Generic top-k obtains rows through the correlated scan filter;
+            // this shortcut cannot bind a dependent residual before iteration.
+            return Ok(None);
+        }
         // Residual filter: the FULL (materialized) predicate is re-applied
         // per row, so bound semantics stay identical to the generic path.
         let materialized_predicate = predicate.map(|p| self.materialize_subqueries(p)).transpose()?;
-
-        let source_name = alias.as_ref().unwrap_or(table_name);
-        let actual_schema = Arc::new(scan::schema_with_source(schema.as_ref(), source_name, table_name));
         let residual = materialized_predicate.as_ref().map(|pred| {
             let evaluator = crate::sql::Evaluator::with_parameters(actual_schema.clone(), self.parameters.clone());
             let bound = evaluator.bind(pred.clone());
@@ -1457,6 +1461,7 @@ impl<'a> Executor<'a> {
         let Some((table_name, scan_schema, post_predicate)) = self.knn_scan_with_filter(sort_input)? else {
             return Ok(None);
         };
+        storage.check_table_readable(&table_name)?;
         // R2.3: kNN out of the HNSW index is allowed inside a transaction only
         // for ReadCommitted session txns with no staged writes on this table
         // (HNSW, like ART, only reflects this txn's writes at commit).
@@ -1494,6 +1499,41 @@ impl<'a> Executor<'a> {
         // Find an HNSW index on (table, column) whose metric matches the
         // operator. A cosine index can't answer an L2 ORDER BY correctly.
         let vector_indexes = storage.vector_indexes();
+        // A failed hook can leave a graph stale even after all writers finish.
+        // Keep the exact row scan until reopen or a proven graph rebuild.
+        if vector_indexes.hook_error_generation(&table_name) != Some(0) {
+            return Ok(None);
+        }
+        #[cfg(all(test, feature = "vector-search"))]
+        ann_publication_tests::run_hook("before_ticket");
+        // A graph and the rows fetched through it must describe one publication.
+        // The census detects a writer still in flight; the two generations also
+        // detect a writer that starts AND finishes during this ANN attempt.
+        let row_epoch = storage.row_locks().table_epoch(&table_name);
+        let schema_generation = storage.schema_generation();
+        let Some(vector_ticket) = vector_indexes.publication_ticket() else {
+            return Ok(None);
+        };
+        let publication_is_current = || {
+            !storage.has_uncommitted_writes_for_table(&table_name)
+                && !storage.row_locks().changed_since(&table_name, row_epoch)
+                && storage.schema_generation() == schema_generation
+                && vector_indexes.publication_is_current(vector_ticket)
+                && vector_indexes.hook_error_generation(&table_name) == Some(0)
+                && self
+                    .transaction
+                    .is_none_or(|txn| storage.table_unchanged_since(&table_name, txn.snapshot_id()))
+        };
+        let decline_changed_publication = || {
+            if crate::storage::layout_epochs::statement_may_retry() {
+                Ok(None)
+            } else {
+                Err(crate::storage::layout_epochs::layout_changed(&table_name))
+            }
+        };
+        if !publication_is_current() {
+            return decline_changed_publication();
+        }
         let mut chosen: Option<String> = None;
         for index_name in vector_indexes.find_indexes(&table_name, &col_name) {
             if let Ok(meta) = vector_indexes.get_metadata(&index_name) {
@@ -1565,11 +1605,20 @@ impl<'a> Executor<'a> {
         loop {
             results.clear();
             tuples.clear();
-            let neighbours = vector_indexes.search(&index_name, &query_vec, fetch_k)?;
+            let neighbours = match vector_indexes.search(&index_name, &query_vec, fetch_k) {
+                Ok(neighbours) => neighbours,
+                Err(_) if !publication_is_current() => return decline_changed_publication(),
+                Err(error) => return Err(error),
+            };
             let candidates = neighbours.len();
+            #[cfg(all(test, feature = "vector-search"))]
+            ann_publication_tests::run_hook("after_candidates");
             for (row_id, distance) in neighbours {
-                let Some(tuple) = storage.get_row_by_id(&table_name, row_id, scan_schema.as_ref())? else {
-                    continue;
+                let tuple = match storage.get_row_by_id(&table_name, row_id, scan_schema.as_ref()) {
+                    Ok(Some(tuple)) => tuple,
+                    Ok(None) => continue,
+                    Err(_) if !publication_is_current() => return decline_changed_publication(),
+                    Err(error) => return Err(error),
                 };
                 if let Some((evaluator, pred)) = &post_filter {
                     match evaluator.evaluate(pred, &tuple)? {
@@ -1687,6 +1736,16 @@ impl<'a> Executor<'a> {
             }
             None => scan,
         };
+
+        #[cfg(all(test, feature = "vector-search"))]
+        ann_publication_tests::run_hook("after_rows");
+        // Every candidate row and any projected subquery is materialized before
+        // validation. A volatile effect ends retries; never repeat it in a scan.
+        if !publication_is_current() {
+            return decline_changed_publication();
+        }
+        #[cfg(all(test, feature = "vector-search"))]
+        ann_publication_tests::note_served();
 
         // VectorScanOperator already returns at most k rows ordered by
         // ascending distance; the LimitOperator applies the offset skip and
@@ -1831,8 +1890,12 @@ impl<'a> Executor<'a> {
         {
             return Ok(None);
         }
+        // Direct Executor callers can pin a plan across a completed ALTER.
+        // A fresh publication ticket cannot validate that old decode layout.
+        let current = storage.catalog().get_table_schema(table_name)?;
+        scan::refuse_plan_of_another_layout(storage, table_name, table_name, schema, &current)?;
         let source_name = alias.as_ref().unwrap_or(table_name);
-        let mut scan_schema = schema.as_ref().clone();
+        let mut scan_schema = current;
         for column in &mut scan_schema.columns {
             column.source_table = Some(source_name.clone());
             column.source_table_name = Some(table_name.clone());
@@ -1893,8 +1956,10 @@ impl<'a> Executor<'a> {
                 {
                     return Ok(None);
                 }
+                let current = storage.catalog().get_table_schema(table_name)?;
+                scan::refuse_plan_of_another_layout(storage, table_name, table_name, schema, &current)?;
                 let source_name = alias.as_ref().unwrap_or(table_name);
-                let mut scan_schema = schema.as_ref().clone();
+                let mut scan_schema = current;
                 for column in &mut scan_schema.columns {
                     column.source_table = Some(source_name.clone());
                     column.source_table_name = Some(table_name.clone());
@@ -1989,6 +2054,33 @@ impl<'a> Executor<'a> {
         self.materialize_subqueries_inner(expr, true)
     }
 
+    /// Nested reads share the owning statement's transaction and remaining
+    /// deadline. A fresh executor must not fall back to committed/current rows.
+    fn once_subquery_executor(&self) -> Executor<'a> {
+        let mut executor = if let Some(storage) = self.storage {
+            Executor::with_storage(storage)
+        } else {
+            Executor::new()
+        }
+        .with_parameters(self.parameters.clone());
+        executor.cte_context = self.cte_context.clone();
+        executor.transaction = self.transaction;
+        executor.timeout_ctx = self.timeout_ctx.clone();
+        executor
+    }
+
+    /// Legacy introspection may substitute NULL/false for unsupported nested
+    /// expressions. Storage failures (including quarantined-table reads),
+    /// statement refusals, cancellation and deadlines must reach the caller,
+    /// including before JOIN fallback mapping.
+    fn is_subquery_control_error(error: &Error) -> bool {
+        matches!(
+            error,
+            Error::Storage(_) | Error::QueryTimeout(_) | Error::QueryCancelled(_)
+        ) || error.is_applied_publication_failure()
+            || crate::storage::layout_epochs::is_layout_changed(error)
+    }
+
     fn materialize_subqueries_inner(
         &self,
         expr: &crate::sql::LogicalExpr,
@@ -2003,12 +2095,7 @@ impl<'a> Executor<'a> {
                 negated,
             } => {
                 // Execute the subquery to get the list of values
-                let mut subquery_executor = if let Some(storage) = self.storage {
-                    Executor::with_storage(storage)
-                } else {
-                    Executor::new()
-                }
-                .with_parameters(self.parameters.clone());
+                let mut subquery_executor = self.once_subquery_executor();
 
                 let results = subquery_executor.execute(subquery)?;
 
@@ -2046,12 +2133,7 @@ impl<'a> Executor<'a> {
                 // subqueries — the UPDATE executor calls
                 // `materialize_scalar_subquery_with_outer` before
                 // per-row evaluation when correlation is involved.
-                let mut subquery_executor = if let Some(storage) = self.storage {
-                    Executor::with_storage(storage)
-                } else {
-                    Executor::new()
-                }
-                .with_parameters(self.parameters.clone());
+                let mut subquery_executor = self.once_subquery_executor();
 
                 // KanttBan #23 phase 2.10: same fallback as
                 // correlated EXISTS (phase 2.5b) — when the inner
@@ -2065,6 +2147,7 @@ impl<'a> Executor<'a> {
                 // ON-clause is false → no match).
                 let results = match subquery_executor.execute(subquery) {
                     Ok(r) => r,
+                    Err(error) if Self::is_subquery_control_error(&error) => return Err(error),
                     // GH#29 (c6, m1 / c7, M5): in a JOIN's ON condition the
                     // NULL stand-in is a silent wrong answer (the term is
                     // never true, so the join loses rows with no diagnostic).
@@ -2092,12 +2175,7 @@ impl<'a> Executor<'a> {
             }
             LogicalExpr::Exists { subquery, negated } => {
                 // Execute the subquery to check if any rows exist
-                let mut subquery_executor = if let Some(storage) = self.storage {
-                    Executor::with_storage(storage)
-                } else {
-                    Executor::new()
-                }
-                .with_parameters(self.parameters.clone());
+                let mut subquery_executor = self.once_subquery_executor();
 
                 // KanttBan #23 phase 2.5: correlated EXISTS
                 // (inner WHERE references outer columns) fails here
@@ -2114,6 +2192,7 @@ impl<'a> Executor<'a> {
                 // wait for the full implementation.
                 let results = match subquery_executor.execute(subquery) {
                     Ok(r) => r,
+                    Err(error) if Self::is_subquery_control_error(&error) => return Err(error),
                     Err(e) => {
                         tracing::debug!(
                             "Correlated EXISTS subquery failed ({e}); falling back to false. \
@@ -2134,6 +2213,22 @@ impl<'a> Executor<'a> {
                 left: Box::new(self.materialize_subqueries_inner(left, refuse_correlated_scalar)?),
                 op: *op,
                 right: Box::new(self.materialize_subqueries_inner(right, refuse_correlated_scalar)?),
+            }),
+            LogicalExpr::Cast { expr, data_type } => Ok(LogicalExpr::Cast {
+                expr: Box::new(self.materialize_subqueries_inner(expr, refuse_correlated_scalar)?),
+                data_type: data_type.clone(),
+            }),
+            LogicalExpr::ScalarFunction { fun, args } => Ok(LogicalExpr::ScalarFunction {
+                fun: fun.clone(),
+                args: args
+                    .iter()
+                    .map(|expr| self.materialize_subqueries_inner(expr, refuse_correlated_scalar))
+                    .collect::<Result<Vec<_>>>()?,
+            }),
+            LogicalExpr::InSet { expr, values, negated } => Ok(LogicalExpr::InSet {
+                expr: Box::new(self.materialize_subqueries_inner(expr, refuse_correlated_scalar)?),
+                values: values.clone(),
+                negated: *negated,
             }),
             LogicalExpr::UnaryExpr { op, expr: inner } => Ok(LogicalExpr::UnaryExpr {
                 op: *op,
@@ -2215,6 +2310,44 @@ impl<'a> Executor<'a> {
     // each subquery's inner plan has its FREE (outer-referencing) column refs bound
     // to the current outer row's values, then it is executed. See the Filter arm.
 
+    /// Aggregate pushdown cannot evaluate dependent predicates. Decline before
+    /// materializing any subquery; ordinary scan/filter owns its evaluation.
+    fn expr_contains_subquery(expr: &crate::sql::LogicalExpr) -> bool {
+        use crate::sql::LogicalExpr as E;
+        match expr {
+            E::Exists { .. } | E::ScalarSubquery { .. } | E::InSubquery { .. } => true,
+            E::BinaryExpr { left, right, .. } => {
+                Self::expr_contains_subquery(left) || Self::expr_contains_subquery(right)
+            }
+            E::UnaryExpr { expr, .. } | E::IsNull { expr, .. } | E::Cast { expr, .. } | E::InSet { expr, .. } => {
+                Self::expr_contains_subquery(expr)
+            }
+            E::Between { expr, low, high, .. } => {
+                Self::expr_contains_subquery(expr)
+                    || Self::expr_contains_subquery(low)
+                    || Self::expr_contains_subquery(high)
+            }
+            E::InList { expr, list, .. } => {
+                Self::expr_contains_subquery(expr) || list.iter().any(Self::expr_contains_subquery)
+            }
+            E::ScalarFunction { args, .. } => args.iter().any(Self::expr_contains_subquery),
+            E::Case {
+                expr,
+                when_then,
+                else_result,
+            } => {
+                expr.as_ref().is_some_and(|expr| Self::expr_contains_subquery(expr))
+                    || when_then
+                        .iter()
+                        .any(|(when, then)| Self::expr_contains_subquery(when) || Self::expr_contains_subquery(then))
+                    || else_result
+                        .as_ref()
+                        .is_some_and(|expr| Self::expr_contains_subquery(expr))
+            }
+            _ => false,
+        }
+    }
+
     /// Base-table schema of a (single-table) subquery plan, used to decide whether a
     /// column reference is satisfied by the subquery's own table (inner) or is FREE
     /// (a correlated outer reference).
@@ -2244,7 +2377,9 @@ impl<'a> Executor<'a> {
             E::BinaryExpr { left, right, .. } => {
                 Self::expr_has_free_outer_ref(left, inner, outer) || Self::expr_has_free_outer_ref(right, inner, outer)
             }
-            E::UnaryExpr { expr, .. } | E::IsNull { expr, .. } => Self::expr_has_free_outer_ref(expr, inner, outer),
+            E::UnaryExpr { expr, .. } | E::IsNull { expr, .. } | E::Cast { expr, .. } | E::InSet { expr, .. } => {
+                Self::expr_has_free_outer_ref(expr, inner, outer)
+            }
             E::Between { expr, low, high, .. } => {
                 Self::expr_has_free_outer_ref(expr, inner, outer)
                     || Self::expr_has_free_outer_ref(low, inner, outer)
@@ -2254,6 +2389,9 @@ impl<'a> Executor<'a> {
                 Self::expr_has_free_outer_ref(expr, inner, outer)
                     || list.iter().any(|e| Self::expr_has_free_outer_ref(e, inner, outer))
             }
+            E::ScalarFunction { args, .. } => args
+                .iter()
+                .any(|expr| Self::expr_has_free_outer_ref(expr, inner, outer)),
             E::Case {
                 expr,
                 when_then,
@@ -2302,7 +2440,9 @@ impl<'a> Executor<'a> {
             E::BinaryExpr { left, right, .. } => {
                 self.expr_has_correlated_subquery(left, outer) || self.expr_has_correlated_subquery(right, outer)
             }
-            E::UnaryExpr { expr, .. } | E::IsNull { expr, .. } => self.expr_has_correlated_subquery(expr, outer),
+            E::UnaryExpr { expr, .. } | E::IsNull { expr, .. } | E::Cast { expr, .. } | E::InSet { expr, .. } => {
+                self.expr_has_correlated_subquery(expr, outer)
+            }
             E::Between { expr, low, high, .. } => {
                 self.expr_has_correlated_subquery(expr, outer)
                     || self.expr_has_correlated_subquery(low, outer)
@@ -2312,6 +2452,7 @@ impl<'a> Executor<'a> {
                 self.expr_has_correlated_subquery(expr, outer)
                     || list.iter().any(|e| self.expr_has_correlated_subquery(e, outer))
             }
+            E::ScalarFunction { args, .. } => args.iter().any(|expr| self.expr_has_correlated_subquery(expr, outer)),
             E::Case {
                 expr,
                 when_then,
@@ -2348,7 +2489,9 @@ impl<'a> Executor<'a> {
                 Self::bind_expr_to_outer(left, inner, outer, row);
                 Self::bind_expr_to_outer(right, inner, outer, row);
             }
-            E::UnaryExpr { expr, .. } | E::IsNull { expr, .. } => Self::bind_expr_to_outer(expr, inner, outer, row),
+            E::UnaryExpr { expr, .. } | E::IsNull { expr, .. } | E::Cast { expr, .. } | E::InSet { expr, .. } => {
+                Self::bind_expr_to_outer(expr, inner, outer, row)
+            }
             E::Between { expr, low, high, .. } => {
                 Self::bind_expr_to_outer(expr, inner, outer, row);
                 Self::bind_expr_to_outer(low, inner, outer, row);
@@ -2358,6 +2501,11 @@ impl<'a> Executor<'a> {
                 Self::bind_expr_to_outer(expr, inner, outer, row);
                 for e in list {
                     Self::bind_expr_to_outer(e, inner, outer, row);
+                }
+            }
+            E::ScalarFunction { args, .. } => {
+                for expr in args {
+                    Self::bind_expr_to_outer(expr, inner, outer, row);
                 }
             }
             E::Case {
@@ -2411,8 +2559,8 @@ impl<'a> Executor<'a> {
 
     /// Like `materialize_subqueries`, but evaluates each subquery for a specific
     /// OUTER row (binding free outer refs first), so correlated subqueries are
-    /// correct. On execution failure it falls back to the same false/NULL the
-    /// uncorrelated path uses (preserves drizzle / info_schema introspection).
+    /// correct. Preserve inner execution errors, including layout fences: an
+    /// error cannot stand in for an empty EXISTS or a successful NOT EXISTS.
     fn materialize_subqueries_with_outer(
         &self,
         expr: &crate::sql::LogicalExpr,
@@ -2420,7 +2568,7 @@ impl<'a> Executor<'a> {
         row: &Tuple,
     ) -> Result<crate::sql::LogicalExpr> {
         use crate::sql::LogicalExpr as E;
-        let run = |plan: &LogicalPlan| -> Vec<Tuple> {
+        let run = |plan: &LogicalPlan| -> Result<Vec<Tuple>> {
             let bound = Self::bind_plan_to_outer(plan, outer, row);
             let mut ex = if let Some(s) = self.storage {
                 Executor::with_storage(s)
@@ -2431,7 +2579,11 @@ impl<'a> Executor<'a> {
             // Carry materialized CTEs so a correlated subquery can reference a
             // WITH relation defined in the outer query (e.g. EXISTS over a CTE).
             ex.cte_context = self.cte_context.clone();
-            ex.execute(&bound).unwrap_or_default()
+            // Dependent reads belong to the same transaction/snapshot and use
+            // the statement's remaining deadline, not a fresh timeout budget.
+            ex.transaction = self.transaction;
+            ex.timeout_ctx = self.timeout_ctx.clone();
+            ex.execute(&bound)
         };
         match expr {
             E::InSubquery {
@@ -2439,7 +2591,7 @@ impl<'a> Executor<'a> {
                 subquery,
                 negated,
             } => {
-                let results = run(subquery);
+                let results = run(subquery)?;
                 let materialized_inner = self.materialize_subqueries_with_outer(inner_expr, outer, row)?;
                 let list: Vec<E> = results
                     .iter()
@@ -2452,7 +2604,7 @@ impl<'a> Executor<'a> {
                 })
             }
             E::ScalarSubquery { subquery } => {
-                let results = run(subquery);
+                let results = run(subquery)?;
                 let value = results
                     .first()
                     .and_then(|t| t.values.first().cloned())
@@ -2460,7 +2612,7 @@ impl<'a> Executor<'a> {
                 Ok(E::Literal(value))
             }
             E::Exists { subquery, negated } => {
-                let exists = !run(subquery).is_empty();
+                let exists = !run(subquery)?.is_empty();
                 Ok(E::Literal(crate::Value::Boolean(if *negated {
                     !exists
                 } else {
@@ -2471,6 +2623,22 @@ impl<'a> Executor<'a> {
                 left: Box::new(self.materialize_subqueries_with_outer(left, outer, row)?),
                 op: *op,
                 right: Box::new(self.materialize_subqueries_with_outer(right, outer, row)?),
+            }),
+            E::Cast { expr, data_type } => Ok(E::Cast {
+                expr: Box::new(self.materialize_subqueries_with_outer(expr, outer, row)?),
+                data_type: data_type.clone(),
+            }),
+            E::ScalarFunction { fun, args } => Ok(E::ScalarFunction {
+                fun: fun.clone(),
+                args: args
+                    .iter()
+                    .map(|expr| self.materialize_subqueries_with_outer(expr, outer, row))
+                    .collect::<Result<Vec<_>>>()?,
+            }),
+            E::InSet { expr, values, negated } => Ok(E::InSet {
+                expr: Box::new(self.materialize_subqueries_with_outer(expr, outer, row)?),
+                values: values.clone(),
+                negated: *negated,
             }),
             E::UnaryExpr { op, expr: inner } => Ok(E::UnaryExpr {
                 op: *op,
@@ -2739,6 +2907,9 @@ impl<'a> Executor<'a> {
         if storage.has_uncommitted_writes_for_table(table_name) {
             return Ok(None);
         }
+        if Self::expr_contains_subquery(predicate) {
+            return Ok(None);
+        }
         let predicate = self.materialize_subqueries(predicate)?;
         if let Some((lower, upper)) = self.pk_int_range_from_predicate(&predicate, &pk_col.name, &pk_col.data_type) {
             return storage.count_table_pk_int_range_with_schema(table_name, schema, lower, upper);
@@ -2925,6 +3096,9 @@ impl<'a> Executor<'a> {
             return Ok(None);
         }
 
+        if predicate.is_some_and(Self::expr_contains_subquery) {
+            return Ok(None);
+        }
         let predicate = predicate
             .map(|predicate| self.materialize_subqueries(predicate))
             .transpose()?;
@@ -2984,6 +3158,9 @@ impl<'a> Executor<'a> {
         if self.txn_forces_slow_reads_for_table(&storage_table_name) {
             return Ok(None);
         }
+        // Spec R5.6: decodes by the plan's layout; refused if the table has another.
+        let now = storage.catalog().get_table_schema(table_name)?;
+        scan::refuse_plan_of_another_layout(storage, table_name, &storage_table_name, schema, &now)?;
         let tuples = storage.aggregate_columnar_columns(
             &storage_table_name,
             schema,
@@ -3023,6 +3200,9 @@ impl<'a> Executor<'a> {
             return Ok(None);
         }
 
+        if predicate.is_some_and(Self::expr_contains_subquery) {
+            return Ok(None);
+        }
         let predicate = predicate
             .map(|predicate| self.materialize_subqueries(predicate))
             .transpose()?;
@@ -3083,6 +3263,9 @@ impl<'a> Executor<'a> {
         if self.txn_forces_slow_reads_for_table(&storage_table_name) {
             return Ok(None);
         }
+        // Spec R5.6: decodes by the plan's layout; refused if the table has another.
+        let now = storage.catalog().get_table_schema(table_name)?;
+        scan::refuse_plan_of_another_layout(storage, table_name, &storage_table_name, schema, &now)?;
         let Some(tuples) = storage.try_aggregate_row_columns(
             &storage_table_name,
             schema,
@@ -4119,14 +4302,32 @@ impl<'a> Executor<'a> {
                                             // Build scan operator to get schema, then iterate + filter + count
                                             let mut scan_op = self.plan_to_operator(&Box::new(scan_plan.clone()))?;
                                             let schema = scan_op.schema();
-                                            let evaluator =
-                                                crate::sql::Evaluator::with_parameters(schema, self.parameters.clone());
+                                            let correlated = self.expr_has_correlated_subquery(predicate, &schema);
+                                            let materialized = if correlated {
+                                                None
+                                            } else {
+                                                Some(self.materialize_subqueries(predicate)?)
+                                            };
+                                            let evaluator = crate::sql::Evaluator::with_parameters(
+                                                schema.clone(),
+                                                self.parameters.clone(),
+                                            );
                                             let _ = table_name; // used for debug context
                                             let mut count: i64 = 0;
                                             while let Some(tuple) = scan_op.next()? {
                                                 if let Some(ref ctx) = self.timeout_ctx {
                                                     ctx.check_timeout()?;
                                                 }
+                                                let bound;
+                                                let predicate = match &materialized {
+                                                    Some(predicate) => predicate,
+                                                    None => {
+                                                        bound = self.materialize_subqueries_with_outer(
+                                                            predicate, &schema, &tuple,
+                                                        )?;
+                                                        &bound
+                                                    }
+                                                };
                                                 let result = evaluator.evaluate(predicate, &tuple)?;
                                                 if matches!(result, crate::Value::Boolean(true)) {
                                                     count += 1;
@@ -4234,253 +4435,211 @@ impl<'a> Executor<'a> {
                 let storage = self
                     .storage
                     .ok_or_else(|| Error::query_execution("CREATE SEQUENCE requires storage context".to_string()))?;
+                #[cfg(feature = "internal-tests")]
+                crate::sql::sequences::run_before_ddl_owner();
+                let written = crate::sql::sequences::with_sequence_ddl_owner(storage, name, || {
+                    // IF NOT EXISTS: honour as a no-op when a def already exists
+                    // (do NOT overwrite/reset). Without it, re-create resets —
+                    // matching the lenient idempotent-migration behaviour.
+                    if *if_not_exists && storage.catalog().sequence_exists(name)? {
+                        return Ok(None);
+                    }
 
-                // IF NOT EXISTS: honour as a no-op when a def already exists
-                // (do NOT overwrite/reset). Without it, re-create resets —
-                // matching the lenient idempotent-migration behaviour.
-                if *if_not_exists && storage.catalog().sequence_exists(name)? {
-                    return Ok(Box::new(
-                        ScanOperator::new(
-                            String::new(),
-                            Arc::new(crate::Schema { columns: vec![] }),
-                            None,
-                            vec![],
-                            vec![],
-                        )
-                        .with_timeout(self.timeout_ctx()),
-                    ));
+                    let def = Self::build_sequence_def(
+                        name,
+                        data_type.as_deref(),
+                        *start_value,
+                        *increment_by,
+                        *min_value,
+                        *no_minvalue,
+                        *max_value,
+                        *no_maxvalue,
+                        *cache,
+                        *cycle,
+                        owned_by.clone(),
+                    )?;
+
+                    // A CREATE without IF NOT EXISTS on a name that ALREADY exists is
+                    // lenient (idempotent re-migration, spec D8): we overwrite the
+                    // DEFINITION but must NOT reset the durable high-water downward —
+                    // doing so would re-issue already-served values (a duplicate-PK
+                    // hazard for `DEFAULT nextval(...)` columns when an ORM re-runs a
+                    // migration). So we seed fresh state ONLY when the sequence is
+                    // genuinely new; an existing high-water is preserved.
+                    let already_exists = storage.catalog().sequence_exists(name)?;
+                    // Spec R5.3: the definition, a new sequence's seed state and the
+                    // logical-WAL entry (GH#36) are ONE write group.
+                    let seed = (!already_exists).then_some(crate::storage::PersistedSeqState {
+                        last_reserved: def.start_value,
+                        is_called: false,
+                    });
+                    let mut ddl = crate::storage::DdlBatch::new(storage);
+                    storage.catalog().stage_sequence(&def, false, seed.as_ref(), &mut ddl)?;
+                    ddl.commit().map(Some)
+                })?;
+                if let Some(written) = written {
+                    written.wait_replicated();
                 }
-
-                let def = Self::build_sequence_def(
-                    name,
-                    data_type.as_deref(),
-                    *start_value,
-                    *increment_by,
-                    *min_value,
-                    *no_minvalue,
-                    *max_value,
-                    *no_maxvalue,
-                    *cache,
-                    *cycle,
-                    owned_by.clone(),
-                )?;
-
-                // A CREATE without IF NOT EXISTS on a name that ALREADY exists is
-                // lenient (idempotent re-migration, spec D8): we overwrite the
-                // DEFINITION but must NOT reset the durable high-water downward —
-                // doing so would re-issue already-served values (a duplicate-PK
-                // hazard for `DEFAULT nextval(...)` columns when an ORM re-runs a
-                // migration). So we seed fresh state ONLY when the sequence is
-                // genuinely new; an existing high-water is preserved.
-                let already_exists = storage.catalog().sequence_exists(name)?;
-                // Spec R5.3: the definition, a new sequence's seed state and the
-                // logical-WAL entry (GH#36) are ONE write group.
-                let seed = (!already_exists).then_some(crate::storage::PersistedSeqState {
-                    last_reserved: def.start_value,
-                    is_called: false,
-                });
-                let mut ddl = crate::storage::DdlBatch::new(storage);
-                storage.catalog().stage_sequence(&def, false, seed.as_ref(), &mut ddl)?;
-                ddl.commit()?.wait_replicated();
-                // Evict any cached runtime so the next nextval lazy-loads the
-                // new durable def (and, on re-create, the PRESERVED durable
-                // state). The post-statement durability barrier fsyncs the def +
-                // seed-state puts. sprinter d15933f528b0: `_on(storage, ..)` so
-                // the eviction is bound to the database we just wrote, not to a
-                // thread-local that must merely happen to be installed.
-                crate::sql::sequences::invalidate_cache_on(storage, name);
-
-                Ok(Box::new(
-                    ScanOperator::new(
-                        String::new(),
-                        Arc::new(crate::Schema { columns: vec![] }),
-                        None,
-                        vec![],
-                        vec![],
-                    )
-                    .with_timeout(self.timeout_ctx()),
-                ))
+                self.empty_ddl_result()
             }
             LogicalPlan::AlterSequence(action) => {
                 let storage = self
                     .storage
                     .ok_or_else(|| Error::query_execution("ALTER SEQUENCE requires storage context".to_string()))?;
-                let catalog = storage.catalog();
+                #[cfg(feature = "internal-tests")]
+                crate::sql::sequences::run_before_ddl_owner();
+                let written = crate::sql::sequences::with_sequence_ddl_owner(storage, &action.name, || {
+                    let catalog = storage.catalog();
 
-                let mut def = match catalog.get_sequence(&action.name)? {
-                    Some(d) => d,
-                    None if action.if_exists => {
-                        return Ok(Box::new(
-                            ScanOperator::new(
-                                String::new(),
-                                Arc::new(crate::Schema { columns: vec![] }),
-                                None,
-                                vec![],
-                                vec![],
-                            )
-                            .with_timeout(self.timeout_ctx()),
-                        ));
-                    }
-                    None => {
-                        return Err(Error::query_execution(format!(
-                            "relation \"{}\" does not exist",
-                            action.name
-                        )));
-                    }
-                };
-
-                // Whether this ALTER explicitly set MIN/MAXVALUE (so an AS-type
-                // change does NOT clobber an explicitly-set bound this stmt).
-                let min_set = action.min_value.is_some();
-                let max_set = action.max_value.is_some();
-
-                // AS <type>: re-derive bounds from the new type for any bound
-                // not explicitly set in this ALTER.
-                if let Some(new_type) = &action.data_type {
-                    def.data_type = new_type.clone();
-                    let incr_sign = action.increment.unwrap_or(def.increment_by);
-                    let (tmin, tmax) = crate::storage::PersistedSequence::type_bounds(new_type);
-                    if !min_set {
-                        def.min_value = if incr_sign >= 0 { 1 } else { tmin };
-                    }
-                    if !max_set {
-                        def.max_value = if incr_sign >= 0 { tmax } else { -1 };
-                    }
-                }
-
-                if let Some(incr) = action.increment {
-                    if incr == 0 {
-                        return Err(Error::query_execution(
-                            "ALTER SEQUENCE INCREMENT must not be zero".to_string(),
-                        ));
-                    }
-                    def.increment_by = incr;
-                }
-                if let Some(c) = action.cache {
-                    def.cache = c.max(1);
-                }
-                if let Some(cyc) = action.cycle {
-                    def.cycle = cyc;
-                }
-                if let Some(s) = action.start_value {
-                    def.start_value = s;
-                }
-                match &action.min_value {
-                    Some(Some(n)) => def.min_value = *n,
-                    Some(None) => {
-                        // NO MINVALUE -> type/sign default.
-                        let (tmin, _) = crate::storage::PersistedSequence::type_bounds(&def.data_type);
-                        def.min_value = if def.increment_by >= 0 { 1 } else { tmin };
-                    }
-                    None => {}
-                }
-                match &action.max_value {
-                    Some(Some(n)) => def.max_value = *n,
-                    Some(None) => {
-                        let (_, tmax) = crate::storage::PersistedSequence::type_bounds(&def.data_type);
-                        def.max_value = if def.increment_by >= 0 { tmax } else { -1 };
-                    }
-                    None => {}
-                }
-                match &action.owned_by {
-                    Some(Some((t, c))) => {
-                        def.owned_by_table = Some(t.clone());
-                        def.owned_by_column = Some(c.clone());
-                    }
-                    Some(None) => {
-                        def.owned_by_table = None;
-                        def.owned_by_column = None;
-                    }
-                    None => {}
-                }
-
-                if def.min_value > def.max_value {
-                    return Err(Error::query_execution(format!(
-                        "ALTER SEQUENCE \"{}\": MINVALUE ({}) must be <= MAXVALUE ({})",
-                        action.name, def.min_value, def.max_value
-                    )));
-                }
-                if def.start_value < def.min_value || def.start_value > def.max_value {
-                    return Err(Error::query_execution(format!(
-                        "ALTER SEQUENCE \"{}\": START value ({}) out of bounds [{}, {}]",
-                        action.name, def.start_value, def.min_value, def.max_value
-                    )));
-                }
-
-                // RESTART rewrites the durable high-water (acts like
-                // setval(., false) to the restart point): the next nextval
-                // returns exactly that value. Some(None) -> start; Some(n) -> n.
-                let restart = match action.restart {
-                    Some(restart) => {
-                        let target = restart.unwrap_or(def.start_value);
-                        // BOUND-SAFETY invariant: the not-called refill branch serves
-                        // the RESTART target directly (no clamp on `first`), so an
-                        // out-of-range target would make nextval return a value
-                        // outside [min,max]. Validated BEFORE anything is written
-                        // (spec R5.3: a refused RESTART used to leave the new
-                        // definition behind; CREATE validates START and setval
-                        // validates its value the same way).
-                        if target < def.min_value || target > def.max_value {
+                    let mut def = match catalog.get_sequence(&action.name)? {
+                        Some(d) => d,
+                        None if action.if_exists => {
+                            return Ok(None);
+                        }
+                        None => {
                             return Err(Error::query_execution(format!(
-                                "ALTER SEQUENCE \"{}\": RESTART value ({}) out of bounds [{}, {}]",
-                                action.name, target, def.min_value, def.max_value
+                                "relation \"{}\" does not exist",
+                                action.name
                             )));
                         }
-                        Some(crate::storage::PersistedSeqState {
-                            last_reserved: target,
-                            is_called: false,
-                        })
+                    };
+
+                    // Whether this ALTER explicitly set MIN/MAXVALUE (so an AS-type
+                    // change does NOT clobber an explicitly-set bound this stmt).
+                    let min_set = action.min_value.is_some();
+                    let max_set = action.max_value.is_some();
+
+                    // AS <type>: re-derive bounds from the new type for any bound
+                    // not explicitly set in this ALTER.
+                    if let Some(new_type) = &action.data_type {
+                        def.data_type = new_type.clone();
+                        let incr_sign = action.increment.unwrap_or(def.increment_by);
+                        let (tmin, tmax) = crate::storage::PersistedSequence::type_bounds(new_type);
+                        if !min_set {
+                            def.min_value = if incr_sign >= 0 { 1 } else { tmin };
+                        }
+                        if !max_set {
+                            def.max_value = if incr_sign >= 0 { tmax } else { -1 };
+                        }
                     }
-                    None => None,
-                };
-                // Spec R5.3: the definition, the RESTART state and the logical-WAL
-                // entry (GH#36) are ONE write group.
-                let mut ddl = crate::storage::DdlBatch::new(storage);
-                catalog.stage_sequence(&def, true, restart.as_ref(), &mut ddl)?;
-                ddl.commit()?.wait_replicated();
 
-                // Evict the cached runtime so the lock-free counter discards any
-                // in-flight cached block (RESTART correctness) and the next
-                // nextval rebuilds from the freshly written def + state.
-                // sprinter d15933f528b0: bound to THIS database's namespace.
-                crate::sql::sequences::invalidate_cache_on(storage, &action.name);
+                    if let Some(incr) = action.increment {
+                        if incr == 0 {
+                            return Err(Error::sequence_parameter_invalid(
+                                "ALTER SEQUENCE INCREMENT must not be zero",
+                            ));
+                        }
+                        def.increment_by = incr;
+                    }
+                    if let Some(c) = action.cache {
+                        def.cache = c.max(1);
+                    }
+                    if let Some(cyc) = action.cycle {
+                        def.cycle = cyc;
+                    }
+                    if let Some(s) = action.start_value {
+                        def.start_value = s;
+                    }
+                    match &action.min_value {
+                        Some(Some(n)) => def.min_value = *n,
+                        Some(None) => {
+                            // NO MINVALUE -> type/sign default.
+                            let (tmin, _) = crate::storage::PersistedSequence::type_bounds(&def.data_type);
+                            def.min_value = if def.increment_by >= 0 { 1 } else { tmin };
+                        }
+                        None => {}
+                    }
+                    match &action.max_value {
+                        Some(Some(n)) => def.max_value = *n,
+                        Some(None) => {
+                            let (_, tmax) = crate::storage::PersistedSequence::type_bounds(&def.data_type);
+                            def.max_value = if def.increment_by >= 0 { tmax } else { -1 };
+                        }
+                        None => {}
+                    }
+                    match &action.owned_by {
+                        Some(Some((t, c))) => {
+                            def.owned_by_table = Some(t.clone());
+                            def.owned_by_column = Some(c.clone());
+                        }
+                        Some(None) => {
+                            def.owned_by_table = None;
+                            def.owned_by_column = None;
+                        }
+                        None => {}
+                    }
 
-                Ok(Box::new(
-                    ScanOperator::new(
-                        String::new(),
-                        Arc::new(crate::Schema { columns: vec![] }),
-                        None,
-                        vec![],
-                        vec![],
-                    )
-                    .with_timeout(self.timeout_ctx()),
-                ))
+                    if def.min_value > def.max_value {
+                        return Err(Error::sequence_parameter_invalid(format!(
+                            "ALTER SEQUENCE \"{}\": MINVALUE ({}) must be <= MAXVALUE ({})",
+                            action.name, def.min_value, def.max_value
+                        )));
+                    }
+                    if def.start_value < def.min_value || def.start_value > def.max_value {
+                        return Err(Error::sequence_parameter_invalid(format!(
+                            "ALTER SEQUENCE \"{}\": START value ({}) out of bounds [{}, {}]",
+                            action.name, def.start_value, def.min_value, def.max_value
+                        )));
+                    }
+
+                    // RESTART rewrites the durable high-water (acts like
+                    // setval(., false) to the restart point): the next nextval
+                    // returns exactly that value. Some(None) -> start; Some(n) -> n.
+                    let restart = match action.restart {
+                        Some(restart) => {
+                            let target = restart.unwrap_or(def.start_value);
+                            // BOUND-SAFETY invariant: the not-called refill branch serves
+                            // the RESTART target directly (no clamp on `first`), so an
+                            // out-of-range target would make nextval return a value
+                            // outside [min,max]. Validated BEFORE anything is written
+                            // (spec R5.3: a refused RESTART used to leave the new
+                            // definition behind; CREATE validates START and setval
+                            // validates its value the same way).
+                            if target < def.min_value || target > def.max_value {
+                                return Err(Error::sequence_parameter_invalid(format!(
+                                    "ALTER SEQUENCE \"{}\": RESTART value ({}) out of bounds [{}, {}]",
+                                    action.name, target, def.min_value, def.max_value
+                                )));
+                            }
+                            Some(crate::storage::PersistedSeqState {
+                                last_reserved: target,
+                                is_called: false,
+                            })
+                        }
+                        None => None,
+                    };
+                    // Spec R5.3: the definition, the RESTART state and the logical-WAL
+                    // entry (GH#36) are ONE write group.
+                    let mut ddl = crate::storage::DdlBatch::new(storage);
+                    catalog.stage_sequence(&def, true, restart.as_ref(), &mut ddl)?;
+                    ddl.commit().map(Some)
+                })?;
+                if let Some(written) = written {
+                    written.wait_replicated();
+                }
+                self.empty_ddl_result()
             }
             LogicalPlan::DropSequence { name, if_exists } => {
                 let storage = self
                     .storage
                     .ok_or_else(|| Error::query_execution("DROP SEQUENCE requires storage context".to_string()))?;
-                let catalog = storage.catalog();
-                if !*if_exists && !catalog.sequence_exists(name)? {
-                    return Err(Error::query_execution(format!("sequence \"{name}\" does not exist")));
+                #[cfg(feature = "internal-tests")]
+                crate::sql::sequences::run_before_ddl_owner();
+                let written = crate::sql::sequences::with_sequence_ddl_owner(storage, name, || {
+                    let catalog = storage.catalog();
+                    if !*if_exists && !catalog.sequence_exists(name)? {
+                        return Err(Error::query_execution(format!("sequence \"{name}\" does not exist")));
+                    }
+                    // Spec R5.3: both deletes and the logical-WAL entry (GH#36) are ONE
+                    // write group.
+                    let mut ddl = crate::storage::DdlBatch::new(storage);
+                    crate::storage::Catalog::stage_sequence_drop(name, &mut ddl)?;
+                    ddl.commit().map(Some)
+                })?;
+                if let Some(written) = written {
+                    written.wait_replicated();
                 }
-                // Spec R5.3: both deletes and the logical-WAL entry (GH#36) are ONE
-                // write group.
-                let mut ddl = crate::storage::DdlBatch::new(storage);
-                crate::storage::Catalog::stage_sequence_drop(name, &mut ddl);
-                ddl.commit()?.wait_replicated();
-                // sprinter d15933f528b0: bound to THIS database's namespace.
-                crate::sql::sequences::invalidate_cache_on(storage, name);
-                Ok(Box::new(
-                    ScanOperator::new(
-                        String::new(),
-                        Arc::new(crate::Schema { columns: vec![] }),
-                        None,
-                        vec![],
-                        vec![],
-                    )
-                    .with_timeout(self.timeout_ctx()),
-                ))
+                self.empty_ddl_result()
             }
             // ---------------------------------------------------------------
             // Role / ACL DDL. ONE implementation, reached by BOTH DML executor
@@ -5202,12 +5361,12 @@ impl<'a> Executor<'a> {
         }
 
         if min > max {
-            return Err(Error::query_execution(format!(
+            return Err(Error::sequence_parameter_invalid(format!(
                 "CREATE SEQUENCE \"{name}\": MINVALUE ({min}) must be <= MAXVALUE ({max})"
             )));
         }
         if start < min || start > max {
-            return Err(Error::query_execution(format!(
+            return Err(Error::sequence_parameter_invalid(format!(
                 "CREATE SEQUENCE \"{name}\": START value ({start}) out of bounds [{min}, {max}]"
             )));
         }
@@ -5902,4 +6061,174 @@ fn walk_expr_subplans(expr: &crate::sql::LogicalExpr, visit: &mut dyn FnMut(&cra
         _ => {}
     }
     walk_expr_children(expr, &mut |child| walk_expr_subplans(child, visit));
+}
+
+#[cfg(all(test, feature = "vector-search"))]
+pub(crate) mod ann_publication_tests;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod once_subquery_context_tests {
+    use super::{Executor, TimeoutContext};
+    use crate::sql::{LogicalExpr, LogicalPlan};
+    use crate::{EmbeddedDatabase, Error, Value};
+    use std::time::{Duration, Instant};
+
+    fn scan(db: &EmbeddedDatabase) -> LogicalPlan {
+        LogicalPlan::Scan {
+            table_name: "once_inner".into(),
+            alias: None,
+            schema: std::sync::Arc::new(db.storage.catalog().get_table_schema("once_inner").unwrap()),
+            projection: None,
+            as_of: None,
+        }
+    }
+
+    fn expressions(plan: LogicalPlan) -> [LogicalExpr; 4] {
+        [
+            LogicalExpr::InSubquery {
+                expr: Box::new(LogicalExpr::Literal(Value::Int4(1))),
+                subquery: Box::new(plan.clone()),
+                negated: false,
+            },
+            LogicalExpr::ScalarSubquery {
+                subquery: Box::new(plan.clone()),
+            },
+            LogicalExpr::Exists {
+                subquery: Box::new(plan.clone()),
+                negated: false,
+            },
+            LogicalExpr::Exists {
+                subquery: Box::new(plan),
+                negated: true,
+            },
+        ]
+    }
+
+    fn seed() -> EmbeddedDatabase {
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE once_inner(id INT PRIMARY KEY)").unwrap();
+        db.execute("INSERT INTO once_inner VALUES(1)").unwrap();
+        db
+    }
+
+    #[test]
+    fn once_subqueries_share_the_expired_parent_deadline_without_false_or_null() {
+        let db = seed();
+        for expression in expressions(scan(&db)) {
+            let mut executor = Executor::with_storage(&db.storage);
+            let mut timeout = TimeoutContext::new(Some(1));
+            timeout.start_time = Instant::now() - Duration::from_secs(2);
+            executor.timeout_ctx = Some(timeout);
+            let error = executor.materialize_subqueries(&expression).unwrap_err();
+            assert!(matches!(error, Error::QueryTimeout(_)), "{expression:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn once_subqueries_return_obsolete_inner_layout_errors_without_fallback() {
+        let db = seed();
+        let old_plan = scan(&db);
+        db.execute("ALTER TABLE once_inner ADD COLUMN extra INT").unwrap();
+        for expression in expressions(old_plan) {
+            for join_context in [false, true] {
+                let executor = Executor::with_storage(&db.storage);
+                let error = executor
+                    .materialize_subqueries_inner(&expression, join_context)
+                    .unwrap_err();
+                assert!(
+                    crate::storage::layout_epochs::is_layout_changed(&error),
+                    "{expression:?}, join={join_context}: {error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn quarantined_once_subqueries_return_storage_error_without_repair_writes() {
+        let db = seed();
+        db.execute("CREATE TABLE once_healthy(id INT PRIMARY KEY)").unwrap();
+        db.execute("INSERT INTO once_healthy VALUES(7)").unwrap();
+        let inner_plan = scan(&db);
+        let raw = db.storage.db();
+        let image = || {
+            raw.iterator(rocksdb::IteratorMode::Start)
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        let before = image();
+        let sequence = raw.latest_sequence_number();
+        let refusals = db.storage.write_gate().refusals();
+
+        // Use the actual recovery fence, including its read and write gates.
+        let _ = db
+            .storage
+            .quarantine_generic_indexes("once_inner", "test actual-state reconciliation failure");
+        let expected = db.storage.check_table_readable("once_inner").unwrap_err();
+        assert!(matches!(expected, Error::Storage(_)), "{expected}");
+        assert!(!crate::storage::layout_epochs::is_layout_changed(&expected));
+        assert!(!expected.is_applied_publication_failure());
+        assert!(db.storage.write_gate().check_table_available("once_inner").is_err());
+        for expression in expressions(inner_plan) {
+            for join_context in [false, true] {
+                let executor = Executor::with_storage(&db.storage);
+                let error = executor
+                    .materialize_subqueries_inner(&expression, join_context)
+                    .unwrap_err();
+                assert!(matches!(error, Error::Storage(_)), "{expression:?}: {error}");
+                assert_eq!(
+                    error.to_string(),
+                    expected.to_string(),
+                    "{expression:?}, join={join_context}"
+                );
+            }
+        }
+        assert_eq!(
+            db.query_with_columns("SELECT id FROM once_healthy").unwrap().0[0].values,
+            vec![Value::Int4(7)]
+        );
+        assert_eq!(
+            raw.latest_sequence_number(),
+            sequence,
+            "quarantine/read must not repair storage"
+        );
+        assert_eq!(image(), before, "quarantine/read must preserve every durable key/value");
+        assert_eq!(
+            db.storage.write_gate().refusals(),
+            refusals,
+            "no attempted repair writes"
+        );
+    }
+
+    #[test]
+    fn legacy_unbound_introspection_fallback_stays_false_or_null() {
+        let db = seed();
+        let unsupported = LogicalPlan::Filter {
+            input: Box::new(scan(&db)),
+            predicate: LogicalExpr::Column {
+                table: Some("unbound_outer".into()),
+                name: "id".into(),
+            },
+        };
+        let executor = Executor::with_storage(&db.storage);
+        let scalar = LogicalExpr::ScalarSubquery {
+            subquery: Box::new(unsupported.clone()),
+        };
+        assert!(matches!(
+            executor.materialize_subqueries(&scalar).unwrap(),
+            LogicalExpr::Literal(Value::Null)
+        ));
+        for negated in [false, true] {
+            let expression = LogicalExpr::Exists {
+                subquery: Box::new(unsupported.clone()),
+                negated,
+            };
+            assert!(matches!(
+                executor.materialize_subqueries(&expression).unwrap(),
+                LogicalExpr::Literal(Value::Boolean(value)) if value == negated
+            ));
+        }
+        let error = executor.materialize_join_subqueries(&scalar).unwrap_err();
+        assert!(error.to_string().contains("correlated subquery"), "{error}");
+    }
 }

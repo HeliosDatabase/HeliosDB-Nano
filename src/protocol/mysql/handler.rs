@@ -3784,6 +3784,9 @@ fn value_to_mysql_string(v: &Value) -> String {
 
 /// Map an error message to the appropriate MySQL error code and SQL state.
 fn map_error_code(err_msg: &str) -> (u16, &'static str) {
+    if err_msg.contains(crate::error::APPLIED_PUBLICATION_FAILURE_MARKER) {
+        return (1105, "HY000"); // applied rows: system error, before nested causes
+    }
     let lower = err_msg.to_lowercase();
     // GH#29 (c7, n4): the refusals that are 0A000 feature_not_supported on
     // the PostgreSQL wire are ER_NOT_SUPPORTED_YET here — MySQL spells that
@@ -4243,6 +4246,19 @@ mod tests {
         assert!(starts_with_icase("SELECT * FROM t", "SELECT"));
         assert!(starts_with_icase("select * FROM t", "SELECT"));
         assert!(!starts_with_icase("INS", "INSERT"));
+    }
+
+    #[test]
+    fn applied_publication_errors_do_not_inherit_nested_retry_or_constraint_codes() {
+        use crate::Error;
+        for cause in [
+            Error::write_group_too_large(1024, 64),
+            Error::transaction("serialization failure: persistent row image changed during graph publication"),
+            Error::constraint_violation("duplicate key after derived publication"),
+        ] {
+            let applied = Error::applied_publication_failure(cause);
+            assert_eq!(map_error_code(&applied.to_string()), (1105, "HY000"));
+        }
     }
 
     #[test]

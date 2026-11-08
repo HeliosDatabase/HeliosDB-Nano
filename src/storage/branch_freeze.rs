@@ -1525,6 +1525,16 @@ impl StorageEngine {
     /// not changed since is what it is now. No record exists for such a statement of an
     /// earlier release: it reads as it always did.
     ///
+    /// Spec R5.5: a table with a layout record (`storage::table_layout`, written with
+    /// every such change since) is read by it instead, the rule `AS OF` on main reads
+    /// by, so the two give the same answer for the same time: a version older than a
+    /// `DROP COLUMN` is taken across it (the anchor reads each value under its own
+    /// column), a `RENAME COLUMN` moves no position, and only a cut refuses (a rename
+    /// of the table or a refresh that swapped its rows; past a rename, a row it
+    /// moved that has no version at the anchor and changed since). Representation
+    /// changes preserve logical versions. An actual legacy physical version is
+    /// refused by the snapshot read, without using mutable current sidecars.
+    ///
     /// Memory: one chunk of copies ([`branch_view::materialize_chunk_rows`] rows or
     /// [`branch_view::MATERIALIZE_CHUNK_BYTES`] bytes), plus the ids of the deleted
     /// rows of the table in hand. The branch does not exist until its creation batch,
@@ -1541,20 +1551,33 @@ impl StorageEngine {
             if crate::sql::temp_tables::is_temp_key(&table) {
                 continue;
             }
-            let shape = catalog.main_table_shape_change(&table)?;
+            let layout = catalog.durable_table_layout(&table)?;
+            let shape = match &layout {
+                Some(layout) => {
+                    if let Some(cause) = layout.first_cut_after(anchor) {
+                        return Err(Error::branch_anchor_before_shape_change(
+                            name,
+                            &super::table_layout::describe_cut(cause, &table),
+                        ));
+                    }
+                    None
+                }
+                None => catalog.main_table_shape_change(&table)?,
+            };
             if let Some(change) = shape.as_ref().filter(|change| anchor < change.changed_at) {
                 return Err(Error::branch_anchor_before_shape_change(name, &change.describe(&table)));
             }
-            tables.push((table, shape));
+            tables.push((table, shape, layout));
         }
         let mut chunk = AnchorChunk::default();
-        for (table, shape) in tables {
+        for (table, shape, layout) in tables {
             let at = AnchorTable {
                 level,
                 name,
                 table: &table,
                 anchor,
                 shape: shape.as_ref(),
+                layout: layout.as_ref(),
             };
             let deleted = snapshots.rows_with_delete_event(&table)?;
             let prefix = format!("data:{table}:");
@@ -1619,6 +1642,56 @@ impl StorageEngine {
         Ok(false)
     }
 
+    /// Spec R5.5: row `row`'s image at the anchor in today's layout, by the table's
+    /// layout record, as `AS OF` on main reads it (`StorageEngine::scan_table_at_snapshot`):
+    /// a version older than a `DROP COLUMN` taken across it, refused at a cut, and a row
+    /// a rename moved here that has no version at the anchor and changed since refused
+    /// (`SnapshotManager::history_lost_at`, `AS OF`'s question, asked before the read).
+    fn anchor_image_in_layout(
+        &self,
+        at: &AnchorTable<'_>,
+        layout: &super::table_layout::TableLayout,
+        row: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        let snapshots = self.snapshot_manager();
+        let refuse = |cause| {
+            Error::branch_anchor_before_shape_change(at.name, &super::table_layout::describe_cut(cause, at.table))
+        };
+        if let Some(cause) = snapshots.history_lost_at(layout, at.table, row, at.anchor)? {
+            return Err(refuse(cause));
+        }
+        match snapshots.read_at_snapshot_sourced(at.table, row, at.anchor)? {
+            Some((super::time_travel::ImageSource::Version(written), image)) if layout.changed_since(written) => {
+                let mut tuple: Tuple = bincode::deserialize(&image)
+                    .map_err(|e| Error::storage(format!("Failed to deserialize a row version: {e}")))?;
+                let time = snapshots.version_layout_time(at.table, row, written)?;
+                if let Some(cause) = layout.try_bring_forward(time, &mut tuple) {
+                    return Err(refuse(cause));
+                }
+                snapshots.normalize_snapshot_tuple(
+                    at.table,
+                    row,
+                    super::time_travel::ImageSource::Version(written),
+                    &mut tuple,
+                )?;
+                bincode::serialize(&tuple)
+                    .map(Some)
+                    .map_err(|e| Error::storage(format!("Failed to serialize a row version: {e}")))
+            }
+            Some((source, image)) => {
+                let mut tuple: Tuple = bincode::deserialize(&image)
+                    .map_err(|e| Error::storage(format!("Failed to deserialize a row version: {e}")))?;
+                if !snapshots.normalize_snapshot_tuple(at.table, row, source, &mut tuple)? {
+                    return Ok(Some(image));
+                }
+                bincode::serialize(&tuple)
+                    .map(Some)
+                    .map_err(|e| Error::storage(format!("Failed to serialize a logical anchor row: {e}")))
+            }
+            None => Ok(None),
+        }
+    }
+
     fn stage_anchor_row(
         &self,
         at: &AnchorTable<'_>,
@@ -1627,10 +1700,34 @@ impl StorageEngine {
         chunk: &mut AnchorChunk,
     ) -> Result<()> {
         let (level, table) = (at.level, at.table);
-        if !self.anchor_version_is_current_shape(at, row)? {
-            return Ok(());
-        }
-        let at_anchor = self.snapshot_manager().read_at_snapshot(table, row, at.anchor)?;
+        let at_anchor = match at.layout {
+            Some(layout) => self.anchor_image_in_layout(at, layout, row)?,
+            None => {
+                if !self.anchor_version_is_current_shape(at, row)? {
+                    return Ok(());
+                }
+                match self
+                    .snapshot_manager()
+                    .read_at_snapshot_sourced(table, row, at.anchor)?
+                {
+                    Some((source, image)) => {
+                        let mut tuple: Tuple = bincode::deserialize(&image)
+                            .map_err(|e| Error::storage(format!("Failed to deserialize an anchor row: {e}")))?;
+                        if self
+                            .snapshot_manager()
+                            .normalize_snapshot_tuple(table, row, source, &mut tuple)?
+                        {
+                            Some(bincode::serialize(&tuple).map_err(|e| {
+                                Error::storage(format!("Failed to serialize a logical anchor row: {e}"))
+                            })?)
+                        } else {
+                            Some(image)
+                        }
+                    }
+                    None => None,
+                }
+            }
+        };
         let row_key = branch_row_key(level, table, row);
         let tombstone_key = branch_tombstone_key(level, table, row);
         // In this order. A main write after the read of `current` froze `current`,
@@ -1727,6 +1824,8 @@ struct AnchorTable<'a> {
     table: &'a str,
     anchor: u64,
     shape: Option<&'a TableShapeChange>,
+    /// Spec R5.5: the table's layout record; with one, `shape` is not asked.
+    layout: Option<&'a super::table_layout::TableLayout>,
 }
 
 /// The batch of a branch's anchor being written.

@@ -126,3 +126,40 @@ addressed). FK cascade child writes, `Transaction::{update_tuples, delete_tuples
 `update_tuples_branch_aware` / `delete_tuples_branch_aware` (no main SQL statement reaches them since decision 10)
 lock nothing. A cycle through a table-lock upgrade and a row lock is not detected; the timeouts end it. The fork
 test of B4 F7 is the one-group test: a fork lands between write groups (B4).
+
+### Review fix pass (r534 review, 2026-11-07)
+
+- **F1, the row cache.** A writer reads the row from storage (`PkLookupCache::Bypass`: the write-path PK lookups and
+  the text family's PK candidate), and every invalidation of a row-cache shard (`invalidate`, `invalidate_table`,
+  `clear`, the generation-fenced one) moves the shard's count under its lock; a reader's fill carries the count it read
+  before its storage read (`RowCache::fill_ticket` / `put_if_ticket`) and is refused if it moved. Before, a point
+  reader refilled the old image after a write's invalidation, and the next PK increment trusted it under an unmoved
+  epoch.
+- **F3, key holds.** A transaction's eager removal of a PRIMARY KEY / UNIQUE key (DELETE, key-moving UPDATE, the
+  upsert's moved key, a cascade) records a hold in the index entry under the tree's write lock
+  (`ArtIndexManager::on_delete_holding`); a claim by another transaction is refused with the hold
+  (`reserve_insert_tuple_as`, `on_insert_tuple_collect_index_values_as`) and waits for the row's lock
+  (`StorageEngine::wait_out_key_hold`), a writer's PK probe that misses finds the held row (`pk_hold`), and an upsert
+  waits out a held arbiter key (`held_key_for`). The restore of a rollback lifts each hold with its key; a commit lets
+  them all go before its row locks (`release_holds_of`, an `after_commit` hook). A hold whose owner no longer holds
+  its row is stale and lifted by the claimant. Not covered: a key-moving UPDATE *into* a held value (its own
+  uniqueness probe sees the key free), `MERGE BRANCH`'s key claims, TRUNCATE (its exclusive table lock keeps writers
+  out anyway).
+- **F4, cascades.** `ON DELETE CASCADE` / `SET NULL` lock each child (`lock_cascade_children`) and use it as
+  committed (a moved child is re-checked against the parent's key). `ON UPDATE` actions remain unenforced
+  altogether (not a lock matter: there is no `ON UPDATE` code path).
+- **F5, branches.** Row locks and change epochs are keyed by branch level and row (`RowKey::on_level`,
+  `table_epoch_on_level`); a commit moves the epochs of the (level, table) pairs it staged; the four DML arms and both
+  branch upsert legs lock and re-read through the branch view.
+- **F6, speculative insertion.** `upsert_conflict_settled` runs on both families: the statement holds the value of
+  each arbiter key until its transaction ends (`RowKey::unique_value`), takes its verdict again, and for DO UPDATE
+  locks the conflicting row and waits for it to be committed; a row deleted meanwhile becomes an insert. Replaces the
+  20 × 1 ms look and the 40001.
+- **F9** `ROLLBACK TO SAVEPOINT` (and a failed statement's implicit one) releases the row locks taken after it, after
+  the index undo. **F12** a row or table lock wait's `statement_timeout` is counted from the statement's start
+  (`STATEMENT_STARTED`, set by the outermost `SessionScopedStateGuard`). **F13** `Transaction::put` /
+  `put_insert_fast` / `delete` count staged bytes and refuse (54000) once the staged `data:` rows times the copies the
+  group will hold (row, version, logical-WAL op) pass the ceiling; the gate's exact check stays. Effective limit with
+  the defaults: about 1.33 GiB of row data per statement or transaction.
+- **F10** stays open (documented): table-lock and row-lock owners are different objects, so there is no cheap joint
+  wait graph.

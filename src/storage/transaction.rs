@@ -19,8 +19,12 @@ use dashmap::{DashMap, DashSet};
 use parking_lot::RwLock;
 use rocksdb::{WriteOptions, DB};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tracing::{debug, trace, warn};
+
+/// Spec R5.4 (review F13): the most copies of one staged row a commit's group holds:
+/// the row, its version and its logical-WAL operation (`Transaction::write_group_copies`).
+const MAX_GROUP_COPIES: usize = 3;
 
 /// THE process-global transaction-id counter. ONE atomic, shared by EVERY
 /// `Transaction` constructor in this module.
@@ -41,6 +45,35 @@ use tracing::{debug, trace, warn};
 /// NEVER reintroduce a per-constructor counter. Any new constructor must draw
 /// from this static.
 static TXN_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+#[cfg(feature = "internal-tests")]
+thread_local! {
+    static FAIL_NEXT_APPLIED_COMMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static NEXT_AFTER_COMMIT_BARRIER: std::cell::RefCell<Option<Box<dyn FnOnce() + Send>>> = std::cell::RefCell::new(None);
+    static NEXT_AFTER_NATIVE_TRANSACTION_WRITE: std::cell::RefCell<Option<Box<dyn FnOnce() + Send>>> = std::cell::RefCell::new(None);
+}
+
+#[cfg(feature = "internal-tests")]
+pub(crate) fn debug_fail_next_applied_commit() {
+    FAIL_NEXT_APPLIED_COMMIT.with(|fail| fail.set(true));
+}
+
+#[cfg(feature = "internal-tests")]
+pub(crate) fn debug_next_after_commit_barrier(hook: impl FnOnce() + Send + 'static) {
+    NEXT_AFTER_COMMIT_BARRIER.with(|next| *next.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(feature = "internal-tests")]
+pub(crate) fn debug_next_after_native_transaction_write(hook: impl FnOnce() + Send + 'static) {
+    NEXT_AFTER_NATIVE_TRANSACTION_WRITE.with(|next| *next.borrow_mut() = Some(Box::new(hook)));
+}
+
+/// Reuse one callback queue and lock for success publication and cache fences.
+/// An attempted-write fence must also run when a failed write may have applied.
+enum AfterWriteHook {
+    Committed(Box<dyn FnOnce() + Send>),
+    Attempted(Box<dyn FnOnce() + Send>),
+}
 
 /// Transaction state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -192,7 +225,29 @@ pub struct Transaction {
     /// autocommit TRUNCATE's clear of the table's ART trees, which used to run at
     /// the statement, before the deletes were durable (a failed commit left a table
     /// with its rows and empty trees, and a reader of the index saw none of them).
-    after_commit: parking_lot::Mutex<Vec<Box<dyn FnOnce() + Send>>>,
+    after_commit: parking_lot::Mutex<Vec<AfterWriteHook>>,
+    vector_rows: OnceLock<Arc<super::vector_row::VectorRowContext>>,
+    /// Derived-state reconciliation for aborted direct executor operations. The
+    /// callback sees the restored write set at a savepoint, or an empty write
+    /// set at full abort/Drop, and must rebuild from actual stored rows rather
+    /// than blindly undoing a possibly-applied failed RocksDB write.
+    rollback_actions: parking_lot::Mutex<Vec<Box<dyn FnOnce(&Transaction) + Send>>>,
+    /// Ownership cleanup (index key holds) survives savepoint rollback and
+    /// runs at every transaction end, after abort reconciliation, before locks.
+    end_actions: parking_lot::Mutex<Vec<Box<dyn FnOnce() + Send>>>,
+    /// Parent-key NO ACTION checks belong to this transaction, including its
+    /// savepoints. Captures storage components, never an EmbeddedDatabase clone.
+    deferred_parent_fk_checks: parking_lot::Mutex<
+        Vec<(
+            Vec<u8>,
+            crate::fk_update::FkTimingKey,
+            Box<dyn Fn(&Transaction, &mut crate::fk_update::FkValidationRun) -> Result<()> + Send + Sync>,
+        )>,
+    >,
+    /// SET CONSTRAINTS override: 0 = declaration, 1 = DEFERRED, 2 = IMMEDIATE.
+    fk_check_timing: AtomicU8,
+    /// Per-name overrides take precedence over the last ALL timing.
+    named_fk_check_timing: parking_lot::Mutex<std::collections::HashMap<crate::fk_update::FkTimingKey, bool>>,
     /// R1.3: fsync the commit WriteBatch (power-loss durable commits).
     sync_commit: bool,
     /// R1.3 phase 2: engine-wide leader/follower group committer. When set
@@ -225,6 +280,10 @@ pub struct Transaction {
     /// this transaction's snapshot (first-committer-wins).
     conflict_registry: Option<Arc<WriteConflictRegistry>>,
     conflict_validation: bool,
+    /// Spec R5.5: tables whose history this transaction cut itself (its own `ALTER
+    /// TABLE … RENAME TO` gave them their name): its reads of them at its older
+    /// snapshot are not refused ([`Self::note_own_history_cut`]).
+    own_history_cuts: parking_lot::Mutex<Vec<String>>,
     /// R4.3: id of this transaction's version-GC snapshot pin in the
     /// conflict registry. EVERY transaction with a registry pins its
     /// snapshot (ReadCommitted session transactions also scan at their
@@ -278,6 +337,10 @@ pub struct Transaction {
     /// statement on a table to its end. `None` for an autocommit transaction, which
     /// ends inside its statement: the statement's scope holds them.
     table_locks: Option<super::table_locks::TransactionLocks>,
+    /// A raw autocommit writer with no ambient statement must keep its own
+    /// table locks from its first staged row or metadata through publication. SQL autocommit
+    /// continues to use its statement owner and never creates this holder.
+    raw_table_locks: OnceLock<super::table_locks::TransactionLocks>,
     /// sprinter 37a5968e7698: THIS transaction's savepoint stack — innermost
     /// last. Read [`SavepointEntry`] for why it is here and not on the engine
     /// handle or the session.
@@ -325,6 +388,16 @@ pub struct Transaction {
     /// One autocommit statement's own transaction
     /// (`StorageEngine::begin_autocommit_transaction`), ended by that statement.
     statement_scoped: bool,
+    /// Spec R5.4 (review F13): the bytes of the keys and values this transaction has
+    /// staged so far (an overwritten write-set key counted once), so that a group
+    /// past the write-group ceiling is refused while it is being staged
+    /// ([`Self::note_staged_bytes`]), not after the whole group was built. May
+    /// overstate (a row inserted and then updated in one transaction counts twice;
+    /// a ROLLBACK TO SAVEPOINT does not take its rows back off); never understates.
+    staged_bytes: AtomicUsize,
+    /// Spec R5.4 (review F3): this transaction holds index keys it took out
+    /// ([`Self::first_index_key_hold`]).
+    holds_index_keys: AtomicBool,
 }
 
 /// Spec R5.4: what a transaction needs to lock rows and to commit after the rows'
@@ -371,6 +444,16 @@ impl Drop for Transaction {
             if let Some(registry) = &self.conflict_registry {
                 registry.unpin_snapshot(pin_id);
             }
+        }
+        // A dropped/aborted direct executor statement has no surviving write
+        // set. Rebuild its derived state from what is ACTUALLY stored (which
+        // also handles an uncertain failed write) before its census/locks go.
+        self.write_set.clear();
+        self.insert_log.write().clear();
+        self.row_counter_stages.write().clear();
+        self.reconcile_rollback_actions_from(0);
+        for action in std::mem::take(&mut *self.end_actions.lock()) {
+            action();
         }
         // Leave the uncommitted-write census however this transaction ended.
         // `Drop` is the ONLY release point precisely because it is the one
@@ -840,6 +923,15 @@ pub struct TransactionSavepointSnapshot {
     branch_claims_len: usize,
     /// How many [`Transaction::log_on_commit`] operations preceded it.
     commit_wal_ops_len: usize,
+    after_commit_len: usize,
+    rollback_actions_len: usize,
+    holds_index_keys: bool,
+    deferred_parent_fk_checks_len: usize,
+    fk_check_timing: u8,
+    named_fk_check_timing: std::collections::HashMap<crate::fk_update::FkTimingKey, bool>,
+    /// Spec R5.4 (review F9): how many rows the transaction held locked
+    /// ([`Transaction::release_row_locks_after_savepoint`]).
+    row_locks_len: usize,
 }
 
 /// One entry of a transaction's savepoint stack.
@@ -918,18 +1010,26 @@ impl Transaction {
             statement_wal: None,
             commit_wal_ops: RwLock::new(Vec::new()),
             after_commit: parking_lot::Mutex::new(Vec::new()),
+            vector_rows: OnceLock::new(),
+            rollback_actions: parking_lot::Mutex::new(Vec::new()),
+            end_actions: parking_lot::Mutex::new(Vec::new()),
+            deferred_parent_fk_checks: parking_lot::Mutex::new(Vec::new()),
+            fk_check_timing: AtomicU8::new(0),
+            named_fk_check_timing: parking_lot::Mutex::new(std::collections::HashMap::new()),
             sync_commit: false,
             group_committer: None,
             row_cache: None,
             write_watermarks: None,
             conflict_registry: None,
             conflict_validation: false,
+            own_history_cuts: parking_lot::Mutex::new(Vec::new()),
             gc_pin_id: None,
             key_manager: None,
             sql_aborted: AtomicBool::new(false),
             branch_binding: parking_lot::Mutex::new(None),
             write_census: None,
             table_locks: None,
+            raw_table_locks: OnceLock::new(),
             savepoints: RwLock::new(Vec::new()),
             branch_staged: parking_lot::Mutex::new(super::BranchStagedWrites::default()),
             branch_claims: parking_lot::Mutex::new(Vec::new()),
@@ -939,6 +1039,8 @@ impl Transaction {
             derive_wal_sync: AtomicBool::new(false),
             bound_to_thread: AtomicBool::new(false),
             statement_scoped: false,
+            staged_bytes: AtomicUsize::new(0),
+            holds_index_keys: AtomicBool::new(false),
         })
     }
 
@@ -1113,7 +1215,7 @@ impl Transaction {
     /// binding drops, so what it locks stays locked until the transaction ends. An
     /// autocommit transaction binds nothing: its statement's own scope is the owner.
     pub(crate) fn bind_table_locks(&self) -> super::table_locks::BoundLockOwner {
-        match &self.table_locks {
+        match self.table_locks.as_ref().or_else(|| self.raw_table_locks.get()) {
             Some(locks) => locks.bind(),
             None => super::table_locks::BoundLockOwner::inert(),
         }
@@ -1124,7 +1226,7 @@ impl Transaction {
     /// creates none. What the statement runs on this thread, a function body that
     /// writes included, then finds the transaction's locks as its own.
     pub(crate) fn bind_existing_table_locks(&self) -> super::table_locks::BoundLockOwner {
-        match &self.table_locks {
+        match self.table_locks.as_ref().or_else(|| self.raw_table_locks.get()) {
             Some(locks) => locks.bind_existing(),
             None => super::table_locks::BoundLockOwner::inert(),
         }
@@ -1137,7 +1239,86 @@ impl Transaction {
     pub(crate) fn table_locks_hold(&self) -> Option<Arc<super::table_locks::TransactionLockHold>> {
         self.table_locks
             .as_ref()
+            .or_else(|| self.raw_table_locks.get())
             .and_then(super::table_locks::TransactionLocks::hold_copy)
+    }
+
+    /// Lock before changing the write set, dirty tracker, or census. Explicit
+    /// transactions retain their normal owner; an autocommit statement borrows
+    /// its ambient Statement owner, or lazily retains an owner until commit.
+    fn ensure_staged_table_shared(&self, table: &str) -> Result<()> {
+        let level = super::table_locks::MAIN_LEVEL;
+        if let Some(locks) = self.table_locks.as_ref().or_else(|| self.raw_table_locks.get()) {
+            return locks.ensure_raw_write_shared(level, table);
+        }
+        let Some(set) = &self.row_locks else {
+            return Ok(());
+        };
+        if set.table_locks.lock_raw_write_shared_in_statement(level, table)? {
+            return Ok(());
+        }
+        self.raw_table_locks
+            .get_or_init(|| super::table_locks::TransactionLocks::new(Arc::clone(&set.table_locks)))
+            .ensure_raw_write_shared(level, table)
+    }
+
+    /// Every nonempty table/column split is a possible owner, including a
+    /// name a concurrent CREATE could introduce. Nested prefixes are already
+    /// unique and sorted; borrow them so many colons cannot copy O(keylen²)
+    /// bytes. Bound aggregate key-processing work before allocating the list
+    /// or taking any lock, using the write group's existing resource ceiling.
+    fn dictionary_owner_tables<'a>(&self, key: &'a [u8]) -> Result<Vec<&'a str>> {
+        let suffix = key.strip_prefix(b"dict:").unwrap_or_default();
+        let suffix = std::str::from_utf8(suffix).map_err(|_| Error::storage("invalid dictionary metadata name"))?;
+        let limit = self.gate.write_group_ceiling();
+        let mut work = key.len();
+        let mut count = 0_usize;
+        for (position, _) in suffix.match_indices(':') {
+            if position != 0 && position + 1 < suffix.len() {
+                work = work
+                    .saturating_add(position)
+                    .saturating_add(std::mem::size_of::<&str>());
+                count = count.saturating_add(1);
+                if work > limit {
+                    return Err(Error::QueryExecution(format!(
+                        "dictionary owner lock processing needs {work} bytes, {} (the limit is {limit}): nothing was staged",
+                        crate::error::BRANCH_MATERIALIZE_TOO_LARGE_MARKER
+                    )));
+                }
+            }
+        }
+        let mut owners = Vec::with_capacity(count);
+        for (position, _) in suffix.match_indices(':') {
+            if position != 0 && position + 1 < suffix.len() {
+                owners.push(&suffix[..position]);
+            }
+        }
+        Ok(owners)
+    }
+
+    fn enroll_staged_key(&self, key: &[u8]) -> Result<()> {
+        if let Some(rest) = key.strip_prefix(b"data:") {
+            if let Ok(text) = std::str::from_utf8(rest) {
+                if let Some((table, _)) = text.rsplit_once(':') {
+                    return self.ensure_staged_table_shared(table);
+                }
+            }
+        }
+        if let Some(table) = key.strip_prefix(b"counter:") {
+            let table = std::str::from_utf8(table).map_err(|_| Error::storage("invalid row counter table name"))?;
+            return self.ensure_staged_table_shared(table);
+        }
+        if !key.starts_with(b"dict:") {
+            return Ok(());
+        }
+        let owners = self.dictionary_owner_tables(key)?;
+        if owners.is_empty() {
+            return Err(Error::storage("dictionary metadata must name a table and column"));
+        }
+        for table in &owners {
+            self.ensure_staged_table_shared(table)?;
+        }
+        Ok(())
     }
 
     /// Spec R5.4 (P12): this transaction locks the rows it changes, on `locks`, and a
@@ -1168,6 +1349,51 @@ impl Transaction {
             .lock(self.transaction_id, table, row_id, set.table_locks.row_lock_bounds())?
         {
             self.held_rows.lock().push(super::row_locks::RowKey::new(table, row_id));
+        }
+        Ok(())
+    }
+
+    /// Spec R5.4 (review F3): `true` the first time this transaction takes an index key
+    /// out and holds it (`ArtIndexManager::on_delete_holding`): its caller then has
+    /// the commit release them all, once (`after_commit`).
+    pub fn first_index_key_hold(&self) -> bool {
+        !self.holds_index_keys.swap(true, Ordering::AcqRel)
+    }
+
+    /// Spec R5.4 (review F5): [`Self::lock_row`] for row `row_id` of `table` on branch
+    /// level `level`: a branch's rows are written by its own sessions, and two of them
+    /// changing one row lost one change exactly as main's writers did.
+    pub fn lock_branch_row(&self, level: u64, table: &str, row_id: u64) -> Result<()> {
+        let Some(set) = &self.row_locks else {
+            return Ok(());
+        };
+        let key = super::row_locks::RowKey::on_level(level, table, row_id);
+        if set.locks.lock_key(
+            self.transaction_id,
+            key,
+            table,
+            row_id,
+            set.table_locks.row_lock_bounds(),
+        )? {
+            self.held_rows.lock().push(key);
+        }
+        Ok(())
+    }
+
+    /// Spec R5.4 (review F6): hold the unique value `encoded` of `table` (an upsert's
+    /// arbiter key, [`super::row_locks::RowKey::unique_value`]) for this transaction
+    /// until it ends, waiting for another transaction's hold, bounded as a row lock.
+    /// A no-op on a bare store.
+    pub fn lock_unique_value(&self, table: &str, encoded: &[u8]) -> Result<()> {
+        let Some(set) = &self.row_locks else {
+            return Ok(());
+        };
+        let key = super::row_locks::RowKey::unique_value(table, encoded);
+        if set
+            .locks
+            .lock_key(self.transaction_id, key, table, 0, set.table_locks.row_lock_bounds())?
+        {
+            self.held_rows.lock().push(key);
         }
         Ok(())
     }
@@ -1394,8 +1620,118 @@ impl Transaction {
     /// Spec R5.3: run `hook` once this transaction's commit has written its batch,
     /// never if it fails or rolls back. For an in-memory change that must not be
     /// visible before the change it describes is durable.
+    pub(crate) fn set_vector_row_context(&self, context: Option<Arc<super::vector_row::VectorRowContext>>) {
+        if let Some(context) = context {
+            let _ = self.vector_rows.set(context);
+        }
+    }
+
+    pub(crate) fn has_vector_row_context(&self) -> bool {
+        self.vector_rows.get().is_some()
+    }
+
     pub(crate) fn after_commit(&self, hook: impl FnOnce() + Send + 'static) {
-        self.after_commit.lock().push(Box::new(hook));
+        self.after_commit.lock().push(AfterWriteHook::Committed(Box::new(hook)));
+    }
+
+    pub(crate) fn after_write_attempt(&self, hook: impl FnOnce() + Send + 'static) {
+        self.after_commit.lock().push(AfterWriteHook::Attempted(Box::new(hook)));
+    }
+
+    /// Reconcile derived state if this operation is rolled back. At full abort
+    /// the callback must use committed storage as its source of truth, including
+    /// after a RocksDB write error whose application is uncertain. Successful
+    /// writes discard these actions BEFORE any fsync/replication wait can fail.
+    pub(crate) fn on_rollback(&self, action: impl FnOnce(&Transaction) + Send + 'static) {
+        self.rollback_actions.lock().push(Box::new(action));
+    }
+
+    pub(crate) fn on_end(&self, action: impl FnOnce() + Send + 'static) {
+        self.end_actions.lock().push(Box::new(action));
+    }
+
+    fn reconcile_rollback_actions_from(&self, first: usize) {
+        let actions = {
+            let mut actions = self.rollback_actions.lock();
+            if first >= actions.len() {
+                return;
+            }
+            actions.split_off(first)
+        };
+        for action in actions.into_iter().rev() {
+            action(self);
+        }
+    }
+
+    /// Each immutable obligation has a separate identity. Appending a new row
+    /// or old-key check after a savepoint never mutates a pre-savepoint capture.
+    pub(crate) fn defer_parent_fk_check(
+        &self,
+        identity: Vec<u8>,
+        constraint_name: crate::fk_update::FkTimingKey,
+        check: impl Fn(&Transaction, &mut crate::fk_update::FkValidationRun) -> Result<()> + Send + Sync + 'static,
+    ) {
+        let mut checks = self.deferred_parent_fk_checks.lock();
+        if checks.iter().any(|(key, _, _)| key == &identity) {
+            return;
+        }
+        checks.push((identity, constraint_name, Box::new(check)));
+    }
+
+    pub(crate) fn validate_parent_fk_checks(&self) -> Result<()> {
+        self.validate_parent_fk_checks_named(&[])
+    }
+
+    pub(crate) fn preflight_parent_fk_checks(&self) -> Result<()> {
+        self.run_parent_fk_checks(&[], crate::fk_update::FkValidationRun::preflight())
+    }
+
+    pub(crate) fn validate_parent_fk_checks_named(&self, names: &[crate::fk_update::FkTimingKey]) -> Result<()> {
+        self.run_parent_fk_checks(names, crate::fk_update::FkValidationRun::default())
+    }
+
+    fn run_parent_fk_checks(
+        &self,
+        names: &[crate::fk_update::FkTimingKey],
+        mut run: crate::fk_update::FkValidationRun,
+    ) -> Result<()> {
+        for (_, name, check) in self.deferred_parent_fk_checks.lock().iter() {
+            if names.is_empty() || names.contains(name) {
+                check(self, &mut run)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn set_fk_check_timing(&self, names: &[crate::fk_update::FkTimingKey], deferred: bool) {
+        let mut named = self.named_fk_check_timing.lock();
+        if names.is_empty() {
+            named.clear();
+            self.fk_check_timing
+                .store(if deferred { 1 } else { 2 }, Ordering::Release);
+        } else {
+            for name in names {
+                named.insert(name.clone(), deferred);
+            }
+        }
+    }
+
+    pub(crate) fn defers_fk_check(&self, fk: &crate::sql::ForeignKeyConstraint) -> bool {
+        fk.deferrable
+            && self
+                .named_fk_check_timing
+                .lock()
+                .get(&crate::fk_update::fk_timing_key(fk))
+                .copied()
+                .unwrap_or_else(|| match self.fk_check_timing.load(Ordering::Acquire) {
+                    1 => true,
+                    2 => false,
+                    _ => fk.initially_deferred,
+                })
+    }
+
+    pub(crate) fn derives_row_wal_at_commit(&self) -> bool {
+        self.wal.is_some() || self.derive_wal_at_commit.load(Ordering::Acquire)
     }
 
     /// Spec R5.4: this autocommit statement staged rows it logged nothing for (the
@@ -1472,18 +1808,26 @@ impl Transaction {
             statement_wal: None,
             commit_wal_ops: RwLock::new(Vec::new()),
             after_commit: parking_lot::Mutex::new(Vec::new()),
+            vector_rows: OnceLock::new(),
+            rollback_actions: parking_lot::Mutex::new(Vec::new()),
+            end_actions: parking_lot::Mutex::new(Vec::new()),
+            deferred_parent_fk_checks: parking_lot::Mutex::new(Vec::new()),
+            fk_check_timing: AtomicU8::new(0),
+            named_fk_check_timing: parking_lot::Mutex::new(std::collections::HashMap::new()),
             sync_commit: false,
             group_committer: None,
             row_cache: None,
             write_watermarks: None,
             conflict_registry: None,
             conflict_validation: false,
+            own_history_cuts: parking_lot::Mutex::new(Vec::new()),
             gc_pin_id: None,
             key_manager: None,
             sql_aborted: AtomicBool::new(false),
             branch_binding: parking_lot::Mutex::new(None),
             write_census: None,
             table_locks: None,
+            raw_table_locks: OnceLock::new(),
             savepoints: RwLock::new(Vec::new()),
             branch_staged: parking_lot::Mutex::new(super::BranchStagedWrites::default()),
             branch_claims: parking_lot::Mutex::new(Vec::new()),
@@ -1493,6 +1837,8 @@ impl Transaction {
             derive_wal_sync: AtomicBool::new(false),
             bound_to_thread: AtomicBool::new(false),
             statement_scoped: false,
+            staged_bytes: AtomicUsize::new(0),
+            holds_index_keys: AtomicBool::new(false),
         })
     }
 
@@ -1640,7 +1986,36 @@ impl Transaction {
         // This implements the core MVCC logic: find the latest version <= snapshot_ts.
         // `read_at_snapshot` decodes with the same rule before returning, so
         // this arm needs no decode of its own.
-        self.snapshot_manager.read_at_snapshot(table_name, row_id, snapshot_ts)
+        //
+        // Spec R5.5: in today's layout, as the caller decodes it under today's
+        // schema: a version older than a DROP COLUMN is read across it, and a read
+        // from before a cut of the table's history is refused (one map lookup when
+        // the table's layout never moved).
+        let layout = self.snapshot_manager.table_layout(table_name)?;
+        if let Some(layout) = layout.as_deref() {
+            if !self.made_history_cut(table_name) {
+                layout.refuse_reads_before(table_name, snapshot_ts)?;
+            }
+        }
+        self.snapshot_manager
+            .read_at_snapshot_in_layout(table_name, row_id, snapshot_ts, layout.as_deref())
+    }
+
+    /// Spec R5.5: this transaction's own `RENAME TO` gave `table` its name. Its reads
+    /// of the table at its snapshot, which is older, see the rows as the rename moved
+    /// them (nothing else writes them after it: the rename holds the table until the
+    /// transaction ends), not a refusal for a history the rename itself cut. DDL is not
+    /// transactional here: the rename is durable, and this is what follows it.
+    pub(crate) fn note_own_history_cut(&self, table: &str) {
+        let mut cuts = self.own_history_cuts.lock();
+        if !cuts.iter().any(|cut| cut.as_str() == table) {
+            cuts.push(table.to_string());
+        }
+    }
+
+    /// Spec R5.5: see [`Self::note_own_history_cut`].
+    pub(crate) fn made_history_cut(&self, table: &str) -> bool {
+        self.own_history_cuts.lock().iter().any(|cut| cut.as_str() == table)
     }
 
     /// Read a key straight from RocksDB and decode it through the shared
@@ -1668,6 +2043,15 @@ impl Transaction {
         let state = TransactionState::from_u8(state_value);
         if state != TransactionState::Active {
             return Err(Error::transaction("Transaction is not active"));
+        }
+
+        self.enroll_staged_key(&key)?;
+
+        if let Some(table) = key.strip_prefix(b"counter:") {
+            let table = std::str::from_utf8(table).map_err(|_| Error::storage("invalid row counter table name"))?;
+            let high_water: u64 =
+                bincode::deserialize(&value).map_err(|e| Error::storage(format!("invalid staged row counter: {e}")))?;
+            self.stage_row_counter(table, high_water)?;
         }
 
         // Acquire write lock (all isolation levels require write locks)
@@ -1701,8 +2085,15 @@ impl Transaction {
         self.note_written_key(&key, StagedKey::Value)?;
 
         // Lock-free write_set insert using DashMap
-        self.write_set.insert(key, Some(value));
-        Ok(())
+        let key_len = key.len();
+        let added = key_len + value.len();
+        let replaced = self
+            .write_set
+            .insert(key, Some(value))
+            .map_or(0, |old| key_len + old.map_or(0, |old| old.len()));
+        // Spec R5.4 (review F13): after the insert, so the hot path pays no second
+        // probe; a refusal fails the statement, whose rollback takes the row back off.
+        self.note_staged_bytes(added, replaced)
     }
 
     /// Stage a fast INSERT data row without the per-row DashMap overhead.
@@ -1721,10 +2112,17 @@ impl Transaction {
             return self.put(key, value);
         }
 
+        if key.starts_with(b"counter:") || key.starts_with(b"dict:") {
+            return self.put(key, value);
+        }
+
+        self.enroll_staged_key(&key)?;
         // R2.3: attribute the staged insert to its table (see `written_tables`).
         self.note_written_key(&key, StagedKey::Value)?;
+        let added = key.len() + value.len();
         self.insert_log.write().push((key, value));
-        Ok(())
+        // Spec R5.4 (review F13).
+        self.note_staged_bytes(added, 0)
     }
 
     /// Stage a table row-counter update to be written once at commit.
@@ -1740,6 +2138,8 @@ impl Transaction {
         if state != TransactionState::Active {
             return Err(Error::transaction("Transaction is not active"));
         }
+
+        self.ensure_staged_table_shared(table_name)?;
 
         // A staged row counter implies staged rows (see `note_written_key`).
         if let Some(gate) = &self.write_census {
@@ -1777,12 +2177,113 @@ impl Transaction {
             return Err(Error::transaction("Transaction is not active"));
         }
 
+        self.enroll_staged_key(&key)?;
+
         // R2.3: attribute the staged tombstone to its table (see `written_tables`).
         self.note_written_key(&key, StagedKey::Tombstone)?;
 
         // Lock-free write_set insert (tombstone) using DashMap
-        self.write_set.insert(key, None);
+        let key_len = key.len();
+        let replaced = self
+            .write_set
+            .insert(key, None)
+            .map_or(0, |old| key_len + old.map_or(0, |old| old.len()));
+        // Spec R5.4 (review F13).
+        self.note_staged_bytes(key_len, replaced)
+    }
+
+    /// Spec R5.4 (review F13): count `added` staged bytes (less `replaced`, what the
+    /// staging overwrote) and refuse the statement, 54000, as soon as what is staged
+    /// can no longer fit one write group. The group is refused at its commit anyway
+    /// (`WriteGate::apply`), but only after the whole statement ran and the batch was
+    /// built from it: an `INSERT … SELECT` of 2.8 GB of rows built an 8.6 GB group,
+    /// at 25 GB of RSS, before the refusal came. Here it comes once the rows staged
+    /// reach the ceiling divided by the copies the group holds of each
+    /// ([`Self::write_group_copies`]), and the statement's rollback frees them.
+    ///
+    /// One multiplication and one comparison per staged write while the total is
+    /// below a third of the ceiling (a group holds at most three copies of a row);
+    /// past it, [`Self::check_staged_group_size`].
+    #[inline]
+    fn note_staged_bytes(&self, added: usize, replaced: usize) -> Result<()> {
+        let total = if added >= replaced {
+            let grown = added - replaced;
+            self.staged_bytes
+                .fetch_add(grown, Ordering::Relaxed)
+                .saturating_add(grown)
+        } else {
+            let shrunk = replaced - added;
+            let previous = self
+                .staged_bytes
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v.saturating_sub(shrunk)))
+                .unwrap_or(0);
+            previous.saturating_sub(shrunk)
+        };
+        if total.saturating_mul(MAX_GROUP_COPIES) <= self.gate.write_group_ceiling() {
+            return Ok(());
+        }
+        self.check_staged_group_size(total)
+    }
+
+    /// How many copies of each staged `data:` row this transaction's commit writes in
+    /// its group: the row; its version, with time travel on (unless the latest
+    /// version is elided, W3.2); its logical-WAL operation, when the commit derives
+    /// them (`set_wal`, [`Self::log_staged_writes_at_commit`]).
+    fn write_group_copies(&self) -> usize {
+        let version = self.versioning_enabled && !self.snapshot_manager.elide_latest_version();
+        let log =
+            self.wal.is_some() || (self.statement_wal.is_some() && self.derive_wal_at_commit.load(Ordering::Acquire));
+        1 + usize::from(version) + usize::from(log)
+    }
+
+    /// Spec R5.4 (review F13): the cold half of [`Self::note_staged_bytes`]. The
+    /// running total may overstate, so before refusing, what is staged is measured:
+    /// every `data:` row times [`Self::write_group_copies`], everything else once,
+    /// a lower bound of the group the commit would build (sealing, record headers
+    /// and the snapshot record only add to it). Refused when that passes the
+    /// ceiling; otherwise the total is corrected to the measure, so a walk is paid
+    /// again only once as much more is staged as the overstatement was.
+    #[cold]
+    fn check_staged_group_size(&self, total: usize) -> Result<()> {
+        let limit = self.gate.write_group_ceiling();
+        let copies = self.write_group_copies();
+        if total.saturating_mul(copies) <= limit {
+            return Ok(());
+        }
+        let (data, other) = self.measure_staged_bytes();
+        let estimate = data.saturating_mul(copies).saturating_add(other);
+        if estimate > limit {
+            return Err(Error::write_group_too_large(estimate, limit));
+        }
+        self.staged_bytes.store(data.saturating_add(other), Ordering::Relaxed);
         Ok(())
+    }
+
+    /// The bytes staged right now, as (`data:` rows, everything else): the write set,
+    /// and every `insert_log` row the write set does not override (the commit skips
+    /// those, as it does here).
+    fn measure_staged_bytes(&self) -> (usize, usize) {
+        let mut data = 0usize;
+        let mut other = 0usize;
+        let mut count = |key: &[u8], value_len: usize| {
+            let bytes = key.len().saturating_add(value_len);
+            if key.starts_with(b"data:") {
+                data = data.saturating_add(bytes);
+            } else {
+                other = other.saturating_add(bytes);
+            }
+        };
+        for entry in self.write_set.iter() {
+            count(entry.key(), entry.value().as_ref().map_or(0, Vec::len));
+        }
+        let overridden = !self.write_set.is_empty();
+        for (key, value) in self.insert_log.read().iter() {
+            if overridden && self.write_set.contains_key(key) {
+                continue;
+            }
+            count(key, value.len());
+        }
+        (data, other)
     }
 
     /// Update tuples within transaction
@@ -1853,13 +2354,70 @@ impl Transaction {
     /// writer-lock detector names whoever committed, not the write in here.
     #[track_caller]
     pub fn commit_with_timestamp(self, commit_ts: u64) -> Result<()> {
+        self.commit_with_timestamp_inner(commit_ts, None, &mut |_, _, _| {})
+    }
+
+    #[track_caller]
+    pub(crate) fn commit_with_timestamp_observed(
+        self,
+        commit_ts: u64,
+        attempt: &super::write_outcome::WriteAttempt,
+    ) -> Result<()> {
+        self.commit_with_timestamp_inner(commit_ts, Some(attempt), &mut |_, _, _| {})
+    }
+
+    /// Settle eager indexes before this transaction's end-actions, key claims,
+    /// write census and row locks can be released. Native errors settle before
+    /// the commit barrier is lifted; early refusals and late durability errors
+    /// settle on return while the transaction is still alive.
+    #[track_caller]
+    pub(crate) fn commit_with_timestamp_settled(
+        self,
+        commit_ts: u64,
+        attempt: &super::write_outcome::WriteAttempt,
+        settle: impl FnOnce(&Transaction, super::write_outcome::WriteOutcome, bool),
+    ) -> Result<()> {
+        let mut settle = Some(settle);
+        let result = self.commit_with_timestamp_inner(commit_ts, Some(attempt), &mut |txn, outcome, succeeded| {
+            if let Some(settle) = settle.take() {
+                settle(txn, outcome, succeeded);
+            }
+        });
+        if let Some(settle) = settle.take() {
+            settle(&self, attempt.outcome(), result.is_ok());
+        }
+        result
+    }
+
+    #[track_caller]
+    fn commit_with_timestamp_inner(
+        &self,
+        commit_ts: u64,
+        attempt: Option<&super::write_outcome::WriteAttempt>,
+        settle: &mut dyn FnMut(&Transaction, super::write_outcome::WriteOutcome, bool),
+    ) -> Result<()> {
+        // A raw/public commit has no outer observer. Vector publication still
+        // needs a stack proof to preserve handles after a known cap refusal.
+        let vector_attempt = self
+            .vector_rows
+            .get()
+            .map(|_| super::write_outcome::WriteAttempt::default());
+        let attempt = attempt.or(vector_attempt.as_ref());
         // Spec R5.1: this commit's write is made on behalf of the owner holding the
         // table locks, whichever thread runs it. They are released when the
         // transaction drops, after the write.
         let _bound_locks = self
             .table_locks
             .as_ref()
+            .or_else(|| self.raw_table_locks.get())
             .map(super::table_locks::TransactionLocks::bind_existing);
+        // Before any durable effect or the committed-state transition. A
+        // failed deferred parent check aborts the same whole transaction.
+        if let Err(error) = self.validate_parent_fk_checks() {
+            // Low-level callers may already have announced this timestamp. The
+            // refusal precedes every write, but must retire that announcement.
+            return Err(self.abort_partial_commit(self.has_tracked_writes(), commit_ts, error));
+        }
         let commit_start = std::time::Instant::now();
         let insert_count = self.insert_log.read().len();
         let row_counter_count = self.row_counter_stages.read().len();
@@ -1947,19 +2505,41 @@ impl Transaction {
         // Apply write set atomically using RocksDB batch
         let mut batch = rocksdb::WriteBatch::default();
         let write_set_has_entries = !self.write_set.is_empty();
-        // Item #2: hoist the "any COPY markers live?" check out of the per-entry
-        // loop so a no-COPY commit pays one atomic load, not a `data:`-key parse
-        // per write. Only when markers exist do we parse keys + materialize.
-        let check_copy_markers = self.versioning_enabled && self.snapshot_manager.has_any_copy_markers();
-        // W3.2: `elide` decides whether NEW versions written this commit skip the
-        // `v:` copy (flagged `v_idx:` event). `check_elided` decides whether an
-        // OVERWRITE must first materialize a prior flagged event — armed whenever
-        // any flagged row might exist, including ones a prior session left when
-        // this session has elision off (`maybe_elided_rows` ⊇ `elide_latest_version`).
+        // New versions may elide their image, but every overwrite/delete must
+        // preserve an unversioned row's pre-image as well as COPY/elided history.
         let elide = self.versioning_enabled && self.snapshot_manager.elide_latest_version();
-        let check_elided = self.versioning_enabled && self.snapshot_manager.maybe_elided_rows();
         let mut version_key_buf = Vec::with_capacity(128);
         let mut version_index_key_buf = Vec::with_capacity(128);
+
+        // Only sidecars are copied, for versioned commits or authoritative
+        // vector row images (which also work with time travel disabled). A decoder
+        // invoked while iterating a DashMap data entry must not re-enter that
+        // map's shard to find a pending column batch. Plain SQL rows remain
+        // borrowed; the overlay is consulted only for actual physical refs.
+        let mut history_sidecars = std::collections::HashMap::new();
+        {
+            let is_sidecar = |key: &[u8]| {
+                key.starts_with(b"dict:")
+                    || ((self.versioning_enabled || self.vector_rows.get().is_some())
+                        && (key.starts_with(b"col:")
+                            || key.starts_with(b"cas:")
+                            || key.starts_with(b"meta:table:")
+                            || key.starts_with(b"meta:attmissing:")))
+            };
+            for (key, value) in self.insert_log.read().iter().filter(|(key, _)| is_sidecar(key)) {
+                history_sidecars.insert(key.clone(), Some(value.clone()));
+            }
+            for entry in self.write_set.iter().filter(|entry| is_sidecar(entry.key())) {
+                history_sidecars.insert(entry.key().clone(), entry.value().clone());
+            }
+        }
+        let mut vector_plan = self.vector_rows.get().map(|context| context.plan());
+        let pending_history = |key: &[u8]| history_sidecars.get(key).cloned();
+        let pending_history: Option<&super::time_travel::PendingHistoryRead<'_>> =
+            (!history_sidecars.is_empty()).then_some(&pending_history);
+        // Match direct writers' order: dictionary serialization BEFORE columnar
+        // stats. Decode remains unlocked for the gate's old-row freeze hook.
+        let writes_dictionaries = history_sidecars.keys().any(|key| key.starts_with(b"dict:"));
 
         {
             let insert_log = self.insert_log.read();
@@ -1967,9 +2547,16 @@ impl Transaction {
                 if write_set_has_entries && self.write_set.contains_key(key) {
                     continue;
                 }
+                if let Some(plan) = &mut vector_plan {
+                    if let Err(error) = plan.stage(key, Some(val.as_slice()), pending_history, &mut batch) {
+                        return Err(self.abort_partial_commit(inflight, commit_ts, error));
+                    }
+                }
                 if let Err(e) = Self::put_versioned_batch(
                     &mut batch,
                     self.key_manager.as_deref(),
+                    &self.snapshot_manager,
+                    pending_history,
                     key,
                     val,
                     self.versioning_enabled,
@@ -2000,42 +2587,38 @@ impl Transaction {
             // live-row presence (`colp:`) sidecars alongside the batch.
             // Applying them under the zone-stats write lock (below) keeps
             // lazy stats/presence backfill from racing this commit.
-            if !touches_columnar && (key.starts_with(b"col:") || key.starts_with(b"colz:") || key.starts_with(b"colp:"))
+            if !touches_columnar
+                && (key.starts_with(b"col:")
+                    || key.starts_with(b"colz:")
+                    || key.starts_with(b"colp:")
+                    || key.starts_with(b"colpm:"))
             {
                 touches_columnar = true;
             }
-            // This commit is about to overwrite/delete this entry's `data:` row.
-            // BEFORE it does, stage the pre-image version(s) into the SAME batch
-            // (crash-atomic), so AS-OF reads predating this commit still resolve:
-            //   * Item #2 — a COPY marker-covered row (its per-row `v:`/`v_idx:`
-            //     were elided at COPY) gets its insert version from the pre-commit
-            //     `data:`; else [copy_ts, commit_ts) would find no version.
-            //   * W3.2 — a prior FLAGGED (elided) version of the row is
-            //     materialized to a real `v:` with the flag cleared.
-            // Both gates are hoisted above, so a plain commit parses no key.
-            if check_copy_markers || check_elided {
+            // Preserve history in the SAME batch before replacing a main row.
+            // A bulk-loaded/older row may have no version yet: without its
+            // pre-image, the first transaction update makes it disappear from
+            // every earlier snapshot. The helper also materializes COPY and
+            // elided versions. Errors must retire the in-flight commit.
+            if self.versioning_enabled {
                 if let Some(rest) = key.strip_prefix(b"data:".as_slice()) {
                     if let Ok(text) = std::str::from_utf8(rest) {
-                        if let Some(pos) = text.rfind(':') {
-                            if let Ok(row_id) = text[pos + 1..].parse::<u64>() {
-                                if check_copy_markers {
-                                    self.snapshot_manager.materialize_copy_marker_row(
-                                        &mut batch,
-                                        &text[..pos],
-                                        row_id,
-                                        commit_ts,
-                                    )?;
-                                }
-                                if check_elided {
-                                    self.snapshot_manager.materialize_elided_latest_version(
-                                        &mut batch,
-                                        &text[..pos],
-                                        row_id,
-                                    )?;
+                        if let Some((table, row)) = text.rsplit_once(':') {
+                            if let Ok(row_id) = row.parse::<u64>() {
+                                if let Err(error) = self
+                                    .snapshot_manager
+                                    .stage_row_pre_history(&mut batch, table, row_id, commit_ts)
+                                {
+                                    return Err(self.abort_partial_commit(inflight, commit_ts, error));
                                 }
                             }
                         }
                     }
+                }
+            }
+            if let Some(plan) = &mut vector_plan {
+                if let Err(error) = plan.stage(key, value.as_deref(), pending_history, &mut batch) {
+                    return Err(self.abort_partial_commit(inflight, commit_ts, error));
                 }
             }
             match value {
@@ -2043,6 +2626,8 @@ impl Transaction {
                     if let Err(e) = Self::put_versioned_batch(
                         &mut batch,
                         self.key_manager.as_deref(),
+                        &self.snapshot_manager,
+                        pending_history,
                         key,
                         val,
                         self.versioning_enabled,
@@ -2080,6 +2665,38 @@ impl Transaction {
             }
         }
 
+        // Direct, volatile and transactional writers share the gate's counter
+        // locks. Normalize at the last staging point, then keep these locks
+        // through the SAME data/WAL group. A delayed older transaction cannot
+        // overwrite a newer allocation or logical UpdateCounter value.
+        let mut counter_tables: Vec<_> = self.row_counter_stages.read().keys().cloned().collect();
+        counter_tables.sort();
+        let counter_locks: Vec<_> = counter_tables
+            .iter()
+            .map(|table| self.gate.counter_lock(table))
+            .collect();
+        let counter_guards: Vec<_> = counter_locks.iter().map(|lock| lock.lock()).collect();
+        for (table, staged) in self.row_counter_stages.write().iter_mut() {
+            let current = match self.gate.raise_counter_high_water(table, *staged) {
+                Some(current) => current,
+                None => match self.read_raw_decoded(&format!("counter:{table}").into_bytes()) {
+                    Ok(Some(bytes)) => match bincode::deserialize::<u64>(&bytes) {
+                        Ok(durable) => durable.max(*staged),
+                        Err(error) => {
+                            return Err(self.abort_partial_commit(
+                                inflight,
+                                commit_ts,
+                                Error::storage(format!("invalid durable row counter: {error}")),
+                            ))
+                        }
+                    },
+                    Ok(None) => *staged,
+                    Err(error) => return Err(self.abort_partial_commit(inflight, commit_ts, error)),
+                },
+            };
+            *staged = current;
+        }
+
         for (table_name, row_id) in self.row_counter_stages.read().iter() {
             let key = format!("counter:{}", table_name);
             // Must NOT early-return with `?` in this loop: an announced
@@ -2102,40 +2719,18 @@ impl Transaction {
             batch.put(key.as_bytes(), stored.as_ref());
         }
 
-        // P0 (ROADMAP_V5.md §1.8): explicit and session transactions appended
-        // NOTHING to the logical WAL and were never broadcast to an HA standby
-        // — `skip_fast_paths` suppresses every per-statement
-        // `log_data_insert`/`log_data_update`/`log_data_delete` call, and this
-        // function writes straight to RocksDB. Emit now, from the SAME
-        // `insert_log`/`write_set`/`row_counter_stages` the batch above was
-        // just built from; `collect_logical_wal_ops` documents why sharing
-        // that source of truth is what makes ROLLBACK, ROLLBACK TO SAVEPOINT
-        // and cascading FK actions correct with no extra code here. `wal` is
-        // `None` for autocommit transactions, which already log per statement
-        // — see `set_wal` for that double-logging hazard.
+        // Explicit/session transactions derive history from the final staged
+        // insert_log, write_set and row_counter_stages. An implicit statement
+        // can instead contribute its captured operations. In every case stage
+        // the resulting operations into THIS data batch before its one write,
+        // then publish or abandon after the write's outcome. Neither an append
+        // before data nor an append after data is an atomic substitute.
         //
-        // ORDERING IS LOAD-BEARING — DO NOT MOVE THIS BELOW THE BATCH WRITE.
-        // This is write-ahead, matching the shipped autocommit contract
-        // exactly (`txn.put()`, then `log_data_insert()`, then — later — the
-        // enclosing `execute_with_implicit_transaction`'s `txn.commit()`). If
-        // the batch write below then fails, a WAL entry (and, in sync mode, a
-        // standby ACK) exists for data that did not land locally: the SAME
-        // risk every autocommit statement has always carried, and one that
-        // `replay_wal()` at open repairs for a true crash. Emitting AFTER the
-        // write instead trades it for a strictly worse failure — a crash
-        // between a successful local commit and the append leaves the standby
-        // silently and permanently missing a transaction the client was
-        // already told succeeded, with no error and no retry signal. That is a
-        // second instance of the exact silent-divergence bug being fixed here.
-        //
-        // Placed before `_columnar_stats_guard` below on purpose too: in
-        // sync/semi-sync mode this call blocks on a standby ACK, and it must
-        // not hold the columnar zone-stats write lock while it does.
-        // Logical WAL: the operations this commit makes visible are collected here and
-        // staged into the SAME RocksDB batch as the data just before it is written
-        // (below), then published to standbys only after that write succeeded. The old
-        // order (append and broadcast first, write second) let a failed commit leave
-        // history behind for data that never landed.
+        // Current-format startup adopts durable RocksDB groups without logical
+        // redo. It cannot repair detached history or re-execute an older image
+        // over a later committed value. Explicit replay is a separate API.
+        // Build the plan before the columnar stats guard; publication and ACK
+        // occur after the data write and after inner storage guards release.
         let mut wal_plan: Option<(Arc<RwLock<WriteAheadLog>>, Vec<WalOperation>, bool)> =
             self.wal.as_ref().map(|wal| {
                 let ops = Self::collect_logical_wal_ops(
@@ -2189,7 +2784,72 @@ impl Transaction {
 
         // R3.1: exclude zone-stats backfill while columnar batches + their
         // stats sidecars are applied (no-op guard for non-columnar commits).
+        // Counter serialization (when present) is already held here. Keep the
+        // direct INSERT order counter -> dictionary writer -> columnar stats.
+        let dictionary_guard = writes_dictionaries.then(|| self.snapshot_manager.dictionary_writer_lock());
+        for (key, proposed) in history_sidecars.iter().filter(|(key, _)| key.starts_with(b"dict:")) {
+            if let Some(proposed) = proposed {
+                if let Err(error) = self.snapshot_manager.validate_staged_dictionary(key, proposed) {
+                    return Err(self.abort_partial_commit(inflight, commit_ts, error));
+                }
+            }
+        }
         let _columnar_stats_guard = touches_columnar.then(super::columnar::stats_write_lock);
+        // A staged complete marker requests a cold manifest rebuild in THIS
+        // group. Use current rows under the stats lock, plus final transaction
+        // changes, so an intervening committed insert cannot be lost.
+        if touches_columnar {
+            let mut presence_tables: Vec<String> = self
+                .write_set
+                .iter()
+                .filter_map(|entry| {
+                    (entry.value().as_deref() == Some(&[1u8][..]))
+                        .then(|| {
+                            entry
+                                .key()
+                                .strip_prefix(b"colpm:")
+                                .and_then(|name| std::str::from_utf8(name).ok())
+                                .map(str::to_owned)
+                        })
+                        .flatten()
+                })
+                .collect();
+            presence_tables.sort();
+            for table in presence_tables {
+                let data_prefix = format!("data:{table}:").into_bytes();
+                let presence_prefix = format!("colp:{table}:").into_bytes();
+                let parse_row = |key: &[u8]| {
+                    key.strip_prefix(data_prefix.as_slice())
+                        .and_then(|digits| std::str::from_utf8(digits).ok())
+                        .and_then(|digits| digits.parse::<u64>().ok())
+                };
+                // insert_log precedes write_set in the batch. Applying the latter
+                // last also handles an inserted row subsequently deleted/changed.
+                let mut changes: Vec<(u64, bool)> = self
+                    .insert_log
+                    .read()
+                    .iter()
+                    .filter_map(|(key, _)| parse_row(key).map(|id| (id, true)))
+                    .collect();
+                let mut pending_presence_keys = Vec::new();
+                for entry in self.write_set.iter() {
+                    if let Some(id) = parse_row(entry.key()) {
+                        changes.push((id, entry.value().is_some()));
+                    } else if entry.key().starts_with(&presence_prefix) {
+                        pending_presence_keys.push(entry.key().clone());
+                    }
+                }
+                if let Err(error) = super::columnar::ColumnarStore::stage_complete_presence_for_transaction(
+                    &self.db,
+                    &mut batch,
+                    &table,
+                    &changes,
+                    &pending_presence_keys,
+                ) {
+                    return Err(self.abort_partial_commit(inflight, commit_ts, error));
+                }
+            }
+        }
 
         // W2.5: raise the committed-write watermark for every table this
         // transaction wrote to `commit_ts` BEFORE the batch is applied. The
@@ -2289,6 +2949,9 @@ impl Transaction {
         // COMMIT of a read-only transaction on a read-only or physical open
         // still succeeds without attempting a write.
         let wrote = !batch.is_empty();
+        if let Some(plan) = &mut vector_plan {
+            plan.write_call_started();
+        }
         let result = if batch.is_empty() {
             if self.rocksdb_wal_enabled && ((self.sync_commit && !group_fsync) || wal_force_sync) && self.gate.is_open()
             {
@@ -2303,16 +2966,43 @@ impl Transaction {
                 // amortize it across concurrent committers.
                 let mut write_opts = WriteOptions::default();
                 write_opts.set_sync(true);
-                self.gate.write(&self.db, batch, Some(&write_opts))
+                match attempt {
+                    Some(attempt) => self.gate.write_observed(&self.db, batch, Some(&write_opts), attempt),
+                    None => self.gate.write(&self.db, batch, Some(&write_opts)),
+                }
             } else {
-                self.gate.write(&self.db, batch, None)
+                match attempt {
+                    Some(attempt) => self.gate.write_observed(&self.db, batch, None, attempt),
+                    None => self.gate.write(&self.db, batch, None),
+                }
             }
         } else {
             let mut write_opts = WriteOptions::default();
             write_opts.set_sync(false);
             write_opts.disable_wal(true);
-            self.gate.write(&self.db, batch, Some(&write_opts))
+            match attempt {
+                Some(attempt) => self.gate.write_observed(&self.db, batch, Some(&write_opts), attempt),
+                None => self.gate.write(&self.db, batch, Some(&write_opts)),
+            }
         };
+
+        if result.is_ok() && wrote {
+            #[cfg(feature = "internal-tests")]
+            if let Some(hook) = NEXT_AFTER_NATIVE_TRANSACTION_WRITE.with(|next| next.borrow_mut().take()) {
+                hook();
+            }
+            if let Some(plan) = &vector_plan {
+                plan.after_write_crash_point();
+            }
+        }
+
+        // The data reached RocksDB. Never reconcile it as an abort merely
+        // because a later group fsync/replication wait or publication fails.
+        if result.is_ok()
+            || attempt.is_some_and(|attempt| attempt.outcome() != super::write_outcome::WriteOutcome::NotWritten)
+        {
+            self.rollback_actions.lock().clear();
+        }
 
         // Spec P2.1: the physical sequence this commit's standbys must
         // acknowledge, read right after its data write (a conservative upper
@@ -2328,12 +3018,34 @@ impl Transaction {
         // has definitively succeeded or failed; the zone-stats lock is released first
         // because the sync-mode ACK wait below must not hold it.
         drop(_columnar_stats_guard);
+        // After dropping stats (the inverse order deadlocks a direct dictionary
+        // writer waiting for stats), and before end_commit/publication/ACKs.
+        // Forget after an error too, because the group may have reached RocksDB.
+        if writes_dictionaries {
+            self.snapshot_manager.forget_committed_dictionaries();
+        }
+        drop(dictionary_guard);
+        drop(counter_guards);
+        if result.is_err() {
+            if let Some(attempt) = attempt {
+                settle(self, attempt.outcome(), false);
+            }
+        }
         if let Some((wal, staged)) = staged_wal {
             let wal = wal.read();
             if result.is_ok() {
                 wal.publish_staged(staged);
             } else {
                 wal.abandon_staged(staged);
+            }
+        }
+
+        // A write may have landed even when its fsync reports an error.
+        // Invalidate historical lookup cache generations before readers pass
+        // the commit barrier, just as the current-row cache is invalidated.
+        if wrote {
+            for table in self.written_tables.iter() {
+                self.snapshot_manager.invalidate_cached_versions(table.key());
             }
         }
 
@@ -2363,12 +3075,44 @@ impl Transaction {
             }
         }
 
-        // Spec R5.3: what the transaction's statements deferred to its commit, now
-        // that the write is applied (never after a failed one).
+        // Success publication and attempted-write cache fences share one queue.
+        // A failed write may have applied; its fences still precede end_commit.
+        // Native success remains the truth for every ownership callback, even
+        // if a graph publisher fails. Collect that error, complete the native-OK
+        // queue, then settle/fence before releasing the snapshot barrier.
+        let mut publication_error = if result.is_ok() {
+            vector_plan.as_ref().and_then(|plan| plan.publish().err())
+        } else {
+            None
+        };
         let after_commit = std::mem::take(&mut *self.after_commit.lock());
-        if result.is_ok() {
-            for hook in after_commit {
-                hook();
+        for hook in after_commit {
+            match hook {
+                AfterWriteHook::Committed(hook) if result.is_ok() => hook(),
+                AfterWriteHook::Attempted(hook) => hook(),
+                AfterWriteHook::Committed(_) => {}
+            }
+        }
+
+        if let Some(plan) = &mut vector_plan {
+            plan.settle(
+                attempt.map_or(super::write_outcome::WriteOutcome::NotWritten, |attempt| {
+                    attempt.outcome()
+                }),
+                result.is_ok() && publication_error.is_none(),
+            );
+            if result.is_ok() && publication_error.is_none() {
+                publication_error = plan.check_publication_available().err();
+            }
+        }
+        // These are ONLY post-native publication failures. Native errors
+        // keep their original classification and priority above/below.
+        publication_error = publication_error.map(Error::applied_publication_failure);
+        if publication_error.is_some() {
+            if let Some(attempt) = attempt {
+                // NativeOK is Applied. The caller clears its eager journal;
+                // it must not undo rows or keys that actually committed.
+                settle(self, attempt.outcome(), false);
             }
         }
 
@@ -2382,6 +3126,13 @@ impl Transaction {
         // come after the batch was applied (a failed fsync), and a cached
         // overlay must never be trusted past a write it did not see.
         let staged = std::mem::take(&mut *self.branch_staged.lock());
+        // Spec R5.4 (review F5): the branch tables this commit wrote, whose change
+        // epochs move with main's below.
+        let branch_tables = if self.row_locks.is_some() {
+            staged.touched_tables()
+        } else {
+            Vec::new()
+        };
         if result.is_ok() {
             staged.publish();
         } else {
@@ -2400,6 +3151,9 @@ impl Transaction {
                     set.locks.note_rows_changed(table.key());
                 }
             }
+            for (level, table) in &branch_tables {
+                set.locks.note_rows_changed_on_level(*level, table);
+            }
         }
         if result.is_ok() {
             self.release_row_locks();
@@ -2414,6 +3168,13 @@ impl Transaction {
         }
 
         // Release all acquired locks
+        #[cfg(feature = "internal-tests")]
+        {
+            let hook = NEXT_AFTER_COMMIT_BARRIER.with(|next| next.borrow_mut().take());
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         self.acquired_locks.write().clear();
 
         // Register the snapshot so it's visible to future queries. Not when it wrote
@@ -2448,6 +3209,12 @@ impl Transaction {
         // power-loss durable: report the error (RocksDB records the WAL-sync
         // failure as a background error and rejects subsequent writes, so a
         // lost generation cannot be silently followed by a "durable" one).
+        #[cfg(feature = "internal-tests")]
+        if FAIL_NEXT_APPLIED_COMMIT.with(|fail| fail.replace(false)) {
+            return Err(publication_error
+                .take()
+                .unwrap_or_else(|| Error::transaction("injected durability failure after the commit applied")));
+        }
         if group_fsync {
             if let Some(committer) = &self.group_committer {
                 committer
@@ -2458,9 +3225,15 @@ impl Transaction {
                             error = %e,
                             "Group WAL fsync failed; commit applied but not durable"
                         );
-                        Error::transaction(format!("Commit failed: WAL group fsync failed: {}", e))
+                        publication_error.take().unwrap_or_else(|| {
+                            Error::transaction(format!("Commit failed: WAL group fsync failed: {}", e))
+                        })
                     })?;
             }
+        }
+
+        if let Some(error) = publication_error {
+            return Err(error);
         }
 
         // Spec P2.1: sync/semi-sync replication — the commit is durable here;
@@ -2479,8 +3252,13 @@ impl Transaction {
             if let Some(locks) = &self.table_locks {
                 locks.release_for_replication_wait();
             }
+            if let Some(locks) = self.raw_table_locks.get() {
+                locks.release_for_replication_wait();
+            }
         }
-        if !super::table_locks::defer_commit_replication_wait(replication_barrier) {
+        if !super::table_locks::defer_replication_wait(replication_barrier)
+            && !super::table_locks::defer_commit_replication_wait(replication_barrier)
+        {
             WriteAheadLog::wait_replicated_sequence(replication_barrier);
         }
 
@@ -2639,10 +3417,8 @@ impl Transaction {
     /// THIS IS THE STORAGE BOUNDARY for every explicit transaction, every
     /// session transaction, the params/extended-protocol DML family and every
     /// autocommit statement that falls through to an implicit transaction. The
-    /// value is sealed HERE — once — and the same sealed bytes are used for the
-    /// `data:` row and its `v:` twin, because they are the same plaintext and
-    /// storing one ciphertext twice reveals nothing a reader of the two keys
-    /// did not already know.
+    /// value is sealed HERE. Inline logical rows reuse that sealed image for
+    /// their v: twin; compact physical rows get a separately sealed logical twin.
     ///
     /// `key_manager` is `None` on the default configuration, in which case
     /// `seal_row_value` returns the caller's slice borrowed and `batch.put` is
@@ -2650,6 +3426,8 @@ impl Transaction {
     fn put_versioned_batch(
         batch: &mut rocksdb::WriteBatch,
         key_manager: Option<&KeyManager>,
+        snapshots: &SnapshotManager,
+        pending: Option<&super::time_travel::PendingHistoryRead<'_>>,
         key: &[u8],
         val: &[u8],
         versioning_enabled: bool,
@@ -2681,11 +3459,35 @@ impl Transaction {
         // row value. Read-committed reads use the `data:` key directly, so they
         // are unaffected.
         if versioning_enabled {
+            // The row store may contain compact physical references. The v:
+            // twin must instead contain logical values, decoded from THIS
+            // commit's sidecars when they are still pending. Such a twin cannot
+            // be elided: data: does not contain the same logical row bytes.
+            let logical = if let Some(rest) = key.strip_prefix(b"data:") {
+                let text = std::str::from_utf8(rest).ok();
+                if let Some((table, row)) = text.and_then(|text| text.rsplit_once(':')) {
+                    if let Ok(row) = row.parse::<u64>() {
+                        snapshots.logical_current_row_for_history(table, row, val, pending)?
+                    } else {
+                        std::borrow::Cow::Borrowed(val)
+                    }
+                } else {
+                    std::borrow::Cow::Borrowed(val)
+                }
+            } else {
+                std::borrow::Cow::Borrowed(val)
+            };
+            let same_image = matches!(logical, std::borrow::Cow::Borrowed(_));
+            let version = if same_image {
+                std::borrow::Cow::Borrowed(stored.as_ref())
+            } else {
+                tde::seal(key_manager, logical.as_ref())?
+            };
             Self::put_version_index_batch(
                 batch,
                 key,
-                stored.as_ref(),
-                elide,
+                version.as_ref(),
+                elide && same_image,
                 commit_ts_text,
                 reverse_ts_text,
                 commit_ts_bytes,
@@ -2696,10 +3498,8 @@ impl Transaction {
         Ok(())
     }
 
-    /// `val` is the STORED form of the row value (already sealed by
-    /// `put_versioned_batch` when encryption is on), because the `v:` twin must
-    /// hold exactly what `data:` holds — the version chain and the live row are
-    /// read through the same tolerant decode.
+    /// `val` is the sealed LOGICAL row image. It may share data:'s stored bytes
+    /// only when the data row is already logical, which is also the elision gate.
     fn put_version_index_batch(
         batch: &mut rocksdb::WriteBatch,
         key: &[u8],
@@ -2818,6 +3618,18 @@ impl Transaction {
         self.commit_with_timestamp(ts)
     }
 
+    #[track_caller]
+    pub(crate) fn commit_settled(
+        self,
+        attempt: &super::write_outcome::WriteAttempt,
+        settle: impl FnOnce(&Transaction, super::write_outcome::WriteOutcome, bool),
+    ) -> Result<()> {
+        let ts = self
+            .fresh_commit_timestamp()
+            .unwrap_or_else(|| self.snapshot_ts.load(Ordering::Acquire));
+        self.commit_with_timestamp_settled(ts, attempt, settle)
+    }
+
     /// Rollback the transaction
     ///
     /// Discard all buffered writes.
@@ -2917,6 +3729,36 @@ impl Transaction {
     /// RocksDB directly, and a stale row-cache entry would otherwise serve
     /// pre-commit values to later snapshot-clean transactions (R0.2
     /// lost-update vector via the UPDATE arm's PK point-lookup read).
+    /// Error-only attribution. Branch rows also fence their logical table;
+    /// no per-row allocation or heap read is added to healthy commits.
+    pub(crate) fn affected_row_tables(&self) -> Vec<String> {
+        fn table_of(key: &[u8]) -> Option<&str> {
+            let rest = if let Some(rest) = key.strip_prefix(b"data:") {
+                rest
+            } else if let Some(rest) = key.strip_prefix(b"bdata:").or_else(|| key.strip_prefix(b"bdel:")) {
+                let colon = rest.iter().position(|byte| *byte == b':')?;
+                &rest[colon + 1..]
+            } else {
+                return None;
+            };
+            let text = std::str::from_utf8(rest).ok()?;
+            let (table, _) = text.rsplit_once(':')?;
+            Some(table)
+        }
+        let mut tables = std::collections::BTreeSet::new();
+        for entry in self.write_set.iter() {
+            if let Some(table) = table_of(entry.key()) {
+                tables.insert(table.to_owned());
+            }
+        }
+        for (key, _) in self.insert_log.read().iter() {
+            if let Some(table) = table_of(key) {
+                tables.insert(table.to_owned());
+            }
+        }
+        tables.into_iter().collect()
+    }
+
     pub fn written_data_keys(&self) -> Vec<(String, u64)> {
         if self.write_set.is_empty() {
             return Vec::new();
@@ -2977,12 +3819,8 @@ impl Transaction {
                 if let Some(pos) = text.rfind(':') {
                     let table = &text[..pos];
                     if !self.written_tables.contains(table) {
-                        // Spec R5.1: a transaction driven directly on the storage
-                        // API has no statement that locked the table for it. Every
-                        // SQL path did, and this finds it held.
-                        if let Some(locks) = &self.table_locks {
-                            locks.ensure_shared(super::table_locks::MAIN_LEVEL, table)?;
-                        }
+                        // All staging entry points acquired the table boundary
+                        // before dirty tracking/census in enroll_staged_key.
                         // Arming the census rides the branch that discovers the
                         // table is new to this transaction, so the per-row cost
                         // of the census stays at the one relaxed load above.
@@ -3121,7 +3959,39 @@ impl Transaction {
             insert_log_len: self.insert_log.read().len(),
             branch_claims_len: self.branch_claims.lock().len(),
             commit_wal_ops_len: self.commit_wal_ops.read().len(),
+            after_commit_len: self.after_commit.lock().len(),
+            rollback_actions_len: self.rollback_actions.lock().len(),
+            holds_index_keys: self.holds_index_keys.load(Ordering::Acquire),
+            deferred_parent_fk_checks_len: self.deferred_parent_fk_checks.lock().len(),
+            fk_check_timing: self.fk_check_timing.load(Ordering::Acquire),
+            named_fk_check_timing: self.named_fk_check_timing.lock().clone(),
+            row_locks_len: self.held_rows.lock().len(),
         }
+    }
+
+    /// Spec R5.4 (review F9): let go of the rows this transaction locked after
+    /// `snapshot`, once a ROLLBACK TO SAVEPOINT (or a failed statement's implicit
+    /// one) undid what it changed in them, as PostgreSQL ends the subtransaction that
+    /// locked them. A writer waiting for one of them used to wait for the whole
+    /// transaction, until its `lock_timeout`, for a change that no longer existed.
+    /// A row locked before the savepoint stays locked (its lock was not taken again).
+    ///
+    /// Call AFTER the savepoint's index undo is replayed: a waiter must not change
+    /// a row before the index says again what the row says (see [`RowLockHold`]).
+    /// Nothing the released rows hold was written, so no change epoch moves: a
+    /// waiter keeps the row it read.
+    pub fn release_row_locks_after_savepoint(&self, snapshot: &TransactionSavepointSnapshot) {
+        let Some(set) = &self.row_locks else {
+            return;
+        };
+        let released = {
+            let mut held = self.held_rows.lock();
+            if held.len() <= snapshot.row_locks_len {
+                return;
+            }
+            held.split_off(snapshot.row_locks_len)
+        };
+        set.locks.unlock_all(self.transaction_id, &released);
     }
 
     /// Rollback the write set to a previously captured savepoint snapshot.
@@ -3133,6 +4003,17 @@ impl Transaction {
     /// # Arguments
     /// * `snapshot` - The write set snapshot captured at savepoint creation time
     pub fn rollback_to_savepoint(&self, snapshot: &TransactionSavepointSnapshot) {
+        self.rollback_to_savepoint_with_index_undo(snapshot, || {});
+    }
+
+    /// Restore rows, undo the caller's ART/vector journal, then reconcile the
+    /// storage-owned index actions. The latter must run last: restoring a
+    /// TRUNCATE key before undoing a later INSERT of it would remove it again.
+    pub(crate) fn rollback_to_savepoint_with_index_undo(
+        &self,
+        snapshot: &TransactionSavepointSnapshot,
+        undo_indexes: impl FnOnce(),
+    ) {
         // Build a set of keys that existed at savepoint time for quick lookup
         let snapshot_keys: std::collections::HashSet<&Key> = snapshot.write_set.iter().map(|(k, _)| k).collect();
 
@@ -3159,6 +4040,16 @@ impl Transaction {
         self.branch_staged.lock().rewound();
         self.branch_claims.lock().truncate(snapshot.branch_claims_len);
         self.commit_wal_ops.write().truncate(snapshot.commit_wal_ops_len);
+        self.after_commit.lock().truncate(snapshot.after_commit_len);
+        self.holds_index_keys
+            .store(snapshot.holds_index_keys, Ordering::Release);
+        undo_indexes();
+        self.reconcile_rollback_actions_from(snapshot.rollback_actions_len);
+        self.deferred_parent_fk_checks
+            .lock()
+            .truncate(snapshot.deferred_parent_fk_checks_len);
+        self.fk_check_timing.store(snapshot.fk_check_timing, Ordering::Release);
+        *self.named_fk_check_timing.lock() = snapshot.named_fk_check_timing.clone();
     }
 
     /// Does THIS transaction have at least one live savepoint?
@@ -3444,6 +4335,481 @@ mod tests {
     use super::*;
     use crate::storage::StorageEngine;
     use crate::Config;
+
+    #[test]
+    fn deferred_prewrite_refusal_retires_an_already_announced_commit() {
+        let engine = StorageEngine::open_in_memory(&Config::in_memory()).unwrap();
+        let txn = engine.begin_transaction().unwrap();
+        txn.put(b"meta:uncommitted".to_vec(), b"absent".to_vec()).unwrap();
+        txn.defer_parent_fk_check(vec![1], ("c".into(), "fk".into()), |_, _| {
+            Err(Error::constraint_violation("Foreign key deferred refusal"))
+        });
+        let timestamp = engine.next_commit_timestamp(txn.has_tracked_writes());
+        assert!(matches!(
+            txn.commit_with_timestamp(timestamp),
+            Err(Error::ConstraintViolation(_))
+        ));
+        assert!(engine.db.get(b"meta:uncommitted").unwrap().is_none());
+        let registry = engine.conflict_registry();
+        let (done, received) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            registry.snapshot_barrier(u64::MAX);
+            done.send(()).unwrap();
+        });
+        received
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("refused low-level commit must retire its announced timestamp");
+        waiter.join().unwrap();
+    }
+
+    #[test]
+    fn cold_presence_commit_uses_current_rows_and_discards_pending_orphan_bits() {
+        use super::super::{BatchPresence, ColumnarStore};
+        use crate::{Column, DataType, Schema, Tuple, Value};
+        let engine = StorageEngine::open_in_memory(&Config::in_memory()).unwrap();
+        engine
+            .catalog()
+            .create_table("p", Schema::new(vec![Column::new("id", DataType::Int4)]))
+            .unwrap();
+        let old = engine.insert_tuple("p", Tuple::new(vec![Value::Int4(1)])).unwrap();
+        let txn = engine.begin_transaction().unwrap();
+        txn.put(ColumnarStore::presence_marker_key("p"), vec![1]).unwrap();
+        txn.delete(StorageEngine::build_data_key("p", old)).unwrap();
+        let mut stale = BatchPresence::default();
+        stale.set(999);
+        txn.put(b"colp:p:0".to_vec(), bincode::serialize(&stale).unwrap())
+            .unwrap();
+        // This commit occurs AFTER the cold initialization was staged. A
+        // snapshot-time backfill would omit its row from a complete manifest.
+        let newer = engine.insert_tuple("p", Tuple::new(vec![Value::Int4(2)])).unwrap();
+        let timestamp = engine.next_commit_timestamp(txn.has_tracked_writes());
+        txn.commit_with_timestamp(timestamp).unwrap();
+        assert!(ColumnarStore::presence_manifest_complete(&engine.db, "p"));
+        let map = ColumnarStore::load_presence_map(&engine.db, "p").unwrap();
+        let expected_batch = newer / super::super::BATCH_SIZE as u64;
+        assert_eq!(map.len(), 1);
+        assert_eq!(map[0].0, expected_batch);
+        assert_eq!(map[0].1.live_count, 1);
+        assert!(map[0].1.is_live((newer % super::super::BATCH_SIZE as u64) as usize));
+        assert!(!map[0].1.is_live(999));
+        assert!(engine
+            .db
+            .get(StorageEngine::build_data_key("p", old))
+            .unwrap()
+            .is_none());
+        assert!(engine
+            .db
+            .get(StorageEngine::build_data_key("p", newer))
+            .unwrap()
+            .is_some());
+    }
+
+    fn metadata_fixture() -> StorageEngine {
+        let engine = StorageEngine::open_in_memory(&Config::in_memory()).unwrap();
+        engine
+            .catalog()
+            .create_table(
+                "guarded",
+                crate::Schema::new(vec![crate::Column::new("body", crate::DataType::Text)]),
+            )
+            .unwrap();
+        engine
+    }
+
+    fn metadata_dictionary() -> Vec<u8> {
+        let mut dictionary = super::super::ColumnDictionary::new();
+        dictionary.encode("kept");
+        bincode::serialize(&dictionary).unwrap()
+    }
+
+    #[test]
+    fn raw_metadata_uses_its_own_owner_and_refuses_an_unrelated_transaction_owner_before_staging() {
+        let engine = metadata_fixture();
+        let raw = engine.begin_autocommit_transaction().unwrap();
+        raw.put(b"dict:guarded:body".to_vec(), metadata_dictionary()).unwrap();
+        raw.stage_row_counter("guarded", 7).unwrap();
+        assert!(raw.raw_table_locks.get().is_some());
+        {
+            let _bound = raw.bind_existing_table_locks();
+            raw.stage_row_counter("guarded", 8).unwrap();
+            raw.put(
+                b"data:guarded:1".to_vec(),
+                bincode::serialize(&Tuple::new(vec![crate::Value::String("own raw owner".into())])).unwrap(),
+            )
+            .unwrap();
+        }
+        raw.commit().unwrap();
+
+        let owner = engine.begin_transaction().unwrap();
+        {
+            let _bound = owner.bind_table_locks();
+            owner.put(b"dict:guarded:body".to_vec(), metadata_dictionary()).unwrap();
+            owner.stage_row_counter("guarded", 9).unwrap();
+            let unrelated = engine.begin_autocommit_transaction().unwrap();
+            let error = unrelated
+                .put(b"dict:guarded:body".to_vec(), metadata_dictionary())
+                .unwrap_err();
+            assert!(error.to_string().contains("unrelated transaction"));
+            assert!(unrelated.delete(b"counter:guarded".to_vec()).is_err());
+            assert!(unrelated.stage_row_counter("guarded", 99).is_err());
+            let row = bincode::serialize(&Tuple::new(vec![crate::Value::String("refused".into())])).unwrap();
+            assert!(unrelated.put(b"data:other:1".to_vec(), row.clone()).is_err());
+            assert!(unrelated
+                .put_insert_fast(b"data:other:1".to_vec(), row.clone())
+                .is_err());
+            assert!(unrelated.delete(b"data:other:1".to_vec()).is_err());
+            assert!(unrelated.write_set.is_empty());
+            assert!(unrelated.row_counter_stages.read().is_empty());
+            assert!(unrelated.raw_table_locks.get().is_none());
+            assert!(unrelated.written_tables.is_empty());
+            let unrelated_explicit = engine.begin_transaction().unwrap();
+            let error = unrelated_explicit
+                .put(b"dict:guarded:body".to_vec(), metadata_dictionary())
+                .unwrap_err();
+            assert!(error.to_string().contains("unrelated transaction"));
+            assert!(unrelated_explicit.stage_row_counter("guarded", 99).is_err());
+            assert!(unrelated_explicit.put(b"data:other:1".to_vec(), row).is_err());
+            assert!(unrelated_explicit.write_set.is_empty());
+            assert!(unrelated_explicit.row_counter_stages.read().is_empty());
+            assert!(unrelated_explicit.table_locks_hold().is_none());
+        }
+        owner.commit().unwrap();
+        assert_eq!(
+            bincode::deserialize::<u64>(&engine.get(&b"counter:guarded".to_vec()).unwrap().unwrap()).unwrap(),
+            9
+        );
+    }
+
+    #[test]
+    fn metadata_autocommit_reuses_ambient_shared_and_exclusive_statement_owners() {
+        let engine = metadata_fixture();
+        engine.table_locks().set_timeout(std::time::Duration::from_millis(50));
+        let write = |expected| {
+            let raw = engine.begin_autocommit_transaction().unwrap();
+            raw.put(b"dict:guarded:body".to_vec(), metadata_dictionary()).unwrap();
+            raw.stage_row_counter("guarded", expected).unwrap();
+            raw.put(
+                b"data:guarded:1".to_vec(),
+                bincode::serialize(&Tuple::new(vec![crate::Value::String("ambient owner".into())])).unwrap(),
+            )
+            .unwrap();
+            assert!(raw.raw_table_locks.get().is_none(), "the statement owns these locks");
+            raw.commit().unwrap();
+        };
+        {
+            let _shared = engine.lock_main_table_for_write("guarded").unwrap();
+            write(1);
+        }
+        {
+            let _exclusive = engine
+                .lock_tables_exclusive(super::super::table_locks::MAIN_LEVEL, &["guarded"], "test DDL")
+                .unwrap();
+            write(2);
+        }
+        assert_eq!(
+            bincode::deserialize::<u64>(&engine.get(&b"counter:guarded".to_vec()).unwrap().unwrap()).unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn raw_row_and_metadata_staging_wait_for_table_ownership_before_census() {
+        for operation in ["dictionary", "counter", "data", "fast", "delete"] {
+            let engine = metadata_fixture();
+            let txn = Arc::new(engine.begin_autocommit_transaction().unwrap());
+            let guard = engine
+                .lock_tables_exclusive(super::super::table_locks::MAIN_LEVEL, &["guarded"], "test DDL")
+                .unwrap();
+            std::thread::scope(|scope| {
+                let writing = Arc::clone(&txn);
+                let writer = scope.spawn(move || {
+                    let row = bincode::serialize(&Tuple::new(vec![crate::Value::String("new".into())])).unwrap();
+                    match operation {
+                        "dictionary" => writing.put(b"dict:guarded:body".to_vec(), metadata_dictionary()),
+                        "counter" => writing.put(b"counter:guarded".to_vec(), bincode::serialize(&42_u64).unwrap()),
+                        "data" => writing.put(b"data:guarded:1".to_vec(), row),
+                        "fast" => writing.put_insert_fast(b"data:guarded:1".to_vec(), row),
+                        "delete" => writing.delete(b"data:guarded:1".to_vec()),
+                        _ => unreachable!(),
+                    }
+                });
+                let end = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                while engine.debug_table_lock_waiters("guarded").1 == 0 {
+                    assert!(std::time::Instant::now() < end, "metadata writer did not wait");
+                    std::thread::yield_now();
+                }
+                assert!(txn.write_set.is_empty());
+                assert!(txn.row_counter_stages.read().is_empty());
+                assert!(txn.written_tables.is_empty());
+                assert!(!txn.write_census.as_ref().unwrap().counted.load(Ordering::Acquire));
+                drop(guard);
+                writer.join().unwrap().unwrap();
+            });
+            Arc::try_unwrap(txn)
+                .unwrap_or_else(|_| panic!("writer released its transaction"))
+                .rollback()
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn dictionary_owner_processing_refuses_adversarial_names_before_allocation_locks_or_staging() {
+        let engine = metadata_fixture();
+        let txn = engine.begin_autocommit_transaction().unwrap();
+        engine.debug_set_write_group_ceiling(Some(1024));
+        let key = format!("dict:{}:body", "a:".repeat(64)).into_bytes();
+        assert!(
+            key.len() < 1024,
+            "the key itself fits; aggregate ownership work does not"
+        );
+        let before = engine.debug_table_lock_late_acquisitions();
+        let error = txn.put(key, metadata_dictionary()).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains(crate::error::BRANCH_MATERIALIZE_TOO_LARGE_MARKER));
+        assert!(error.to_string().contains("dictionary owner lock processing"));
+        assert!(txn.raw_table_locks.get().is_none());
+        assert!(txn.write_set.is_empty());
+        assert!(txn.row_counter_stages.read().is_empty());
+        assert!(txn.written_tables.is_empty());
+        assert_eq!(engine.debug_table_lock_late_acquisitions(), before);
+        engine.debug_set_write_group_ceiling(None);
+    }
+
+    #[test]
+    fn a_failed_metadata_commit_releases_its_locks_without_publishing_metadata() {
+        for explicit in [false, true] {
+            let engine = metadata_fixture();
+            let txn = if explicit {
+                engine.begin_transaction().unwrap()
+            } else {
+                engine.begin_autocommit_transaction().unwrap()
+            };
+            txn.put(b"dict:guarded:body".to_vec(), metadata_dictionary()).unwrap();
+            txn.stage_row_counter("guarded", 42).unwrap();
+            let before = engine.db().latest_sequence_number();
+            let counter_before = engine.get(&b"counter:guarded".to_vec()).unwrap();
+            engine.write_gate().fence("metadata test refusal");
+            assert!(txn.commit().is_err());
+            assert_eq!(engine.db().latest_sequence_number(), before);
+            assert!(engine.get(&b"dict:guarded:body".to_vec()).unwrap().is_none());
+            assert_eq!(engine.get(&b"counter:guarded".to_vec()).unwrap(), counter_before);
+            let _guard = engine
+                .lock_tables_exclusive(
+                    super::super::table_locks::MAIN_LEVEL,
+                    &["guarded"],
+                    "after failed commit",
+                )
+                .unwrap();
+        }
+    }
+
+    #[cfg(feature = "ha-tier1")]
+    #[test]
+    fn metadata_commits_publish_then_release_owned_locks_before_ack_and_defer_ambient_waits() {
+        const CHILD: &str = "NANO_RAW_METADATA_ACK_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "storage::transaction::tests::metadata_commits_publish_then_release_owned_locks_before_ack_and_defer_ambient_waits",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("RAW_METADATA_ACK_OWNERSHIP_PROVED"));
+            return;
+        }
+        use crate::replication::ha_state::{
+            ha_state, HARole, NodeConfig, StandbyRegistration, StandbyState, SyncMode, SyncTimeoutAction,
+        };
+        use crate::storage::replication_wait::{report_scope, take_unconfirmed};
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let engine = metadata_fixture();
+        engine.table_locks().set_timeout(Duration::from_millis(500));
+        let history = uuid::Uuid::new_v4();
+        ha_state().set_history(Some(history));
+        let config = |timeout| NodeConfig {
+            role: HARole::Primary,
+            sync_mode: SyncMode::SemiSync,
+            min_acks: 1,
+            sync_timeout: timeout,
+            sync_timeout_action: SyncTimeoutAction::Fail,
+            ..NodeConfig::default()
+        };
+        ha_state().set_config(config(Duration::from_secs(5)));
+        ha_state().set_replication_serving(true);
+        assert!(ha_state().sync_wait_enabled());
+        let standby = ha_state().register_standby(StandbyRegistration {
+            node_id: uuid::Uuid::new_v4(),
+            address: "test metadata ACK".into(),
+            history: Some(history),
+            pg_port: 0,
+            sync_mode: SyncMode::SemiSync,
+            cursor: Some(0),
+            state: StandbyState::Streaming,
+            counts_for_sync: true,
+        });
+        for explicit in [false, true] {
+            let txn = if explicit {
+                engine.begin_transaction().unwrap()
+            } else {
+                engine.begin_autocommit_transaction().unwrap()
+            };
+            txn.stage_row_counter("guarded", if explicit { 11 } else { 10 })
+                .unwrap();
+            let (published, publication) = mpsc::channel();
+            txn.after_commit(move || published.send(()).unwrap());
+            std::thread::scope(|scope| {
+                let commit = scope.spawn(move || txn.commit());
+                publication.recv_timeout(Duration::from_secs(2)).unwrap();
+                // Acquire while the real ACK is still absent. Waiting behind
+                // the committing owner here would hit the 500 ms lock bound.
+                let guard = engine
+                    .lock_tables_exclusive(super::super::table_locks::MAIN_LEVEL, &["guarded"], "during ACK")
+                    .unwrap();
+                assert!(!commit.is_finished(), "commit still waits for the missing ACK");
+                let value = engine.get(&b"counter:guarded".to_vec()).unwrap().unwrap();
+                assert_eq!(
+                    bincode::deserialize::<u64>(&value).unwrap(),
+                    if explicit { 11 } else { 10 }
+                );
+                let sequence = engine.db().latest_sequence_number();
+                standby.record_ack(sequence, sequence);
+                drop(guard);
+                commit.join().unwrap().unwrap();
+            });
+        }
+        drop(standby);
+        ha_state().set_config(config(Duration::from_millis(20)));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(report_scope(async {
+            let shared = engine.lock_main_table_for_write("guarded").unwrap();
+            let txn = engine.begin_autocommit_transaction().unwrap();
+            txn.stage_row_counter("guarded", 12).unwrap();
+            assert!(txn.raw_table_locks.get().is_none());
+            txn.commit().unwrap();
+            assert!(
+                take_unconfirmed().is_none(),
+                "no ACK wait while shared statement is held"
+            );
+            drop(shared);
+            assert!(
+                take_unconfirmed().is_some(),
+                "shared scope performs the actual wait after unlock"
+            );
+            assert!(take_unconfirmed().is_none());
+
+            let exclusive = engine
+                .lock_tables_exclusive(super::super::table_locks::MAIN_LEVEL, &["guarded"], "metadata DDL")
+                .unwrap();
+            let txn = engine.begin_autocommit_transaction().unwrap();
+            txn.stage_row_counter("guarded", 13).unwrap();
+            assert!(txn.raw_table_locks.get().is_none());
+            txn.commit().unwrap();
+            assert!(
+                take_unconfirmed().is_none(),
+                "no ACK wait while exclusive guard is held"
+            );
+            drop(exclusive);
+            assert!(
+                take_unconfirmed().is_some(),
+                "exclusive guard waits after unlock in this request"
+            );
+            assert!(take_unconfirmed().is_none());
+        }));
+        assert!(runtime.block_on(report_scope(async { take_unconfirmed() })).is_none());
+        ha_state().set_replication_serving(false);
+        println!("RAW_METADATA_ACK_OWNERSHIP_PROVED");
+    }
+
+    /// A direct executor's owned transaction commits under a real exclusive
+    /// guard. The ACK wait runs when that guard releases its locks, while the
+    /// original client report scope still exists, and never reaches a later
+    /// request. Use a fresh process because HA state is process-global.
+    #[cfg(feature = "ha-tier1")]
+    #[test]
+    fn guarded_commit_defers_ack_until_unlock_and_preserves_report_scope() {
+        const CHILD: &str = "HELIOS_R57_GUARDED_COMMIT_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "storage::transaction::tests::guarded_commit_defers_ack_until_unlock_and_preserves_report_scope",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("GUARDED_COMMIT_ACK_SCOPE_PROVED"));
+            return;
+        }
+        use crate::replication::ha_state::{ha_state, HARole, NodeConfig, SyncMode, SyncTimeoutAction};
+        use crate::storage::replication_wait::{report_scope, take_unconfirmed};
+        let engine = StorageEngine::open_in_memory(&Config::in_memory()).unwrap();
+        engine
+            .catalog()
+            .create_table(
+                "guarded",
+                crate::Schema::new(vec![crate::Column::new("id", crate::DataType::Int4)]),
+            )
+            .unwrap();
+        engine
+            .insert_tuple("guarded", Tuple::new(vec![crate::Value::Int4(1)]))
+            .unwrap();
+        ha_state().set_config(NodeConfig {
+            role: HARole::Primary,
+            sync_mode: SyncMode::SemiSync,
+            min_acks: 1,
+            sync_timeout: std::time::Duration::from_millis(20),
+            sync_timeout_action: SyncTimeoutAction::Fail,
+            ..NodeConfig::default()
+        });
+        ha_state().set_replication_serving(true);
+        assert!(ha_state().sync_wait_enabled());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(report_scope(async {
+            let guard = engine
+                .lock_tables_exclusive(super::super::table_locks::MAIN_LEVEL, &["guarded"], "TRUNCATE")
+                .unwrap();
+            let txn = engine.begin_autocommit_transaction().unwrap();
+            txn.delete(b"data:guarded:1".to_vec()).unwrap();
+            txn.commit().unwrap();
+            assert!(take_unconfirmed().is_none(), "commit did not wait under the guard");
+            drop(guard);
+            assert!(
+                take_unconfirmed().is_some(),
+                "guard drop waited inside the original report scope"
+            );
+            assert!(take_unconfirmed().is_none(), "reported only once");
+        }));
+        assert!(
+            runtime.block_on(report_scope(async { take_unconfirmed() })).is_none(),
+            "no report in the next request"
+        );
+        ha_state().set_replication_serving(false);
+        println!("GUARDED_COMMIT_ACK_SCOPE_PROVED");
+    }
 
     #[test]
     fn test_transaction_commit() {

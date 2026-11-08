@@ -7,15 +7,181 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed — every catalog DDL statement is one write group (spec R5.3)
+Release-candidate notes for 4.42.0. Final correctness, physical-standby and performance
+acceptance remains pending; these entries describe the current implementation.
+
+### Fixed — distinguish a refused write from an applied write whose publication failed
+
+- A refusal before the native data write rolls back the statement's staged rows and eager index
+  changes. A native write error whose outcome is unknown preserves the original error and fences
+  the affected tables until reopen; it does not undo indexes as though the rows had been rejected.
+- If the native row group succeeded but derived vector publication fails, the operation reports
+  **PostgreSQL `58000` / MySQL `1105` (`HY000`)**, including “row changes were already applied”. The
+  affected table is unavailable until reopen reconstructs its indexes from durable state. **Do not
+  retry that write automatically**: inspect the reopened data first. A nested size-limit or layout
+  error describes the derived publication failure, not a refusal of the already-applied rows.
+- Global embedded, per-session and RAII transaction settlement retains row/index ownership through
+  undo or fencing. Deferred foreign-key refusal happens before native publication; a failed COMMIT
+  does not leave a missing primary-key lookup or an unfinished snapshot announcement.
+- Direct row inserts, COPY batches and branch-to-main landing settle their index claims from the
+  owning native write outcome too. Direct branch writes invalidate cached overlays after an
+  uncertain native error without publishing an unproven desired image.
+- CREATE TABLE and UNIQUE INDEX retain committed indexes after an applied write reports an error.
+  Persistent vector CREATE preserves a referenced graph, retires an incomplete failed build from
+  memory, and fences the table when its catalog cannot be reconciled. A later explicit CREATE can
+  reclaim only proven unreferenced scratch, including leftovers whose graph metadata is absent.
+- Applied sequence CREATE, ALTER and DROP publish their cached-window changes even when the write
+  later reports an error. An unresolved sequence definition is refused until reopen reconciles it;
+  unrelated sequence names and database namespaces remain usable. Cold loading, refill and setval
+  serialize with managed definition changes and reject an old runtime after a completed ALTER;
+  cached value serving retains its existing fast path. A failed `setval` reconciles its cached
+  reservation with the actual stored state, or refuses that name when the outcome cannot be read.
+  Sequence refills and setters obey the same write-group size cap as other managed writes.
+- Function and procedure DDL settle their live registry together with the durable definition.
+  Readers wait for the outcome instead of observing an uncommitted body. Replacing a differently
+  cased name removes old durable aliases in the same write group, so reopen retains the new body.
+  SQL function lookup uses the calling database's registry. A quarantined name reports a storage
+  error through direct and nested calls instead of invoking another database's body or returning
+  a fallback NULL/boolean result. An explicitly scoped engine without an installed routine registry
+  cannot borrow another database's body. A quarantined BEFORE INSERT recipe refuses CREATE TRIGGER
+  before registration; ordinary missing or unsupported recipes retain their documented inert behavior.
+- Direct single-key puts and deletes enforce the encoded native group's size limit before writing.
+  Branch snapshot copies remain part of the final group's limit, and a refusal leaves stored bytes
+  and the native sequence unchanged.
+
+### Fixed — direct storage writes invalidate SQL result caches
+
+- Successful writes through the public storage row APIs invalidate warmed embedded SQL results
+  after row and index maintenance. Inserts, prepared batches, key and payload updates, and deletes
+  use the data epoch, preserving existing transaction snapshots. A definite write refusal leaves
+  its old cached result valid.
+
+### Fixed — vector recovery follows the committed rows
+
+- Managed persistent HNSW/PQ indexes (`--features vector-persist`) record each changed row's latest
+  vector or deletion in the **same write group as the row**. A crash before the later graph hook
+  cannot leave that change absent after reopen. Open and physical application reconcile unfinished
+  graph publication in RAM, preserving the configured persistent backend, PQ codebook and
+  F32/F16/I8 rerank precision. Read-only reconstruction changes no database keys or sequence and
+  does not attempt a repair write through its closed gate.
+- Ordinary HNSW dump-cache validity is invalidated in the owning row group too. Checkpoint export
+  skips an existing write/lock owner and serializes with supported table writers through their
+  final index publication; vector-manager changes retain their publication check. A stale dump
+  cannot become eligible again between a row write and its graph hook. Missing or invalid caches
+  are rebuilt from table rows.
+- Saving a quantized HNSW graph includes only current live row mappings. Loading that graph no
+  longer resurrects deleted rows or an overwritten row's old slot. The byte codec remains readable;
+  old dumps which omitted their deletion information cannot recover it from those bytes alone and
+  should be rebuilt from table rows.
+- **Encryption boundary:** the new authoritative persistent `row_image:` records use the engine's
+  encryption key when encryption is enabled. Existing opt-in persistent graph metadata, adjacency,
+  vector and PQ-code values remain unsealed. This change does not provide encryption for that
+  whole backend; use disk encryption until that separate gap is resolved. Default HNSW dump-file
+  suppression on encrypted stores remains in effect.
+
+### Fixed — schema races and SQL utility routing
+
+- A plan records the layouts used to resolve its tables. Execution validates those layouts before
+  exposing rows, including a warm result-cache hit, a prepared plan and an indexed/vector scan.
+  A pure read can replan within the bounded retry policy; writes and statements with sequence,
+  procedure or advisory-lock effects are not replayed after those effects. An unrecoverable layout
+  race returns `40001`; an already-described result-shape change returns `0A000` before execution.
+- SQL `PREPARE`, `EXECUTE` and `DEALLOCATE` share session-scoped routing in both executor families;
+  inner `$N` placeholders remain the prepared statement's parameters. A prepared body which is
+  itself a prepared utility or transaction-control statement is refused before registration. The custom `SET STORAGE`, `MERGE BRANCH` and
+  materialized-view refresh syntax also reaches the parameterized planner without running at Parse.
+
+### Fixed — nested queries keep their row and transaction context
+
+- Correlated `EXISTS` and `NOT EXISTS` bind each candidate's complete outer row on point,
+  `IN`, range and fused scans. Ordered limits and `COUNT` retain subquery evaluation context,
+  and a correlated inner execution error reaches the caller.
+- Once-evaluated `IN`, scalar and `EXISTS` subqueries inherit the active transaction, snapshot,
+  parameters and remaining statement deadline. They observe staged writes and savepoints.
+  Storage quarantine, layout, cancellation, timeout and already-applied publication failures
+  propagate before the legacy unsupported-introspection fallback.
+
+### Fixed — foreign-key actions follow parent changes
+
+- Normal `UPDATE` and both supported `ON CONFLICT … DO UPDATE` forms enforce `ON UPDATE NO ACTION`,
+  `RESTRICT`, `CASCADE`, `SET NULL` and `SET DEFAULT`, including composite keys, self-references and
+  cascading changes. Recursive `ON DELETE` actions operate on staged/current child rows; an explicit
+  self-reference repair is preserved. A child INSERT cannot race a parent key change or DELETE into
+  leaving an orphan: affected tables are locked in a stable order before the relationship scan.
+- `RESTRICT` remains immediate. Deferrable `NO ACTION` obligations belong to the transaction and
+  its savepoints, validate the affected relationships at `SET CONSTRAINTS … IMMEDIATE` or COMMIT,
+  and allow a relationship repaired or deleted later in that transaction. `SET DEFAULT` still has
+  to satisfy the resulting foreign key. Existing Off/Proxy, Audit and constraint-enforcement modes
+  retain their policy; Audit does not emit a duplicate event from COMMIT's preflight.
+- Named `SET CONSTRAINTS` supports unqualified foreign-key names under the default `public`
+  search path. Unknown, qualified, nondeferrable or unsupported schema selections are refused
+  explicitly; `ALL` selects all supported foreign keys. It does not silently change an unrelated
+  same-name constraint in another schema.
+- `MERGE BRANCH` validates the final target schema and relationships before landing. Under default
+  enforcement, a merge that would orphan a child newly added on the target is refused `23503`,
+  preserving both branches. Interrupted landing revalidates with its recorded policy before
+  continuing; a valid target edit made in the meantime can require repair before resume. Empty or
+  NULL-only children do not excuse a missing parent table or referenced key definition.
+
+### Fixed — `ALTER TABLE` is one write group, every clause of it; `AS OF` across a `DROP COLUMN` (spec R5.5)
+
+- Column drops also retire ordinary and multi-column user indexes and their durable definitions,
+  including a column renamed earlier in the same statement. Parent-column renames and cascading
+  drops lock referencing tables before reading their constraint records, preserving a child's
+  concurrent constraint changes.
+- **A multi-clause `ALTER TABLE` is atomic**, as `AGENTS.md` has always said. Each clause used to be a write of its
+  own: a crash between them, or a later clause's refusal, kept the earlier ones (`ADD COLUMN c INT DEFAULT 1 CHECK
+  (c > 5)` failed `23514` and left `c`; `ADD COLUMN price INT, DROP COLUMN nosuch` left `price`), and a reader saw the
+  first clause without the second. Now every clause is asked against the table as the clauses before it left it,
+  everything is refused before anything is written, and the statement is one write group: whole or not at all, for a
+  crash, a reader, a physical standby and a branch fork. Both executor families, every interface. A volatile default in
+  such a statement is evaluated once per row (it was twice, a `nextval` default skipping values). `RENAME TO` combined
+  with other clauses is refused `0A000`, as PostgreSQL refuses the combination; run it on its own.
+- **`DROP COLUMN` is one write group**: the schema, every row's new image with its version, the column's missing
+  value, the constraints and constraint-owned indexes naming it, its identity entry and its columnar side data. It used
+  to write the schema, then one group per row, then the rest: a reader or a crash in between saw a schema without the
+  column over rows that still had it, and every later column's value under the wrong name. `ALTER COLUMN … SET STORAGE`
+  is one group too (the rows, the schema, the dictionary, content-addressed and columnar records). `DROP CONSTRAINT` of a
+  single-column `UNIQUE` that set the column's flag is one group (the flag's schema rewrite was a second).
+- **The size of such a statement is capped** by `[storage] max_atomic_rewrite_bytes` (default 256 MiB), as a volatile
+  `ADD COLUMN` already was: the rows' new images and their versions (two to three times the table's data with time
+  travel on), with the copies main's live branches take. Above it the statement is refused `54000` and nothing is
+  written; copy the table (`CREATE TABLE … AS SELECT` the columns it keeps, then `RENAME`), or raise the setting. A
+  `DROP COLUMN` or `SET STORAGE` of a table larger than that used to succeed in many groups; it is refused now. Memory
+  is the group (the cap) plus one value per row of a volatile default.
+- **`AS OF` and transactions across a `DROP COLUMN` read each value under its own column.** A row version keeps the
+  columns it was written with, and read under today's schema by position it showed a dropped column's value under the
+  next column's name: `AS OF` a time before the drop, a `REPEATABLE READ` transaction begun before it, the very
+  transaction that ran it (`BEGIN; ALTER TABLE t DROP COLUMN x; SELECT * FROM t` showed `x` under `y` for every row it
+  had not written). A new record, `meta:table_layout:{table}`, written in the change's own group, says what each `DROP
+  COLUMN` moved; such a version is read under the layout it was written with and shown in today's columns. A column
+  added since reads its default, as before. `VERSIONS BETWEEN` the same.
+- **Historical reads cross column storage changes using retained logical values.** New versions and
+  rewrites retain the logical dictionary, content-addressed and columnar payload rather than
+  resolving an old reference against today's side storage. `DROP COLUMN` maps the retained image
+  to today's columns; `RENAME COLUMN` preserves its positions. `AS OF`, `VERSIONS BETWEEN`,
+  repeatable-read transactions and branch anchors use that mapping. A legacy image whose physical
+  reference has no retained logical payload is refused `0A000` for that image.
+- **History cannot cross a table rename or a materialized-view shape replacement that discarded
+  it.** `AS OF` and branch anchors before that cut are refused `0A000`; reads after it use the
+  change's own snapshot record. A rename carries side storage, including inherited branch data,
+  but does not reconstruct history purged under the old table name. A compatible-shape refresh
+  preserves row history and its earlier anchors; a true shape replacement records its history cut
+  in the same group as the replacement.
+- Startup no longer replays old logical row images over these committed rewrites; see the local
+  recovery migration note below. Layout epochs prevent a read from combining a pre-change schema
+  with rows read after its rewrite.
+
+### Fixed — catalog DDL and materialized-view population use one write group (spec R5.3)
 
 A schema statement wrote several RocksDB write groups (`CREATE TABLE` four, `RENAME TO` six,
 `REFRESH MATERIALIZED VIEW` one per row and more). A crash between them left a half-made catalog,
 and a reader, a physical standby (which applies the primary's groups one by one) or a branch fork
 in between saw one. Each of these statements now stages everything it makes durable — catalog
 records, moved or deleted rows, its logical-WAL entries, a live branch's frozen copies — and writes
-it once; the caches and registries it changes are published after that write, and a write that
-fails publishes nothing and takes back what the statement registered:
+it once; caches and registries publish with that owning write. A proven pre-write refusal takes
+back eager registration. An uncertain or applied failure reconciles durable state or fences the
+affected table; it is not treated as proof that the write changed nothing:
 
 - `CREATE TABLE` with its constraints, identity record and partition link. A crash used to be
   able to leave the table without its CHECK, FOREIGN KEY or UNIQUE records.
@@ -30,14 +196,14 @@ fails publishes nothing and takes back what the statement registered:
   A trigger whose record could not be written used to be accepted anyway (and be gone at the next
   restart); the statement now fails. `ALTER SEQUENCE … RESTART` out of bounds used to leave the
   ALTER's new definition behind; it is now refused before anything is written.
-- `REFRESH MATERIALIZED VIEW` (plain, `CONCURRENTLY`, the auto-refresh worker's) deletes every row
-  and inserts the new ones in one transaction with the refreshed record: a reader never sees an
-  empty or a partial view (it saw 48 to 1018 of 2000 rows), a killed refresh keeps the old rows or
-  the new ones, and a refresh of any size writes one `snapshot:` record (one per row before, of
-  which only the last 1000 survived a restart). The rows keep their history, so a branch anchored
-  before such a refresh is no longer refused: it reads the view as it was at the anchor. A view's
-  data table with an index or a column storage mode is still refreshed the old way (and an anchor
-  before that refresh is still refused). `DROP MATERIALIZED VIEW` is one group too.
+- `CREATE MATERIALIZED VIEW` stages its metadata, backing table, rows and logical history together.
+  `REFRESH MATERIALIZED VIEW` (plain, `CONCURRENTLY`, `INCREMENTALLY` or the auto-refresh worker)
+  uses the same atomic population path, including backing tables with indexes and non-default
+  column storage. Compatible shapes keep their index/storage definitions; a changed logical shape
+  atomically replaces the backing definition and rows and records the historical cut. Persistent
+  vector replacement joins the owning group. Readers see the old or new view, with one snapshot
+  record per refresh. `DROP MATERIALIZED VIEW` is one group too. `INCREMENTALLY` may choose a full
+  refresh; this does not promise delta application for every SQL mutation or refresh strategy.
 
 Also:
 
@@ -45,19 +211,76 @@ Also:
   UNIQUE` register it hidden — writers maintain it, the read path's index choice skips it — and it
   becomes visible after its write. A query during the backfill used to take the empty index and
   return no rows.
-- **`TRUNCATE` clears the table's index trees after its commit**, not at the statement: a failed
-  commit left the rows with empty trees.
+- **`TRUNCATE` stages its rows, columnar presence and logical entry in its owning transaction.**
+  Index key holds and undo respect savepoints and failed commits; an explicit transaction may
+  insert new rows after truncating without losing their keys. Direct borrowed-executor execution
+  uses the same grouped path. A rollback reconciles actual durable rows and the current schema;
+  it does not issue persistent-vector repair writes from an error callback.
 - **`REFRESH`, `DROP` and `ALTER MATERIALIZED VIEW` and `ALTER SEQUENCE` run over the extended
   protocol** (and REST); they did not parse there.
 - **`EXPLAIN ANALYZE TRUNCATE` is refused** (`0A000`): it deleted the rows at once, apart from the
   statement's transaction, so `BEGIN; EXPLAIN ANALYZE TRUNCATE t; ROLLBACK` emptied `t` for good.
   PostgreSQL has no `EXPLAIN` of `TRUNCATE`.
+- **`RENAME TO` and `RENAME COLUMN` carry the column side storage**, in the same group: a
+  `DICTIONARY` column's dictionary and a `COLUMNAR` column's batches, zone statistics and live-row
+  presence are keyed by the table's and the column's name and stayed behind. A renamed
+  `DICTIONARY` column failed every read and `TRUNCATE` (`XX000 Invalid dict_id 0`), a value
+  inserted between a `RENAME COLUMN` and its reverse read back as another row's value, and a
+  renamed `COLUMNAR` column read as empty (`WHERE v < 50` returned no row).
+- **A renamed table's triggers follow it in the live registry.** They stopped firing after
+  `RENAME TO`, `DROP TRIGGER … ON <new name>` said they did not exist, and `DROP TRIGGER … ON <old
+  name>` reported success without removing the record, so the trigger came back at the next start.
+- **`pg_indexes` lists a table's indexes all or none** while a `RENAME TO` or `DROP TABLE`
+  publishes (on a primary and on a standby): the user indexes are read from their durable
+  definitions, which change in the same group as the table, instead of the in-memory registry.
+- **An out-of-range sequence parameter is `22023`** (`invalid_parameter_value`, as in PostgreSQL),
+  not `XX000`: `RESTART`/`START` outside the bounds, `MINVALUE` above `MAXVALUE`, `INCREMENT 0`.
 - **A write group a standby could never receive is refused before it is written** (`54000`): above
   `MAX_BATCH_BYTES` (about 4 GiB), whatever made it — a schema statement, a transaction's commit,
   a branch freeze. It used to be written, and every standby then stopped at it for good.
 - Still more than one group (documented in `docs/NANO_CONCURRENCY_LOCKING.md`): `CREATE TABLE … AS`,
-  `CREATE MATERIALIZED VIEW`, `CREATE SCHEMA` with elements, a multi-clause `ALTER TABLE`, `ADD` /
-  `DROP COLUMN`, `SET STORAGE`, `DROP TABLE a, b`, roles and grants, `CREATE DATABASE BRANCH`.
+  `CREATE SCHEMA` with elements, `DROP TABLE a, b`, roles and grants,
+  `CREATE DATABASE BRANCH`. Every clause of `ALTER TABLE` shares its statement's group.
+
+### Fixed — no committed write is lost beside a concurrent writer (spec R5.4, review fix pass)
+
+- **A PK increment beside point readers lost nothing.** A simple-protocol point `SELECT` that read a
+  row's old image before a write could put it back into the row cache after the write dropped it,
+  and the next `UPDATE … SET n = n + 1 WHERE id = k` computed from that image: 7-15 increments lost
+  in ~25k. Writers now read the row from storage, and every write fences the cache's fills.
+- **An open transaction's DELETE no longer frees its key.** A concurrent INSERT or upsert of the
+  key went ahead at once, and after that transaction's ROLLBACK two rows shared one primary key; a
+  concurrent PK UPDATE or DELETE found nothing and its change was lost. The key is now held for the
+  deleting (or key-moving) transaction: the other writer waits for it, then inserts after a commit
+  or fails 23505 / updates the restored row after a rollback, as in PostgreSQL.
+- **`ON DELETE CASCADE` / `SET NULL` lock the child rows** and work on the child as committed: a
+  child updated by an open transaction was deleted under it and written back by its COMMIT, an
+  orphan.
+- **Two upserts of one new key no longer race.** The second waits for the first and then takes its
+  DO UPDATE (or inserts, if the first rolled back), instead of failing 23505 or 40001; a conflicting
+  row deleted meanwhile makes the upsert insert, not fail 40001.
+- **Writers on a branch lock their rows** (by branch level and row): six clients incrementing one
+  row of a branch lost up to 81% of the increments, with no error.
+- `ROLLBACK TO SAVEPOINT` lets go of the rows locked after the savepoint (a writer of one waited out
+  the whole `lock_timeout`), and `statement_timeout` during a row or table lock wait counts from the
+  start of the statement, not of the wait.
+- **A statement too big for one write group is refused while it stages its rows** (54000), not after
+  it built the whole group: a 2.8 GB `INSERT … SELECT` used to run 64 s to an 8.6 GB group at 25 GB of
+  RSS before the refusal.
+
+Known limits:
+
+- **One statement (or transaction) writes at most about 1.33 GiB of row data** (keys plus serialized
+  rows) with the defaults, about 2 GiB with time travel off: its write group carries each row up to
+  three times (the row, its version, its logical-WAL entry) and may not exceed what a standby can
+  receive (about 4 GiB). Split larger loads (`INSERT … SELECT … WHERE id BETWEEN …`, COPY in batches).
+  v4.41.1 wrote such a statement row by row, not atomically.
+- A cycle through a table-lock upgrade and a row lock can still end at `lock_timeout` rather
+  than deadlock detection; an upsert racing a plain INSERT of the same new key can get 23505.
+- Statement atomicity does not make DDL transactional across `BEGIN` / `ROLLBACK`: a completed
+  schema statement can survive rollback of the block's DML. Take a backup or branch before a
+  destructive migration. The lower-level raw KV/index APIs retain their caller-owned index and
+  locking contracts; they are not substitutes for a constrained SQL mutation.
 
 ### Added — `heliosdb-nano standby verify` (spec R1 §1)
 
@@ -89,22 +312,36 @@ primary, a token or version problem — keeps the copy and fails the run. An ado
 summary says "adopted the completed copy at …, nothing copied in this run" instead of
 "0 B".
 
-### Fixed — a primary's crash recovery no longer brings back dropped or renamed tables (sprinter e21903322db7)
+### Changed — local startup adopts committed data instead of replaying logical WAL (spec R5.7)
 
-Open recovery skips a `DROP TABLE`, `TRUNCATE` or rename it finds above the logical WAL
-checkpoint (`storage.wal_replay_destructive_ddl = "refuse"`, the default) but replayed
-every other entry around it. After a crash within the checkpoint interval (default 1000
-entries / 30 s), with rows logged — every explicit transaction, and every statement on an
-HA primary — a table created and dropped in that window came back with its rows, a table
-dropped and re-created under the same name received the old rows (overwriting its own at
-colliding row ids), and a renamed table's rows came back under a re-created source name.
-Under `warn` / `apply` the replay also wrote its batched rows only after the DDL entries
-that followed them. A destructive entry now skips every earlier entry naming its tables,
-under every policy, and the pending rows are written before any DDL entry is replayed.
-`CREATE TABLE`, `DROP TABLE` and the rename write their entry in their own catalog write
-group (it used to be a separate append, first, so a write that then failed left an entry
-the next crash replayed), and a transactional `TRUNCATE` logs with its transaction's
-commit (a `BEGIN; TRUNCATE; ROLLBACK` left an entry that `warn` / `apply` replayed).
+RocksDB's committed data groups are authoritative at primary startup. Logical-WAL operations ride
+with their owning data/catalog group; open advances the checkpoint and applies retention without
+redoing old INSERT, UPDATE, DELETE or DDL over rows already committed. This prevents crash recovery
+from undoing a newer PK update, restoring a deleted row or shifting values after a column rewrite.
+Physical standby and archive recovery still apply complete physical groups through their own
+cursor protocol; this change does not replace those recovery tools.
+
+A clean 4.41.x directory, or a legacy directory with no checkpoint to contradict its retained log,
+upgrades automatically. A legacy directory with retained entries above an existing checkpoint is
+ambiguous: an older binary could have written data and its log in separate groups. Writable open
+refuses before backfill or cleanup and names this explicit offline adoption command:
+
+```sh
+heliosdb-nano recover-wal --data-dir /path/to/data --adopt-local-state
+```
+
+Stop all processes using that directory first. The command holds its exclusive directory lock and
+writes only four recovery metadata keys in one synced group, preserving local rows, catalogs,
+branches, history and retained log-entry bytes. It adopts the local state; **it does not recover
+missing acknowledged data from an older writer**. It refuses a missing/live directory, a physical
+replica, interrupted promotion or a fenced role. Those roles require their physical recovery
+procedure. Read-only inspection of unclassified legacy data remains available. An unknown or
+corrupt recovery-format marker is refused. Keep a backup before adopting an ambiguous legacy store.
+
+`storage.wal_replay_destructive_ddl` remains parseable for explicit replay compatibility, but is
+deprecated for automatic startup recovery: `refuse`, `warn` and `apply` cannot enable startup redo
+or bypass this migration check. Logical history and supported explicit/live logical apply APIs
+remain available; the retained log is not a primary startup redo window.
 
 ### Changed — key rotation is refused while it would strand a physical standby (spec R1 §3)
 
@@ -173,7 +410,8 @@ otherwise it refuses because no re-encryption exists.
   product above 1 panicked the insert or search. The index now orders rows exactly as `<#>`
   does and reports `<#>`'s value (`-dot`) as the distance — the unfiltered vector search used to
   report `1 - dot`. Inner-product graph dumps written before this release are rebuilt once.
-- **Encrypted stores no longer write plaintext vectors** to `hnsw_snapshots/`: no graph dump is
+- **The default HNSW dump cache no longer writes plaintext vectors on encrypted stores** to
+  `hnsw_snapshots/`: no graph dump is
   written, and every HNSW index is rebuilt from its sealed rows at every open — open time grows
   with index size, and each rebuild is logged with its duration. Dumps left by an unencrypted
   run are deleted at the first encrypted open; deleting does not erase their bytes from free
@@ -290,16 +528,16 @@ starting it on a new, empty data directory. Its old directory is refused with a
 message that says so; keep it until the new standby is verified. Data can also
 be moved over the PostgreSQL wire. This supersedes the two logical-standby
 entries under "Replication" below: the logical standby, its native reader and
-its history window are removed (the window's key remains only as the primary's
-redo window, default 0).
+its history window are removed (the retention setting remains for the primary's logical history, default 0;
+it is not used as automatic startup redo).
 
-- **One replication connection, protocol `NPHYS003`.** The bootstrap copy, the
+- **One replication connection, protocol `NPHYS004`.** The bootstrap copy, the
   physical WAL and the control plane (identity, dataset history, epoch,
   heartbeats, acknowledgements) share one connection per standby, so they can no
   longer disagree. `[replication] replication_port` (`--replication-port`,
   default 5433) is the single replication port, and a standby's
   `--primary-host` names it; a standby pointed at a PostgreSQL or HTTP port is
-  told so. `NPHYS001` peers (and `NPHYS002` peers of pre-release builds) are
+  told so. `NPHYS001`, `NPHYS002` and `NPHYS003` peers are
   refused with a typed `Version` refusal naming both versions, and a 4.41.x
   native peer is told to upgrade. Without TLS the
   replication port stays on loopback whatever `--listen` opens (see "Added —
@@ -321,19 +559,18 @@ redo window, default 0).
   naming the removal; an `observer_hosts` key is an unknown key.
 - **Removed: the failover watcher and the split-brain protector**, which only
   spoke the native v3 channel and were never wired to a safe promotion. Fencing
-  returns with promotion in plan phase P5; until then `SWITCHOVER` stays refused.
-- **`[replication] logical_wal_retention_entries`** is now only the primary's
-  own redo window below its checkpoint, default **0** (was 100000). No standby
-  reads the logical WAL.
+  is provided by the physical promotion and switchover paths described above.
+- **`[replication] logical_wal_retention_entries`** retains only the primary's logical
+  history below its checkpoint, default **0** (was 100000). No standby reads that log,
+  and local startup does not redo it.
 
 ### Added — the replication connection's control plane and synchronous replication
-- **Control frames** on `NPHYS003`: `Hello` / `HelloOk` (node id, role, dataset
+- **Control frames** on `NPHYS004`: `Hello` / `HelloOk` (node id, role, dataset
   history, epoch, durable cursor, capabilities, PostgreSQL port, sync mode;
   the primary answers with its history, epoch and barrier), `Refuse`,
   `Heartbeat` (the standby's applied and durable sequence: THE acknowledgement,
   sent every 5 s when idle and after every durable advance, coalesced to one per
-  50 ms), `HeartbeatAck`, and `Fence` (reserved for promotion, refused by both
-  sides now). A wrong token is `Refuse { AuthFailed }`; `NPHYS001`'s kind 13 is
+  50 ms), `HeartbeatAck`, and `Fence` for the physical promotion protocol. A wrong token is `Refuse { AuthFailed }`; `NPHYS001`'s kind 13 is
   retired.
 - **Typed refusal codes mapped to the standby's posture.** `HistoryMismatch`,
   `Gap`, `WalPruned`, `EpochStale` and `Version` put the standby in

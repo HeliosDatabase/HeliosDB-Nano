@@ -47,8 +47,9 @@
 //! A waiter sleeps on its shard's condition variable, off the async workers
 //! ([`crate::runtime_offload::off_worker`]), bounded like a table-lock wait: the
 //! session's `lock_timeout` (55P03, [`Error::row_lock_timeout`]), its
-//! `statement_timeout` and a cancel request (57014). A wait that would close a cycle
-//! of waiters is a deadlock (40P01), refused at once to the waiter that closes it.
+//! `statement_timeout`, counted from the statement's start, and a cancel request
+//! (57014). A wait that would close a cycle of waiters is a deadlock (40P01), refused
+//! at once to the waiter that closes it.
 //! An owner only waits for one row at a time, and lets its rows go only when it ends,
 //! so the graph's edges always point at owners that are still running, or at owners
 //! that ended and can no longer wait for anything: a stale edge never makes a cycle.
@@ -80,6 +81,14 @@ const WAIT_TICK: Duration = Duration::from_millis(50);
 /// The longest chain of waiters the deadlock check follows.
 const MAX_WAIT_CHAIN: usize = 128;
 
+/// Mixed into a table's hash for the keys of its unique values ([`RowKey::unique_value`]),
+/// so they never meet its rows' keys.
+const UNIQUE_VALUE_SPACE: u64 = 0x756e_6971_7565_5f76;
+
+/// Mixed into a table's hash, with the level, for the rows of a branch level
+/// ([`RowKey::on_level`]), so they never meet main's.
+const BRANCH_LEVEL_SPACE: u64 = 0x6272_616e_6368_5f6c;
+
 /// Owners of fast-path writes, which have no transaction: above every transaction id
 /// (`storage::transaction`'s counter starts at 1 and counts up), so the two never meet.
 static NEXT_STATEMENT_OWNER: AtomicU64 = AtomicU64::new(1 << 62);
@@ -110,7 +119,15 @@ fn table_hash(table: &str) -> u64 {
     hash
 }
 
-/// One row's identity: the hash of its table's name and its row id (main's rows).
+/// Spec R5.4 (review F5): a branch level's table, as the row locks and the change
+/// epochs know it: its own lock space and epoch slot, apart from main's table of the
+/// same name and from every other level's.
+fn level_table_hash(level: u64, table: &str) -> u64 {
+    table_hash(table) ^ level.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ BRANCH_LEVEL_SPACE
+}
+
+/// One row's identity: the hash of its table's name (and, on a branch, its level) and
+/// its row id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RowKey {
     table: u64,
@@ -123,6 +140,35 @@ impl RowKey {
         Self {
             table: table_hash(table),
             row: row_id,
+        }
+    }
+
+    /// Spec R5.4 (review F5): the key of row `row_id` of `table` on branch level `level`
+    /// (a branch's own rows and the ones it inherited, as the branch writes them).
+    pub fn on_level(level: u64, table: &str, row_id: u64) -> Self {
+        Self {
+            table: level_table_hash(level, table),
+            row: row_id,
+        }
+    }
+
+    /// Spec R5.4 (review F6): the key of one value of a unique key of `table`, `encoded`
+    /// (the columns and the values, see `EmbeddedDatabase::lock_upsert_arbiter_keys`),
+    /// apart from every row's key. An `INSERT … ON CONFLICT` holds the value it
+    /// arbitrates on from its conflict check until its transaction ends, so a second
+    /// upsert of the same new value waits for the first and then takes its DO UPDATE
+    /// (or DO NOTHING) instead of losing the race to insert it (23505) or finding a
+    /// row that is not there yet (40001). A hash collision only makes two upserts
+    /// wait for each other.
+    pub fn unique_value(table: &str, encoded: &[u8]) -> Self {
+        let mut value: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in encoded {
+            value ^= u64::from(*byte);
+            value = value.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        Self {
+            table: table_hash(table) ^ UNIQUE_VALUE_SPACE,
+            row: value,
         }
     }
 
@@ -151,8 +197,11 @@ struct Shard {
 pub struct RowLockBounds {
     /// `lock_timeout`: 55P03 after it.
     pub lock_timeout: Duration,
-    /// `statement_timeout`, counted from the start of the wait: 57014 after it.
-    pub statement_timeout: Option<Duration>,
+    /// When the statement's `statement_timeout` runs out: 57014 then. Counted from the
+    /// start of the STATEMENT where it is known (review F12; `TableLocks::row_lock_bounds`),
+    /// as PostgreSQL bounds the whole statement: a statement that reached the wait
+    /// 0.4 s in with a 500 ms timeout used to wait until 0.9 s.
+    pub statement_deadline: Option<Instant>,
 }
 
 /// The row write locks and change epochs of one engine.
@@ -216,9 +265,36 @@ impl RowLocks {
 
     /// In range: modulo the slice's length.
     #[inline]
-    #[allow(clippy::indexing_slicing)]
     fn epoch_slot(&self, table: &str) -> &AtomicU64 {
-        &self.epochs[(table_hash(table) % EPOCH_SLOTS as u64) as usize]
+        self.epoch_slot_of(table_hash(table))
+    }
+
+    /// In range: modulo the slice's length.
+    #[inline]
+    #[allow(clippy::indexing_slicing)]
+    fn epoch_slot_of(&self, hash: u64) -> &AtomicU64 {
+        &self.epochs[(hash % EPOCH_SLOTS as u64) as usize]
+    }
+
+    /// Spec R5.4 (review F5): [`Self::table_epoch`] of `table` on branch level `level`.
+    #[inline]
+    pub fn table_epoch_on_level(&self, level: u64, table: &str) -> u64 {
+        self.epoch_slot_of(level_table_hash(level, table))
+            .load(Ordering::SeqCst)
+    }
+
+    /// Spec R5.4 (review F5): [`Self::changed_since`] of `table` on branch level `level`.
+    #[inline]
+    pub fn changed_since_on_level(&self, level: u64, table: &str, epoch: u64) -> bool {
+        self.table_epoch_on_level(level, table) != epoch
+    }
+
+    /// Spec R5.4 (review F5): [`Self::note_rows_changed`] of `table` on branch level
+    /// `level`.
+    #[inline]
+    pub fn note_rows_changed_on_level(&self, level: u64, table: &str) {
+        self.epoch_slot_of(level_table_hash(level, table))
+            .fetch_add(1, Ordering::SeqCst);
     }
 
     /// `table`'s change epoch. Load it BEFORE reading the rows a statement may change
@@ -255,7 +331,12 @@ impl RowLocks {
     /// Lock row `row_id` of `table` for `owner`, waiting for another owner's hold to
     /// end. `Ok(true)` when this call took it, `Ok(false)` when `owner` held it already.
     pub fn lock(&self, owner: u64, table: &str, row_id: u64, bounds: RowLockBounds) -> Result<bool> {
-        let key = RowKey::new(table, row_id);
+        self.lock_key(owner, RowKey::new(table, row_id), table, row_id, bounds)
+    }
+
+    /// Spec R5.4 (review F6): [`Self::lock`] for any key, a row's or a unique value's
+    /// ([`RowKey::unique_value`]). `row_id` only names it in an error.
+    pub fn lock_key(&self, owner: u64, key: RowKey, table: &str, row_id: u64, bounds: RowLockBounds) -> Result<bool> {
         {
             let mut state = self.shard(key).state.lock();
             match state.rows.get(&key) {
@@ -276,9 +357,7 @@ impl RowLocks {
         self.contended.fetch_add(1, Ordering::Relaxed);
         let shard = self.shard(key);
         let started = Instant::now();
-        let statement_deadline = bounds
-            .statement_timeout
-            .and_then(|timeout| started.checked_add(timeout));
+        let statement_deadline = bounds.statement_deadline;
         crate::runtime_offload::off_worker(|| {
             let mut state = shard.state.lock();
             let outcome = loop {
@@ -422,7 +501,7 @@ mod tests {
     fn bounds(ms: u64) -> RowLockBounds {
         RowLockBounds {
             lock_timeout: Duration::from_millis(ms),
-            statement_timeout: None,
+            statement_deadline: None,
         }
     }
 
@@ -509,6 +588,58 @@ mod tests {
         let other = other.unwrap().unwrap_err().to_string();
         assert!(other.contains(crate::error::ROW_LOCK_TIMEOUT_MARKER), "{other}");
         locks.unbind_owner(1);
+    }
+
+    /// Review F12: the statement's deadline bounds the wait, not a timeout counted from
+    /// the start of the wait: a statement whose time is up when it reaches the row is
+    /// refused at once (57014), whatever `lock_timeout` allows.
+    #[test]
+    fn a_wait_ends_at_the_statements_deadline_not_a_timeout_from_the_wait() {
+        let locks = RowLocks::new();
+        assert!(locks.lock(1, "t", 6, bounds(100)).unwrap());
+        let started = Instant::now();
+        let refused = locks
+            .lock(
+                2,
+                "t",
+                6,
+                RowLockBounds {
+                    lock_timeout: Duration::from_secs(60),
+                    statement_deadline: Some(Instant::now()),
+                },
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("statement timeout"), "{refused}");
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "at once, not at the lock timeout"
+        );
+        assert_eq!(locks.holder("t", 6), Some(1));
+    }
+
+    /// Review F5 / F6: a branch level's row, main's row of the same id and a unique
+    /// value are three different locks; each level's epoch is its own.
+    #[test]
+    fn a_branch_row_and_a_unique_value_are_locks_of_their_own() {
+        let locks = RowLocks::new();
+        assert!(locks.lock(1, "t", 8, bounds(100)).unwrap());
+        let on_level = RowKey::on_level(42, "t", 8);
+        assert!(
+            locks.lock_key(2, on_level, "t", 8, bounds(100)).unwrap(),
+            "not main's row"
+        );
+        let value = RowKey::unique_value("t", b"id\0\x01\x80\0\0\x08");
+        assert!(locks.lock_key(3, value, "t", 0, bounds(100)).unwrap(), "not a row");
+        assert!(locks.lock_key(4, value, "t", 0, bounds(20)).is_err(), "held by 3");
+        let main_before = locks.table_epoch("t");
+        let level_before = locks.table_epoch_on_level(42, "t");
+        locks.note_rows_changed_on_level(42, "t");
+        assert!(locks.changed_since_on_level(42, "t", level_before));
+        let slot = |hash: u64| hash % EPOCH_SLOTS as u64;
+        if slot(level_table_hash(42, "t")) != slot(table_hash("t")) {
+            assert!(!locks.changed_since("t", main_before), "main's epoch did not move");
+        }
     }
 
     #[test]

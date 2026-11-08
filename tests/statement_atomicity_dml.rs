@@ -957,6 +957,356 @@ fn commit_above_the_write_group_ceiling_is_refused_before_writing() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Review fix pass (r534_review, 2026-11-07)
+// ---------------------------------------------------------------------------
+
+fn row_id_of(db: &EmbeddedDatabase, table: &str, id: i32) -> u64 {
+    let schema = db.storage.catalog().get_table_schema(table).unwrap();
+    db.storage
+        .get_row_by_typed_pk_for_write_with_schema(table, &Value::Int4(id), &schema)
+        .unwrap()
+        .unwrap_or_else(|| panic!("{table} has row {id}"))
+        .row_id
+        .unwrap()
+}
+
+/// Review F1: a writer computes its row from storage, never from the row cache. A point
+/// reader that read a row's old image before a write put it back into the cache after
+/// the write had dropped it (the fill was fenced by the schema generation only, which a
+/// row write does not move); the next PK increment then read that old image, found the
+/// table's change epoch unmoved since it loaded it, and wrote old + 1 over the
+/// committed value: 7-15 increments lost in ~25k. The image is planted here as that
+/// reader left it. Before the fix every writer below wrote 1.
+#[test]
+fn a_pk_writer_computes_from_storage_never_a_stale_cached_row() {
+    let db = in_memory();
+    counter_table(&db);
+    db.execute("UPDATE cnt SET n = 5 WHERE id = 1").unwrap();
+    let row_id = row_id_of(&db, "cnt", 1);
+    type Writer = fn(&EmbeddedDatabase) -> heliosdb_nano::Result<u64>;
+    let writers: [(&str, Writer); 3] = [
+        ("text fast PK UPDATE", |db| {
+            db.execute("UPDATE cnt SET n = n + 1 WHERE id = 1")
+        }),
+        ("params fast PK UPDATE", |db| {
+            db.execute_params(
+                "UPDATE cnt SET n = n + $1 WHERE id = $2",
+                &[Value::Int8(1), Value::Int4(1)],
+            )
+        }),
+        ("text UPDATE in a session transaction", |db| {
+            let session = db.create_session("f1", IsolationLevel::ReadCommitted).unwrap();
+            db.begin_transaction_for_session(session).unwrap();
+            let changed = db.execute_for_session(session, "UPDATE cnt SET n = n + 1 WHERE id = 1");
+            db.commit_transaction_for_session(session).unwrap();
+            db.destroy_session(session).unwrap();
+            changed
+        }),
+    ];
+    for (what, writer) in writers {
+        let committed = count(&db, "SELECT n FROM cnt WHERE id = 1");
+        let mut stale = Tuple::new(vec![Value::Int4(1), Value::Int8(0), Value::String("x".into())]);
+        stale.row_id = Some(row_id);
+        db.storage.row_cache().put("cnt", row_id, stale);
+        assert_eq!(writer(&db).unwrap(), 1, "{what}: one row");
+        let schema = db.storage.catalog().get_table_schema("cnt").unwrap();
+        let stored = db
+            .storage
+            .get_row_by_typed_pk_for_write_with_schema("cnt", &Value::Int4(1), &schema)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            int(stored.values.get(1)),
+            committed + 1,
+            "{what}: computed from the committed {committed}, not the cached 0"
+        );
+    }
+}
+
+/// Review F9: a row locked after a SAVEPOINT is let go by ROLLBACK TO SAVEPOINT (its
+/// change is undone, as PostgreSQL ends the subtransaction that locked it); one locked
+/// before the savepoint stays locked. A writer of the first used to wait for the whole
+/// transaction, until its lock_timeout.
+#[test]
+fn rollback_to_savepoint_lets_go_of_the_rows_it_locked() {
+    let db = in_memory();
+    counter_table(&db);
+    let first = row_id_of(&db, "cnt", 1);
+    let second = row_id_of(&db, "cnt", 2);
+    let session = db.create_session("f9", IsolationLevel::ReadCommitted).unwrap();
+    db.begin_transaction_for_session(session).unwrap();
+    db.execute_for_session(session, "UPDATE cnt SET n = n + 1 WHERE id = 2")
+        .unwrap();
+    db.execute_for_session(session, "SAVEPOINT s1").unwrap();
+    db.execute_for_session(session, "UPDATE cnt SET n = n + 1 WHERE id = 1")
+        .unwrap();
+    assert!(db.storage.row_locks().holder("cnt", first).is_some());
+    db.execute_for_session(session, "ROLLBACK TO SAVEPOINT s1").unwrap();
+    assert_eq!(
+        db.storage.row_locks().holder("cnt", first),
+        None,
+        "the row locked after the savepoint is free"
+    );
+    assert!(
+        db.storage.row_locks().holder("cnt", second).is_some(),
+        "the row locked before it stays locked"
+    );
+    let contended = db.storage.row_locks().contended();
+    assert_eq!(db.execute("UPDATE cnt SET n = n + 10 WHERE id = 1").unwrap(), 1);
+    assert_eq!(db.storage.row_locks().contended(), contended, "taken without a wait");
+    db.commit_transaction_for_session(session).unwrap();
+    db.destroy_session(session).unwrap();
+    assert_eq!(counter(&db), 10);
+    assert_eq!(count(&db, "SELECT n FROM cnt WHERE id = 2"), 1);
+}
+
+/// Review F13: a group past the write-group ceiling is refused while it is staged, not
+/// after the whole statement ran and its batch was built (an `INSERT … SELECT` of
+/// 2.8 GB of rows built an 8.6 GB group at 25 GB of RSS before the 54000 came). The
+/// gate never sees it: its refusal count does not move.
+#[test]
+fn a_group_past_the_ceiling_is_refused_while_it_is_staged() {
+    let db = in_memory();
+    db.execute("CREATE TABLE big (id INT PRIMARY KEY, body TEXT)").unwrap();
+    let insert = "INSERT INTO big SELECT x, repeat('x', 200) FROM generate_series(1, 5000) x";
+    let gate_refusals = db.storage.write_gate().refusals();
+    db.storage.debug_set_write_group_ceiling(Some(64 * 1024));
+    let refused = db.execute(insert);
+    db.storage.debug_set_write_group_ceiling(None);
+    let err = refused.expect_err("about 1 MB of rows are above a 64 KB ceiling");
+    assert!(err.to_string().contains(BRANCH_MATERIALIZE_TOO_LARGE_MARKER), "{err}");
+    assert_eq!(
+        db.storage.write_gate().refusals(),
+        gate_refusals,
+        "refused while staging: no batch reached the gate"
+    );
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM big"), 0, "nothing was written");
+    assert_eq!(db.execute(insert).unwrap(), 5000, "and it fits the real ceiling");
+}
+
+/// Review F6: two upserts of one NEW key. The second waits for the first (it holds the
+/// value it arbitrates on) and then takes its DO UPDATE once the first commits, or
+/// inserts once it rolls back, as PostgreSQL's speculative insertion does. It used to
+/// race: 23505 when both found the key free, 40001 when it found the first's key before
+/// its row.
+#[test]
+fn a_second_upsert_of_a_new_key_waits_for_the_first() {
+    let _watchdog = watchdog("a_second_upsert_of_a_new_key_waits_for_the_first", TEST_AT_MOST);
+    let db = Arc::new(in_memory());
+    db.execute("CREATE TABLE u (id INT PRIMARY KEY, n INT)").unwrap();
+    for (key, commit) in [(5, true), (6, false)] {
+        let upsert = format!("INSERT INTO u VALUES ({key}, 1) ON CONFLICT (id) DO UPDATE SET n = u.n + 1");
+        let first = db.create_session("first", IsolationLevel::ReadCommitted).unwrap();
+        db.begin_transaction_for_session(first).unwrap();
+        db.execute_for_session(first, &upsert).unwrap();
+        let second = {
+            let db = Arc::clone(&db);
+            let upsert = upsert.clone();
+            std::thread::spawn(move || db.execute(&upsert))
+        };
+        wait_for("the second upsert to wait for the first", || {
+            db.storage.row_locks().waiting() > 0
+        });
+        if commit {
+            db.commit_transaction_for_session(first).unwrap();
+        } else {
+            db.rollback_transaction_for_session(first).unwrap();
+        }
+        db.destroy_session(first).unwrap();
+        assert_eq!(second.join().unwrap().unwrap(), 1, "key {key}: one row");
+        let found = rows(&db, &format!("SELECT n FROM u WHERE id = {key}"));
+        assert_eq!(found.len(), 1, "key {key}: one row with it");
+        let expected = if commit { 2 } else { 1 };
+        assert_eq!(int(found[0].values.first()), expected, "key {key}");
+    }
+}
+
+/// Review F3 (pre-existing): an open transaction's DELETE took its key out of the
+/// index at once, so a concurrent INSERT of the key went ahead, and after that
+/// transaction's ROLLBACK two rows shared one primary key; a concurrent PK UPDATE found
+/// nothing and its change was lost. The key stays the deleter's until it ends: the
+/// INSERT waits and fails 23505 after a rollback (succeeds after a commit), the UPDATE
+/// waits and applies after a rollback.
+#[test]
+fn an_uncommitted_delete_holds_its_key_until_it_ends() {
+    let _watchdog = watchdog("an_uncommitted_delete_holds_its_key_until_it_ends", TEST_AT_MOST);
+    let db = Arc::new(in_memory());
+    db.execute("CREATE TABLE r (id INT PRIMARY KEY, v INT, n INT)").unwrap();
+    type Writer = fn(&EmbeddedDatabase) -> heliosdb_nano::Result<u64>;
+    let cases: [(&str, Writer, bool); 4] = [
+        (
+            "INSERT, deleter rolls back",
+            |db| db.execute("INSERT INTO r VALUES (1, 9, 9)"),
+            false,
+        ),
+        (
+            "INSERT, deleter commits",
+            |db| db.execute("INSERT INTO r VALUES (1, 9, 9)"),
+            true,
+        ),
+        (
+            "PK UPDATE, deleter rolls back",
+            |db| db.execute("UPDATE r SET n = n + 1 WHERE id = 1"),
+            false,
+        ),
+        (
+            "upsert, deleter rolls back",
+            |db| db.execute("INSERT INTO r VALUES (1, 9, 9) ON CONFLICT (id) DO UPDATE SET n = r.n + 1"),
+            false,
+        ),
+    ];
+    for (what, writer, commit) in cases {
+        db.execute("DELETE FROM r").unwrap();
+        db.execute("INSERT INTO r VALUES (1, 1, 0), (2, 2, 0)").unwrap();
+        let deleter = db.create_session("deleter", IsolationLevel::ReadCommitted).unwrap();
+        db.begin_transaction_for_session(deleter).unwrap();
+        db.execute_for_session(deleter, "DELETE FROM r WHERE id = 1").unwrap();
+        let concurrent = {
+            let db = Arc::clone(&db);
+            std::thread::spawn(move || writer(&db))
+        };
+        wait_for("the writer to wait for the deleter", || {
+            db.storage.row_locks().waiting() > 0
+        });
+        if commit {
+            db.commit_transaction_for_session(deleter).unwrap();
+        } else {
+            db.rollback_transaction_for_session(deleter).unwrap();
+        }
+        db.destroy_session(deleter).unwrap();
+        let outcome = concurrent.join().unwrap();
+        let found: Vec<(i64, i64)> = rows(&db, "SELECT v, n FROM r WHERE id = 1")
+            .iter()
+            .map(|row| (int(row.values.first()), int(row.values.get(1))))
+            .collect();
+        let all = count(&db, "SELECT COUNT(*) FROM r");
+        match what {
+            "INSERT, deleter rolls back" => {
+                let err = outcome.expect_err("the key is the restored row's");
+                assert!(
+                    err.to_string().to_ascii_lowercase().contains("duplicate"),
+                    "{what}: {err}"
+                );
+                assert_eq!(found, vec![(1, 0)], "{what}: only the original row");
+                assert_eq!(all, 2, "{what}");
+            }
+            "INSERT, deleter commits" => {
+                assert_eq!(outcome.unwrap(), 1, "{what}");
+                assert_eq!(found, vec![(9, 9)], "{what}: only the new row");
+                assert_eq!(all, 2, "{what}");
+            }
+            "PK UPDATE, deleter rolls back" => {
+                assert_eq!(outcome.unwrap(), 1, "{what}: the restored row is updated");
+                assert_eq!(found, vec![(1, 1)], "{what}");
+            }
+            _ => {
+                assert_eq!(outcome.unwrap(), 1, "{what}: the DO UPDATE of the restored row");
+                assert_eq!(found, vec![(1, 1)], "{what}");
+                assert_eq!(all, 2, "{what}");
+            }
+        }
+        assert_eq!(
+            rows(&db, "SELECT id FROM r WHERE id = 1").len(),
+            found.len(),
+            "{what}: the key finds every row that holds it"
+        );
+    }
+}
+
+/// Review F4 (pre-existing): ON DELETE CASCADE took no lock on the children, so a child
+/// updated by an open transaction was deleted under it and written back by that
+/// transaction's COMMIT: an orphan. The cascade's exclusive inbound-table request
+/// waits for the child's transaction before it reads and deletes committed rows.
+#[test]
+fn a_cascade_waits_for_a_child_an_open_transaction_changed() {
+    let _watchdog = watchdog("a_cascade_waits_for_a_child_an_open_transaction_changed", TEST_AT_MOST);
+    let db = Arc::new(in_memory());
+    db.execute("CREATE TABLE par (id INT PRIMARY KEY)").unwrap();
+    db.execute("INSERT INTO par VALUES (1), (2)").unwrap();
+    db.execute("CREATE TABLE chd (id INT PRIMARY KEY, pid INT REFERENCES par(id) ON DELETE CASCADE, n INT)")
+        .unwrap();
+    db.execute("INSERT INTO chd VALUES (5, 1, 0), (6, 2, 0)").unwrap();
+    let holder = db.create_session("child", IsolationLevel::ReadCommitted).unwrap();
+    db.begin_transaction_for_session(holder).unwrap();
+    db.execute_for_session(holder, "UPDATE chd SET n = n + 1 WHERE id = 5")
+        .unwrap();
+    let cascade = {
+        let db = Arc::clone(&db);
+        std::thread::spawn(move || db.execute("DELETE FROM par WHERE id = 1"))
+    };
+    wait_for("the cascade's exclusive child-table request", || {
+        assert!(
+            !cascade.is_finished(),
+            "cascade cannot complete before the child commits"
+        );
+        db.storage.debug_table_lock_waiters("chd").0 > 0
+    });
+    assert!(!cascade.is_finished());
+    db.commit_transaction_for_session(holder).unwrap();
+    db.destroy_session(holder).unwrap();
+    assert_eq!(cascade.join().unwrap().unwrap(), 1);
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM chd WHERE pid = 1"), 0, "no orphan");
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM chd"), 1);
+    assert_eq!(
+        rows(&db, "SELECT id,pid,n FROM chd")[0].values,
+        vec![Value::Int4(6), Value::Int4(2), Value::Int4(0)]
+    );
+}
+
+/// Review F5: a branch's rows are locked like main's (by level and row). Two sessions
+/// on one branch incrementing one row lost up to 81% of the increments, with no error.
+#[test]
+fn a_waiting_writer_on_a_branch_changes_the_row_its_lock_holder_committed() {
+    let _watchdog = watchdog(
+        "a_waiting_writer_on_a_branch_changes_the_row_its_lock_holder_committed",
+        TEST_AT_MOST,
+    );
+    let db = Arc::new(in_memory());
+    counter_table(&db);
+    db.execute("CREATE BRANCH bx AS OF NOW").unwrap();
+    let on_branch = |name: &str| {
+        let session = db.create_session(name, IsolationLevel::ReadCommitted).unwrap();
+        db.execute_for_session(session, "USE BRANCH bx").unwrap();
+        session
+    };
+    let reader = on_branch("reader");
+    let branch_counter = || {
+        let found = db
+            .query_in_session(reader, "SELECT n FROM cnt WHERE id = 1", &[])
+            .unwrap();
+        int(found[0].values.first())
+    };
+    for family in ["text", "params"] {
+        let before = branch_counter();
+        let holder = on_branch("holder");
+        db.begin_transaction_for_session(holder).unwrap();
+        db.execute_for_session(holder, "UPDATE cnt SET n = n + 1 WHERE id = 1")
+            .unwrap();
+        let waiter = on_branch("waiter");
+        let waiting = {
+            let db = Arc::clone(&db);
+            std::thread::spawn(move || match family {
+                "text" => db.execute_for_session(waiter, "UPDATE cnt SET n = n + 1 WHERE id = 1"),
+                _ => db.execute_params_for_session(
+                    waiter,
+                    "UPDATE cnt SET n = n + $1 WHERE id = $2",
+                    &[Value::Int8(1), Value::Int4(1)],
+                ),
+            })
+        };
+        wait_for("the branch writer to wait for the row", || {
+            db.storage.row_locks().waiting() > 0
+        });
+        db.commit_transaction_for_session(holder).unwrap();
+        db.destroy_session(holder).unwrap();
+        assert_eq!(waiting.join().unwrap().unwrap(), 1, "{family}: one row");
+        db.destroy_session(waiter).unwrap();
+        assert_eq!(branch_counter(), before + 2, "{family}: neither increment is lost");
+    }
+    assert_eq!(counter(&db), 0, "main is untouched");
+}
+
 /// P11 (pre-existing): the extended protocol did not see a session's temp tables. An
 /// INSERT into one failed 42P01, and with a permanent table of the same name it wrote
 /// into the permanent table.

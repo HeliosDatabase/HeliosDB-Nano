@@ -47,7 +47,10 @@ pub enum KeyClass {
     Snapshot,
     /// `txn_map:{txn}` / `scn_map:{scn}` — legacy snapshot mappings. Nothing
     /// writes them since R1.4; snapshot GC still deletes them, so they appear
-    /// as deletes in the WAL and as live keys in older databases.
+    /// as deletes in the WAL and as live keys in older databases. Also the
+    /// snapshot index `scn_map:@{wall_secs:020}:{ts:020}` and its marker
+    /// `scn_map:@~` (`time_travel::SNAPSHOT_INDEX_PREFIX`, review F16), written
+    /// with every `snapshot:` record: a standby derives nothing from them.
     SnapshotMap,
     /// `vmeta:{table}:{first:020}:{last:020}` — a COPY / multi-row INSERT
     /// visibility marker standing in for per-row versions.
@@ -67,6 +70,12 @@ pub enum KeyClass {
     /// COLUMN`, `RENAME TO`, `SET STORAGE`), in the DDL's own write: what refuses a
     /// branch anchored before it (sprinter 6bc4a4040eb7, B4 fix pass).
     MetaTableShape,
+    /// `meta:table_layout:{table}` — every change of main's table since it took its
+    /// name that moved the positions of its columns (`DROP COLUMN`) or cut its history
+    /// (`RENAME TO`, `SET STORAGE` out of a stored representation), in the change's
+    /// own write: what a row version written before one is read across, or refused
+    /// at (spec R5.5, `storage::table_layout`).
+    MetaTableLayout,
     /// `meta:history_purge:{table}` — the version history under the name is to be
     /// deleted, and no table has the name: written in a `DROP` or `RENAME` batch,
     /// deleted when the history is (sprinter 6bc4a4040eb7, B4 fix pass).
@@ -98,7 +107,7 @@ pub enum KeyClass {
     /// `meta:col_storage:{table}:{column}` — written only by WAL replay of
     /// `AlterColumnStorage`.
     MetaColStorage,
-    /// `meta:delta:last_id` — the MV delta id allocator.
+    /// `meta:delta:last_id` (legacy) and `meta:delta:floor:{lane:02}` — MV delta allocator evidence.
     MetaDelta,
     /// `meta:tde:keycheck` — the encryption key-check sentinel.
     MetaTdeKeyCheck,
@@ -182,6 +191,8 @@ pub enum KeyClass {
     WalCheckpoint,
     /// `wal:pruned_through` — the logical WAL history floor.
     WalPrunedThrough,
+    /// `wal:atomic_groups` — the logical-WAL atomic-data-group format version.
+    WalAtomicGroups,
     /// `repl:applied_lsn` — a logical standby's applied cursor (node-local).
     ReplAppliedLsn,
     /// `repl:epoch` — the dataset's replication epoch (spec P5.1), written
@@ -257,6 +268,8 @@ pub const PREFIXES: &[(&[u8], KeyClass)] = &[
     (b"counter:", KeyClass::Counter),
     // storage/engine.rs:2228 `extract_table_from_key` legacy read arm
     (b"meta:counter:", KeyClass::LegacyCounter),
+    // storage/write_gate.rs: permanent bounded MV delta allocator floors.
+    (b"meta:delta:floor:", KeyClass::MetaDelta),
     // --- Catalog ---
     // storage/catalog.rs:3895 `table_metadata_key`
     (b"meta:table:", KeyClass::MetaTable),
@@ -266,6 +279,8 @@ pub const PREFIXES: &[(&[u8], KeyClass)] = &[
     (b"meta:attmissing:", KeyClass::MetaAttMissing),
     // storage/catalog.rs `table_shape_key` (sprinter 6bc4a4040eb7, B4 fix pass)
     (b"meta:table_shape:", KeyClass::MetaTableShape),
+    // storage/table_layout.rs `TABLE_LAYOUT_PREFIX` (spec R5.5)
+    (b"meta:table_layout:", KeyClass::MetaTableLayout),
     // storage/catalog.rs `history_purge_key` (sprinter 6bc4a4040eb7, B4 fix pass)
     (b"meta:history_purge:", KeyClass::MetaHistoryPurge),
     // storage/catalog.rs:3899 `index_metadata_key`
@@ -339,6 +354,8 @@ pub const PREFIXES: &[(&[u8], KeyClass)] = &[
     (b"branch:children:", KeyClass::Branch),
     // storage/branch_catalog.rs `branch_merge_intent_key` (sprinter 6bc4a4040eb7, B3 fix pass)
     (b"branch:merge:", KeyClass::Branch),
+    // Versioned merge FK policy, atomic with its intent, separate from intent enumeration.
+    (b"branch:merge_fk_policy:", KeyClass::Branch),
     // storage/branch.rs:26 `BRANCH_DATA_PREFIX`; storage/engine.rs:15711 `branch_aware_data_key`
     (b"bdata:", KeyClass::BranchData),
     // storage/engine.rs:16379 `format!("bdel:{}:{}:{}")`
@@ -397,7 +414,7 @@ pub const PREFIXES: &[(&[u8], KeyClass)] = &[
 pub const FIXED_KEYS: &[(&[u8], KeyClass)] = &[
     // storage/catalog.rs:4644 `role_oid_counter_key`
     (b"meta:role_oid_next", KeyClass::MetaRole),
-    // storage/mv_delta.rs:332 `save_last_delta_id`
+    // storage/mv_delta.rs: `LEGACY_DELTA_ID_KEY` (compatibility input)
     (b"meta:delta:last_id", KeyClass::MetaDelta),
     // storage/tde.rs:366 `KEY_CHECK_KEY`
     (b"meta:tde:keycheck", KeyClass::MetaTdeKeyCheck),
@@ -413,6 +430,8 @@ pub const FIXED_KEYS: &[(&[u8], KeyClass)] = &[
     (b"wal:checkpoint", KeyClass::WalCheckpoint),
     // storage/wal.rs:1192 `PRUNED_THROUGH_KEY`
     (b"wal:pruned_through", KeyClass::WalPrunedThrough),
+    // storage/wal_recovery.rs `ATOMIC_GROUPS_KEY`
+    (b"wal:atomic_groups", KeyClass::WalAtomicGroups),
     // storage/engine.rs:11415 `REPLICATION_CURSOR_KEY`
     (b"repl:applied_lsn", KeyClass::ReplAppliedLsn),
     // storage/replication_epoch.rs `EPOCH_KEY`
@@ -580,6 +599,7 @@ mod tests {
         (b"meta:procedure:log_it", KeyClass::MetaProcedure, None),
         (b"meta:col_storage:users:bio", KeyClass::MetaColStorage, None),
         (b"meta:delta:last_id", KeyClass::MetaDelta, None),
+        (b"meta:delta:floor:07", KeyClass::MetaDelta, None),
         (b"meta:tde:keycheck", KeyClass::MetaTdeKeyCheck, None),
         (b"table_constraints:users", KeyClass::TableConstraints, None),
         (b"constraint:users:users_pkey", KeyClass::TableConstraints, None),
@@ -617,8 +637,10 @@ mod tests {
         (b"bfrz:2:users:42", KeyClass::BranchFrozen, Some("users")),
         (b"bkey:2:7573657273:75:0102:42", KeyClass::BranchKey, None),
         (b"branch:merge:2", KeyClass::Branch, None),
+        (b"branch:merge_fk_policy:2", KeyClass::Branch, None),
         (b"meta:table_incarnation:users", KeyClass::MetaTableIncarnation, None),
         (b"meta:table_shape:users", KeyClass::MetaTableShape, None),
+        (b"meta:table_layout:users", KeyClass::MetaTableLayout, None),
         (b"meta:history_purge:users", KeyClass::MetaHistoryPurge, None),
         (b"git:config", KeyClass::Git, None),
         (b"git:link:feature", KeyClass::Git, None),
@@ -635,6 +657,7 @@ mod tests {
         (b"wal:last_lsn", KeyClass::WalLastLsn, None),
         (b"wal:checkpoint", KeyClass::WalCheckpoint, None),
         (b"wal:pruned_through", KeyClass::WalPrunedThrough, None),
+        (b"wal:atomic_groups", KeyClass::WalAtomicGroups, None),
         (b"repl:applied_lsn", KeyClass::ReplAppliedLsn, None),
         (b"repl:epoch", KeyClass::ReplEpoch, None),
         (b"__nano_physical_replica_cursor_v1", KeyClass::PhysicalCursor, None),
@@ -753,6 +776,7 @@ mod tests {
             b"meta:plain:put",
             b"wal:",
             b"wal:last_lsn_v2",
+            b"wal:atomic_groups_v2",
             b"repl:epoch_v2",
             b"repl:",
             b"branch:registry2",

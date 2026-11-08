@@ -13608,3 +13608,41 @@ fn a_shape_change_after_the_handlers_check_is_refused_by_the_arm_before_it_write
         }
     }
 }
+
+/// Spec R5.3 (review F17): a sequence parameter out of range is 22023
+/// (invalid_parameter_value), as in PostgreSQL, on both executor families — it
+/// was XX000. Classified by the emitter's marker
+/// (`Error::sequence_parameter_invalid`).
+#[test]
+fn sequence_parameters_out_of_range_classify_as_22023() {
+    let db = EmbeddedDatabase::new_in_memory().expect("db");
+    db.execute("CREATE SEQUENCE sq MINVALUE 1 MAXVALUE 10").expect("create");
+    for sql in [
+        "ALTER SEQUENCE sq RESTART WITH 50",
+        "ALTER SEQUENCE sq MAXVALUE 20 RESTART WITH 50",
+        "ALTER SEQUENCE sq INCREMENT BY 0",
+        "ALTER SEQUENCE sq MINVALUE 20",
+        "CREATE SEQUENCE sq2 MINVALUE 10 MAXVALUE 1",
+        "CREATE SEQUENCE sq3 START WITH 50 MAXVALUE 10",
+    ] {
+        for params in [false, true] {
+            let refused = if params {
+                db.execute_params(sql, &[])
+            } else {
+                db.execute(sql)
+            }
+            .expect_err(sql);
+            assert!(
+                refused
+                    .to_string()
+                    .contains(crate::error::SEQUENCE_PARAMETER_INVALID_MARKER),
+                "{sql} (params: {params}): {refused}"
+            );
+            assert_eq!(
+                super::handler::sqlstate_for_error(&refused),
+                "22023",
+                "{sql} (params: {params}): {refused}"
+            );
+        }
+    }
+}

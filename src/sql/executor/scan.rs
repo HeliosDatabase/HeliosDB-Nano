@@ -214,6 +214,11 @@ fn txn_base_tuples(
             return Ok(tuples);
         }
     }
+    // Spec R5.5: a snapshot older than a cut of the table's history reads nothing
+    // right, unless this transaction's own rename made the cut.
+    if !txn.made_history_cut(actual_table_name) {
+        storage.refuse_history_before_cuts(actual_table_name, snapshot)?;
+    }
     let base_tuples = storage.scan_table_at_transaction_snapshot(actual_table_name, snapshot)?;
     let shape = storage.row_shape(actual_table_name, schema.columns.len())?;
     txn.merge_with_write_set_shaped(actual_table_name, base_tuples, &shape)
@@ -267,7 +272,9 @@ fn storage_filter_value_matches_type(data_type: &DataType, value: &Value) -> boo
             matches!(value, Value::Int2(_) | Value::Int4(_) | Value::Int8(_))
         }
         DataType::Float4 | DataType::Float8 => matches!(value, Value::Float4(_) | Value::Float8(_)),
-        DataType::Text | DataType::Varchar(_) | DataType::Char(_) => matches!(value, Value::String(_)),
+        DataType::Text | DataType::Varchar(_) | DataType::Char(_) => {
+            matches!(value, Value::String(_))
+        }
         DataType::Boolean => matches!(value, Value::Boolean(_)),
         DataType::Bytea => matches!(value, Value::Bytes(_)),
         DataType::Uuid => matches!(value, Value::Uuid(_)),
@@ -330,6 +337,68 @@ fn filter_tuples_with_evaluator(
                     result
                 )));
             }
+        }
+    }
+    Ok(filtered)
+}
+
+/// Correlated predicates need the current candidate row. Keep them intact
+/// while choosing an index bound; only uncorrelated subqueries can be run once.
+fn materialize_scan_predicate(
+    executor: &Executor,
+    predicate: &LogicalExpr,
+    schema: &Schema,
+    source_name: &str,
+    table_name: &str,
+) -> Result<(LogicalExpr, Option<Arc<Schema>>)> {
+    if !Executor::expr_contains_subquery(predicate) {
+        // Preserve the ordinary probe path: no full schema clone/stamp until
+        // eligibility succeeds and its fetched rows need an output schema.
+        return Ok((executor.materialize_subqueries(predicate)?, None));
+    }
+    let schema = Arc::new(schema_with_source(schema, source_name, table_name));
+    let predicate = if executor.expr_has_correlated_subquery(predicate, &schema) {
+        predicate.clone()
+    } else {
+        executor.materialize_subqueries(predicate)?
+    };
+    Ok((predicate, Some(schema)))
+}
+
+fn correlated_candidate_matches(
+    executor: &Executor,
+    evaluator: &crate::sql::Evaluator,
+    schema: &Schema,
+    predicate: &LogicalExpr,
+    tuple: &Tuple,
+) -> Result<bool> {
+    if let Some(context) = executor.timeout_ctx() {
+        context.check_timeout()?;
+    }
+    let bound = executor.materialize_subqueries_with_outer(predicate, schema, tuple)?;
+    match evaluator.evaluate(&bound, tuple)? {
+        Value::Boolean(true) => Ok(true),
+        Value::Boolean(false) | Value::Null => Ok(false),
+        result => Err(Error::query_execution(format!(
+            "Filter predicate must evaluate to boolean, got: {result:?}"
+        ))),
+    }
+}
+
+fn filter_scan_candidates(
+    executor: &Executor,
+    tuples: Vec<Tuple>,
+    schema: Arc<Schema>,
+    predicate: &LogicalExpr,
+) -> Result<Vec<Tuple>> {
+    if !executor.expr_has_correlated_subquery(predicate, &schema) {
+        return filter_tuples_with_evaluator(tuples, schema, predicate, executor.parameters());
+    }
+    let evaluator = crate::sql::Evaluator::with_parameters(schema.clone(), executor.parameters().to_vec());
+    let mut filtered = Vec::with_capacity(tuples.len());
+    for tuple in tuples {
+        if correlated_candidate_matches(executor, &evaluator, &schema, predicate, &tuple)? {
+            filtered.push(tuple);
         }
     }
     Ok(filtered)
@@ -401,7 +470,9 @@ pub(super) fn try_index_point_lookup_for_scan(
         return Ok(None);
     }
 
-    let materialized_predicate = executor.materialize_subqueries(predicate)?;
+    let source_name = alias.as_ref().unwrap_or(table_name);
+    let (materialized_predicate, actual_schema) =
+        materialize_scan_predicate(executor, predicate, schema.as_ref(), source_name, table_name)?;
     let Some((index_name, lookup_value)) = indexed_equality_lookup(
         storage,
         table_name,
@@ -445,14 +516,9 @@ pub(super) fn try_index_point_lookup_for_scan(
         }
     }
 
-    let source_name = alias.as_ref().unwrap_or(table_name);
-    let actual_schema = Arc::new(schema_with_source(schema.as_ref(), source_name, table_name));
-    let tuples = filter_tuples_with_evaluator(
-        tuples,
-        actual_schema.clone(),
-        &materialized_predicate,
-        executor.parameters(),
-    )?;
+    let actual_schema =
+        actual_schema.unwrap_or_else(|| Arc::new(schema_with_source(schema.as_ref(), source_name, table_name)));
+    let tuples = filter_scan_candidates(executor, tuples, actual_schema.clone(), &materialized_predicate)?;
 
     Ok(Some(Box::new(
         ScanOperator::new(
@@ -553,7 +619,9 @@ pub(super) fn try_index_in_list_for_scan(
         return Ok(None);
     }
 
-    let materialized_predicate = executor.materialize_subqueries(predicate)?;
+    let source_name = alias.as_ref().unwrap_or(table_name);
+    let (materialized_predicate, actual_schema) =
+        materialize_scan_predicate(executor, predicate, schema.as_ref(), source_name, table_name)?;
     let Some((index_name, lookup_values)) = indexed_in_list_lookup(
         storage,
         table_name,
@@ -596,16 +664,11 @@ pub(super) fn try_index_in_list_for_scan(
         }
     }
 
-    let source_name = alias.as_ref().unwrap_or(table_name);
-    let actual_schema = Arc::new(schema_with_source(schema.as_ref(), source_name, table_name));
     // Re-filter with the full predicate: an `IN (…) AND other` keeps `other`,
     // and this is the correctness backstop for the index probe.
-    let tuples = filter_tuples_with_evaluator(
-        tuples,
-        actual_schema.clone(),
-        &materialized_predicate,
-        executor.parameters(),
-    )?;
+    let actual_schema =
+        actual_schema.unwrap_or_else(|| Arc::new(schema_with_source(schema.as_ref(), source_name, table_name)));
+    let tuples = filter_scan_candidates(executor, tuples, actual_schema.clone(), &materialized_predicate)?;
 
     Ok(Some(Box::new(
         ScanOperator::new(
@@ -928,7 +991,9 @@ pub(super) fn try_index_range_scan_for_scan(
         return Ok(None);
     }
 
-    let materialized_predicate = executor.materialize_subqueries(predicate)?;
+    let source_name = alias.as_ref().unwrap_or(table_name);
+    let (materialized_predicate, actual_schema) =
+        materialize_scan_predicate(executor, predicate, schema.as_ref(), source_name, table_name)?;
 
     let Some(pairs) = guarded_range_pairs(storage, &spec) else {
         return Ok(None);
@@ -975,14 +1040,9 @@ pub(super) fn try_index_range_scan_for_scan(
         }
     }
 
-    let source_name = alias.as_ref().unwrap_or(table_name);
-    let actual_schema = Arc::new(schema_with_source(schema.as_ref(), source_name, table_name));
-    let tuples = filter_tuples_with_evaluator(
-        tuples,
-        actual_schema.clone(),
-        &materialized_predicate,
-        executor.parameters(),
-    )?;
+    let actual_schema =
+        actual_schema.unwrap_or_else(|| Arc::new(schema_with_source(schema.as_ref(), source_name, table_name)));
+    let tuples = filter_scan_candidates(executor, tuples, actual_schema.clone(), &materialized_predicate)?;
 
     tracing::debug!(
         "index range scan: '{}' on {}.{} ({}) served {} rows",
@@ -2043,11 +2103,45 @@ impl PhysicalOperator for MaterializedOperator {
 }
 
 /// Handle Scan logical plan node
+/// Spec R5.6: a scan reads its table under the layout the catalog holds now, while the
+/// plan it runs was built under the layout of when it was planned: its expressions name
+/// the columns it resolved then, and its decode hints (`compute_scan_decode_hints`) say
+/// which of them a row is decoded for. The two differ only when a schema statement
+/// landed between the planning and this scan, and a plan run over a layout it does not
+/// describe answers wrongly and quietly: `SELECT count(*), count(u)` planned before
+/// `ADD COLUMN u` (an aggregate's argument is not resolved at plan time) decoded no
+/// column of the new layout and counted `u` NULL in every row, on a primary and, for
+/// the whole publication of the change, on a physical standby. Refused here with the
+/// statement's layout-change error (40001), which the statement entries retry by
+/// planning again; a cached or pinned plan of the old layout is not served again
+/// (`storage::layout_epochs`). Also records the epoch of a materialized view's data
+/// table, including a direct executor whose caller did not resolve the view.
+pub(super) fn refuse_plan_of_another_layout(
+    storage: &crate::storage::StorageEngine,
+    table_name: &str,
+    actual_table_name: &str,
+    planned: &Schema,
+    now: &Schema,
+) -> Result<()> {
+    if actual_table_name != table_name {
+        crate::storage::layout_epochs::note_table(storage.layout_epochs(), actual_table_name);
+    }
+    let same = planned.columns.len() == now.columns.len()
+        && planned.columns.iter().zip(&now.columns).all(|(planned, now)| {
+            planned.name == now.name && planned.data_type == now.data_type && planned.storage_mode == now.storage_mode
+        });
+    if same {
+        Ok(())
+    } else {
+        Err(crate::storage::layout_epochs::layout_changed(table_name))
+    }
+}
+
 pub(super) fn handle_scan(executor: &Executor, plan: &LogicalPlan) -> Result<Box<dyn PhysicalOperator>> {
     if let LogicalPlan::Scan {
         table_name,
         alias,
-        schema: _plan_schema,
+        schema: plan_schema,
         projection,
         as_of,
     } = plan
@@ -2117,7 +2211,6 @@ pub(super) fn handle_scan(executor: &Executor, plan: &LogicalPlan) -> Result<Box
             // First check if it's a materialized view
             // We need to do this first because MVs are stored in __mv_<name> tables
             let (schema, actual_table_name) = if mv_catalog.view_exists(table_name)? {
-                let mv_metadata = mv_catalog.get_view(table_name)?;
                 let mv_data_table = crate::storage::MaterializedViewCatalog::mv_data_table_name(table_name);
 
                 // Check if MV data table exists (view has been refreshed)
@@ -2128,7 +2221,7 @@ pub(super) fn handle_scan(executor: &Executor, plan: &LogicalPlan) -> Result<Box
                     )));
                 }
 
-                (mv_metadata.schema, mv_data_table)
+                (catalog.get_table_schema(&mv_data_table)?, mv_data_table)
             } else {
                 // Not an MV, try regular table
                 match catalog.get_table_schema(table_name) {
@@ -2136,6 +2229,7 @@ pub(super) fn handle_scan(executor: &Executor, plan: &LogicalPlan) -> Result<Box
                     Err(e) => return Err(e),
                 }
             };
+            refuse_plan_of_another_layout(storage, table_name, &actual_table_name, plan_schema, &schema)?;
 
             // Handle time-travel or transactional queries
             let tuples = if let Some(txn) = executor.transaction() {
@@ -2194,6 +2288,14 @@ pub(super) fn handle_scan(executor: &Executor, plan: &LogicalPlan) -> Result<Box
                         match bincode::deserialize::<crate::Tuple>(&value_bytes) {
                             Ok(mut tuple) => {
                                 tuple.row_id = Some(row_id);
+                                // Spec R5.5: a version older than a DROP COLUMN in
+                                // today's layout, refused across a cut.
+                                snapshot_mgr.bring_version_forward(
+                                    &actual_table_name,
+                                    row_id,
+                                    crate::storage::time_travel::ImageSource::Version(timestamp),
+                                    &mut tuple,
+                                )?;
                                 // Spec R5.2: a version older than a column reads
                                 // its missing value, under the version rule.
                                 storage.shape_version_row(&actual_table_name, schema.columns.len(), &mut tuple)?;
@@ -2293,7 +2395,7 @@ pub(super) fn handle_scan(executor: &Executor, plan: &LogicalPlan) -> Result<Box
             (Arc::new(schema_with_source), tuples)
         } else {
             // No storage, use placeholder schema from plan
-            (_plan_schema.clone(), Vec::new())
+            (plan_schema.clone(), Vec::new())
         };
 
         Ok(Box::new(
@@ -2319,7 +2421,7 @@ pub(super) fn handle_filtered_scan(executor: &Executor, plan: &LogicalPlan) -> R
     if let LogicalPlan::FilteredScan {
         table_name,
         alias,
-        schema: _plan_schema,
+        schema: plan_schema,
         projection,
         predicate,
         as_of,
@@ -2327,6 +2429,43 @@ pub(super) fn handle_filtered_scan(executor: &Executor, plan: &LogicalPlan) -> R
     {
         // Use alias for column source_table (for JOIN disambiguation), fallback to table_name
         let source_name = alias.as_ref().unwrap_or(table_name);
+        if let Some(predicate) = predicate
+            .as_ref()
+            .filter(|predicate| Executor::expr_contains_subquery(predicate))
+        {
+            let outer = schema_with_source(plan_schema.as_ref(), source_name, table_name);
+            if executor.expr_has_correlated_subquery(predicate, &outer) {
+                // Do not push a correlated expression into storage or evaluate it
+                // before a row exists. Read the full outer row, then apply the
+                // requested scan projection after evaluating its predicate.
+                let scan = LogicalPlan::Scan {
+                    table_name: table_name.clone(),
+                    alias: alias.clone(),
+                    schema: plan_schema.clone(),
+                    projection: None,
+                    as_of: as_of.clone(),
+                };
+                let mut input = handle_scan(executor, &scan)?;
+                let schema = input.schema();
+                let evaluator = crate::sql::Evaluator::with_parameters(schema.clone(), executor.parameters().to_vec());
+                let mut tuples = Vec::new();
+                while let Some(tuple) = input.next()? {
+                    if correlated_candidate_matches(executor, &evaluator, &schema, predicate, &tuple)? {
+                        tuples.push(tuple);
+                    }
+                }
+                return Ok(Box::new(
+                    ScanOperator::new(
+                        table_name.clone(),
+                        schema,
+                        projection.clone(),
+                        tuples,
+                        executor.parameters().to_vec(),
+                    )
+                    .with_timeout(executor.timeout_ctx()),
+                ));
+            }
+        }
         let materialized_predicate = predicate
             .as_ref()
             .map(|pred| executor.materialize_subqueries(pred))
@@ -2419,7 +2558,6 @@ pub(super) fn handle_filtered_scan(executor: &Executor, plan: &LogicalPlan) -> R
 
             // First check if it's a materialized view
             let (schema, actual_table_name) = if mv_catalog.view_exists(table_name)? {
-                let mv_metadata = mv_catalog.get_view(table_name)?;
                 let mv_data_table = crate::storage::MaterializedViewCatalog::mv_data_table_name(table_name);
 
                 // Check if MV data table exists (view has been refreshed)
@@ -2430,7 +2568,7 @@ pub(super) fn handle_filtered_scan(executor: &Executor, plan: &LogicalPlan) -> R
                     )));
                 }
 
-                (mv_metadata.schema, mv_data_table)
+                (catalog.get_table_schema(&mv_data_table)?, mv_data_table)
             } else {
                 // Not an MV, try regular table
                 match catalog.get_table_schema(table_name) {
@@ -2438,6 +2576,7 @@ pub(super) fn handle_filtered_scan(executor: &Executor, plan: &LogicalPlan) -> R
                     Err(e) => return Err(e),
                 }
             };
+            refuse_plan_of_another_layout(storage, table_name, &actual_table_name, plan_schema, &schema)?;
 
             // Analyze the predicate for storage-level pushdown
             let analyzed_predicates = if let Some(ref pred) = materialized_predicate {
@@ -2563,7 +2702,13 @@ pub(super) fn handle_filtered_scan(executor: &Executor, plan: &LogicalPlan) -> R
                         match bincode::deserialize::<crate::Tuple>(&value_bytes) {
                             Ok(mut tuple) => {
                                 tuple.row_id = Some(row_id);
-                                // Spec R5.2: as in `handle_scan`.
+                                // Spec R5.5 and R5.2: as in `handle_scan`.
+                                snapshot_mgr.bring_version_forward(
+                                    &actual_table_name,
+                                    row_id,
+                                    crate::storage::time_travel::ImageSource::Version(timestamp),
+                                    &mut tuple,
+                                )?;
                                 storage.shape_version_row(&actual_table_name, schema.columns.len(), &mut tuple)?;
                                 version_tuples.push(tuple);
                             }
@@ -2755,7 +2900,7 @@ pub(super) fn handle_filtered_scan(executor: &Executor, plan: &LogicalPlan) -> R
             (actual_schema, tuples)
         } else {
             // No storage, use placeholder schema from plan
-            (_plan_schema.clone(), Vec::new())
+            (plan_schema.clone(), Vec::new())
         };
 
         Ok(Box::new(
@@ -3052,6 +3197,92 @@ mod tests {
     use crate::Column;
     use crate::DataType;
     use crate::Value;
+
+    #[test]
+    fn correlated_filtered_scan_binds_qualified_outer_rows_before_output_projection() {
+        let db = crate::EmbeddedDatabase::new_in_memory().unwrap();
+        for sql in [
+            "CREATE TABLE customers (id INT PRIMARY KEY, name TEXT)",
+            "CREATE TABLE orders (order_id INT PRIMARY KEY, customer_id INT)",
+            "INSERT INTO customers VALUES (1,'a'),(2,'b'),(3,'c')",
+            "INSERT INTO orders VALUES (10,1),(11,2),(12,NULL)",
+        ] {
+            db.execute(sql).unwrap();
+        }
+        let catalog = db.storage.catalog();
+        let outer_schema = Arc::new(catalog.get_table_schema("customers").unwrap());
+        let inner_schema = Arc::new(catalog.get_table_schema("orders").unwrap());
+        let executor = Executor::with_storage(&db.storage);
+        for negated in [false, true] {
+            let subquery = LogicalPlan::Filter {
+                input: Box::new(LogicalPlan::Scan {
+                    table_name: "orders".into(),
+                    alias: Some("o".into()),
+                    schema: inner_schema.clone(),
+                    projection: None,
+                    as_of: None,
+                }),
+                predicate: LogicalExpr::BinaryExpr {
+                    left: Box::new(LogicalExpr::Column {
+                        table: Some("o".into()),
+                        name: "customer_id".into(),
+                    }),
+                    op: crate::sql::BinaryOperator::Eq,
+                    right: Box::new(LogicalExpr::Column {
+                        table: Some("c".into()),
+                        name: "id".into(),
+                    }),
+                },
+            };
+            let exists = LogicalExpr::Exists {
+                subquery: Box::new(subquery),
+                negated,
+            };
+            let predicates = [
+                exists.clone(),
+                LogicalExpr::Cast {
+                    expr: Box::new(exists.clone()),
+                    data_type: DataType::Boolean,
+                },
+                LogicalExpr::ScalarFunction {
+                    fun: "coalesce".into(),
+                    args: vec![exists.clone(), LogicalExpr::Literal(Value::Boolean(false))],
+                },
+                LogicalExpr::InSet {
+                    expr: Box::new(exists),
+                    values: std::collections::HashSet::from([Value::Boolean(true)]),
+                    negated: false,
+                },
+            ];
+            for predicate in predicates {
+                let plan = LogicalPlan::FilteredScan {
+                    table_name: "customers".into(),
+                    alias: Some("c".into()),
+                    schema: outer_schema.clone(),
+                    projection: Some(vec![1]),
+                    predicate: Some(predicate),
+                    as_of: None,
+                };
+                // Directly require the fused handler; the test cannot pass by an
+                // optimizer declining the plan or choosing Filter(Scan) instead.
+                let mut operator = handle_filtered_scan(&executor, &plan).unwrap();
+                assert_eq!(operator.schema().columns.len(), 1);
+                assert_eq!(operator.schema().columns[0].name, "name");
+                let mut rows = Vec::new();
+                while let Some(row) = operator.next().unwrap() {
+                    rows.push(row.values);
+                }
+                assert_eq!(
+                    rows,
+                    if negated {
+                        vec![vec![Value::String("c".into())]]
+                    } else {
+                        vec![vec![Value::String("a".into())], vec![Value::String("b".into())]]
+                    }
+                );
+            }
+        }
+    }
 
     fn test_schema() -> Arc<Schema> {
         Arc::new(Schema {

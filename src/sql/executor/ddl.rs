@@ -8,8 +8,25 @@ use super::scan::ScanOperator;
 use super::{Executor, PhysicalOperator};
 use crate::sql::LogicalPlan;
 use crate::{Error, Result};
-use rocksdb::{IteratorMode, ReadOptions};
 use std::sync::Arc;
+
+#[cfg(feature = "internal-tests")]
+type BeforeVectorBackfill = Box<dyn FnOnce(&crate::storage::VectorIndexManager, &str, &[(u64, crate::vector::Vector)])>;
+
+#[cfg(feature = "internal-tests")]
+thread_local! {
+    static NEXT_BEFORE_VECTOR_BACKFILL: std::cell::RefCell<Option<BeforeVectorBackfill>> =
+        std::cell::RefCell::new(None);
+}
+
+/// Arm a fault after graph registration and the early catalog budget check.
+#[cfg(feature = "internal-tests")]
+#[doc(hidden)]
+pub fn debug_next_before_vector_backfill(
+    hook: impl FnOnce(&crate::storage::VectorIndexManager, &str, &[(u64, crate::vector::Vector)]) + 'static,
+) {
+    NEXT_BEFORE_VECTOR_BACKFILL.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
 
 fn empty_ddl_result(executor: &Executor) -> Box<dyn PhysicalOperator> {
     Box::new(
@@ -175,12 +192,31 @@ fn drop_index_unless_written(
 fn drop_vector_index_unless_written(
     storage: &crate::storage::StorageEngine,
     name: &str,
+    table: &str,
     ddl: &mut crate::storage::DdlBatch<'_>,
 ) {
     let vectors = Arc::clone(storage.vector_indexes_arc());
+    let engine = ddl.engine();
     let index = name.to_string();
+    let table = table.to_string();
     ddl.on_abort(move || {
-        let _ = vectors.drop_index(&index);
+        if let Err(cleanup) = vectors.drop_index(&index) {
+            // All DDL resources and planning leases settled before this abort
+            // phase. A cleanup error must not leave an incomplete graph usable,
+            // and does not authorize another native repair attempt.
+            let reconciled = engine.catalog().index_definitions_strict().and_then(|definitions| {
+                if definitions.iter().any(|(name, _)| name == &index) {
+                    return Err(Error::storage("failed CREATE graph still has an actual definition"));
+                }
+                vectors.retire_unwritten_index(&index, &table)
+            });
+            if let Err(error) = reconciled {
+                engine.quarantine_generic_indexes(
+                    &table,
+                    &format!("failed vector CREATE cleanup: {cleanup}; cannot prove RAM retirement: {error}"),
+                );
+            }
+        }
     });
 }
 
@@ -258,6 +294,10 @@ fn backfill_vector_index(
     index_name: &str,
     vectors: &[(u64, crate::vector::Vector)],
 ) -> Result<usize> {
+    #[cfg(feature = "internal-tests")]
+    if let Some(hook) = NEXT_BEFORE_VECTOR_BACKFILL.with(|slot| slot.borrow_mut().take()) {
+        hook(vector_indexes, index_name, vectors);
+    }
     // Parallel bulk build: hands the whole batch to the index, which uses
     // Rayon (`parallel_insert`) to construct the HNSW graph across all cores.
     // This replaces the old single-threaded per-row `insert_vector` loop and
@@ -265,7 +305,9 @@ fn backfill_vector_index(
     // table (e.g. ~1120s → far less for 678k vectors). Results are identical
     // to sequential insertion; only build wall-time changes.
     if let Err(e) = vector_indexes.insert_vectors_batch(index_name, vectors) {
-        let _ = vector_indexes.drop_index(index_name);
+        // Every caller registered settled abort cleanup before entering here.
+        // In particular, do not acquire manager/graph leases before DdlBatch
+        // has released any other resources this statement owns.
         return Err(Error::query_execution(format!(
             "Failed to backfill HNSW index '{}': {}",
             index_name, e
@@ -515,6 +557,20 @@ pub(super) fn handle_create_index(executor: &Executor, plan: &LogicalPlan) -> Re
                             None
                         };
 
+                        // Stage the definition/history descriptors before any
+                        // derived graph writes. A group already over budget
+                        // cannot become valid by building a graph first.
+                        stage_index_definition(
+                            storage,
+                            name,
+                            table_name,
+                            column_name,
+                            Some("persistent_hnsw"),
+                            options,
+                            &mut ddl,
+                        )?;
+                        ddl.check_staged_budget()?;
+
                         // Decision 8: a persistent graph keeps TODAY's order — its own
                         // writes, BEFORE the definition that makes it reachable (a dangling
                         // id is filtered on read). Not folded into the statement's group.
@@ -522,6 +578,8 @@ pub(super) fn handle_create_index(executor: &Executor, plan: &LogicalPlan) -> Re
                             let _own_batch = crate::storage::ddl_batch::allow_side_write(
                                 "a persistent HNSW graph, written before the definition that makes it reachable",
                             );
+                            #[cfg(feature = "vector-persist")]
+                            vector_indexes.prepare_persistent_index_creation(name, table_name, storage)?;
                             vector_indexes.create_persistent_index(
                                 name.clone(),
                                 table_name.clone(),
@@ -534,7 +592,7 @@ pub(super) fn handle_create_index(executor: &Executor, plan: &LogicalPlan) -> Re
                                 storage.db(),
                                 std::sync::Arc::clone(storage.write_gate()),
                             )?;
-                            drop_vector_index_unless_written(storage, name, &mut ddl);
+                            drop_vector_index_unless_written(storage, name, table_name, &mut ddl);
                             backfill_vector_index(vector_indexes, name, &existing_vectors)?
                         };
                         tracing::info!(
@@ -544,15 +602,6 @@ pub(super) fn handle_create_index(executor: &Executor, plan: &LogicalPlan) -> Re
                             column_name,
                             backfilled
                         );
-                        stage_index_definition(
-                            storage,
-                            name,
-                            table_name,
-                            column_name,
-                            Some("persistent_hnsw"),
-                            options,
-                            &mut ddl,
-                        )?;
                         ddl.commit()?.wait_replicated();
                         return Ok(empty_ddl_result(executor));
                     }
@@ -593,7 +642,7 @@ pub(super) fn handle_create_index(executor: &Executor, plan: &LogicalPlan) -> Re
                                 hnsw_m,
                                 hnsw_ef_construction,
                             )?;
-                            drop_vector_index_unless_written(storage, name, &mut ddl);
+                            drop_vector_index_unless_written(storage, name, table_name, &mut ddl);
                             let backfilled = backfill_vector_index(vector_indexes, name, &existing_vectors)?;
                             tracing::info!(
                                 "Created quantized HNSW index '{}' on table '{}' column '{}' with {} existing vectors",
@@ -624,7 +673,7 @@ pub(super) fn handle_create_index(executor: &Executor, plan: &LogicalPlan) -> Re
                                 hnsw_m,
                                 hnsw_ef_construction,
                             )?;
-                            drop_vector_index_unless_written(storage, name, &mut ddl);
+                            drop_vector_index_unless_written(storage, name, table_name, &mut ddl);
                             let backfilled = backfill_vector_index(vector_indexes, name, &existing_vectors)?;
                             tracing::info!(
                                 "Created HNSW index '{}' on table '{}' column '{}' with {} existing vectors",
@@ -850,6 +899,10 @@ pub(super) fn handle_drop_index(executor: &Executor, name: &str, if_exists: bool
     // snapshot artefacts are purged after the group that removed the definition
     // (decision 8's order), as derived state no reader can reach any more.
     let mut ddl = crate::storage::DdlBatch::new(storage);
+    if let Some(definition) = &definition {
+        ddl.affect_table(&definition.table_name);
+        crate::storage::Catalog::stage_persistent_index_retirement(name, definition, &mut ddl)?;
+    }
     crate::storage::Catalog::stage_index_definition_drop(name, &mut ddl);
     ddl.log(crate::storage::WalOperation::DropIndex { name: name.to_string() });
     {
@@ -977,6 +1030,12 @@ fn stage_table_and_partition_children_drop<'d>(
 /// Handle TRUNCATE logical plan node
 pub(super) fn handle_truncate(executor: &Executor, table_name: &str) -> Result<Box<dyn PhysicalOperator>> {
     if let Some(storage) = executor.storage() {
+        // Direct executors do not pass through EmbeddedDatabase's statement
+        // scope. Bind an attached transaction BEFORE taking the exclusive lock,
+        // so the same owner keeps it through commit/rollback.
+        let _txn_locks = executor
+            .transaction()
+            .map(crate::storage::Transaction::bind_table_locks);
         // Spec R5.1: whatever route got here holds the table exclusively: both DML
         // families took it at their statement, and this keeps a route that did not
         // (an executor driven directly, `query_params`) from deleting beside a writer.
@@ -1010,69 +1069,81 @@ pub(super) fn handle_truncate(executor: &Executor, table_name: &str) -> Result<B
             ));
         }
 
-        // Item #2: preserve AS-OF history for COPY marker-covered rows before
-        // their `data:` is removed below — TRUNCATE leaves `v:`/`v_idx:` intact
-        // (so the per-row baseline stays queryable AS-OF), and markers must
-        // match that by materializing their insert versions first.
-        storage.materialize_copy_markers_for_table(table_name)?;
-
-        // Delete all rows from the table
-        let prefix = format!("data:{}:", table_name);
-        let prefix_bytes = prefix.as_bytes();
-        let mut keys_to_delete = Vec::new();
-
-        // Collect all keys for this table
-        // Use total_order_seek to bypass prefix bloom filter for full table scans
-        let mut read_opts = ReadOptions::default();
-        read_opts.set_total_order_seek(true);
-        let iter = storage.db.iterator_opt(IteratorMode::Start, read_opts);
-        for item in iter {
-            let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
-
-            if !key.starts_with(prefix_bytes) {
-                if let (Some(&k), Some(&p)) = (key.first(), prefix_bytes.first()) {
-                    if k > p {
-                        break;
+        // Direct executors (including EXPLAIN ANALYZE) must stage exactly as
+        // the public statement funnels do. The transaction's commit owns row
+        // tombstones, columnar changes, versions, one snapshot and Truncate WAL.
+        // No index or cache is published when this statement/transaction aborts.
+        let owned = if executor.transaction().is_none() {
+            Some(storage.begin_autocommit_transaction()?)
+        } else {
+            None
+        };
+        let txn = executor
+            .transaction()
+            .or(owned.as_ref())
+            .ok_or_else(|| Error::internal("TRUNCATE has no staging transaction"))?;
+        txn.set_vector_row_context(storage.vector_row_context());
+        let committed = storage.scan_table_with_schema(table_name, &schema)?;
+        let shape = storage.row_shape(table_name, schema.columns.len())?;
+        let rows = txn.merge_with_write_set_shaped(table_name, committed, &shape)?;
+        let mut ids = Vec::with_capacity(rows.len());
+        for tuple in &rows {
+            let Some(id) = tuple.row_id else {
+                continue;
+            };
+            txn.delete(format!("data:{table_name}:{id}").into_bytes())?;
+            ids.push(id);
+        }
+        storage.stage_columnar_deletes_grouped_in_transaction(table_name, &ids, &schema, txn)?;
+        txn.log_on_commit(crate::storage::WalOperation::Truncate {
+            table: table_name.to_string(),
+        });
+        // Direct executors have no EmbeddedDatabase ART journal. Reconcile
+        // their table from committed rows plus the RESTORED write set on abort,
+        // after the caller has undone any later ordinary DML index changes.
+        // This also handles an uncertain failed write by reading actual data.
+        txn.on_rollback(storage.truncate_rollback_reconciler(table_name.to_string(), ids.clone()));
+        let owner = txn.transaction_id();
+        let art = Arc::clone(storage.art_indexes());
+        // This cleanup must survive ROLLBACK TO even when that truncates the
+        // after-commit publication hooks. The holds own no durable data.
+        txn.on_end(move || art.release_holds_of(owner));
+        if txn.first_index_key_hold() {
+            let art = Arc::clone(storage.art_indexes());
+            txn.after_commit(move || art.release_holds_of(owner));
+        }
+        txn.note_index_key_removal(table_name);
+        for tuple in &rows {
+            let Some(id) = tuple.row_id else {
+                continue;
+            };
+            let columns = schema
+                .columns
+                .iter()
+                .zip(&tuple.values)
+                .map(|(column, value)| (column.name.clone(), value.clone()))
+                .collect();
+            storage
+                .art_indexes()
+                .on_delete_holding(table_name, id, &columns, owner)
+                .map_err(|e| Error::constraint_violation(e.to_string()))?;
+        }
+        txn.after_write_attempt(storage.truncate_write_attempt_publication(table_name.to_string()));
+        let vectors = Arc::clone(storage.vector_indexes_arc());
+        let table = table_name.to_string();
+        txn.after_commit(move || {
+            // Only the removed row ids leave the vector indexes. ART removals
+            // already happened under held keys, so later INSERTs keep their keys.
+            if vectors.table_has_indexes(&table) {
+                for tuple in &rows {
+                    if let Some(id) = tuple.row_id {
+                        vectors.on_row_delete_staged(&table, id, Some(&schema), Some(tuple));
                     }
                 }
-                continue;
             }
-
-            keys_to_delete.push(key.to_vec());
-        }
-
-        // Delete all collected keys. Sprinter 6bc4a4040eb7 (B4): each with its delete
-        // event, so `AS OF` before this shows the rows.
-        storage.delete_rows_with_events(&keys_to_delete)?;
-
-        // R3.3: purge columnar sidecars (col:/colz:/colzm:/colp:/colpm:) with
-        // the rows — stale batches or live-row presence must not resurrect
-        // truncated rows. No-op prefix seeks for row-only tables.
-        crate::storage::ColumnarStore::purge_table_sidecars(&storage.db, storage.write_gate(), table_name)?;
-
-        // Clear ART index entries for this table so that stale PK/UNIQUE
-        // values do not block re-insertion of the same values.
-        //
-        // sprinter 6bc4a4040eb7 (phase B2): unconditionally. This used to be
-        // skipped "as a safety measure" whenever a user branch existed, which
-        // left main's PK/UNIQUE trees full of the truncated keys — re-inserting
-        // one on main then failed 23505. Nothing on a branch trusts a main
-        // index entry on its own any more: the branch view counts a main
-        // candidate only when main still holds the row
-        // (`BranchView::rows_with_key`).
-        storage.art_indexes().clear_table_indexes(table_name);
-
-        // sprinter 29ecb34e3245 (same hazard as the DROP TABLE purge above):
-        // the rows these bloom filters / zone maps summarise are gone, and
-        // nothing rebuilds them incrementally, so a surviving structure would
-        // keep pruning against the PRE-truncate contents once rows are
-        // re-inserted. Dropping them degrades to "no storage-level pruning for
-        // this table", never to a wrong answer.
-        storage.predicate_pushdown().remove_table(table_name);
-
-        // Log to WAL for replication
-        if let Err(e) = storage.log_truncate(table_name) {
-            tracing::warn!("Failed to log TRUNCATE to WAL: {}", e);
+        });
+        if let Some(txn) = owned {
+            txn.commit()?;
         }
 
         // Return empty result set for DDL

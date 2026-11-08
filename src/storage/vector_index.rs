@@ -169,6 +169,160 @@ pub enum PersistentPolicy {
     ReplicaMemoryOnly,
 }
 
+/// One persistent table graph staged in its MV's existing row group.
+/// Publishing consumes the write lease before any later registry operation.
+#[cfg(feature = "vector-persist")]
+struct PreparedTableVector {
+    name: String,
+    replacement: crate::vector::persistent::PreparedPersistentReplacement,
+}
+
+#[cfg(feature = "vector-persist")]
+impl PreparedTableVector {
+    fn publish(self) -> String {
+        self.replacement.publish();
+        self.name
+    }
+}
+
+#[cfg(feature = "vector-persist")]
+#[derive(Default)]
+struct RegistryPlanning {
+    busy: parking_lot::Mutex<bool>,
+    ready: parking_lot::Condvar,
+}
+
+struct RegistryOperation {
+    #[cfg(feature = "vector-persist")]
+    planning: Arc<RegistryPlanning>,
+}
+
+#[cfg(feature = "vector-persist")]
+impl RegistryPlanning {
+    fn acquire(self: &Arc<Self>) -> RegistryOperation {
+        let mut busy = self.busy.lock();
+        if *busy {
+            crate::runtime_offload::off_worker(|| {
+                while *busy {
+                    self.ready.wait(&mut busy);
+                }
+            });
+        }
+        *busy = true;
+        drop(busy);
+        RegistryOperation {
+            planning: Arc::clone(self),
+        }
+    }
+}
+
+#[cfg(feature = "vector-persist")]
+impl Drop for RegistryOperation {
+    fn drop(&mut self) {
+        *self.planning.busy.lock() = false;
+        self.planning.ready.notify_all();
+    }
+}
+
+/// Snapshot once, before the batch's FIRST purge lease. Later cascade targets
+/// never need a manager registry lock while an earlier lease remains held.
+#[derive(Default)]
+pub(crate) struct PersistentRetirementHandles {
+    #[cfg(feature = "vector-persist")]
+    handles: HashMap<String, crate::vector::persistent::PersistentVectorIndex>,
+    #[cfg(feature = "vector-persist")]
+    _planning: Option<RegistryOperation>,
+}
+
+impl PersistentRetirementHandles {
+    #[cfg(feature = "vector-persist")]
+    fn target(&self, name: &str) -> Option<crate::vector::persistent::PersistentRetirement> {
+        self.handles.get(name).and_then(|index| index.retirement_target())
+    }
+}
+
+/// Staged physical graph removal. A native error is not proof of rejection:
+/// only an unchanged complete prefix AND definition preserve the old handle.
+struct PreparedPersistentPurge {
+    db: Arc<rocksdb::DB>,
+    prefix: Vec<u8>,
+    before: [u8; 32],
+    definition_key: Vec<u8>,
+    definition: Option<Vec<u8>>,
+    settled: bool,
+    #[cfg(feature = "vector-persist")]
+    target: Option<crate::vector::persistent::PersistentRetirement>,
+}
+
+impl PreparedPersistentPurge {
+    fn retire(&mut self) {
+        #[cfg(feature = "vector-persist")]
+        if let Some(target) = self.target.take() {
+            target.retire();
+        }
+        self.settled = true;
+    }
+
+    fn settle(mut self, success: bool) {
+        if success {
+            self.retire();
+        }
+        // Error or unwritten drop: Drop proves non-application, otherwise
+        // retires before its lease releases. It never writes or compacts.
+    }
+}
+
+impl Drop for PreparedPersistentPurge {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        let unchanged = (|| -> Result<bool> {
+            if self.db.get(&self.definition_key)? != self.definition {
+                return Ok(false);
+            }
+            Ok(VectorIndexManager::index_image_digest(&self.db, &self.prefix, |_| {})? == self.before)
+        })();
+        match unchanged {
+            Ok(true) => {}
+            Ok(false) => self.retire(),
+            Err(error) => {
+                self.retire();
+                tracing::error!("persistent purge could not verify actual state: {error}; old handle retired");
+            }
+        }
+    }
+}
+
+const PUBLICATION_INFLIGHT: u64 = 0xffff;
+const PUBLICATION_EXHAUSTED: u64 = 1 << 63;
+
+fn advance_publication(epoch: &std::sync::atomic::AtomicU64, delta: u64) {
+    use std::sync::atomic::Ordering;
+    let _ = epoch.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+        Some(
+            if value & PUBLICATION_EXHAUSTED != 0
+                || (delta == 1 && value & PUBLICATION_INFLIGHT == PUBLICATION_INFLIGHT)
+            {
+                PUBLICATION_EXHAUSTED
+            } else {
+                value
+                    .checked_add(delta)
+                    .filter(|next| next & PUBLICATION_EXHAUSTED == 0)
+                    .unwrap_or(PUBLICATION_EXHAUSTED)
+            },
+        )
+    });
+}
+
+pub(crate) struct VectorPublication<'a>(&'a std::sync::atomic::AtomicU64);
+
+impl Drop for VectorPublication<'_> {
+    fn drop(&mut self) {
+        advance_publication(self.0, PUBLICATION_INFLIGHT);
+    }
+}
+
 /// Vector index manager
 pub struct VectorIndexManager {
     /// Map from index name to index storage
@@ -183,6 +337,11 @@ pub struct VectorIndexManager {
     /// relaxed atomic load in the overwhelmingly common no-vector-index case,
     /// instead of taking the `metadata` read lock on every INSERT/UPDATE/DELETE.
     index_count: std::sync::atomic::AtomicUsize,
+    /// Read tickets distinguish a writer that starts AND finishes during ANN.
+    publication_epoch: std::sync::atomic::AtomicU64,
+    hook_faults: dashmap::DashMap<String, std::sync::atomic::AtomicU64>,
+    #[cfg(feature = "vector-persist")]
+    registry_planning: Arc<RegistryPlanning>,
     /// R4.2: true while the persisted HNSW snapshot markers still describe the
     /// in-memory graphs. First mutation after a checkpoint flips it and fires
     /// `snapshot_invalidation_hook` once (durable marker delete).
@@ -196,6 +355,9 @@ pub struct VectorIndexManager {
     /// Spec P1.2: [`PersistentPolicy::ReplicaMemoryOnly`] when set. One
     /// relaxed load per check, so a primary (`Durable`) pays nothing else.
     replica_memory_only: std::sync::atomic::AtomicBool,
+    /// Installed once by an engine before managed persistent hydration. The
+    /// standalone manager keeps its existing unencrypted default.
+    persistent_key_manager: std::sync::OnceLock<Option<Arc<crate::crypto::KeyManager>>>,
 }
 
 impl VectorIndexManager {
@@ -207,11 +369,211 @@ impl VectorIndexManager {
             records: Arc::new(RwLock::new(HashMap::new())),
             external_ids: Arc::new(RwLock::new(HashMap::new())),
             index_count: std::sync::atomic::AtomicUsize::new(0),
+            publication_epoch: std::sync::atomic::AtomicU64::new(0),
+            hook_faults: dashmap::DashMap::new(),
+            #[cfg(feature = "vector-persist")]
+            registry_planning: Arc::new(RegistryPlanning::default()),
             snapshot_clean: std::sync::atomic::AtomicBool::new(true),
             snapshot_invalidation_hook: RwLock::new(None),
             degraded: RwLock::new(HashMap::new()),
             replica_memory_only: std::sync::atomic::AtomicBool::new(false),
+            persistent_key_manager: std::sync::OnceLock::new(),
         }
+    }
+
+    pub(crate) fn set_persistent_key_manager(&self, key_manager: Option<Arc<crate::crypto::KeyManager>>) {
+        let _ = self.persistent_key_manager.set(key_manager);
+    }
+
+    #[cfg(feature = "vector-persist")]
+    fn persistent_key_manager(&self) -> Option<Arc<crate::crypto::KeyManager>> {
+        self.persistent_key_manager.get().and_then(Option::as_ref).cloned()
+    }
+
+    /// Stage authoritative latest row images and invalidate every vector dump
+    /// in the owning heap batch. No hook or mutation is executed here.
+    pub(crate) fn stage_row_images(
+        &self,
+        table: &str,
+        row: u64,
+        schema: &crate::Schema,
+        tuple: Option<&crate::Tuple>,
+        batch: &mut rocksdb::WriteBatch,
+        ceiling: usize,
+    ) -> Result<()> {
+        #[cfg(not(feature = "vector-persist"))]
+        let _ = (row, schema, tuple);
+        if !self.has_any_index() {
+            return Ok(());
+        }
+        // Preserve the existing global clean/dirty contract: the first
+        // mutation invalidates every cache marker, now in the owning row group.
+        if self.snapshot_clean.load(std::sync::atomic::Ordering::Acquire) {
+            for name in self.metadata.read().keys() {
+                batch.delete(super::index_snapshot::vec_snapshot_marker_key(name));
+                if batch.size_in_bytes() > ceiling {
+                    return Err(Error::write_group_too_large(batch.size_in_bytes(), ceiling));
+                }
+            }
+        }
+        let metadata: Vec<_> = self
+            .metadata
+            .read()
+            .values()
+            .filter(|meta| meta.table_name == table)
+            .cloned()
+            .collect();
+        for meta in metadata {
+            batch.delete(super::index_snapshot::vec_snapshot_marker_key(&meta.name));
+            #[cfg(feature = "vector-persist")]
+            if let VectorIndexType::Persistent(config) = &meta.index_type {
+                let vector = tuple.and_then(|tuple| Self::tuple_vector_value(schema, tuple, &meta.column_name));
+                if vector.is_some_and(|vector| vector.len() != config.dimension) {
+                    return Err(Error::query_execution(format!(
+                        "vector dimension mismatch for index '{}'",
+                        meta.name
+                    )));
+                }
+                let image =
+                    crate::vector::persistent::encode_row_image(self.persistent_key_manager().as_deref(), vector)?;
+                batch.put(
+                    crate::vector::persistent::row_image_key(stable_index_id(&meta.name), row),
+                    image,
+                );
+            }
+            if batch.size_in_bytes() > ceiling {
+                return Err(Error::write_group_too_large(batch.size_in_bytes(), ceiling));
+            }
+        }
+        Ok(())
+    }
+
+    /// The original data group has already invalidated its snapshot markers.
+    /// Clear only the RAM flag here; invoking its durable hook would add a group.
+    pub(crate) fn row_group_applied(&self) {
+        self.snapshot_clean.store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Complete committed row images, after the owning group and before its
+    /// census/locks release. The backend re-reads current overlay truth, so an
+    /// old callback cannot overwrite a later row with its captured tuple.
+    pub(crate) fn publish_row_images(&self, table: &str, row: u64) -> Result<()> {
+        #[cfg(feature = "vector-persist")]
+        {
+            let _publication = self.begin_publication();
+            let targets: Vec<_> = {
+                let indexes = self.indexes.read();
+                let metadata = self.metadata.read();
+                metadata
+                    .values()
+                    .filter(|meta| meta.table_name == table)
+                    .filter_map(|meta| match indexes.get(&meta.name) {
+                        Some(IndexStorage::Persistent(index)) => Some((meta.name.clone(), index.replacement_handle())),
+                        _ => None,
+                    })
+                    .collect()
+            };
+            let mut first_error = None;
+            for (name, index) in targets {
+                if let Err(error) = index.apply_latest_row_image(row) {
+                    self.note_hook_error(table, &name, row, &error);
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
+            if let Some(error) = first_error {
+                return Err(error);
+            }
+        }
+        #[cfg(not(feature = "vector-persist"))]
+        let _ = (table, row);
+        Ok(())
+    }
+
+    fn publish_committed_row_image(&self, table: &str, index: &str, row: u64) -> bool {
+        #[cfg(feature = "vector-persist")]
+        {
+            let target = {
+                let indexes = self.indexes.read();
+                match indexes.get(index) {
+                    Some(IndexStorage::Persistent(target)) => Some(target.replacement_handle()),
+                    _ => None,
+                }
+            };
+            if let Some(target) = target {
+                return match target.apply_latest_row_image(row) {
+                    Ok(found) => found,
+                    Err(error) => {
+                        self.note_hook_error(table, index, row, &error);
+                        true
+                    }
+                };
+            }
+        }
+        #[cfg(not(feature = "vector-persist"))]
+        let _ = (table, index, row);
+        false
+    }
+
+    fn persistent_names_on_table(&self, table: &str) -> Vec<String> {
+        self.metadata
+            .read()
+            .values()
+            .filter(|meta| meta.table_name == table)
+            .filter(|meta| matches!(meta.index_type, VectorIndexType::Persistent(_)))
+            .map(|meta| meta.name.clone())
+            .collect()
+    }
+
+    /// Persistent graph writes are deferred to the transaction's final row
+    /// group. Standard/quantized eager undo remains unchanged.
+    pub(crate) fn on_row_insert_staged(
+        &self,
+        table: &str,
+        row: u64,
+        schema: &crate::Schema,
+        tuple: &crate::Tuple,
+    ) -> Vec<VectorIndexUndoOp> {
+        if !self.has_any_index() {
+            return Vec::new();
+        }
+        self.on_row_insert_with_policy(table, row, schema, tuple, &self.persistent_names_on_table(table), true)
+    }
+
+    pub(crate) fn on_row_delete_staged(
+        &self,
+        table: &str,
+        row: u64,
+        schema: Option<&crate::Schema>,
+        tuple: Option<&crate::Tuple>,
+    ) -> Vec<VectorIndexUndoOp> {
+        if !self.has_any_index() {
+            return Vec::new();
+        }
+        self.on_row_delete_with_policy(table, row, schema, tuple, &self.persistent_names_on_table(table), true)
+    }
+
+    pub(crate) fn on_row_update_staged(
+        &self,
+        table: &str,
+        row: u64,
+        schema: &crate::Schema,
+        old: Option<&crate::Tuple>,
+        new: &crate::Tuple,
+    ) -> Vec<VectorIndexUndoOp> {
+        if !self.has_any_index() {
+            return Vec::new();
+        }
+        self.on_row_update_with_policy(
+            table,
+            row,
+            schema,
+            old,
+            new,
+            &self.persistent_names_on_table(table),
+            true,
+        )
     }
 
     // ---- Spec P1.2: the persistent-keyspace policy -------------------------
@@ -276,6 +638,130 @@ impl VectorIndexManager {
             .any(|(index_name, _)| !self.follows_replicated_records(index_name))
     }
 
+    /// Relabel metadata once from ORIGINAL to final column names. Bulk mapping
+    /// handles rename cycles without changing graph identity/config/records.
+    /// Called only in ordinary publication after all owned write leases settle.
+    pub(crate) fn relabel_table_columns(&self, table: &str, renames: &[(String, String)]) {
+        let _registry_operation = self.registry_operation();
+        let _publication = self.begin_publication();
+        let mut metadata = self.metadata.write();
+        for meta in metadata.values_mut().filter(|meta| meta.table_name == table) {
+            if let Some((_, new)) = renames.iter().find(|(old, _)| old == &meta.column_name) {
+                meta.column_name.clone_from(new);
+            }
+        }
+    }
+
+    /// Reconcile labels/retirement against actual durable definitions after a
+    /// possibly-applied column DDL. Surviving graph identities/configs are kept;
+    /// a genuinely missing definition retires RAM only. The caller proves row
+    /// vector identity and validates schema/definitions under table ownership.
+    pub(crate) fn reconcile_table_vector_definitions(
+        &self,
+        table: &str,
+        definitions: &[(String, super::PersistedIndexDefinition)],
+    ) -> Result<()> {
+        let _registry_operation = self.registry_operation();
+        let _publication = self.begin_publication();
+        for (name, definition) in definitions
+            .iter()
+            .filter(|(_, definition)| definition.table_name == table)
+        {
+            if super::catalog::index_family(definition.index_type.as_deref()).is_none() {
+                return Err(Error::storage(format!(
+                    "vector reconciliation found unknown backend for index '{name}'"
+                )));
+            }
+        }
+        let desired: HashMap<_, _> = definitions
+            .iter()
+            .filter(|(_, definition)| {
+                definition.table_name == table
+                    && super::catalog::index_family(definition.index_type.as_deref())
+                        == Some(super::catalog::IndexFamily::Vector)
+            })
+            .map(|(name, definition)| (name.as_str(), definition))
+            .collect();
+        let live: Vec<_> = self
+            .metadata
+            .read()
+            .values()
+            .filter(|meta| meta.table_name == table)
+            .cloned()
+            .collect();
+        for (name, _) in &desired {
+            if !live.iter().any(|meta| meta.name == *name) {
+                return Err(Error::storage(format!(
+                    "vector index '{name}' needs actual-state rebuild"
+                )));
+            }
+        }
+        let mut removed = Vec::new();
+        for meta in &live {
+            let Some(definition) = desired.get(meta.name.as_str()) else {
+                removed.push(meta.name.clone());
+                continue;
+            };
+            let compatible = matches!(
+                (&meta.index_type, definition.index_type.as_deref()),
+                (VectorIndexType::Standard(_), Some("hnsw"))
+                    | (VectorIndexType::Quantized(_), Some("hnsw_pq"))
+                    | (VectorIndexType::Persistent(_), Some("persistent_hnsw"))
+            );
+            if !compatible {
+                return Err(Error::storage(format!(
+                    "vector index '{}' changed backend during column DDL",
+                    meta.name
+                )));
+            }
+        }
+        #[cfg(feature = "vector-persist")]
+        self.retire_persistent_handles(&removed, &_registry_operation);
+        {
+            let mut indexes = self.indexes.write();
+            let mut metadata = self.metadata.write();
+            for meta in live {
+                if let Some(definition) = desired.get(meta.name.as_str()) {
+                    if let Some(actual) = metadata.get_mut(&meta.name) {
+                        actual.column_name.clone_from(&definition.column_name);
+                    }
+                } else {
+                    if indexes.remove(&meta.name).is_some() {
+                        self.index_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    metadata.remove(&meta.name);
+                }
+            }
+        }
+        for name in removed {
+            self.records.write().remove(&name);
+            self.external_ids.write().remove(&name);
+            self.degraded.write().remove(&name);
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "vector-persist")]
+    fn retire_persistent_handles(&self, names: &[String], _planning: &RegistryOperation) {
+        // Gather ALL before the first lease and never reacquire a registry
+        // until every target has retired and every lease has released.
+        let handles: Vec<_> = {
+            let indexes = self.indexes.read();
+            names
+                .iter()
+                .filter_map(|name| match indexes.get(name) {
+                    Some(IndexStorage::Persistent(index)) => Some(index.replacement_handle()),
+                    _ => None,
+                })
+                .collect()
+        };
+        for index in handles {
+            if let Some(target) = index.retirement_target() {
+                target.retire();
+            }
+        }
+    }
+
     /// The registered persistent index whose keyspace is
     /// `__vidx:{index_id}:` (`PersistentVectorIndex::index_id`), if any.
     #[cfg(feature = "vector-persist")]
@@ -295,13 +781,18 @@ impl VectorIndexManager {
     /// ([`Self::reopen_persistent_index`]).
     #[cfg(feature = "vector-persist")]
     pub fn apply_persistent_records(&self, name: &str, records: &[(Vec<u8>, Option<Vec<u8>>)]) -> Result<()> {
+        let _publication = self.begin_publication();
         let indexes = self.indexes.read();
         match indexes.get(name) {
-            Some(IndexStorage::Persistent(index)) => index.apply_records(
-                records
-                    .iter()
-                    .map(|(suffix, value)| (suffix.as_slice(), value.as_deref())),
-            ),
+            Some(IndexStorage::Persistent(index)) => {
+                let target = index.replacement_handle();
+                drop(indexes);
+                target.apply_records(
+                    records
+                        .iter()
+                        .map(|(suffix, value)| (suffix.as_slice(), value.as_deref())),
+                )
+            }
             Some(_) => Err(Error::storage(format!(
                 "vector index '{name}' is not a persistent index; it has no replicated records"
             ))),
@@ -330,7 +821,8 @@ impl VectorIndexManager {
     /// Record a vector index mutation; the first one after a checkpoint
     /// durably invalidates the snapshot markers.
     #[inline]
-    fn note_mutation(&self) {
+    fn note_mutation(&self) -> VectorPublication<'_> {
+        let publication = self.begin_publication();
         use std::sync::atomic::Ordering;
         if self.snapshot_clean.load(Ordering::Relaxed) && self.snapshot_clean.swap(false, Ordering::AcqRel) {
             let hook = self.snapshot_invalidation_hook.read().clone();
@@ -338,6 +830,59 @@ impl VectorIndexManager {
                 hook();
             }
         }
+        publication
+    }
+
+    fn registry_operation(&self) -> RegistryOperation {
+        #[cfg(feature = "vector-persist")]
+        {
+            self.registry_planning.acquire()
+        }
+        #[cfg(not(feature = "vector-persist"))]
+        {
+            RegistryOperation {}
+        }
+    }
+
+    pub(crate) fn hook_error_generation(&self, table: &str) -> Option<u64> {
+        let value = self
+            .hook_faults
+            .get(table)
+            .map_or(0, |fault| fault.load(std::sync::atomic::Ordering::SeqCst));
+        (value != u64::MAX).then_some(value)
+    }
+
+    fn note_hook_error(&self, table: &str, index: &str, row: u64, error: &Error) {
+        let fault = self.hook_faults.entry(table.to_string()).or_default();
+        let _ = fault.fetch_update(
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+            |value| Some(value.saturating_add(1)),
+        );
+        tracing::error!("vector hook failed for table '{table}', index '{index}', row {row}: {error}");
+    }
+
+    fn note_undo_error(&self, index: &str, row: u64, error: &Error) {
+        let owner = self.metadata.read().get(index).map(|meta| meta.table_name.clone());
+        if let Some(owner) = owner {
+            self.note_hook_error(&owner, index, row, error);
+        } else {
+            tracing::error!("vector undo failed for removed index '{index}', row {row}: {error}");
+        }
+    }
+
+    pub(crate) fn begin_publication(&self) -> VectorPublication<'_> {
+        advance_publication(&self.publication_epoch, 1);
+        VectorPublication(&self.publication_epoch)
+    }
+
+    pub(crate) fn publication_ticket(&self) -> Option<u64> {
+        let value = self.publication_epoch.load(std::sync::atomic::Ordering::SeqCst);
+        (value & (PUBLICATION_INFLIGHT | PUBLICATION_EXHAUSTED) == 0).then_some(value)
+    }
+
+    pub(crate) fn publication_is_current(&self, ticket: u64) -> bool {
+        self.publication_epoch.load(std::sync::atomic::Ordering::SeqCst) == ticket
     }
 
     /// Record an index as degraded (rebuild/reload failed at open). The index
@@ -399,7 +944,8 @@ impl VectorIndexManager {
         m: usize,
         ef_construction: usize,
     ) -> Result<()> {
-        self.note_mutation();
+        let _registry_operation = self.registry_operation();
+        let _publication = self.note_mutation();
         let mut indexes = self.indexes.write();
         let mut metadata = self.metadata.write();
 
@@ -434,10 +980,105 @@ impl VectorIndexManager {
 
         indexes.insert(name.clone(), IndexStorage::Standard(index));
         metadata.insert(name.clone(), meta);
+        drop(metadata);
+        drop(indexes);
         self.records.write().entry(name.clone()).or_default();
         self.external_ids.write().entry(name).or_default();
         self.index_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
+        Ok(())
+    }
+
+    /// A later explicit CREATE may reclaim scratch left by its failed
+    /// pre-definition build. Inspect the entire prefix, even if an earlier
+    /// interrupted purge already removed metadata. No error callback calls this.
+    #[cfg(feature = "vector-persist")]
+    pub(crate) fn prepare_persistent_index_creation(
+        &self,
+        name: &str,
+        table: &str,
+        storage: &super::StorageEngine,
+    ) -> Result<()> {
+        self.refuse_replica_persistent_write(name)?;
+        let planning = self.registry_operation();
+        let id = stable_index_id(name);
+        let prefix = format!("__vidx:{id}:").into_bytes();
+        let db = storage.db();
+        let mut options = rocksdb::ReadOptions::default();
+        options.set_total_order_seek(true);
+        options.set_iterate_lower_bound(prefix.clone());
+        let mut upper = prefix.clone();
+        if let Some(last) = upper.last_mut() {
+            *last += 1;
+        }
+        options.set_iterate_upper_bound(upper);
+        let mut iter = db.raw_iterator_opt(options);
+        iter.seek(&prefix);
+        if !iter.valid() {
+            iter.status()?;
+            return Ok(());
+        }
+        {
+            let indexes = self.indexes.read();
+            if indexes.contains_key(name)
+                || indexes
+                    .values()
+                    .any(|index| matches!(index, IndexStorage::Persistent(index) if index.index_id() == id))
+            {
+                return Err(Error::storage("persistent scratch namespace still has a live owner"));
+            }
+        }
+        let definitions = match storage.catalog().index_definitions_strict() {
+            Ok(definitions) => definitions,
+            Err(error) => {
+                // Retirement takes planning itself: release it before a
+                // targeted fence enters any manager registry or graph lease.
+                drop(iter);
+                drop(planning);
+                return Err(storage.quarantine_generic_indexes(
+                    table,
+                    &format!("cannot read persistent CREATE namespace references: {error}"),
+                ));
+            }
+        };
+        // Any name hashing to this namespace is protected, irrespective of
+        // backend tag. A future/unknown definition is never guessed away.
+        if definitions.iter().any(|(recorded, _)| stable_index_id(recorded) == id) {
+            return Err(Error::storage(
+                "persistent scratch namespace still has an actual definition",
+            ));
+        }
+
+        // Scratch has no reader authority, so bounded point-delete chunks are
+        // safe across interruptions. The next explicit retry rechecks all
+        // references and the whole remaining prefix before constructing a graph.
+        let ceiling = storage.write_gate().write_group_ceiling();
+        let chunk_limit = ceiling.min(1024 * 1024);
+        let mut batch = rocksdb::WriteBatch::default();
+        let header = batch.size_in_bytes();
+        while iter.valid() {
+            let key = iter
+                .key()
+                .ok_or_else(|| Error::storage("missing persistent scratch key"))?;
+            if !key.starts_with(&prefix) {
+                return Err(Error::storage("persistent scratch iterator escaped its namespace"));
+            }
+            // Measure the actual encoder's one-key cost; do not invent a
+            // second WriteBatch format or drop keys that happen not to fit.
+            let mut one = rocksdb::WriteBatch::default();
+            one.delete(key);
+            storage.write_gate().refuse_oversized(&one)?;
+            let added = one.size_in_bytes().saturating_sub(header);
+            if !batch.is_empty() && batch.size_in_bytes().saturating_add(added) > chunk_limit {
+                storage.write_gate().write(&db, std::mem::take(&mut batch), None)?;
+            }
+            batch.delete(key);
+            iter.next();
+        }
+        iter.status()?;
+        if !batch.is_empty() {
+            storage.write_gate().write(&db, batch, None)?;
+        }
         Ok(())
     }
 
@@ -456,10 +1097,11 @@ impl VectorIndexManager {
         db: Arc<rocksdb::DB>,
         gate: Arc<super::write_gate::WriteGate>,
     ) -> Result<()> {
+        let _registry_operation = self.registry_operation();
         // Spec P1.2: creating one writes its `meta` key. A standby registers
         // the primary's from the replicated keys (`reopen_persistent_index`).
         self.refuse_replica_persistent_write(&name)?;
-        self.note_mutation();
+        let _publication = self.note_mutation();
         let mut indexes = self.indexes.write();
         let mut metadata = self.metadata.write();
 
@@ -486,7 +1128,8 @@ impl VectorIndexManager {
             )?
         } else {
             crate::vector::persistent::PersistentVectorIndex::create(db, gate, index_id, config)?
-        };
+        }
+        .with_key_manager(self.persistent_key_manager());
 
         let meta = VectorIndexMetadata {
             name: name.clone(),
@@ -502,6 +1145,8 @@ impl VectorIndexManager {
 
         indexes.insert(name.clone(), IndexStorage::Persistent(index));
         metadata.insert(name.clone(), meta);
+        drop(metadata);
+        drop(indexes);
         self.records.write().entry(name.clone()).or_default();
         self.external_ids.write().entry(name).or_default();
         self.index_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -568,7 +1213,8 @@ impl VectorIndexManager {
         m: usize,
         ef_construction: usize,
     ) -> Result<()> {
-        self.note_mutation();
+        let _registry_operation = self.registry_operation();
+        let _publication = self.note_mutation();
         let mut indexes = self.indexes.write();
         let mut metadata = self.metadata.write();
 
@@ -602,6 +1248,8 @@ impl VectorIndexManager {
 
         indexes.insert(name.clone(), IndexStorage::Quantized(index));
         metadata.insert(name.clone(), meta);
+        drop(metadata);
+        drop(indexes);
         self.records.write().entry(name.clone()).or_default();
         self.external_ids.write().entry(name).or_default();
         self.index_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -624,7 +1272,7 @@ impl VectorIndexManager {
 
     /// Insert a vector into an index
     pub fn insert_vector(&self, index_name: &str, row_id: u64, vector: &Vector) -> Result<()> {
-        self.note_mutation();
+        let _publication = self.note_mutation();
         let indexes = self.indexes.read();
         if let Some(index) = indexes.get(index_name) {
             match index {
@@ -633,7 +1281,9 @@ impl VectorIndexManager {
                 #[cfg(feature = "vector-persist")]
                 IndexStorage::Persistent(idx) => {
                     self.refuse_replica_persistent_write(index_name)?;
-                    idx.insert(row_id, vector)?;
+                    let target = idx.replacement_handle();
+                    drop(indexes);
+                    target.insert(row_id, vector)?;
                 }
             }
             Ok(())
@@ -651,7 +1301,7 @@ impl VectorIndexManager {
     /// build path here, so they fall back to the sequential per-row insert —
     /// correctness is identical either way.
     pub fn insert_vectors_batch(&self, index_name: &str, batch: &[(u64, Vector)]) -> Result<()> {
-        self.note_mutation();
+        let _publication = self.note_mutation();
         let indexes = self.indexes.read();
         let Some(index) = indexes.get(index_name) else {
             return Err(Error::query_execution(format!("Index '{}' not found", index_name)));
@@ -667,8 +1317,10 @@ impl VectorIndexManager {
             #[cfg(feature = "vector-persist")]
             IndexStorage::Persistent(idx) => {
                 self.refuse_replica_persistent_write(index_name)?;
+                let target = idx.replacement_handle();
+                drop(indexes);
                 for (row_id, vector) in batch {
-                    idx.insert(*row_id, vector)?;
+                    target.insert(*row_id, vector)?;
                 }
                 Ok(())
             }
@@ -692,54 +1344,348 @@ impl VectorIndexManager {
 
     /// Delete a vector from an index
     pub fn delete_vector(&self, index_name: &str, row_id: u64) -> Result<()> {
-        self.note_mutation();
+        let _publication = self.note_mutation();
         let indexes = self.indexes.read();
-        if let Some(index) = indexes.get(index_name) {
-            match index {
-                IndexStorage::Standard(idx) => idx.delete(row_id)?,
-                IndexStorage::Quantized(idx) => idx.delete(row_id)?,
-                #[cfg(feature = "vector-persist")]
-                IndexStorage::Persistent(idx) => {
-                    self.refuse_replica_persistent_write(index_name)?;
-                    idx.remove(row_id)?;
+        match indexes.get(index_name) {
+            Some(IndexStorage::Standard(idx)) => {
+                idx.delete(row_id)?;
+                drop(indexes);
+            }
+            Some(IndexStorage::Quantized(idx)) => {
+                idx.delete(row_id)?;
+                drop(indexes);
+            }
+            #[cfg(feature = "vector-persist")]
+            Some(IndexStorage::Persistent(idx)) => {
+                self.refuse_replica_persistent_write(index_name)?;
+                let target = idx.replacement_handle();
+                drop(indexes);
+                target.remove(row_id)?;
+            }
+            None => return Err(Error::query_execution(format!("Index '{}' not found", index_name))),
+        }
+        // Namespace fetches hold external_ids before records and may inspect
+        // the registry. Hold neither registry nor a payload map across the next.
+        self.forget_row_record(index_name, row_id);
+
+        Ok(())
+    }
+
+    /// Hash exact raw index bytes under total-order bounds. Framed lengths prevent
+    /// ambiguous key/value concatenations. This also supplies a non-application
+    /// witness for a token discarded after an uncertain native write result.
+    pub(crate) fn index_image_digest(
+        db: &rocksdb::DB,
+        prefix: &[u8],
+        mut visit: impl FnMut(&[u8]),
+    ) -> Result<[u8; 32]> {
+        use sha2::{Digest, Sha256};
+        let mut hash = Sha256::new();
+        let mut options = rocksdb::ReadOptions::default();
+        options.set_total_order_seek(true);
+        options.set_iterate_lower_bound(prefix.to_vec());
+        let mut upper = prefix.to_vec();
+        if let Some(last) = upper.last_mut() {
+            *last += 1;
+        }
+        options.set_iterate_upper_bound(upper);
+        for entry in db.iterator_opt(
+            rocksdb::IteratorMode::From(prefix, rocksdb::Direction::Forward),
+            options,
+        ) {
+            let (key, value) = entry.map_err(Error::from)?;
+            if !key.starts_with(prefix) {
+                break;
+            }
+            hash.update((key.len() as u64).to_le_bytes());
+            hash.update(&key);
+            hash.update((value.len() as u64).to_le_bytes());
+            hash.update(&value);
+            visit(&key);
+        }
+        Ok(hash.finalize().into())
+    }
+
+    pub(crate) fn snapshot_persistent_retirement_handles(&self) -> PersistentRetirementHandles {
+        #[cfg(not(feature = "vector-persist"))]
+        {
+            PersistentRetirementHandles::default()
+        }
+        #[cfg(feature = "vector-persist")]
+        {
+            let planning = self.registry_operation();
+            if !self.has_any_index() {
+                return PersistentRetirementHandles {
+                    handles: HashMap::new(),
+                    _planning: Some(planning),
+                };
+            }
+            let indexes = self.indexes.read();
+            PersistentRetirementHandles {
+                _planning: Some(planning),
+                handles: indexes
+                    .iter()
+                    .filter_map(|(name, index)| match index {
+                        IndexStorage::Persistent(index) => Some((name.clone(), index.replacement_handle())),
+                        _ => None,
+                    })
+                    .collect(),
+            }
+        }
+    }
+
+    /// The existing encoded namespace hashes the whole accepted index name:
+    /// a literal ':' in a quoted name cannot extend another index's prefix.
+    pub(crate) fn stage_persistent_index_purge(
+        &self,
+        name: &str,
+        db: Arc<rocksdb::DB>,
+        ddl: &mut super::DdlBatch<'_>,
+    ) -> Result<()> {
+        if !ddl.begin_persistent_retirement(name) {
+            return Ok(());
+        }
+        #[cfg(feature = "vector-persist")]
+        let target = ddl.persistent_retirement_handles()?.target(name);
+        let prefix = format!("__vidx:{}:", stable_index_id(name)).into_bytes();
+        let definition_key = format!("meta:index:{name}").into_bytes();
+        let definition = db.get(&definition_key)?;
+        let before = Self::index_image_digest(&db, &prefix, |key| ddl.delete(key))?;
+        let purge = PreparedPersistentPurge {
+            db,
+            prefix,
+            before,
+            definition_key,
+            definition,
+            settled: false,
+            #[cfg(feature = "vector-persist")]
+            target,
+        };
+        ddl.after_write_before_publication(move |success| purge.settle(success));
+        Ok(())
+    }
+
+    fn forget_row_record(&self, index_name: &str, row_id: u64) {
+        let removed = self
+            .records
+            .write()
+            .get_mut(index_name)
+            .and_then(|records| records.remove(&row_id));
+        if let Some(record) = removed {
+            if let Some(ids) = self.external_ids.write().get_mut(index_name) {
+                ids.remove(&VectorExternalKey::new(&record.id, record.namespace.as_deref()));
+            }
+        }
+    }
+
+    pub(crate) fn forget_replaced_row_records(&self, indexes: &[String], rows: &[crate::Tuple]) {
+        for name in indexes {
+            for row in rows {
+                if let Some(id) = row.row_id {
+                    self.forget_row_record(name, id);
                 }
             }
-            if let Some(records) = self.records.write().get_mut(index_name) {
-                if let Some(record) = records.remove(&row_id) {
-                    if let Some(ids) = self.external_ids.write().get_mut(index_name) {
-                        ids.remove(&VectorExternalKey::new(&record.id, record.namespace.as_deref()));
+        }
+    }
+
+    /// Stage persistent graphs from the replacement's logical rows, without
+    /// writing or publishing any index state. Release registry guards BEFORE
+    /// acquiring the first owned index lease, and acquire leases by name.
+    pub(crate) fn stage_persistent_table_replacement<'e>(
+        &'e self,
+        table: &str,
+        schema: &crate::Schema,
+        rows: &[(u64, crate::Tuple)],
+        ddl: &mut super::DdlBatch<'e>,
+    ) -> Result<Vec<String>> {
+        #[cfg(not(feature = "vector-persist"))]
+        {
+            let _ = (table, schema, rows, ddl);
+            Ok(Vec::new())
+        }
+        #[cfg(feature = "vector-persist")]
+        {
+            // Avoid topology planning entirely for ordinary, non-persistent
+            // populations. Recheck after taking planning before any lease.
+            if !self
+                .metadata
+                .read()
+                .values()
+                .any(|meta| meta.table_name == table && matches!(meta.index_type, VectorIndexType::Persistent(_)))
+            {
+                return Ok(Vec::new());
+            }
+            let planning = self.registry_operation();
+            let mut targets = {
+                let indexes = self.indexes.read();
+                let metadata = self.metadata.read();
+                let mut targets = Vec::new();
+                for meta in metadata.values().filter(|meta| meta.table_name == table) {
+                    if !matches!(meta.index_type, VectorIndexType::Persistent(_)) {
+                        continue;
+                    }
+                    let Some(IndexStorage::Persistent(index)) = indexes.get(&meta.name) else {
+                        return Err(Error::storage(format!(
+                            "persistent MV index '{}' has no persistent backend",
+                            meta.name
+                        )));
+                    };
+                    targets.push((meta.name.clone(), meta.column_name.clone(), index.replacement_handle()));
+                }
+                targets
+            };
+            targets.sort_by(|left, right| left.0.cmp(&right.0));
+            let mut prepared = Vec::with_capacity(targets.len());
+            for (name, column, index) in targets {
+                let position = schema.get_column_index(&column).ok_or_else(|| {
+                    Error::storage(format!("persistent MV index '{name}' references a missing column"))
+                })?;
+                let mut vectors = Vec::new();
+                for (row, tuple) in rows {
+                    match tuple.values.get(position) {
+                        Some(crate::Value::Null) => {}
+                        Some(crate::Value::Vector(vector)) => vectors.push((*row, vector.clone())),
+                        _ => {
+                            return Err(Error::storage(format!(
+                                "persistent MV index '{name}' received a non-vector value"
+                            )))
+                        }
                     }
                 }
+                let replacement = index.stage_replacement(&vectors, ddl.batch_mut())?;
+                prepared.push(PreparedTableVector { name, replacement });
             }
-            Ok(())
-        } else {
-            Err(Error::query_execution(format!("Index '{}' not found", index_name)))
+            let names = prepared.iter().map(|index| index.name.clone()).collect();
+            // ALL graph leases and topology planning settle before any normal
+            // DDL callback or ACK. Crash injection remains before this phase.
+            ddl.after_write_before_publication(move |success| {
+                if success {
+                    let _publication = self.begin_publication();
+                    for index in prepared {
+                        index.publish();
+                    }
+                } else {
+                    drop(prepared);
+                }
+                drop(planning);
+            });
+            Ok(names)
+        }
+    }
+
+    /// Retire an uncertain table's in-memory handles without changing its
+    /// durable HNSW records or snapshot markers. Only failed reconciliation
+    /// uses this; reopen determines which definitions actually survived.
+    pub(crate) fn retire_table_indexes(&self, table: &str, reason: &str) {
+        let _registry_operation = self.registry_operation();
+        let _publication = self.begin_publication();
+        #[cfg(feature = "vector-persist")]
+        {
+            let names: Vec<_> = self
+                .metadata
+                .read()
+                .values()
+                .filter(|meta| meta.table_name == table)
+                .map(|meta| meta.name.clone())
+                .collect();
+            self.retire_persistent_handles(&names, &_registry_operation);
+        }
+        let names = {
+            let mut indexes = self.indexes.write();
+            let mut metadata = self.metadata.write();
+            let names: Vec<_> = metadata
+                .values()
+                .filter(|meta| meta.table_name == table)
+                .map(|meta| meta.name.clone())
+                .collect();
+            for name in &names {
+                if indexes.remove(name).is_some() {
+                    self.index_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                metadata.remove(name);
+            }
+            names
+        };
+        // Public namespace fetches hold external_ids before records and may
+        // inspect the index registry while holding them. Never keep a registry
+        // or one payload-map guard while acquiring another payload-map guard.
+        for name in names {
+            self.records.write().remove(&name);
+            self.external_ids.write().remove(&name);
+            self.degraded.write().insert(name, reason.to_string());
+        }
+    }
+
+    /// Forget only an unreferenced failed CREATE's registration. The caller
+    /// proved that its definition is absent under the table's exclusive lock.
+    /// Other live (including standalone) registrations are preserved.
+    pub(crate) fn retire_unwritten_index(&self, name: &str, table: &str) -> Result<()> {
+        let _planning = self.registry_operation();
+        let _publication = self.begin_publication();
+        let owner = self.metadata.read().get(name).map(|meta| meta.table_name.clone());
+        match owner {
+            Some(owner) if owner == table => {}
+            Some(_) => return Err(Error::storage("failed CREATE graph changed table ownership")),
+            None if !self.indexes.read().contains_key(name) => return Ok(()),
+            None => return Err(Error::storage("failed CREATE graph has no ownership metadata")),
+        }
+        #[cfg(feature = "vector-persist")]
+        self.retire_persistent_handles(&[name.to_string()], &_planning);
+        {
+            let mut indexes = self.indexes.write();
+            let mut metadata = self.metadata.write();
+            if indexes.remove(name).is_some() {
+                self.index_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            metadata.remove(name);
+        }
+        self.records.write().remove(name);
+        self.external_ids.write().remove(name);
+        self.degraded.write().remove(name);
+        Ok(())
+    }
+
+    /// Actual persistent write-lease contention, for deterministic publication tests.
+    #[cfg(all(feature = "internal-tests", feature = "vector-persist"))]
+    pub fn debug_persistent_write_waiters(&self, name: &str) -> Option<usize> {
+        match self.indexes.read().get(name) {
+            Some(IndexStorage::Persistent(index)) => Some(index.write_waiters()),
+            _ => None,
         }
     }
 
     /// Drop an index
     pub fn drop_index(&self, name: &str) -> Result<()> {
-        self.note_mutation();
-        let mut indexes = self.indexes.write();
-        let mut metadata = self.metadata.write();
-
-        let Some(index) = indexes.remove(name) else {
-            return Err(Error::query_execution(format!("Index '{}' does not exist", name)));
-        };
-
-        // Spec P1.2: a standby forgets the index and keeps its keys — they are
-        // the primary's, whose own drop deletes them, and the deletes replicate.
+        let _registry_operation = self.registry_operation();
+        let _publication = self.note_mutation();
+        // A proven native refusal keeps the live registration and graph.
+        // Clone the persistent target, release the registry, then acquire its
+        // lease. Topology planning keeps the incarnation stable until detach.
         #[cfg(feature = "vector-persist")]
-        if let IndexStorage::Persistent(index) = index {
-            if !self.replica_memory_only() {
+        if !self.replica_memory_only() {
+            let persistent = {
+                let indexes = self.indexes.read();
+                match indexes.get(name) {
+                    Some(IndexStorage::Persistent(index)) => Some(index.replacement_handle()),
+                    _ => None,
+                }
+            };
+            if let Some(index) = persistent {
                 index.drop_storage()?;
             }
         }
-
-        metadata.remove(name);
+        let _index = {
+            let mut indexes = self.indexes.write();
+            let mut metadata = self.metadata.write();
+            let Some(index) = indexes.remove(name) else {
+                return Err(Error::query_execution(format!("Index '{}' does not exist", name)));
+            };
+            metadata.remove(name);
+            self.index_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            index
+        };
         self.records.write().remove(name);
         self.external_ids.write().remove(name);
-        self.index_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
@@ -1049,27 +1995,56 @@ impl VectorIndexManager {
         schema: &crate::Schema,
         tuple: &crate::Tuple,
     ) -> Vec<VectorIndexUndoOp> {
+        self.on_row_insert_excluding(table_name, row_id, schema, tuple, &[])
+    }
+
+    pub(crate) fn on_row_insert_excluding(
+        &self,
+        table_name: &str,
+        row_id: u64,
+        schema: &crate::Schema,
+        tuple: &crate::Tuple,
+        excluded: &[String],
+    ) -> Vec<VectorIndexUndoOp> {
+        self.on_row_insert_with_policy(table_name, row_id, schema, tuple, excluded, false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn on_row_insert_with_policy(
+        &self,
+        table_name: &str,
+        row_id: u64,
+        schema: &crate::Schema,
+        tuple: &crate::Tuple,
+        excluded: &[String],
+        ram_only: bool,
+    ) -> Vec<VectorIndexUndoOp> {
         if !self.has_any_index() {
             return Vec::new();
         }
+        let _publication = self.begin_publication();
         let mut undo = Vec::new();
         for (index_name, column_name) in self.indexes_on_table(table_name) {
+            if excluded.contains(&index_name) {
+                continue;
+            }
             if self.follows_replicated_records(&index_name) {
                 continue; // spec P1.2: its replicated records carry the change
+            }
+            if self.publish_committed_row_image(table_name, &index_name, row_id) {
+                continue;
             }
             let Some(vector) = Self::tuple_vector_value(schema, tuple, &column_name) else {
                 continue; // NULL / missing vector: nothing to index
             };
-            match self.insert_vector(&index_name, row_id, vector) {
+            match if ram_only {
+                self.insert_vector_ram_only(&index_name, row_id, vector)
+            } else {
+                self.insert_vector(&index_name, row_id, vector)
+            } {
                 Ok(()) => undo.push(VectorIndexUndoOp::RemoveInserted { index_name, row_id }),
                 Err(e) => {
-                    tracing::debug!(
-                        "vector index insert for '{}' row {} into '{}': {}",
-                        table_name,
-                        row_id,
-                        index_name,
-                        e
-                    );
+                    self.note_hook_error(table_name, &index_name, row_id, &e);
                 }
             }
         }
@@ -1087,13 +2062,44 @@ impl VectorIndexManager {
         schema: Option<&crate::Schema>,
         old_tuple: Option<&crate::Tuple>,
     ) -> Vec<VectorIndexUndoOp> {
+        self.on_row_delete_excluding(table_name, row_id, schema, old_tuple, &[])
+    }
+
+    pub(crate) fn on_row_delete_excluding(
+        &self,
+        table_name: &str,
+        row_id: u64,
+        schema: Option<&crate::Schema>,
+        old_tuple: Option<&crate::Tuple>,
+        excluded: &[String],
+    ) -> Vec<VectorIndexUndoOp> {
+        self.on_row_delete_with_policy(table_name, row_id, schema, old_tuple, excluded, false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn on_row_delete_with_policy(
+        &self,
+        table_name: &str,
+        row_id: u64,
+        schema: Option<&crate::Schema>,
+        old_tuple: Option<&crate::Tuple>,
+        excluded: &[String],
+        ram_only: bool,
+    ) -> Vec<VectorIndexUndoOp> {
         if !self.has_any_index() {
             return Vec::new();
         }
+        let _publication = self.begin_publication();
         let mut undo = Vec::new();
         for (index_name, column_name) in self.indexes_on_table(table_name) {
+            if excluded.contains(&index_name) {
+                continue;
+            }
             if self.follows_replicated_records(&index_name) {
                 continue; // spec P1.2: its replicated records carry the change
+            }
+            if self.publish_committed_row_image(table_name, &index_name, row_id) {
+                continue;
             }
             let old_vector = match (schema, old_tuple) {
                 (Some(schema), Some(tuple)) => Self::tuple_vector_value(schema, tuple, &column_name).cloned(),
@@ -1101,14 +2107,21 @@ impl VectorIndexManager {
             };
             // Tolerate missing entries (row's vector was NULL, or the row
             // predates the index in ways backfill didn't cover).
-            if self.delete_vector(&index_name, row_id).is_ok() {
-                if let Some(vector) = old_vector {
-                    undo.push(VectorIndexUndoOp::RestoreDeleted {
-                        index_name,
-                        row_id,
-                        vector,
-                    });
+            match if ram_only {
+                self.delete_vector_ram_only(&index_name, row_id)
+            } else {
+                self.delete_vector(&index_name, row_id)
+            } {
+                Ok(()) => {
+                    if let Some(vector) = old_vector {
+                        undo.push(VectorIndexUndoOp::RestoreDeleted {
+                            index_name,
+                            row_id,
+                            vector,
+                        });
+                    }
                 }
+                Err(error) => self.note_hook_error(table_name, &index_name, row_id, &error),
             }
         }
         undo
@@ -1128,13 +2141,46 @@ impl VectorIndexManager {
         old_tuple: Option<&crate::Tuple>,
         new_tuple: &crate::Tuple,
     ) -> Vec<VectorIndexUndoOp> {
+        self.on_row_update_excluding(table_name, row_id, schema, old_tuple, new_tuple, &[])
+    }
+
+    pub(crate) fn on_row_update_excluding(
+        &self,
+        table_name: &str,
+        row_id: u64,
+        schema: &crate::Schema,
+        old_tuple: Option<&crate::Tuple>,
+        new_tuple: &crate::Tuple,
+        excluded: &[String],
+    ) -> Vec<VectorIndexUndoOp> {
+        self.on_row_update_with_policy(table_name, row_id, schema, old_tuple, new_tuple, excluded, false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn on_row_update_with_policy(
+        &self,
+        table_name: &str,
+        row_id: u64,
+        schema: &crate::Schema,
+        old_tuple: Option<&crate::Tuple>,
+        new_tuple: &crate::Tuple,
+        excluded: &[String],
+        ram_only: bool,
+    ) -> Vec<VectorIndexUndoOp> {
         if !self.has_any_index() {
             return Vec::new();
         }
+        let _publication = self.begin_publication();
         let mut undo = Vec::new();
         for (index_name, column_name) in self.indexes_on_table(table_name) {
+            if excluded.contains(&index_name) {
+                continue;
+            }
             if self.follows_replicated_records(&index_name) {
                 continue; // spec P1.2: its replicated records carry the change
+            }
+            if self.publish_committed_row_image(table_name, &index_name, row_id) {
+                continue;
             }
             let old_vector = old_tuple.and_then(|t| Self::tuple_vector_value(schema, t, &column_name));
             let new_vector = Self::tuple_vector_value(schema, new_tuple, &column_name);
@@ -1146,22 +2192,36 @@ impl VectorIndexManager {
             } else if new_vector.is_none() {
                 // Old state unknown and the new value is NULL/absent: drop any
                 // existing entry so the index never serves a stale vector.
-                let _ = self.delete_vector(&index_name, row_id);
+                if let Err(error) = if ram_only {
+                    self.delete_vector_ram_only(&index_name, row_id)
+                } else {
+                    self.delete_vector(&index_name, row_id)
+                } {
+                    self.note_hook_error(table_name, &index_name, row_id, &error);
+                }
                 continue;
             }
 
-            let had_old_entry = self.delete_vector(&index_name, row_id).is_ok();
+            let had_old_entry = match if ram_only {
+                self.delete_vector_ram_only(&index_name, row_id)
+            } else {
+                self.delete_vector(&index_name, row_id)
+            } {
+                Ok(()) => true,
+                Err(error) => {
+                    self.note_hook_error(table_name, &index_name, row_id, &error);
+                    false
+                }
+            };
             let inserted = match new_vector {
-                Some(vector) => match self.insert_vector(&index_name, row_id, vector) {
+                Some(vector) => match if ram_only {
+                    self.insert_vector_ram_only(&index_name, row_id, vector)
+                } else {
+                    self.insert_vector(&index_name, row_id, vector)
+                } {
                     Ok(()) => true,
                     Err(e) => {
-                        tracing::debug!(
-                            "vector index update for '{}' row {} into '{}': {}",
-                            table_name,
-                            row_id,
-                            index_name,
-                            e
-                        );
+                        self.note_hook_error(table_name, &index_name, row_id, &e);
                         false
                     }
                 },
@@ -1178,13 +2238,183 @@ impl VectorIndexManager {
         undo
     }
 
-    /// Revert one eager maintenance op (transaction ROLLBACK). Failures are
-    /// logged and swallowed, mirroring ART undo replay.
+    // Explicit RAM-only paths are separate from normal mutators: even a
+    // Standard mutation's note_mutation hook can write snapshot invalidation.
+    fn insert_vector_ram_only(&self, name: &str, row: u64, vector: &Vector) -> Result<()> {
+        let indexes = self.indexes.read();
+        match indexes.get(name) {
+            Some(IndexStorage::Standard(index)) => index.insert(row, vector),
+            Some(IndexStorage::Quantized(index)) => index.insert(row, vector),
+            #[cfg(feature = "vector-persist")]
+            Some(IndexStorage::Persistent(index)) => {
+                let target = index.replacement_handle();
+                drop(indexes);
+                target.reload_actual_ram()
+            }
+            None => Err(Error::query_execution(format!("Index '{name}' not found"))),
+        }
+    }
+
+    fn delete_vector_ram_only(&self, name: &str, row: u64) -> Result<()> {
+        let indexes = self.indexes.read();
+        match indexes.get(name) {
+            Some(IndexStorage::Standard(index)) => {
+                index.delete_if_present(row);
+            }
+            Some(IndexStorage::Quantized(index)) => {
+                index.delete_if_present(row);
+            }
+            #[cfg(feature = "vector-persist")]
+            Some(IndexStorage::Persistent(index)) => {
+                let target = index.replacement_handle();
+                drop(indexes);
+                target.reload_actual_ram()?;
+                self.forget_row_record(name, row);
+                return Ok(());
+            }
+            None => return Err(Error::query_execution(format!("Index '{name}' not found"))),
+        }
+        drop(indexes);
+        self.forget_row_record(name, row);
+        Ok(())
+    }
+
+    /// Reconcile MAIN's changed row IDs from actual logical rows, with no
+    /// durable snapshot invalidation or graph repair. Caller retains the
+    /// write census/table ownership and quarantines the table on error.
+    /// Persistent indexes reload committed truth ONCE each, after all registry
+    /// reads and with no other persistent lease held.
+    pub(crate) fn reconcile_rows_ram_only(
+        &self,
+        table: &str,
+        schema: &crate::Schema,
+        changes: &[(u64, Option<crate::Tuple>)],
+    ) -> Result<()> {
+        if !self.has_any_index() {
+            return Ok(());
+        }
+        let _planning = self.registry_operation();
+        let _publication = self.begin_publication();
+        let targets: Vec<_> = self
+            .metadata
+            .read()
+            .values()
+            .filter(|meta| meta.table_name == table)
+            .cloned()
+            .collect();
+        for meta in &targets {
+            if schema.get_column_index(&meta.column_name).is_none() {
+                let error = Error::storage(format!(
+                    "vector reconciliation index '{}' references missing column '{}'",
+                    meta.name, meta.column_name
+                ));
+                self.note_hook_error(table, &meta.name, 0, &error);
+                return Err(error);
+            }
+        }
+        #[cfg(feature = "vector-persist")]
+        let mut persistent = Vec::new();
+        {
+            let indexes = self.indexes.read();
+            for meta in &targets {
+                match (indexes.get(&meta.name), &meta.index_type) {
+                    (Some(IndexStorage::Standard(_)), VectorIndexType::Standard(_))
+                    | (Some(IndexStorage::Quantized(_)), VectorIndexType::Quantized(_)) => {}
+                    #[cfg(feature = "vector-persist")]
+                    (Some(IndexStorage::Persistent(index)), VectorIndexType::Persistent(_)) => {
+                        persistent.push((meta.name.clone(), index.replacement_handle()));
+                    }
+                    _ => {
+                        let error = Error::storage(format!(
+                            "vector reconciliation index '{}' has no matching backend",
+                            meta.name
+                        ));
+                        self.note_hook_error(table, &meta.name, 0, &error);
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        for meta in &targets {
+            if matches!(meta.index_type, VectorIndexType::Persistent(_)) {
+                continue;
+            }
+            for (row, actual) in changes {
+                let repaired = (|| -> Result<()> {
+                    self.delete_vector_ram_only(&meta.name, *row)?;
+                    if let Some(vector) = actual
+                        .as_ref()
+                        .and_then(|tuple| Self::tuple_vector_value(schema, tuple, &meta.column_name))
+                    {
+                        self.insert_vector_ram_only(&meta.name, *row, vector)?;
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = repaired {
+                    self.note_hook_error(table, &meta.name, *row, &error);
+                    return Err(error);
+                }
+            }
+        }
+        #[cfg(feature = "vector-persist")]
+        {
+            for (name, index) in &persistent {
+                if let Err(error) = index.reload_actual_ram() {
+                    self.note_hook_error(table, name, 0, &error);
+                    return Err(error);
+                }
+            }
+            // Every graph lease has released before payload bookkeeping.
+            for (name, _) in &persistent {
+                for (row, _) in changes {
+                    self.forget_row_record(name, *row);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Embedded transaction journals undo derived RAM only. Persistent eager
+    /// journals are normally absent; if supplied, reload committed truth rather
+    /// than persisting an old image over a possibly-applied commit.
+    pub(crate) fn apply_undo_ram_only(&self, op: &VectorIndexUndoOp) {
+        let _planning = self.registry_operation();
+        let _publication = self.begin_publication();
+        let (name, row, restored, remove) = match op {
+            VectorIndexUndoOp::RemoveInserted { index_name, row_id } => (index_name, *row_id, None, true),
+            VectorIndexUndoOp::RestoreDeleted {
+                index_name,
+                row_id,
+                vector,
+            } => (index_name, *row_id, Some(vector), false),
+            VectorIndexUndoOp::RestoreUpdated {
+                index_name,
+                row_id,
+                old_vector,
+            } => (index_name, *row_id, old_vector.as_ref(), true),
+        };
+        if remove {
+            if let Err(error) = self.delete_vector_ram_only(name, row) {
+                self.note_undo_error(name, row, &error);
+                return;
+            }
+        }
+        if let Some(vector) = restored {
+            if let Err(error) = self.insert_vector_ram_only(name, row, vector) {
+                self.note_undo_error(name, row, &error);
+            }
+        }
+    }
+
+    /// Revert one eager maintenance op (transaction ROLLBACK). Backend failures
+    /// advance the owner's fault generation, so readers/callers cannot treat
+    /// the derived graph as successfully published merely because rows match.
     pub fn apply_undo(&self, op: &VectorIndexUndoOp) {
+        let _publication = self.begin_publication();
         match op {
             VectorIndexUndoOp::RemoveInserted { index_name, row_id } => {
                 if let Err(e) = self.delete_vector(index_name, *row_id) {
-                    tracing::debug!("vector undo remove-insert '{}' row {}: {}", index_name, row_id, e);
+                    self.note_undo_error(index_name, *row_id, &e);
                 }
             }
             VectorIndexUndoOp::RestoreDeleted {
@@ -1193,7 +2423,7 @@ impl VectorIndexManager {
                 vector,
             } => {
                 if let Err(e) = self.insert_vector(index_name, *row_id, vector) {
-                    tracing::debug!("vector undo restore-delete '{}' row {}: {}", index_name, row_id, e);
+                    self.note_undo_error(index_name, *row_id, &e);
                 }
             }
             VectorIndexUndoOp::RestoreUpdated {
@@ -1201,10 +2431,12 @@ impl VectorIndexManager {
                 row_id,
                 old_vector,
             } => {
-                let _ = self.delete_vector(index_name, *row_id);
+                if let Err(error) = self.delete_vector(index_name, *row_id) {
+                    self.note_undo_error(index_name, *row_id, &error);
+                }
                 if let Some(vector) = old_vector {
                     if let Err(e) = self.insert_vector(index_name, *row_id, vector) {
-                        tracing::debug!("vector undo restore-update '{}' row {}: {}", index_name, row_id, e);
+                        self.note_undo_error(index_name, *row_id, &e);
                     }
                 }
             }
@@ -1252,8 +2484,12 @@ impl VectorIndexManager {
         }
     }
 
-    /// Load index from bytes
+    /// Load index from bytes.
+    /// Legacy PQ dumps did not encode deleted membership; rebuild those from
+    /// authoritative rows (see [`QuantizedHnswIndex::from_bytes`]).
     pub fn load_index(&self, bytes: &[u8]) -> Result<()> {
+        let _registry_operation = self.registry_operation();
+        let _publication = self.begin_publication();
         #[derive(Serialize, Deserialize)]
         struct PersistedIndex {
             metadata: VectorIndexMetadata,
@@ -1479,6 +2715,8 @@ impl VectorIndexManager {
         sidecar: &super::index_snapshot::VectorGraphSidecar,
         dir: &std::path::Path,
     ) -> Result<()> {
+        let _registry_operation = self.registry_operation();
+        let _publication = self.begin_publication();
         if sidecar.format_version != super::index_snapshot::INDEX_SNAPSHOT_FORMAT_VERSION {
             return Err(Error::storage(format!(
                 "vector snapshot format {} != supported {}",
@@ -1545,6 +2783,8 @@ impl VectorIndexManager {
         };
         indexes.insert(sidecar.index_name.clone(), IndexStorage::Standard(index));
         metadata.insert(sidecar.index_name.clone(), meta);
+        drop(metadata);
+        drop(indexes);
         self.records.write().entry(sidecar.index_name.clone()).or_default();
         self.external_ids.write().entry(sidecar.index_name.clone()).or_default();
         self.index_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1564,9 +2804,33 @@ impl VectorIndexManager {
         db: Arc<rocksdb::DB>,
         gate: Arc<super::write_gate::WriteGate>,
     ) -> Result<()> {
+        let _registry_operation = self.registry_operation();
+        let _publication = self.begin_publication();
         let index_id = stable_index_id(name);
-        let index = crate::vector::persistent::PersistentVectorIndex::open(db, gate, index_id)?;
+        let index = crate::vector::persistent::PersistentVectorIndex::open_with_key_manager(
+            db,
+            gate,
+            index_id,
+            self.persistent_key_manager(),
+        )?;
 
+        // Older catalog definitions carry only layout hints, not the backend's
+        // persisted PQ/precision choices. Validate the schema-facing contract,
+        // then publish the configuration actually decoded from durable records.
+        let durable = index.config();
+        if durable.dimension != config.dimension || durable.distance_metric != config.distance_metric {
+            return Err(Error::storage(format!(
+                "persistent index '{name}' catalog layout (dimension {}, metric {:?}) does not match durable graph \
+                 (dimension {}, metric {:?}); refusing to replace its persistent backend",
+                config.dimension, config.distance_metric, durable.dimension, durable.distance_metric
+            )));
+        }
+        let actual = PersistentVectorConfig {
+            dimension: durable.dimension,
+            distance_metric: durable.distance_metric,
+            pq_enabled: durable.pq_enabled,
+            rerank_precision: persistent_precision_name(durable.rerank_precision).to_string(),
+        };
         let mut indexes = self.indexes.write();
         let mut metadata = self.metadata.write();
         if indexes.contains_key(name) {
@@ -1576,10 +2840,12 @@ impl VectorIndexManager {
             name: name.to_string(),
             table_name: table_name.to_string(),
             column_name: column_name.to_string(),
-            index_type: VectorIndexType::Persistent(config),
+            index_type: VectorIndexType::Persistent(actual),
         };
         indexes.insert(name.to_string(), IndexStorage::Persistent(index));
         metadata.insert(name.to_string(), meta);
+        drop(metadata);
+        drop(indexes);
         self.records.write().entry(name.to_string()).or_default();
         self.external_ids.write().entry(name.to_string()).or_default();
         self.index_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1735,6 +3001,475 @@ impl Default for VectorIndexManager {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn staged_standard_hooks_and_undo_defer_snapshot_invalidation_to_the_row_group() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let manager = VectorIndexManager::new();
+        for (index, table) in [("t_vec", "t"), ("u_vec", "u")] {
+            manager
+                .create_index(index.into(), table.into(), "embedding".into(), 2, DistanceMetric::L2)
+                .unwrap();
+        }
+        let schema = crate::Schema::new(vec![crate::Column::new("embedding", crate::DataType::Vector(2))]);
+        let old = crate::Tuple::new(vec![crate::Value::Vector(vec![1.0, 0.0])]);
+        let new = crate::Tuple::new(vec![crate::Value::Vector(vec![0.0, 1.0])]);
+        manager.on_row_insert("t", 1, &schema, &old);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&calls);
+        manager.set_snapshot_invalidation_hook(Arc::new(move || {
+            seen.fetch_add(1, Ordering::SeqCst);
+        }));
+        manager.mark_snapshot_clean();
+        let undo = manager.on_row_update_staged("t", 1, &schema, Some(&old), &new);
+        assert_eq!(manager.search("t_vec", &vec![0.0, 1.0], 1).unwrap()[0].0, 1);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "no durable snapshot hook before COMMIT"
+        );
+        assert!(
+            manager.snapshot_is_clean(),
+            "staging must not consume the global clean flag"
+        );
+        let mut batch = rocksdb::WriteBatch::default();
+        manager
+            .stage_row_images("t", 1, &schema, Some(&new), &mut batch, usize::MAX)
+            .unwrap();
+        struct Deleted(std::collections::BTreeSet<Vec<u8>>);
+        impl rocksdb::WriteBatchIterator for Deleted {
+            fn put(&mut self, _: Box<[u8]>, _: Box<[u8]>) {
+                panic!("Standard snapshot staging has no value writes");
+            }
+            fn delete(&mut self, key: Box<[u8]>) {
+                self.0.insert(key.into_vec());
+            }
+        }
+        let mut deleted = Deleted(std::collections::BTreeSet::new());
+        batch.iterate(&mut deleted);
+        assert_eq!(
+            deleted.0,
+            [
+                super::super::index_snapshot::vec_snapshot_marker_key("t_vec"),
+                super::super::index_snapshot::vec_snapshot_marker_key("u_vec"),
+            ]
+            .into_iter()
+            .collect(),
+            "all dump validity markers ride the owning group"
+        );
+        for action in undo.iter().rev() {
+            manager.apply_undo_ram_only(action);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "ROLLBACK is RAM only");
+        assert!(manager.snapshot_is_clean());
+        assert_eq!(manager.search("t_vec", &vec![1.0, 0.0], 1).unwrap()[0].1, 0.0);
+        // Only an applied owning group consumes the flag. A subsequent raw
+        // vector API still has its original explicit snapshot-hook contract.
+        manager.row_group_applied();
+        assert!(!manager.snapshot_is_clean());
+        manager.mark_snapshot_clean();
+        manager.insert_vector("u_vec", 2, &vec![0.0, 1.0]).unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn publication_ticket_tracks_overlapping_mutations_and_exhaustion() {
+        let manager = VectorIndexManager::new();
+        let before = manager.publication_ticket().unwrap();
+        let first = manager.begin_publication();
+        let second = manager.begin_publication();
+        assert!(manager.publication_ticket().is_none());
+        drop(first);
+        assert!(manager.publication_ticket().is_none());
+        drop(second);
+        assert!(!manager.publication_is_current(before));
+        assert!(manager.publication_ticket().is_some());
+        manager.publication_epoch.store(
+            PUBLICATION_EXHAUSTED - (PUBLICATION_INFLIGHT + 1),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        drop(manager.begin_publication());
+        assert!(
+            manager.publication_ticket().is_none(),
+            "generation never wraps into an accepted old ticket"
+        );
+        drop(manager.begin_publication());
+        assert!(manager.publication_ticket().is_none());
+    }
+
+    #[test]
+    fn hook_faults_are_scoped_to_the_actual_table_and_exhaustion_fails_closed() {
+        let manager = VectorIndexManager::new();
+        manager
+            .create_index(
+                "bad_idx".into(),
+                "bad".into(),
+                "embedding".into(),
+                2,
+                DistanceMetric::L2,
+            )
+            .unwrap();
+        let schema = crate::Schema::new(vec![crate::Column::new("embedding", crate::DataType::Vector(2))]);
+        let wrong = crate::Tuple::new(vec![crate::Value::Vector(vec![1.0, 0.0, 0.0])]);
+        assert!(manager.on_row_insert("bad", 1, &schema, &wrong).is_empty());
+        assert_eq!(manager.hook_error_generation("bad"), Some(1));
+        assert_eq!(manager.hook_error_generation("healthy"), Some(0));
+        manager
+            .hook_faults
+            .get("bad")
+            .unwrap()
+            .store(u64::MAX - 1, std::sync::atomic::Ordering::SeqCst);
+        manager.on_row_insert("bad", 1, &schema, &wrong);
+        assert_eq!(manager.hook_error_generation("bad"), None);
+        manager.on_row_insert("bad", 1, &schema, &wrong);
+        assert_eq!(manager.hook_error_generation("bad"), None);
+        assert_eq!(manager.hook_error_generation("healthy"), Some(0));
+    }
+
+    #[test]
+    fn vector_column_relabel_uses_original_mapping_without_changing_graph_identity() {
+        let manager = VectorIndexManager::new();
+        for (name, column) in [("first", "a"), ("second", "b")] {
+            manager
+                .create_index(name.into(), "t".into(), column.into(), 2, DistanceMetric::L2)
+                .unwrap();
+            manager.insert_vector(name, 7, &vec![1.0, 0.0]).unwrap();
+        }
+        let before = manager.search("first", &vec![1.0, 0.0], 1).unwrap();
+        manager.relabel_table_columns("t", &[("a".into(), "b".into()), ("b".into(), "a".into())]);
+        assert_eq!(manager.get_metadata("first").unwrap().column_name, "b");
+        assert_eq!(manager.get_metadata("second").unwrap().column_name, "a");
+        assert_eq!(manager.search("first", &vec![1.0, 0.0], 1).unwrap(), before);
+    }
+
+    #[test]
+    fn public_quantized_save_load_preserves_deleted_and_replaced_membership() {
+        let manager = VectorIndexManager::new();
+        let training: Vec<_> = (0..16).map(|row| vec![row as f32, 0.0]).collect();
+        manager
+            .create_quantized_index_with_params(
+                "pq_saved".into(),
+                "t".into(),
+                "v".into(),
+                2,
+                DistanceMetric::L2,
+                ProductQuantizerConfig {
+                    num_subquantizers: 1,
+                    num_centroids: 2,
+                    dimension: 2,
+                    training_iterations: 2,
+                    min_training_samples: 16,
+                },
+                &training,
+                12,
+                48,
+            )
+            .unwrap();
+        manager.insert_vector("pq_saved", 1, &vec![0.0, 0.0]).unwrap();
+        manager.insert_vector("pq_saved", 2, &vec![15.0, 0.0]).unwrap();
+        manager.insert_vector("pq_saved", 3, &vec![9.0, 0.0]).unwrap();
+        manager.insert_vector("pq_saved", 2, &vec![1.0, 0.0]).unwrap();
+        manager.delete_vector("pq_saved", 1).unwrap();
+        manager.delete_vector("pq_saved", 3).unwrap();
+        let expected = manager.search("pq_saved", &vec![0.0, 0.0], 10).unwrap();
+        assert_eq!(expected.len(), 1);
+        assert_eq!(expected[0].0, 2);
+        let saved = manager.save_index("pq_saved").unwrap();
+        let loaded = VectorIndexManager::new();
+        loaded.load_index(&saved).unwrap();
+        assert_eq!(loaded.index_live_size("pq_saved"), Some(1));
+        assert_eq!(loaded.search("pq_saved", &vec![0.0, 0.0], 10).unwrap(), expected);
+        assert_eq!(
+            bincode::serialize(&loaded.get_metadata("pq_saved").unwrap()).unwrap(),
+            bincode::serialize(&manager.get_metadata("pq_saved").unwrap()).unwrap(),
+            "public roundtrip preserves table/column/index/config identity"
+        );
+        loaded.insert_vector("pq_saved", 4, &vec![8.0, 0.0]).unwrap();
+        loaded.delete_vector("pq_saved", 2).unwrap();
+        let again = VectorIndexManager::new();
+        again.load_index(&loaded.save_index("pq_saved").unwrap()).unwrap();
+        assert_eq!(again.index_live_size("pq_saved"), Some(1));
+        assert_eq!(again.search("pq_saved", &vec![0.0, 0.0], 10).unwrap()[0].0, 4);
+        again.delete_vector("pq_saved", 4).unwrap();
+        let empty = VectorIndexManager::new();
+        empty.load_index(&again.save_index("pq_saved").unwrap()).unwrap();
+        assert_eq!(empty.index_live_size("pq_saved"), Some(0));
+        assert!(empty.search("pq_saved", &vec![0.0, 0.0], 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn ram_only_reconciliation_and_journal_undo_never_invalidate_durable_snapshots() {
+        let manager = VectorIndexManager::new();
+        manager
+            .create_index("standard".into(), "t".into(), "v".into(), 2, DistanceMetric::L2)
+            .unwrap();
+        let training: Vec<_> = (0..16).map(|row| vec![row as f32, 0.0]).collect();
+        manager
+            .create_quantized_index(
+                "quantized".into(),
+                "t".into(),
+                "v".into(),
+                2,
+                DistanceMetric::L2,
+                ProductQuantizerConfig {
+                    num_subquantizers: 1,
+                    num_centroids: 2,
+                    dimension: 2,
+                    training_iterations: 2,
+                    min_training_samples: 4,
+                },
+                &training,
+            )
+            .unwrap();
+        for name in ["standard", "quantized"] {
+            manager.insert_vector(name, 1, &vec![9.0, 0.0]).unwrap();
+        }
+        let invalidations = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let observed = Arc::clone(&invalidations);
+        manager.set_snapshot_invalidation_hook(Arc::new(move || {
+            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }));
+        manager.mark_snapshot_clean();
+        let schema = crate::Schema::new(vec![crate::Column::new("v", crate::DataType::Vector(2))]);
+        manager
+            .reconcile_rows_ram_only(
+                "t",
+                &schema,
+                &[
+                    (1, None),
+                    (2, Some(crate::Tuple::new(vec![crate::Value::Vector(vec![0.0, 0.0])]))),
+                ],
+            )
+            .unwrap();
+        for name in ["standard", "quantized"] {
+            assert_eq!(manager.index_live_size(name), Some(1));
+            assert_eq!(manager.search(name, &vec![0.0, 0.0], 1).unwrap()[0].0, 2);
+            manager.apply_undo_ram_only(&VectorIndexUndoOp::RemoveInserted {
+                index_name: name.into(),
+                row_id: 2,
+            });
+            assert_eq!(manager.index_live_size(name), Some(0));
+            manager.apply_undo_ram_only(&VectorIndexUndoOp::RestoreDeleted {
+                index_name: name.into(),
+                row_id: 1,
+                vector: vec![9.0, 0.0],
+            });
+            assert_eq!(manager.search(name, &vec![9.0, 0.0], 1).unwrap()[0].0, 1);
+            manager.apply_undo_ram_only(&VectorIndexUndoOp::RestoreUpdated {
+                index_name: name.into(),
+                row_id: 1,
+                old_vector: Some(vec![8.0, 0.0]),
+            });
+            assert_eq!(manager.index_live_size(name), Some(1));
+        }
+        assert_eq!(invalidations.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(manager.snapshot_is_clean());
+        assert_eq!(manager.hook_error_generation("t"), Some(0));
+    }
+
+    #[cfg(feature = "vector-persist")]
+    #[test]
+    fn persistent_reopen_metadata_follows_durable_precision_and_pq_and_refuses_wrong_layout() {
+        use crate::vector::persistent::VectorPrecision;
+        let mut cells = 0;
+        for precision in [VectorPrecision::F32, VectorPrecision::F16, VectorPrecision::I8] {
+            for pq in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let db = Arc::new(rocksdb::DB::open_default(root.path()).unwrap());
+                let gate = super::super::WriteGate::open();
+                let creator = VectorIndexManager::new();
+                let training: Vec<_> = (0..32).map(|row| vec![row as f32, 0.0, 1.0, 0.0]).collect();
+                creator
+                    .create_persistent_index(
+                        "reopen_config".into(),
+                        "t".into(),
+                        "v".into(),
+                        4,
+                        DistanceMetric::L2,
+                        pq.then_some(ProductQuantizerConfig {
+                            num_subquantizers: 2,
+                            num_centroids: 4,
+                            dimension: 4,
+                            training_iterations: 2,
+                            min_training_samples: 32,
+                        }),
+                        Some(precision),
+                        &training,
+                        Arc::clone(&db),
+                        Arc::clone(&gate),
+                    )
+                    .unwrap();
+                creator
+                    .insert_vector("reopen_config", 7, &vec![1.0, 0.0, 1.0, 0.0])
+                    .unwrap();
+                let before = db.latest_sequence_number();
+                let prefix = format!("__vidx:{}:", stable_index_id("reopen_config"));
+                let bytes = VectorIndexManager::index_image_digest(&db, prefix.as_bytes(), |_| {}).unwrap();
+                let legacy_hint = PersistentVectorConfig {
+                    dimension: 4,
+                    distance_metric: DistanceMetric::L2,
+                    pq_enabled: !pq,
+                    rerank_precision: if precision == VectorPrecision::F32 {
+                        "f16"
+                    } else {
+                        "f32"
+                    }
+                    .into(),
+                };
+                let readonly_gate = super::super::WriteGate::closed("read-only reopen control");
+                let reopened = VectorIndexManager::new();
+                reopened
+                    .reopen_persistent_index(
+                        "reopen_config",
+                        "t",
+                        "v",
+                        legacy_hint.clone(),
+                        Arc::clone(&db),
+                        Arc::clone(&readonly_gate),
+                    )
+                    .unwrap();
+                let VectorIndexType::Persistent(actual) = reopened.get_metadata("reopen_config").unwrap().index_type
+                else {
+                    panic!("reopen must retain persistent backend")
+                };
+                assert_eq!(actual.dimension, 4);
+                assert_eq!(actual.distance_metric, DistanceMetric::L2);
+                assert_eq!(actual.pq_enabled, pq);
+                assert_eq!(actual.rerank_precision, persistent_precision_name(precision));
+                assert_eq!(
+                    reopened.search("reopen_config", &vec![1.0, 0.0, 1.0, 0.0], 1).unwrap()[0].0,
+                    7
+                );
+                for (dimension, metric) in [(3, DistanceMetric::L2), (4, DistanceMetric::Cosine)] {
+                    let wrong = VectorIndexManager::new();
+                    let error = wrong
+                        .reopen_persistent_index(
+                            "reopen_config",
+                            "t",
+                            "v",
+                            PersistentVectorConfig {
+                                dimension,
+                                distance_metric: metric,
+                                ..legacy_hint.clone()
+                            },
+                            Arc::clone(&db),
+                            Arc::clone(&readonly_gate),
+                        )
+                        .unwrap_err();
+                    assert!(error.to_string().contains("does not match durable graph"), "{error}");
+                    assert!(!wrong.index_exists("reopen_config"));
+                    assert!(wrong.get_metadata("reopen_config").is_err());
+                }
+                assert_eq!(db.latest_sequence_number(), before);
+                assert_eq!(
+                    VectorIndexManager::index_image_digest(&db, prefix.as_bytes(), |_| {}).unwrap(),
+                    bytes
+                );
+                assert_eq!(readonly_gate.refusals(), 0);
+                cells += 1;
+            }
+        }
+        assert_eq!(cells, 6);
+        eprintln!("persistent-reopen-config-receipt precision_pq_cells={cells}");
+    }
+
+    #[cfg(feature = "vector-persist")]
+    #[test]
+    fn ram_only_persistent_reconciliation_reloads_actual_bytes_once_without_a_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(rocksdb::DB::open_default(dir.path()).unwrap());
+        let gate = super::super::WriteGate::open();
+        let manager = VectorIndexManager::new();
+        manager
+            .create_persistent_index(
+                "persistent".into(),
+                "t".into(),
+                "v".into(),
+                2,
+                DistanceMetric::L2,
+                None,
+                None,
+                &[],
+                Arc::clone(&db),
+                Arc::clone(&gate),
+            )
+            .unwrap();
+        manager.insert_vector("persistent", 1, &vec![9.0, 0.0]).unwrap();
+        // Simulate a native group/applier changing durable graph bytes before
+        // the manager publishes them; this independent backend is not exposed.
+        let durable = crate::vector::persistent::PersistentVectorIndex::open(
+            Arc::clone(&db),
+            Arc::clone(&gate),
+            stable_index_id("persistent"),
+        )
+        .unwrap();
+        durable.remove(1).unwrap();
+        durable.insert(2, &vec![0.0, 0.0]).unwrap();
+        assert_eq!(manager.search("persistent", &vec![0.0, 0.0], 1).unwrap()[0].0, 1);
+        let sequence = db.latest_sequence_number();
+        let prefix = format!("__vidx:{}:", stable_index_id("persistent"));
+        let before = VectorIndexManager::index_image_digest(&db, prefix.as_bytes(), |_| {}).unwrap();
+        let invalidations = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let observed = Arc::clone(&invalidations);
+        manager.set_snapshot_invalidation_hook(Arc::new(move || {
+            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }));
+        manager.mark_snapshot_clean();
+        manager.set_persistent_policy(PersistentPolicy::ReplicaMemoryOnly);
+        let schema = crate::Schema::new(vec![crate::Column::new("v", crate::DataType::Vector(2))]);
+        manager
+            .reconcile_rows_ram_only(
+                "t",
+                &schema,
+                &[
+                    (1, None),
+                    (2, Some(crate::Tuple::new(vec![crate::Value::Vector(vec![0.0, 0.0])]))),
+                ],
+            )
+            .unwrap();
+        assert_eq!(manager.search("persistent", &vec![0.0, 0.0], 1).unwrap()[0].0, 2);
+        assert_eq!(manager.index_live_size("persistent"), Some(1));
+        assert_eq!(db.latest_sequence_number(), sequence);
+        assert_eq!(
+            VectorIndexManager::index_image_digest(&db, prefix.as_bytes(), |_| {}).unwrap(),
+            before
+        );
+        assert_eq!(invalidations.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            gate.refusals(),
+            0,
+            "RAM reconciliation never asks even a replica's gate to write"
+        );
+    }
+
+    #[test]
+    fn uncertain_retirement_forgets_only_target_memory_without_running_durable_invalidation() {
+        let manager = VectorIndexManager::new();
+        for (name, table) in [("target_idx", "target"), ("other_idx", "other")] {
+            manager
+                .create_index(name.into(), table.into(), "embedding".into(), 2, DistanceMetric::L2)
+                .unwrap();
+        }
+        let invalidations = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let observed = Arc::clone(&invalidations);
+        manager.set_snapshot_invalidation_hook(Arc::new(move || {
+            observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }));
+        manager.mark_snapshot_clean();
+        manager.retire_table_indexes("target", "uncertain population");
+        assert_eq!(invalidations.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert!(!manager.index_exists("target_idx"));
+        assert!(!manager.table_has_indexes("target"));
+        assert!(manager.index_exists("other_idx"));
+        assert!(manager.table_has_indexes("other"));
+        assert!(manager.has_any_index());
+        assert!(manager.degraded_indexes().iter().any(|(name, _)| name == "target_idx"));
+        manager.retire_table_indexes("target", "again");
+        assert!(
+            manager.has_any_index(),
+            "idempotent retirement cannot underflow the registry count"
+        );
+    }
 
     #[test]
     fn test_create_index() {

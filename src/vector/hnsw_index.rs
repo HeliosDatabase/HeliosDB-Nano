@@ -500,12 +500,7 @@ where
 
     /// Delete a vector from the index
     pub fn delete(&self, row_id: u64) -> Result<()> {
-        let mut reverse_mapping = self.reverse_mapping.write();
-
-        // hnsw_rs cannot remove a point: the vector stays in the graph as a
-        // tombstone that the result filter (and the exact scan) skips.
-        if reverse_mapping.remove(&row_id).is_some() {
-            self.note_mutation();
+        if self.delete_if_present(row_id) {
             Ok(())
         } else {
             Err(Error::query_execution(format!(
@@ -513,6 +508,18 @@ where
                 row_id
             )))
         }
+    }
+
+    /// An actual-state reconciliation may remove a row that never had a
+    /// vector. Decide and remove under the same mapping guard; no error text.
+    pub(crate) fn delete_if_present(&self, row_id: u64) -> bool {
+        let mut reverse_mapping = self.reverse_mapping.write();
+        // hnsw_rs keeps the physical point as a tombstone; search skips it.
+        let removed = reverse_mapping.remove(&row_id).is_some();
+        if removed {
+            self.note_mutation();
+        }
+        removed
     }
 
     /// Get the number of vectors in the index
@@ -930,6 +937,14 @@ impl MultiMetricHnswIndex {
             Self::L2(index) => index.delete(row_id),
             Self::Cosine(index) => index.delete(row_id),
             Self::InnerProduct(index) => index.delete(row_id),
+        }
+    }
+
+    pub(crate) fn delete_if_present(&self, row_id: u64) -> bool {
+        match self {
+            Self::L2(index) => index.delete_if_present(row_id),
+            Self::Cosine(index) => index.delete_if_present(row_id),
+            Self::InnerProduct(index) => index.delete_if_present(row_id),
         }
     }
 

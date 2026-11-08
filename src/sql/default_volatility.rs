@@ -69,7 +69,9 @@ fn function_is_stable(fun: &str) -> bool {
     if base.contains('.') {
         return false;
     }
-    super::udf_bridge::resolve(base)
+    super::udf_bridge::resolve_owned(base)
+        .ok()
+        .flatten()
         .and_then(|bridge| bridge.registry.get_function(base))
         .and_then(|function| function.volatility)
         .is_some_and(|volatility| {

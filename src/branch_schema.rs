@@ -233,9 +233,16 @@ fn schema_plan_tables(storage: &StorageEngine, plan: &LogicalPlan) -> Vec<String
             .iter()
             .flat_map(|operation| schema_plan_tables(storage, operation))
             .collect(),
+        // These clauses also replace inbound foreign-key records. Lock their
+        // owners before loading those records, or a concurrent ALTER of a child
+        // can be overwritten by the parent's stale copy at publication.
+        LogicalPlan::AlterTableDropColumn { table_name, .. }
+        | LogicalPlan::AlterTableRenameColumn { table_name, .. } => {
+            let mut tables = vec![table_name.clone()];
+            tables.extend(fk_neighbours(storage, table_name));
+            tables
+        }
         LogicalPlan::AlterTableAddColumn { table_name, .. }
-        | LogicalPlan::AlterTableDropColumn { table_name, .. }
-        | LogicalPlan::AlterTableRenameColumn { table_name, .. }
         | LogicalPlan::AlterTableAlterColumnNullability { table_name, .. }
         | LogicalPlan::AlterColumnStorage { table_name, .. }
         | LogicalPlan::AlterTableAddUnique { table_name, .. }
@@ -526,24 +533,56 @@ impl EmbeddedDatabase {
     pub(crate) fn statement_table_locks(&self, plan: &LogicalPlan) -> Result<StatementLockScope<'_>> {
         let scope = self.storage.table_locks().statement_scope();
         match plan {
-            LogicalPlan::Insert { table_name, .. }
-            | LogicalPlan::InsertSelect { table_name, .. }
-            | LogicalPlan::Update { table_name, .. } => {
-                scope.lock_shared(self.storage.statement_lock_level(), table_name)?;
+            LogicalPlan::Update {
+                table_name,
+                assignments,
+                ..
             }
-            LogicalPlan::Delete { table_name, .. } => {
-                // Every table its foreign keys make it write, sorted, before it changes
-                // anything: 55P03 has to mean it changed nothing.
+            | LogicalPlan::Insert {
+                table_name,
+                on_conflict: Some(crate::sql::logical_plan::OnConflictAction::DoUpdate { assignments, .. }),
+                ..
+            } => {
+                let columns: Vec<String> = assignments.iter().map(|(name, _)| name.clone()).collect();
+                let tables = self.fk_update_lock_tables(table_name, &columns)?;
                 let level = self.storage.statement_lock_level();
-                let mut tables = self.cascade_lock_tables(table_name)?;
                 if tables.is_empty() {
                     scope.lock_shared(level, table_name)?;
                 } else {
-                    tables.push(table_name.clone());
-                    tables.sort_unstable();
                     for table in &tables {
-                        scope.lock_shared(level, table)?;
+                        scope.lock_exclusive(level, table, "FK ON UPDATE")?;
                     }
+                }
+                // A newly declared incoming FK between discovery and locking
+                // must not turn into an unprotected child write. No row was
+                // staged yet; refuse for a retry under the current graph.
+                if self
+                    .fk_update_lock_tables(table_name, &columns)?
+                    .iter()
+                    .any(|table| !tables.contains(table))
+                {
+                    return Err(Error::concurrent_update(table_name));
+                }
+            }
+            LogicalPlan::Insert { table_name, .. } | LogicalPlan::InsertSelect { table_name, .. } => {
+                scope.lock_shared(self.storage.statement_lock_level(), table_name)?;
+            }
+            LogicalPlan::Delete { table_name, .. } => {
+                let level = self.storage.statement_lock_level();
+                let tables = self.cascade_lock_tables(table_name)?;
+                if tables.is_empty() {
+                    scope.lock_shared(level, table_name)?;
+                } else {
+                    for table in &tables {
+                        scope.lock_exclusive(level, table, "FK ON DELETE")?;
+                    }
+                }
+                if self
+                    .cascade_lock_tables(table_name)?
+                    .iter()
+                    .any(|table| !tables.contains(table))
+                {
+                    return Err(Error::concurrent_update(table_name));
                 }
             }
             LogicalPlan::Truncate { table_name } => {
@@ -567,6 +606,15 @@ impl EmbeddedDatabase {
         txn: Option<&Transaction>,
         sql: &str,
     ) -> Result<(Option<MainDdlGuard>, bool)> {
+        if let LogicalPlan::MergeBranch {
+            source,
+            target,
+            options,
+        } = plan
+        {
+            self.execute_merge_branch_with_fk_policy(source, target, options)?;
+            return Ok((None, true));
+        }
         // Spec R5.1: a TRUNCATE arriving here is `ddl::handle_truncate`'s, which writes
         // at once. Its guard ends with the statement, and this keeps its plan out of
         // the plan cache, whose hit would skip the lock.

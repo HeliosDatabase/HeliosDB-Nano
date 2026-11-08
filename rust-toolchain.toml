@@ -1,3 +1,5 @@
+# Development and full regression gates use stable. Minimum compiler checks
+# are separate CI jobs: Rust 1.88 default; Rust 1.92 with code-embed.
 [toolchain]
 channel = "stable"
 components = ["rustfmt", "clippy"]

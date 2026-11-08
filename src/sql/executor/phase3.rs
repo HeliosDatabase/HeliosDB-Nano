@@ -33,6 +33,249 @@ fn optimize_view_query(plan: &LogicalPlan) -> Result<LogicalPlan> {
     opt.optimize_recursive(plan.clone())
 }
 
+/// Rebind the stored definition's physical scan layouts while retaining its
+/// declared output. SELECT * expands when the view is defined, not on REFRESH.
+/// Names/types must still exist; source storage-mode changes and appended columns
+/// can be read with the current decoder without altering the view's columns.
+fn rebind_view_layouts(plan: &mut LogicalPlan, storage: &crate::storage::StorageEngine) -> Result<()> {
+    use crate::sql::{LogicalExpr as E, LogicalPlan as P};
+    use std::collections::HashSet;
+    fn expression(expr: &mut E, storage: &crate::storage::StorageEngine, ctes: &HashSet<String>) -> Result<()> {
+        match expr {
+            E::BinaryExpr { left, right, .. }
+            | E::ArraySubscript {
+                array: left,
+                index: right,
+            } => {
+                expression(left, storage, ctes)?;
+                expression(right, storage, ctes)?;
+            }
+            E::UnaryExpr { expr, .. } | E::Cast { expr, .. } | E::IsNull { expr, .. } | E::InSet { expr, .. } => {
+                expression(expr, storage, ctes)?
+            }
+            E::AggregateFunction { args, .. } | E::ScalarFunction { args, .. } | E::Tuple { items: args } => {
+                for arg in args {
+                    expression(arg, storage, ctes)?;
+                }
+            }
+            E::Case {
+                expr,
+                when_then,
+                else_result,
+            } => {
+                if let Some(expr) = expr {
+                    expression(expr, storage, ctes)?;
+                }
+                for (when, then) in when_then {
+                    expression(when, storage, ctes)?;
+                    expression(then, storage, ctes)?;
+                }
+                if let Some(expr) = else_result {
+                    expression(expr, storage, ctes)?;
+                }
+            }
+            E::Between { expr, low, high, .. } => {
+                expression(expr, storage, ctes)?;
+                expression(low, storage, ctes)?;
+                expression(high, storage, ctes)?;
+            }
+            E::InList { expr, list, .. } => {
+                expression(expr, storage, ctes)?;
+                for value in list {
+                    expression(value, storage, ctes)?;
+                }
+            }
+            E::ScalarSubquery { subquery } | E::Exists { subquery, .. } => visit(subquery, storage, ctes)?,
+            E::InSubquery { expr, subquery, .. } => {
+                expression(expr, storage, ctes)?;
+                visit(subquery, storage, ctes)?;
+            }
+            E::WindowFunction {
+                args,
+                partition_by,
+                order_by,
+                ..
+            } => {
+                for expr in args.iter_mut().chain(partition_by.iter_mut()) {
+                    expression(expr, storage, ctes)?;
+                }
+                for (expr, _) in order_by {
+                    expression(expr, storage, ctes)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    fn visit(plan: &mut P, storage: &crate::storage::StorageEngine, ctes: &HashSet<String>) -> Result<()> {
+        match plan {
+            P::Scan {
+                table_name,
+                alias,
+                schema,
+                projection,
+                ..
+            }
+            | P::FilteredScan {
+                table_name,
+                alias,
+                schema,
+                projection,
+                ..
+            } => {
+                if ctes.contains(table_name) {
+                    return Ok(());
+                }
+                let current = storage.catalog().get_table_schema(table_name)?;
+                // Scan predicates can contain physical positions in older plans.
+                // Keep their original order; append/storage changes are safe.
+                if current.columns.len() < schema.columns.len()
+                    || !schema
+                        .columns
+                        .iter()
+                        .zip(&current.columns)
+                        .all(|(old, now)| old.name == now.name && old.data_type == now.data_type)
+                {
+                    return Err(Error::query_execution(format!("materialized view definition depends on columns of '{table_name}' whose names, positions or types changed; recreate the view")));
+                }
+                let original_output = if current.columns.len() != schema.columns.len() {
+                    let positions = projection
+                        .clone()
+                        .unwrap_or_else(|| (0..schema.columns.len()).collect());
+                    let mut output = Vec::with_capacity(positions.len());
+                    for index in positions {
+                        output.push(
+                            schema
+                                .columns
+                                .get(index)
+                                .ok_or_else(|| Error::storage("stored materialized-view projection is out of bounds"))?
+                                .clone(),
+                        );
+                    }
+                    let source = alias.as_ref().unwrap_or(table_name).clone();
+                    // Use a real Project node, not just Scan.projection: all
+                    // logical as well as physical operator schemas retain N
+                    // columns when the source now has N+1 (including CTEs).
+                    *projection = None;
+                    Some((output, source))
+                } else {
+                    None
+                };
+                if original_output.is_some()
+                    || schema
+                        .columns
+                        .iter()
+                        .zip(&current.columns)
+                        .any(|(old, now)| old.storage_mode != now.storage_mode)
+                {
+                    *schema = Arc::new(current);
+                }
+                if let P::FilteredScan {
+                    predicate: Some(predicate),
+                    ..
+                } = plan
+                {
+                    expression(predicate, storage, ctes)?;
+                }
+                if let Some((columns, source)) = original_output {
+                    let input = Box::new(std::mem::replace(plan, P::Noop));
+                    *plan = P::Project {
+                        input,
+                        exprs: columns
+                            .iter()
+                            .map(|column| E::Column {
+                                table: Some(source.clone()),
+                                name: column.name.clone(),
+                            })
+                            .collect(),
+                        aliases: columns.iter().map(|column| column.name.clone()).collect(),
+                        distinct: false,
+                        distinct_on: None,
+                        source_alias: None,
+                    };
+                }
+            }
+            P::Filter { input, predicate } => {
+                visit(input, storage, ctes)?;
+                expression(predicate, storage, ctes)?;
+            }
+            P::Project {
+                input,
+                exprs,
+                distinct_on,
+                ..
+            } => {
+                visit(input, storage, ctes)?;
+                for expr in exprs {
+                    expression(expr, storage, ctes)?;
+                }
+                if let Some(exprs) = distinct_on {
+                    for expr in exprs {
+                        expression(expr, storage, ctes)?;
+                    }
+                }
+            }
+            P::Aggregate {
+                input,
+                group_by,
+                aggr_exprs,
+                having,
+            } => {
+                visit(input, storage, ctes)?;
+                for expr in group_by.iter_mut().chain(aggr_exprs.iter_mut()) {
+                    expression(expr, storage, ctes)?;
+                }
+                if let Some(expr) = having {
+                    expression(expr, storage, ctes)?;
+                }
+            }
+            P::Sort { input, exprs, .. } => {
+                visit(input, storage, ctes)?;
+                for expr in exprs {
+                    expression(expr, storage, ctes)?;
+                }
+            }
+            P::Limit { input, .. } => visit(input, storage, ctes)?,
+            P::Join { left, right, on, .. } => {
+                visit(left, storage, ctes)?;
+                visit(right, storage, ctes)?;
+                if let Some(expr) = on {
+                    expression(expr, storage, ctes)?;
+                }
+            }
+            P::Union { left, right, .. } | P::Intersect { left, right, .. } | P::Except { left, right, .. } => {
+                visit(left, storage, ctes)?;
+                visit(right, storage, ctes)?;
+            }
+            P::With {
+                ctes: definitions,
+                query,
+                recursive,
+            } => {
+                let mut names = ctes.clone();
+                // Match executor visibility: a nonrecursive definition can
+                // still read a real table bearing its own/later sibling's name.
+                for (name, definition, _) in definitions {
+                    if *recursive {
+                        names.insert(name.clone());
+                    }
+                    visit(definition, storage, &names)?;
+                    names.insert(name.clone());
+                }
+                visit(query, storage, &names)?;
+            }
+            P::TableFunction { args, .. } => {
+                for expr in args {
+                    expression(expr, storage, ctes)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    visit(plan, storage, &HashSet::new())
+}
+
 /// Count delta operations by type (inserts, updates, deletes)
 fn count_delta_operations(delta_set: &MvDeltaSet) -> (usize, usize, usize) {
     let mut inserts = 0;
@@ -524,15 +767,9 @@ fn handle_create_materialized_view(
             .ok_or_else(|| Error::execution("No storage engine available"))?;
         let mv_catalog = storage.mv_catalog();
 
-        // Store metadata in catalog
-        mv_catalog.create_view(metadata)?;
-
-        let row_count = mv_catalog.store_view_data(name, tuples, &schema)?;
-
-        // Update metadata with row count
-        let mut updated_metadata = mv_catalog.get_view(name)?;
-        updated_metadata.mark_refreshed(row_count);
-        mv_catalog.update_view(&updated_metadata)?;
+        // The definition, populated table, refreshed record and all logical WAL
+        // entries become durable together. A failure publishes no partial view.
+        let row_count = mv_catalog.create_view_with_data(metadata, &tuples)?;
 
         // Initialize delta tracking for base tables
         // This will enable incremental refresh for this materialized view
@@ -701,7 +938,7 @@ fn handle_refresh_materialized_view(
         let mv_catalog = storage.mv_catalog();
         let mut updated_metadata = metadata.clone();
         updated_metadata.mark_refreshed(metadata.row_count.unwrap_or(0));
-        mv_catalog.update_view(&updated_metadata)?;
+        mv_catalog.refresh_metadata_in_one_group(&updated_metadata, concurrent, incremental_requested)?;
 
         return Ok(Box::new(ScanOperator::new(
             "".to_string(),
@@ -713,7 +950,13 @@ fn handle_refresh_materialized_view(
     }
 
     // Phase 2: Execute query (requires mutable borrow of executor)
-    let query_plan = metadata.get_query_plan()?;
+    let mut query_plan = metadata.get_query_plan()?;
+    rebind_view_layouts(
+        &mut query_plan,
+        executor
+            .storage()
+            .ok_or_else(|| Error::execution("No storage engine available"))?,
+    )?;
     let schema = Arc::new(metadata.schema.clone());
 
     if use_incremental {
@@ -769,27 +1012,10 @@ fn handle_refresh_materialized_view(
         // view, which is also what CONCURRENTLY promises, so it takes the same path;
         // the temporary-table swap is left only for a data table this path cannot
         // rewrite in place (see `refresh_view_in_one_group`).
-        let in_one_group = mv_catalog.refresh_view_in_one_group(name, &tuples, &schema, &refreshed, refresh_entry)?;
-        if in_one_group.is_none() {
-            if concurrent {
-                tracing::info!("Using CONCURRENT refresh with atomic swap for zero downtime");
-                mv_catalog.store_view_data_concurrent(name, tuples, &schema)?;
-            } else {
-                tracing::debug!("Using non-CONCURRENT refresh (table will be briefly unavailable)");
-                mv_catalog.store_view_data(name, tuples, &schema)?;
-            }
-            mv_catalog.update_view(&refreshed)?;
-            if let Err(e) = storage.log_refresh_materialized_view(name, concurrent, incremental_requested) {
-                tracing::warn!("Failed to log REFRESH MATERIALIZED VIEW '{}' to WAL: {}", name, e);
-            }
-        }
+        mv_catalog.refresh_view_in_one_group(name, &tuples, &schema, &refreshed, refresh_entry)?;
 
         if use_incremental {
-            // Clear applied deltas (purge all deltas before current time). After the
-            // refresh's group: the deltas only steer the next refresh's choice, and a
-            // crash before this purge leaves them to a refresh that recomputes anyway.
-            let delta_tracker = storage.mv_delta_tracker();
-            let _ = delta_tracker.purge_deltas_before(chrono::Utc::now());
+            // Applied-delta cleanup rides the refresh's own group too.
             tracing::info!(
                 "Incremental refresh completed for MV '{}': {} rows (processed {} deltas)",
                 name,

@@ -151,6 +151,9 @@ struct SeqRuntime {
     /// persistence handle): refill extends the window in-memory and never
     /// fsyncs.
     volatile: bool,
+    /// RAM-only refusal marker for an unresolved DDL outcome. Kept in the
+    /// existing namespace map, so healthy calls need no new lock/atomic/key.
+    unavailable: Option<String>,
 }
 
 // ============================================================
@@ -173,6 +176,8 @@ struct SeqRuntime {
 /// index registry). One primitive, one rule, no ABA argument to maintain.
 type EngineId = u64;
 
+const MUTATION_OWNER_STRIPES: usize = 64;
+
 /// One database's sequence world: the handle to the engine that owns it, and
 /// that database's OWN `name -> Arc<SeqRuntime>` map.
 struct SeqNamespace {
@@ -185,6 +190,7 @@ struct SeqNamespace {
     /// atomics, so distinct sequences never contend. An inner `HashMap` under
     /// one `parking_lot::Mutex` is used rather than a new `DashMap` dependency.
     store: Mutex<HashMap<String, Arc<SeqRuntime>>>,
+    mutation_owners: [Mutex<()>; MUTATION_OWNER_STRIPES],
 }
 
 impl SeqNamespace {
@@ -192,6 +198,28 @@ impl SeqNamespace {
         SeqNamespace {
             handle: Some(Arc::downgrade(engine)),
             store: Mutex::new(HashMap::new()),
+            mutation_owners: std::array::from_fn(|_| Mutex::new(())),
+        }
+    }
+
+    // Only cold definition/load/reservation paths use these fixed stripes.
+    // Cached nextval performs no owner lookup or additional atomic operation.
+    #[allow(clippy::indexing_slicing)] // Modulo the fixed nonzero array length.
+    fn mutation_owner(&self, name: &str) -> &Mutex<()> {
+        let hash = name.bytes().fold(0xcbf29ce484222325_u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+        });
+        &self.mutation_owners[(hash as usize) % MUTATION_OWNER_STRIPES]
+    }
+
+    fn runtime_is_current(&self, name: &str, runtime: &Arc<SeqRuntime>) -> Result<bool> {
+        let entries = self.store.lock();
+        match entries.get(name) {
+            Some(current) => {
+                current.check_available()?;
+                Ok(Arc::ptr_eq(current, runtime))
+            }
+            None => Ok(false),
         }
     }
 
@@ -249,6 +277,7 @@ fn volatile_namespace() -> Arc<SeqNamespace> {
         Arc::new(SeqNamespace {
             handle: None,
             store: Mutex::new(HashMap::new()),
+            mutation_owners: std::array::from_fn(|_| Mutex::new(())),
         })
     }))
 }
@@ -297,6 +326,13 @@ fn namespace() -> Arc<SeqNamespace> {
 /// sequence from.
 pub(crate) fn current_engine() -> Option<Arc<StorageEngine>> {
     CURRENT_NS.with(|c| c.borrow().as_ref().and_then(|(_, ns)| ns.engine()))
+}
+
+/// The actual storage engine identity bound by EngineScope, independently of
+/// the legacy sequence namespace fallback for an unregistered raw engine.
+/// The engine-less test namespace (ID zero) carries no SQL storage owner.
+pub(crate) fn current_engine_id() -> Option<u64> {
+    CURRENT_NS.with(|scope| scope.borrow().as_ref().map(|(id, _)| *id).filter(|id| *id != 0))
 }
 
 /// The namespace owned by `engine`, for callers that hold the engine outright
@@ -413,6 +449,109 @@ pub fn invalidate_cache_on(engine: &StorageEngine, name: &str) {
     namespace_of(engine).store.lock().remove(name);
 }
 
+/// Keep the managed definition's owner through planning, its native group
+/// and cache callbacks. Return the DdlWrite token and wait for replication
+/// only AFTER this closure's guard has released.
+pub(crate) fn with_sequence_ddl_owner<T>(
+    engine: &StorageEngine,
+    name: &str,
+    change: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let ns = namespace_of(engine);
+    let _owner = ns.mutation_owner(name).lock();
+    change()
+}
+
+/// Retire only this database/name after an unreadable DDL witness. The
+/// placeholder never serves/reserves values and writes no durable repair.
+pub(crate) fn quarantine_cache_on(engine: &StorageEngine, name: &str, reason: &str) -> Error {
+    let message =
+        format!("sequence '{name}' is unavailable after an unresolved DDL outcome: {reason}; reopen to reconcile");
+    let mut marker = SeqRuntime::from_persisted(&PersistedSequence::default_named(name), None, true);
+    marker.unavailable = Some(message.clone());
+    namespace_of(engine)
+        .store
+        .lock()
+        .insert(name.to_string(), Arc::new(marker));
+    Error::storage(message)
+}
+
+#[cfg(feature = "internal-tests")]
+thread_local! {
+    static NEXT_AFTER_COLD_RUNTIME_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Pause the real cold factory after its definition/state reads, before map
+/// publication. The hook is installed on the thread doing that cold load.
+#[cfg(feature = "internal-tests")]
+#[doc(hidden)]
+pub fn debug_next_after_cold_runtime_read(hook: impl FnOnce() + 'static) {
+    NEXT_AFTER_COLD_RUNTIME_READ.with(|next| *next.borrow_mut() = Some(Box::new(hook)));
+}
+
+/// Exercise the same factory used by nextval, without reserving/serving a
+/// number. This isolates cache resurrection from an in-flight value's refill.
+#[cfg(feature = "internal-tests")]
+#[doc(hidden)]
+pub fn debug_load_runtime_on(engine: &StorageEngine, name: &str) -> Result<()> {
+    runtime_for(&namespace_of(engine), name).map(|_| ())
+}
+
+#[cfg(feature = "internal-tests")]
+fn run_after_cold_runtime_read() {
+    if let Some(hook) = NEXT_AFTER_COLD_RUNTIME_READ.with(|next| next.borrow_mut().take()) {
+        hook();
+    }
+}
+
+#[cfg(feature = "internal-tests")]
+thread_local! {
+    static NEXT_BEFORE_REFILL_OWNER: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static NEXT_BEFORE_SETVAL_OWNER: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static NEXT_BEFORE_DDL_OWNER: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Pause after the old runtime was captured and its cached window exhausted,
+/// before acquiring the mutation owner/refill lock.
+#[cfg(feature = "internal-tests")]
+#[doc(hidden)]
+pub fn debug_next_before_refill_owner(hook: impl FnOnce() + 'static) {
+    NEXT_BEFORE_REFILL_OWNER.with(|next| *next.borrow_mut() = Some(Box::new(hook)));
+}
+
+/// Pause after setval captures its runtime, before owner/bounds validation.
+#[cfg(feature = "internal-tests")]
+#[doc(hidden)]
+pub fn debug_next_before_setval_owner(hook: impl FnOnce() + 'static) {
+    NEXT_BEFORE_SETVAL_OWNER.with(|next| *next.borrow_mut() = Some(Box::new(hook)));
+}
+
+/// Observe a managed definition writer before its mutation owner/read cut.
+#[cfg(feature = "internal-tests")]
+#[doc(hidden)]
+pub fn debug_next_before_ddl_owner(hook: impl FnOnce() + 'static) {
+    NEXT_BEFORE_DDL_OWNER.with(|next| *next.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(feature = "internal-tests")]
+fn run_before_refill_owner() {
+    if let Some(hook) = NEXT_BEFORE_REFILL_OWNER.with(|next| next.borrow_mut().take()) {
+        hook();
+    }
+}
+#[cfg(feature = "internal-tests")]
+fn run_before_setval_owner() {
+    if let Some(hook) = NEXT_BEFORE_SETVAL_OWNER.with(|next| next.borrow_mut().take()) {
+        hook();
+    }
+}
+#[cfg(feature = "internal-tests")]
+pub(crate) fn run_before_ddl_owner() {
+    if let Some(hook) = NEXT_BEFORE_DDL_OWNER.with(|next| next.borrow_mut().take()) {
+        hook();
+    }
+}
+
 /// Eagerly load every persisted sequence into `engine`'s runtime map. Optional —
 /// `nextval` lazy-loads on demand, so this is NOT required for correctness and
 /// is NOT wired into the startup hot path. Provided for callers (tests /
@@ -420,8 +559,15 @@ pub fn invalidate_cache_on(engine: &StorageEngine, name: &str) {
 pub fn warm_load(engine: &StorageEngine) -> Result<()> {
     let defs = engine.catalog().list_sequences()?;
     let ns = namespace_of(engine);
-    let mut guard = ns.store.lock();
-    for def in defs {
+    for listed in defs {
+        let _owner = ns.mutation_owner(&listed.name).lock();
+        let mut guard = ns.store.lock();
+        if let Some(current) = guard.get(&listed.name) {
+            current.check_available()?;
+        }
+        let Some(def) = engine.catalog().get_sequence(&listed.name)? else {
+            continue;
+        };
         let st = engine.catalog().get_sequence_state(&def.name)?;
         let rt = SeqRuntime::from_persisted(&def, st, false);
         guard.insert(def.name.clone(), Arc::new(rt));
@@ -430,6 +576,13 @@ pub fn warm_load(engine: &StorageEngine) -> Result<()> {
 }
 
 impl SeqRuntime {
+    fn check_available(&self) -> Result<()> {
+        match &self.unavailable {
+            Some(reason) => Err(Error::storage(reason.clone())),
+            None => Ok(()),
+        }
+    }
+
     /// Seed state for a sequence that has a definition but no persisted state
     /// yet (just created): nothing served, resume point == start.
     fn seed_state(def: &PersistedSequence) -> PersistedSeqState {
@@ -507,6 +660,7 @@ impl SeqRuntime {
             last_served: AtomicI64::new(i64::MIN),
             refill: Mutex::new(()),
             volatile,
+            unavailable: None,
         }
     }
 
@@ -575,18 +729,31 @@ fn runtime_for(ns: &SeqNamespace, name: &str) -> Result<Arc<SeqRuntime>> {
     {
         let guard = ns.store.lock();
         if let Some(rt) = guard.get(name) {
+            rt.check_available()?;
             return Ok(Arc::clone(rt));
         }
     }
+    // A cache miss releases the map before waiting for a mutation owner.
+    let _owner = ns.mutation_owner(name).lock();
+    let mut guard = ns.store.lock();
+    if let Some(rt) = guard.get(name) {
+        rt.check_available()?;
+        return Ok(Arc::clone(rt));
+    }
 
-    // Known-definition path: build outside the map lock to avoid holding it
-    // across catalog I/O, then insert-or-take-existing (another thread may have
-    // raced us). For the AUTO-VIVIFY path we must serialize the durable seed
-    // with claiming the map entry (see below), so it is handled separately.
+    // The cold definition/state read and map publication share one owner.
+    // Otherwise DDL can evict between those steps and a late decoder can
+    // resurrect the pre-DDL runtime. A known runtime retains its original
+    // brief map lookup above; no new lock/atomic is added to cached nextval.
+    // The missing-name path already serialized its raw catalog seed under
+    // this same lock. save_sequence/save_sequence_state are raw setters, not
+    // staged CREATE callbacks, so they never re-enter this namespace.
     let rt = match ns.engine() {
         Some(engine) => match engine.catalog().get_sequence(name)? {
             Some(def) => {
                 let st = engine.catalog().get_sequence_state(name)?;
+                #[cfg(feature = "internal-tests")]
+                run_after_cold_runtime_read();
                 Arc::new(SeqRuntime::from_persisted(&def, st, false))
             }
             None => {
@@ -605,22 +772,21 @@ fn runtime_for(ns: &SeqNamespace, name: &str) -> Result<Arc<SeqRuntime>> {
                 // state. Holding the lock across this catalog I/O is acceptable:
                 // auto-vivify of an unknown name is rare and off the hot path.
                 let def = PersistedSequence::default_named(name);
-                let mut guard = ns.store.lock();
-                if let Some(existing) = guard.get(name) {
-                    return Ok(Arc::clone(existing));
-                }
                 // We are the map winner. Persist the definition (idempotent —
                 // same content) and seed state ONLY IF ABSENT, never lowering an
                 // existing fsynced high-water (no-duplicate invariant).
-                engine.catalog().save_sequence(&def)?;
-                let st = match engine.catalog().get_sequence_state(name)? {
-                    Some(existing) => existing,
-                    None => {
-                        let seed = SeqRuntime::seed_state(&def);
-                        engine.catalog().save_sequence_state(name, &seed)?;
-                        seed
-                    }
-                };
+                // Spec R5.6: a write on behalf of no statement, as `flush_sequence_state`.
+                let st = crate::storage::layout_epochs::outside_statement(|| -> Result<PersistedSeqState> {
+                    engine.catalog().save_sequence(&def)?;
+                    Ok(match engine.catalog().get_sequence_state(name)? {
+                        Some(existing) => existing,
+                        None => {
+                            let seed = SeqRuntime::seed_state(&def);
+                            engine.catalog().save_sequence_state(name, &seed)?;
+                            seed
+                        }
+                    })
+                })?;
                 let rt = Arc::new(SeqRuntime::from_persisted(&def, Some(st), false));
                 guard.insert(name.to_string(), Arc::clone(&rt));
                 return Ok(rt);
@@ -633,8 +799,8 @@ fn runtime_for(ns: &SeqNamespace, name: &str) -> Result<Arc<SeqRuntime>> {
         }
     };
 
-    let mut guard = ns.store.lock();
     let entry = guard.entry(name.to_string()).or_insert_with(|| Arc::clone(&rt));
+    entry.check_available()?;
     Ok(Arc::clone(entry))
 }
 
@@ -677,181 +843,191 @@ pub fn try_nextval(name: &str) -> Result<i64> {
 /// retry below re-enters the SAME database rather than re-resolving the
 /// thread-local (which a nested guard could have moved out from under it).
 fn try_nextval_in(ns: &SeqNamespace, name: &str) -> Result<i64> {
-    let rt = runtime_for(ns, name)?;
-
-    // ---- FAST PATH: lock-free CAS within the reserved durable window ----
-    //
-    // Every `cur` in `[next ..= block_end]` is guaranteed in-range (the refill
-    // clamps `block_end` into `[min, max]`), so serving `cur` is always valid.
-    // The ONLY job here is to advance the pointer past `cur`; the bound / cycle
-    // / overflow decision belongs solely to the refill path (which re-derives
-    // the next value from the durable high-water). So we advance with a plain
-    // `checked_add`, and if that would overflow we publish a sentinel that is
-    // definitively OUTSIDE the block, which simply forces the next call to
-    // refill. We must never let a step-ahead failure abort a call that is
-    // returning an already-reserved `cur`.
+    // Spec R5.6 (decision 2(f)): a value handed out is not handed back, so a statement
+    // that took one is refused for a concurrent schema change, never retried.
+    crate::storage::layout_epochs::note_side_effect("a sequence value was taken");
     loop {
-        let cur = rt.next.load(Ordering::Acquire);
-        let end = rt.block_end.load(Ordering::Acquire);
-        if !rt.in_block(cur, end) {
-            break; // window exhausted -> refill
+        let rt = runtime_for(ns, name)?;
+
+        // ---- FAST PATH: lock-free CAS within the reserved durable window ----
+        //
+        // Every `cur` in `[next ..= block_end]` is guaranteed in-range (the refill
+        // clamps `block_end` into `[min, max]`), so serving `cur` is always valid.
+        // The ONLY job here is to advance the pointer past `cur`; the bound / cycle
+        // / overflow decision belongs solely to the refill path (which re-derives
+        // the next value from the durable high-water). So we advance with a plain
+        // `checked_add`, and if that would overflow we publish a sentinel that is
+        // definitively OUTSIDE the block, which simply forces the next call to
+        // refill. We must never let a step-ahead failure abort a call that is
+        // returning an already-reserved `cur`.
+        loop {
+            let cur = rt.next.load(Ordering::Acquire);
+            let end = rt.block_end.load(Ordering::Acquire);
+            if !rt.in_block(cur, end) {
+                break; // window exhausted -> refill
+            }
+            let stepped = match cur.checked_add(rt.increment) {
+                Some(n) => n,
+                // Overflow: park the pointer just past the block so the next call
+                // refills. `end` itself is in-block, so `end (+/-) 1` is out.
+                None => {
+                    if rt.increment > 0 {
+                        end.saturating_add(1)
+                    } else {
+                        end.saturating_sub(1)
+                    }
+                }
+            };
+            if rt
+                .next
+                .compare_exchange(cur, stepped, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                rt.is_called.store(true, Ordering::Relaxed);
+                // Record the exact value handed out so `pg_sequences.last_value`
+                // reports the served value (not the reserved block end). A racing
+                // store from another thread serving a higher value is fine — under
+                // concurrency last_value is inherently "the most recent server",
+                // matching PG's non-transactional sequence semantics.
+                rt.last_served.store(cur, Ordering::Relaxed);
+                // `cur` is within `[min, max]` (durable, clamped block), invariant holds.
+                return Ok(cur);
+            }
+            // Lost the race; retry.
         }
-        let stepped = match cur.checked_add(rt.increment) {
+
+        // ---- REFILL: serialized per-sequence; ~1/cache of calls ----
+        #[cfg(feature = "internal-tests")]
+        run_before_refill_owner();
+        let _owner = ns.mutation_owner(name).lock();
+        let _g = rt.refill.lock();
+        if !ns.runtime_is_current(name, &rt)? {
+            continue;
+        }
+
+        // Re-check: another thread may have refilled while we waited.
+        {
+            let cur = rt.next.load(Ordering::Acquire);
+            let end = rt.block_end.load(Ordering::Acquire);
+            if rt.in_block(cur, end) {
+                continue;
+            }
+        }
+
+        // Cross-process safety (D8): re-read the durable high-water INSIDE the
+        // lock and take the max with our in-memory view, so two processes over one
+        // data dir never reserve overlapping ranges.
+        let in_mem_high = rt.block_end.load(Ordering::Acquire);
+        let in_mem_called = rt.is_called.load(Ordering::Acquire);
+        // Re-read the durable record (if any). `durable` is None when this runtime
+        // is volatile OR no durable state record exists yet (a just-created sequence
+        // whose seed state was not separately written, or the storage-absent path).
+        let durable: Option<PersistedSeqState> = if rt.volatile {
+            None
+        } else {
+            match ns.engine() {
+                Some(engine) => engine.catalog().get_sequence_state(name)?,
+                None => None,
+            }
+        };
+        let durable_called = durable.map(|d| d.is_called).unwrap_or(false);
+        let base_called = durable_called || in_mem_called;
+
+        // First value of the new block.
+        //
+        // Cross-instance/cross-process note: within ONE process all refills for a
+        // sequence serialize through this `rt.refill` mutex (one namespace hands
+        // every caller of the same database the SAME `Arc<SeqRuntime>`), so
+        // the in-memory `is_called` flag is authoritative and two in-process
+        // refillers can NEVER both take the `!base_called` arm — the first sets
+        // `is_called=true` while holding the lock, so the second re-reads it as
+        // called and steps. The residual unprotected case is two distinct OS
+        // processes over one data dir (separate RocksDB handles, no shared CAS);
+        // there the durable record is the only rendezvous, so we re-read it here and
+        // reconcile via max() in BOTH arms — including the not-called arm, which the
+        // previous code skipped (a TOCTOU that let two processes both serve the very
+        // first value). True cross-OS-process atomicity for the first value is a
+        // documented architectural limitation (see the module + test-file headers).
+        let first = if !base_called {
+            // Not-yet-called: serve the not-called TARGET itself (this is the FIRST
+            // value the sequence ever yields). For a fresh CREATE this is `start`;
+            // for RESTART WITH n / setval(., false) it is `n`. Prefer a durable
+            // not-called record (authoritative — e.g. a RESTART that persisted a new
+            // target), else the runtime's `not_called_target` (set from the durable
+            // state at build time). NEVER use `block_end`, which is the empty-window
+            // sentinel (target ∓ 1) for a not-yet-called runtime.
+            match durable {
+                Some(d) if !d.is_called => d.last_reserved,
+                _ => rt.not_called_target,
+            }
+        } else {
+            // Already called somewhere: step strictly past the highest value any
+            // party (this process's in-mem block, or a durable record written by a
+            // peer process / a prior setval) could have reserved.
+            let durable_high = durable.map(|d| d.last_reserved).unwrap_or(in_mem_high);
+            let high = std::cmp::max(durable_high, in_mem_high);
+            checked_step(name, high, rt.increment, rt.min_value, rt.max_value, rt.cycle)?
+        };
+
+        // Reserve up to `cache` values, clamped to the bound.
+        let last = clamp_block_end(first, rt.increment, rt.cache, rt.min_value, rt.max_value);
+
+        // *** DURABILITY BARRIER — persist+fsync the high-water BEFORE publishing
+        //     the window. After this returns, `first` is durably reserved. ***
+        persist_high_water(ns, &rt, name, last)?;
+
+        // `first` is consumed by THIS call; the next value to hand out is the plain
+        // step past `first`. We must NOT apply bound/cycle logic here (that belongs
+        // to the next refill). If `last == first` (e.g. cache == 1) the stepped
+        // value lands outside the one-element block and the next call refills —
+        // exactly what we want. On overflow, park just past the block.
+        let next_after = match first.checked_add(rt.increment) {
             Some(n) => n,
-            // Overflow: park the pointer just past the block so the next call
-            // refills. `end` itself is in-block, so `end (+/-) 1` is out.
             None => {
                 if rt.increment > 0 {
-                    end.saturating_add(1)
+                    last.saturating_add(1)
                 } else {
-                    end.saturating_sub(1)
+                    last.saturating_sub(1)
                 }
             }
         };
-        if rt
-            .next
-            .compare_exchange(cur, stepped, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            rt.is_called.store(true, Ordering::Relaxed);
-            // Record the exact value handed out so `pg_sequences.last_value`
-            // reports the served value (not the reserved block end). A racing
-            // store from another thread serving a higher value is fine — under
-            // concurrency last_value is inherently "the most recent server",
-            // matching PG's non-transactional sequence semantics.
-            rt.last_served.store(cur, Ordering::Relaxed);
-            // `cur` is within `[min, max]` (durable, clamped block), invariant holds.
-            return Ok(cur);
-        }
-        // Lost the race; retry.
+
+        // *** PUBLICATION ORDER IS LOAD-BEARING (no-duplicate under concurrency) ***
+        //
+        // Store `next` (advanced past `first`) FIRST, then widen `block_end`. The
+        // window `[next ..= block_end]` only becomes serveable to a lock-free
+        // fast-path thread once `block_end` has been widened — and by then `next`
+        // already points at `next_after` (strictly past `first`). So no fast-path
+        // thread can ever observe `next == first` together with the widened
+        // `block_end` and re-hand-out `first` (which this refilling thread is about
+        // to return).
+        //
+        // The reverse order (widen block_end first) has a fatal window: between the
+        // two Release stores, `block_end` is the NEW (wider) end while `next` still
+        // holds its OLD value — and that OLD value equals THIS block's `first`
+        // (for an exhausted ascending block the last fast-path CAS set next = b+inc
+        // == checked_step(b) == first; for a fresh/not-called runtime old next ==
+        // the target == first). A concurrent fast-path thread reading OLD `next`
+        // (== first) and NEW `block_end` would pass `in_block`, CAS-advance, and
+        // return `first` — a duplicate of the value this refiller also returns.
+        // Release/Acquire on two independent atomics does NOT couple the two loads,
+        // so memory ordering alone cannot save the reverse order; only the store
+        // ORDER does.
+        //
+        // While `next` is published but `block_end` is not yet widened, a fast-path
+        // thread sees `next == next_after` (out of the OLD block) and harmlessly
+        // takes the refill path, where it blocks on `rt.refill` until we release it
+        // and then re-checks the now-widened window. No value is lost or duplicated.
+        rt.next.store(next_after, Ordering::Release);
+        rt.is_called.store(true, Ordering::Relaxed);
+        // Record the served value for faithful `pg_sequences.last_value` (the value
+        // handed out, not the block end `last`).
+        rt.last_served.store(first, Ordering::Relaxed);
+        rt.block_end.store(last, Ordering::Release);
+        drop(_g);
+
+        return Ok(first);
     }
-
-    // ---- REFILL: serialized per-sequence; ~1/cache of calls ----
-    let _g = rt.refill.lock();
-
-    // Re-check: another thread may have refilled while we waited.
-    {
-        let cur = rt.next.load(Ordering::Acquire);
-        let end = rt.block_end.load(Ordering::Acquire);
-        if rt.in_block(cur, end) {
-            drop(_g);
-            return try_nextval_in(ns, name);
-        }
-    }
-
-    // Cross-process safety (D8): re-read the durable high-water INSIDE the
-    // lock and take the max with our in-memory view, so two processes over one
-    // data dir never reserve overlapping ranges.
-    let in_mem_high = rt.block_end.load(Ordering::Acquire);
-    let in_mem_called = rt.is_called.load(Ordering::Acquire);
-    // Re-read the durable record (if any). `durable` is None when this runtime
-    // is volatile OR no durable state record exists yet (a just-created sequence
-    // whose seed state was not separately written, or the storage-absent path).
-    let durable: Option<PersistedSeqState> = if rt.volatile {
-        None
-    } else {
-        match ns.engine() {
-            Some(engine) => engine.catalog().get_sequence_state(name)?,
-            None => None,
-        }
-    };
-    let durable_called = durable.map(|d| d.is_called).unwrap_or(false);
-    let base_called = durable_called || in_mem_called;
-
-    // First value of the new block.
-    //
-    // Cross-instance/cross-process note: within ONE process all refills for a
-    // sequence serialize through this `rt.refill` mutex (one namespace hands
-    // every caller of the same database the SAME `Arc<SeqRuntime>`), so
-    // the in-memory `is_called` flag is authoritative and two in-process
-    // refillers can NEVER both take the `!base_called` arm — the first sets
-    // `is_called=true` while holding the lock, so the second re-reads it as
-    // called and steps. The residual unprotected case is two distinct OS
-    // processes over one data dir (separate RocksDB handles, no shared CAS);
-    // there the durable record is the only rendezvous, so we re-read it here and
-    // reconcile via max() in BOTH arms — including the not-called arm, which the
-    // previous code skipped (a TOCTOU that let two processes both serve the very
-    // first value). True cross-OS-process atomicity for the first value is a
-    // documented architectural limitation (see the module + test-file headers).
-    let first = if !base_called {
-        // Not-yet-called: serve the not-called TARGET itself (this is the FIRST
-        // value the sequence ever yields). For a fresh CREATE this is `start`;
-        // for RESTART WITH n / setval(., false) it is `n`. Prefer a durable
-        // not-called record (authoritative — e.g. a RESTART that persisted a new
-        // target), else the runtime's `not_called_target` (set from the durable
-        // state at build time). NEVER use `block_end`, which is the empty-window
-        // sentinel (target ∓ 1) for a not-yet-called runtime.
-        match durable {
-            Some(d) if !d.is_called => d.last_reserved,
-            _ => rt.not_called_target,
-        }
-    } else {
-        // Already called somewhere: step strictly past the highest value any
-        // party (this process's in-mem block, or a durable record written by a
-        // peer process / a prior setval) could have reserved.
-        let durable_high = durable.map(|d| d.last_reserved).unwrap_or(in_mem_high);
-        let high = std::cmp::max(durable_high, in_mem_high);
-        checked_step(name, high, rt.increment, rt.min_value, rt.max_value, rt.cycle)?
-    };
-
-    // Reserve up to `cache` values, clamped to the bound.
-    let last = clamp_block_end(first, rt.increment, rt.cache, rt.min_value, rt.max_value);
-
-    // *** DURABILITY BARRIER — persist+fsync the high-water BEFORE publishing
-    //     the window. After this returns, `first` is durably reserved. ***
-    persist_high_water(ns, &rt, name, last)?;
-
-    // `first` is consumed by THIS call; the next value to hand out is the plain
-    // step past `first`. We must NOT apply bound/cycle logic here (that belongs
-    // to the next refill). If `last == first` (e.g. cache == 1) the stepped
-    // value lands outside the one-element block and the next call refills —
-    // exactly what we want. On overflow, park just past the block.
-    let next_after = match first.checked_add(rt.increment) {
-        Some(n) => n,
-        None => {
-            if rt.increment > 0 {
-                last.saturating_add(1)
-            } else {
-                last.saturating_sub(1)
-            }
-        }
-    };
-
-    // *** PUBLICATION ORDER IS LOAD-BEARING (no-duplicate under concurrency) ***
-    //
-    // Store `next` (advanced past `first`) FIRST, then widen `block_end`. The
-    // window `[next ..= block_end]` only becomes serveable to a lock-free
-    // fast-path thread once `block_end` has been widened — and by then `next`
-    // already points at `next_after` (strictly past `first`). So no fast-path
-    // thread can ever observe `next == first` together with the widened
-    // `block_end` and re-hand-out `first` (which this refilling thread is about
-    // to return).
-    //
-    // The reverse order (widen block_end first) has a fatal window: between the
-    // two Release stores, `block_end` is the NEW (wider) end while `next` still
-    // holds its OLD value — and that OLD value equals THIS block's `first`
-    // (for an exhausted ascending block the last fast-path CAS set next = b+inc
-    // == checked_step(b) == first; for a fresh/not-called runtime old next ==
-    // the target == first). A concurrent fast-path thread reading OLD `next`
-    // (== first) and NEW `block_end` would pass `in_block`, CAS-advance, and
-    // return `first` — a duplicate of the value this refiller also returns.
-    // Release/Acquire on two independent atomics does NOT couple the two loads,
-    // so memory ordering alone cannot save the reverse order; only the store
-    // ORDER does.
-    //
-    // While `next` is published but `block_end` is not yet widened, a fast-path
-    // thread sees `next == next_after` (out of the OLD block) and harmlessly
-    // takes the refill path, where it blocks on `rt.refill` until we release it
-    // and then re-checks the now-widened window. No value is lost or duplicated.
-    rt.next.store(next_after, Ordering::Release);
-    rt.is_called.store(true, Ordering::Relaxed);
-    // Record the served value for faithful `pg_sequences.last_value` (the value
-    // handed out, not the block end `last`).
-    rt.last_served.store(first, Ordering::Relaxed);
-    rt.block_end.store(last, Ordering::Release);
-    drop(_g);
-
-    Ok(first)
 }
 
 /// DATABASE-wide "last value served for `name`", or 0 if never served.
@@ -872,6 +1048,7 @@ pub fn try_currval(name: &str) -> Result<i64> {
         Some(rt) => rt,
         None => return Ok(0),
     };
+    rt.check_available()?;
     if !rt.is_called.load(Ordering::Acquire) {
         return Ok(0);
     }
@@ -917,6 +1094,9 @@ pub fn peek_last_served_on(engine: &StorageEngine, name: &str) -> Option<i64> {
 fn peek_in(ns: &SeqNamespace, name: &str) -> Option<i64> {
     let guard = ns.store.lock();
     let rt = guard.get(name)?;
+    if rt.unavailable.is_some() {
+        return None;
+    }
     let v = rt.last_served.load(Ordering::Relaxed);
     if v == i64::MIN {
         None
@@ -930,66 +1110,107 @@ fn peek_in(ns: &SeqNamespace, name: &str) -> Option<i64> {
 /// on the next `nextval`, and fsyncs the new high-water so it survives restart
 /// (pg_dump emits setval at restore).
 pub fn try_setval(name: &str, value: i64, is_called: bool) -> Result<i64> {
+    // Spec R5.6: as `try_nextval_in`.
+    crate::storage::layout_epochs::note_side_effect("a sequence was set");
     let ns = namespace();
-    let rt = runtime_for(&ns, name)?;
-    if value < rt.min_value || value > rt.max_value {
-        return Err(Error::query_execution(format!(
-            "setval: value {} is out of bounds for sequence \"{}\" (min {}, max {})",
-            value, name, rt.min_value, rt.max_value
-        )));
-    }
+    loop {
+        let rt = runtime_for(&ns, name)?;
+        #[cfg(feature = "internal-tests")]
+        run_before_setval_owner();
+        let _owner = ns.mutation_owner(name).lock();
+        let _g = rt.refill.lock();
+        if !ns.runtime_is_current(name, &rt)? {
+            continue;
+        }
+        if value < rt.min_value || value > rt.max_value {
+            return Err(Error::query_execution(format!(
+                "setval: value {} is out of bounds for sequence \"{}\" (min {}, max {})",
+                value, name, rt.min_value, rt.max_value
+            )));
+        }
 
-    let _g = rt.refill.lock();
-
-    // Durably persist FIRST (skipped for volatile runtimes), so the new
-    // high-water is on disk before any in-memory window change is observable.
-    if !rt.volatile {
-        // sprinter d15933f528b0: resolved from THIS statement's database. The
-        // observed flake — `setval requires storage context` raised on a
-        // perfectly healthy database — was this `ok_or_else` firing because a
-        // DIFFERENT, since-dropped database had overwritten the one global slot.
-        let engine = ns
-            .engine()
-            .ok_or_else(|| Error::query_execution("setval requires storage context"))?;
-        engine.flush_sequence_state(
-            name,
-            PersistedSeqState {
+        // Durably persist FIRST (skipped for volatile runtimes), so the new
+        // high-water is on disk before any in-memory window change is observable.
+        if !rt.volatile {
+            // sprinter d15933f528b0: resolved from THIS statement's database. The
+            // observed flake — `setval requires storage context` raised on a
+            // perfectly healthy database — was this `ok_or_else` firing because a
+            // DIFFERENT, since-dropped database had overwritten the one global slot.
+            let engine = ns
+                .engine()
+                .ok_or_else(|| Error::query_execution("setval requires storage context"))?;
+            // Spec R5.6: this is the nontransactional effect of setval, just as a
+            // nextval refill is. It must not mark the SELECT's row result as durably
+            // validated: a layout change after this write still refuses those rows.
+            let desired = PersistedSeqState {
                 last_reserved: value,
                 is_called,
-            },
-        )?;
-        // Drop the cached runtime so the next nextval/currval rebuilds it from
-        // the freshly-fsynced durable state via `from_persisted` (which parks an
-        // EMPTY initial window). This guarantees the next `nextval` re-enters
-        // the durable refill barrier rather than serving `value` from a stale
-        // in-memory window — preserving the no-duplicate invariant across a
-        // crash right after `setval` (pg_dump restore emits setval).
+            };
+            let key = format!("meta:seqstate:{name}").into_bytes();
+            let before = engine.get(&key)?;
+            let after = crate::storage::Catalog::encode_sequence_state(&desired)?;
+            let attempt = crate::storage::write_outcome::WriteAttempt::default();
+            let written = crate::storage::layout_epochs::outside_statement(|| {
+                engine.flush_sequence_state_observed(name, desired, &attempt)
+            });
+            if let Err(error) = written {
+                if attempt.outcome() != crate::storage::write_outcome::WriteOutcome::NotWritten {
+                    match engine.get(&key) {
+                        Ok(actual) if actual.as_deref() == Some(after.as_slice()) => {
+                            // Known actual state, including metadata-identical
+                            // setval. Discard any old called/window fields.
+                            ns.store.lock().remove(name);
+                        }
+                        Ok(actual) if actual == before => {
+                            // Distinct exact BEFORE proves the old cached
+                            // reservation is still authoritative.
+                        }
+                        actual => {
+                            let reason = match actual {
+                                Ok(_) => "setval state is neither its BEFORE nor AFTER frame".to_string(),
+                                Err(read_error) => format!("Cannot read setval outcome: {read_error}"),
+                            };
+                            quarantine_cache_on(&engine, name, &reason);
+                        }
+                    }
+                }
+                // Never replace the original native/fsync cause with a proof
+                // error, and never repair durable state on this error path.
+                return Err(error);
+            }
+            // Drop the cached runtime so the next nextval/currval rebuilds it from
+            // the freshly-fsynced durable state via `from_persisted` (which parks an
+            // EMPTY initial window). This guarantees the next `nextval` re-enters
+            // the durable refill barrier rather than serving `value` from a stale
+            // in-memory window — preserving the no-duplicate invariant across a
+            // crash right after `setval` (pg_dump restore emits setval).
+            drop(_g);
+            // Evict from the SAME namespace we just persisted into — never
+            // `invalidate_cache`, which would re-resolve the thread-local.
+            ns.store.lock().remove(name);
+            return Ok(value);
+        }
+
+        // Volatile (memory-only / no persistence handle): mutate the in-memory
+        // window directly. No durability requirement (no WAL, no crash recovery),
+        // so it is fine to serve from the in-memory window without a refill.
+        if is_called {
+            // `value` already produced; collapse the window so the next nextval
+            // steps past `value` via the in-memory refill.
+            let nxt = checked_step(name, value, rt.increment, rt.min_value, rt.max_value, true).unwrap_or(value);
+            rt.block_end.store(value, Ordering::Release);
+            rt.next.store(nxt, Ordering::Release);
+        } else {
+            // `value` not yet produced -> the next nextval returns exactly `value`.
+            // A single-element window `[value ..= value]` serves it from the fast
+            // path; the call after that refills and steps past.
+            rt.block_end.store(value, Ordering::Release);
+            rt.next.store(value, Ordering::Release);
+        }
+        rt.is_called.store(is_called, Ordering::Release);
         drop(_g);
-        // Evict from the SAME namespace we just persisted into — never
-        // `invalidate_cache`, which would re-resolve the thread-local.
-        ns.store.lock().remove(name);
         return Ok(value);
     }
-
-    // Volatile (memory-only / no persistence handle): mutate the in-memory
-    // window directly. No durability requirement (no WAL, no crash recovery),
-    // so it is fine to serve from the in-memory window without a refill.
-    if is_called {
-        // `value` already produced; collapse the window so the next nextval
-        // steps past `value` via the in-memory refill.
-        let nxt = checked_step(name, value, rt.increment, rt.min_value, rt.max_value, true).unwrap_or(value);
-        rt.block_end.store(value, Ordering::Release);
-        rt.next.store(nxt, Ordering::Release);
-    } else {
-        // `value` not yet produced -> the next nextval returns exactly `value`.
-        // A single-element window `[value ..= value]` serves it from the fast
-        // path; the call after that refills and steps past.
-        rt.block_end.store(value, Ordering::Release);
-        rt.next.store(value, Ordering::Release);
-    }
-    rt.is_called.store(is_called, Ordering::Release);
-    drop(_g);
-    Ok(value)
 }
 
 /// Build the runtime for a freshly-created/altered sequence directly from its
@@ -1029,6 +1250,7 @@ pub fn create_sequence(name: &str, if_not_exists: bool, start: Option<i64>, incr
     // One resolution for the whole function: every probe and every write below
     // must land on the SAME database (sprinter d15933f528b0).
     let ns = namespace();
+    let _owner = ns.mutation_owner(name).lock();
 
     if if_not_exists {
         // Honour IF NOT EXISTS: if a runtime or durable def already exists,

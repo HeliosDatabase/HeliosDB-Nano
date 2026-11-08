@@ -52,6 +52,15 @@ impl AggregateOperator {
         timeout_ctx: Option<TimeoutContext>,
     ) -> Result<Self> {
         let input_schema = input.schema();
+        // Resolve aggregate arguments even when the input is empty. Evaluating
+        // only per row let a CASE/scalar expression hide an unknown column and
+        // return COUNT(0)/SUM(NULL), unlike an ordinary direct-column argument.
+        // The shared binder walker skips subplans and operator-owned schemas;
+        // it never evaluates a sequence, function, or CASE branch.
+        let streamable = Self::all_streamable(&aggr_exprs);
+        if !streamable {
+            AggregateArgAccessor::validate_arguments(&aggr_exprs, &input_schema)?;
+        }
         // sprinter a3a6cc7c59d6: the HAVING evaluator below needs the SAME bind
         // vector this one gets, so keep a copy before ownership moves. Cloned
         // only when there is a HAVING clause — the common no-HAVING aggregate
@@ -64,7 +73,7 @@ impl AggregateOperator {
         let evaluator = crate::sql::Evaluator::with_parameters(input_schema.clone(), parameters);
 
         // Streaming fast path: no DISTINCT and all aggregates are streamable.
-        let mut output_tuples = if Self::all_streamable(&aggr_exprs) {
+        let mut output_tuples = if streamable {
             if group_by.is_empty() {
                 let result =
                     Self::streaming_aggregate(&mut input, &aggr_exprs, &evaluator, &input_schema, &timeout_ctx)?;
@@ -738,6 +747,36 @@ enum AggregateArgAccessor {
 }
 
 impl AggregateArgAccessor {
+    fn validate_argument(argument: crate::sql::LogicalExpr, schema: &Schema) -> Result<crate::sql::LogicalExpr> {
+        use crate::sql::LogicalExpr;
+        let mut failure = None;
+        let argument = crate::sql::evaluator::map_column_refs(argument, &mut |table, name| {
+            if failure.is_none() && schema.get_qualified_column_index(table.as_deref(), &name).is_none() {
+                failure = Some(Error::query_execution(format!(
+                    "Column '{}' not found in aggregate input schema",
+                    table
+                        .as_ref()
+                        .map_or_else(|| name.clone(), |table| format!("{table}.{name}"))
+                )));
+            }
+            LogicalExpr::Column { table, name }
+        });
+        failure.map_or(Ok(argument), Err)
+    }
+
+    fn validate_arguments(expressions: &[crate::sql::LogicalExpr], schema: &Schema) -> Result<()> {
+        use crate::sql::LogicalExpr;
+        for expression in expressions {
+            let LogicalExpr::AggregateFunction { args, .. } = expression else {
+                return Err(Error::query_execution("Expected aggregate function expression"));
+            };
+            for argument in args {
+                Self::validate_argument(argument.clone(), schema)?;
+            }
+        }
+        Ok(())
+    }
+
     fn for_aggregate(expr: &crate::sql::LogicalExpr, schema: &Schema) -> Result<Self> {
         use crate::sql::LogicalExpr;
 
@@ -765,7 +804,7 @@ impl AggregateArgAccessor {
                     })?;
                 Ok(Self::Column(index))
             }
-            _ => Ok(Self::Expr(arg_expr.clone())),
+            _ => Ok(Self::Expr(Self::validate_argument(arg_expr.clone(), schema)?)),
         }
     }
 }

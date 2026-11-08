@@ -103,6 +103,8 @@ const REQUIRED_CLASSES: &[KeyClass] = &[
     KeyClass::WalEntries,
     KeyClass::WalLastLsn,
     KeyClass::WalCheckpoint,
+    // First-open adoption publishes its exact format marker.
+    KeyClass::WalAtomicGroups,
 ];
 
 // ---------------------------------------------------------------------------
@@ -230,7 +232,7 @@ fn session_one(db: &EmbeddedDatabase) {
     );
     run(db, "INSERT INTO ks_columnar VALUES (1, 'tag-a', 'n')");
     // `dict:` and `cas:` are written by the storage-mode MIGRATION
-    // (`StorageEngine::migrate_column_storage`, reached through
+    // (`StorageEngine::stage_column_storage_migration`, reached through
     // `ALTER TABLE … SET STORAGE …` on a populated table) and by inserts made
     // after it; an inline `STORAGE …` clause on CREATE TABLE does not produce
     // them on its own (see tests/storage_modes_test.rs for the same sequence).

@@ -41,6 +41,43 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Permanent, bounded allocator evidence. Each lane is monotone independently;
+/// a delayed producer never overwrites another lane's higher durable ID.
+pub(crate) const DELTA_ID_LANES: usize = 64;
+pub(crate) const DELTA_FLOOR_PREFIX: &[u8] = b"meta:delta:floor:";
+pub(crate) const LEGACY_DELTA_ID_KEY: &[u8] = b"meta:delta:last_id";
+
+pub(crate) fn delta_key_id(key: &[u8]) -> Option<u64> {
+    let suffix = key.strip_prefix(b"delta:")?;
+    let split = suffix.iter().rposition(|byte| *byte == b':')?;
+    let digits = suffix.get(split + 1..)?;
+    if split == 0 || digits.len() != 20 || !digits.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    std::str::from_utf8(digits).ok()?.parse().ok()
+}
+
+pub(crate) fn delta_floor_key(lane: usize) -> String {
+    format!("meta:delta:floor:{lane:02}")
+}
+
+pub(crate) fn delta_floor_lane(key: &[u8]) -> Option<usize> {
+    let suffix = key.strip_prefix(DELTA_FLOOR_PREFIX)?;
+    if suffix.len() != 2 || !suffix.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let lane = usize::from(suffix[0] - b'0') * 10 + usize::from(suffix[1] - b'0');
+    (lane < DELTA_ID_LANES).then_some(lane)
+}
+
+pub(crate) fn decode_delta_id(bytes: &[u8]) -> Result<u64> {
+    Ok(u64::from_le_bytes(
+        bytes
+            .try_into()
+            .map_err(|_| Error::storage("Invalid delta ID format"))?,
+    ))
+}
+
 /// Delta operation types for materialized view tracking
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum DeltaOperation {
@@ -268,8 +305,6 @@ pub struct DeltaTracker {
     db: Arc<DB>,
     /// The write gate of the engine that owns `db`.
     gate: Arc<WriteGate>,
-    /// Current delta sequence number
-    current_delta_id: parking_lot::RwLock<u64>,
     /// TDE key manager, mirroring `StorageEngine::key_manager`.
     ///
     /// This type writes `delta:` records straight to the `Arc<DB>` it holds, so
@@ -305,51 +340,72 @@ impl DeltaTracker {
         gate: Arc<WriteGate>,
         key_manager: Option<Arc<KeyManager>>,
     ) -> Result<Self> {
-        // Load the last delta ID from storage
+        // Hydration is read-only, including a physical standby. Multiple tracker
+        // handles on one gate share the allocator and cannot issue duplicate IDs.
         let last_delta_id = Self::load_last_delta_id(&db)?;
-
-        Ok(Self {
-            db,
-            gate,
-            current_delta_id: parking_lot::RwLock::new(last_delta_id),
-            key_manager,
-        })
+        gate.install_delta_ids(last_delta_id);
+        Ok(Self { db, gate, key_manager })
     }
 
-    /// Load the last delta ID from storage
+    /// Recover all surviving allocator evidence. Old producers could commit their
+    /// last_id markers out of order, so retained key IDs are authoritative too.
+    /// New floor keys are never removed by delta cleanup, including an empty log.
     fn load_last_delta_id(db: &DB) -> Result<u64> {
-        let key = b"meta:delta:last_id";
-        match db
-            .get(key)
-            .map_err(|e| Error::storage(format!("Failed to read last delta ID: {}", e)))?
-        {
-            Some(bytes) => {
-                let id = u64::from_le_bytes(
-                    bytes
-                        .as_slice()
-                        .try_into()
-                        .map_err(|_| Error::storage("Invalid delta ID format"))?,
-                );
-                Ok(id)
+        let mut maximum = db
+            .get(LEGACY_DELTA_ID_KEY)?
+            .as_deref()
+            .map(decode_delta_id)
+            .transpose()?
+            .unwrap_or(0);
+        for prefix in [DELTA_FLOOR_PREFIX, b"delta:".as_slice()] {
+            let mut options = rocksdb::ReadOptions::default();
+            options.set_total_order_seek(true);
+            let mut end = prefix.to_vec();
+            if let Some(last) = end.last_mut() {
+                *last += 1;
             }
-            None => Ok(0),
+            options.set_iterate_upper_bound(end);
+            let mut iter = db.raw_iterator_opt(options);
+            iter.seek(prefix);
+            while iter.valid() {
+                let key = iter
+                    .key()
+                    .ok_or_else(|| Error::storage("Missing delta allocator key"))?;
+                if !key.starts_with(prefix) {
+                    break;
+                }
+                let id = if prefix == DELTA_FLOOR_PREFIX {
+                    if delta_floor_lane(key).is_none() {
+                        return Err(Error::storage("Invalid delta allocator floor key"));
+                    }
+                    decode_delta_id(
+                        iter.value()
+                            .ok_or_else(|| Error::storage("Missing delta allocator floor"))?,
+                    )?
+                } else {
+                    delta_key_id(key).ok_or_else(|| Error::storage("Invalid delta record key"))?
+                };
+                maximum = maximum.max(id);
+                iter.next();
+            }
+            iter.status()?;
         }
+        Ok(maximum)
     }
 
-    /// Save the last delta ID to storage
-    fn save_last_delta_id(&self, id: u64) -> Result<()> {
-        let key = b"meta:delta:last_id";
-        let value = id.to_le_bytes();
-        self.gate
-            .put(&self.db, key, value, None)
-            .map_err(|e| Error::storage(format!("Failed to save last delta ID: {}", e)))
+    fn next_delta_id(&self) -> Result<u64> {
+        self.gate.next_delta_id()
     }
 
-    /// Get next delta ID
-    fn next_delta_id(&self) -> u64 {
-        let mut current = self.current_delta_id.write();
-        *current += 1;
-        *current
+    pub(crate) fn recover_durable_ids(&self) -> Result<()> {
+        self.gate.observe_delta_id(Self::load_last_delta_id(&self.db)?);
+        Ok(())
+    }
+
+    /// Physical publication only raises volatile state; it never changes source
+    /// bytes or creates allocator markers on a standby.
+    pub(crate) fn observe_physical_id(&self, id: u64) {
+        self.gate.observe_delta_id(id);
     }
 
     /// Record a delta for a table change.
@@ -369,8 +425,9 @@ impl DeltaTracker {
     pub fn record_delta(&self, delta: Delta) -> Result<()> {
         #[allow(deprecated)]
         let delta_id = if delta.delta_id == 0 {
-            self.next_delta_id()
+            self.next_delta_id()?
         } else {
+            self.gate.observe_delta_id(delta.delta_id);
             delta.delta_id
         };
 
@@ -385,19 +442,17 @@ impl DeltaTracker {
         // i.e. byte-for-byte the call below made before, when encryption is off.
         let stored = super::tde::seal_row_value(self.key_manager.as_deref(), key.as_bytes(), &value)?;
 
-        self.gate
-            .put(&self.db, key.as_bytes(), stored.as_ref(), None)
-            .map_err(|e| Error::storage(format!("Failed to store delta: {}", e)))?;
-
-        // Update last delta ID
-        self.save_last_delta_id(delta_id)?;
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.put(key.as_bytes(), stored.as_ref());
+        // The gate adds a permanent monotone floor in this same write group.
+        self.gate.write(&self.db, batch, None)?;
 
         Ok(())
     }
 
     /// Spec R5.4 (F1.2): [`Self::record_insert`] into the caller's write group: the
-    /// delta and the last delta id are put into `batch`, which the caller writes with
-    /// the row they describe, instead of two write groups of their own after it.
+    /// delta is put into `batch`; the gate adds its allocator floor to that same
+    /// group, instead of separate writes after the row.
     pub fn stage_insert(
         &self,
         batch: &mut rocksdb::WriteBatch,
@@ -405,7 +460,7 @@ impl DeltaTracker {
         row_id: u64,
         tuple: Tuple,
     ) -> Result<()> {
-        let delta_id = self.next_delta_id();
+        let delta_id = self.next_delta_id()?;
         let delta = Delta::insert(delta_id, table_name.to_string(), row_id, tuple);
         let key = format!("delta:{}:{:020}", table_name, delta_id);
         let value =
@@ -413,29 +468,49 @@ impl DeltaTracker {
         // The same storage boundary as `record_delta`.
         let stored = super::tde::seal_row_value(self.key_manager.as_deref(), key.as_bytes(), &value)?;
         batch.put(key.as_bytes(), stored.as_ref());
-        batch.put(b"meta:delta:last_id", delta_id.to_le_bytes());
         Ok(())
     }
 
     /// Record an insert delta
     pub fn record_insert(&self, table_name: &str, row_id: u64, tuple: Tuple) -> Result<()> {
-        let delta_id = self.next_delta_id();
+        let delta_id = self.next_delta_id()?;
         let delta = Delta::insert(delta_id, table_name.to_string(), row_id, tuple);
         self.record_delta(delta)
     }
 
     /// Record an update delta
     pub fn record_update(&self, table_name: &str, row_id: u64, old_tuple: Tuple, new_tuple: Tuple) -> Result<()> {
-        let delta_id = self.next_delta_id();
+        let delta_id = self.next_delta_id()?;
         let delta = Delta::update(delta_id, table_name.to_string(), row_id, old_tuple, new_tuple);
         self.record_delta(delta)
     }
 
     /// Record a delete delta
     pub fn record_delete(&self, table_name: &str, row_id: u64, tuple: Tuple) -> Result<()> {
-        let delta_id = self.next_delta_id();
+        let delta_id = self.next_delta_id()?;
         let delta = Delta::delete(delta_id, table_name.to_string(), row_id, tuple);
         self.record_delta(delta)
+    }
+
+    /// Generic storage mutations carry their delta in the row's transaction,
+    /// including when the write applies but a later durability wait fails.
+    pub(crate) fn stage_mutation_in_transaction(
+        &self,
+        txn: &super::transaction::Transaction,
+        table: &str,
+        row: u64,
+        old: Tuple,
+        new: Option<Tuple>,
+    ) -> Result<()> {
+        let id = self.next_delta_id()?;
+        let delta = match new {
+            Some(new) => Delta::update(id, table.to_string(), row, old, new),
+            None => Delta::delete(id, table.to_string(), row, old),
+        };
+        let key = format!("delta:{table}:{id:020}");
+        let value =
+            bincode::serialize(&delta).map_err(|e| Error::storage(format!("Failed to serialize delta: {e}")))?;
+        txn.put(key.into_bytes(), value)
     }
 
     /// Get deltas for tables since a given timestamp
@@ -567,7 +642,7 @@ impl DeltaTracker {
 
     /// Get current delta ID
     pub fn current_delta_id(&self) -> u64 {
-        *self.current_delta_id.read()
+        self.gate.current_delta_id()
     }
 }
 

@@ -248,6 +248,7 @@ pub mod audit;
 pub mod cli; // CLI module
 pub mod compute;
 pub mod crypto;
+mod fk_update;
 pub mod git_integration; // Git workflow integration
 pub mod graph; // Native graph adjacency lists & traversal (RAG-native)
 pub mod multi_tenant; // Multi-tenant support
@@ -318,6 +319,8 @@ pub mod standby_posture;
 pub mod ab_testing;
 
 // Internal modules
+// Spec R5.5: one ALTER TABLE statement, every clause, one write group.
+mod alter_table;
 mod branch_schema; // sprinter 6bc4a4040eb7 (B3): schema DDL on a branch (the one gate)
 mod branch_writes; // sprinter 6bc4a4040eb7 (B2): executor half of writes on a branch
 mod copy_phase_stats;
@@ -682,6 +685,12 @@ thread_local! {
     /// evaluation: every session AND embedded entry point installs one.
     static SESSION_SCOPED_STATE: std::cell::RefCell<Option<std::sync::Arc<crate::session::scoped::SessionScopedState>>> =
         const { std::cell::RefCell::new(None) };
+    /// Spec R5.4 (review F12): when the statement running on THIS thread began — set
+    /// by the outermost `SessionScopedStateGuard`, which every session and embedded
+    /// entry point installs per statement. A wait for a row or table lock counts the
+    /// statement's `statement_timeout` from here, as PostgreSQL bounds the whole
+    /// statement, not each wait ([`statement_started_tls`]).
+    static STATEMENT_STARTED: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
     /// True while THIS thread holds the global `current_transaction`
     /// `parking_lot::Mutex` **across** statement execution — i.e. inside
     /// `execute()`'s in-transaction branch.
@@ -950,17 +959,23 @@ impl Drop for SessionLoginUserOverrideGuard {
 /// a worker thread it has since migrated to.
 struct SessionScopedStateGuard(
     Option<std::sync::Arc<crate::session::scoped::SessionScopedState>>,
+    /// The outermost guard on this thread: it set `STATEMENT_STARTED`, and clears it.
+    bool,
     std::marker::PhantomData<*const ()>,
 );
 
 impl SessionScopedStateGuard {
     /// Publish `state` as this thread's backend for the duration of one
-    /// statement, saving whatever was installed before.
+    /// statement, saving whatever was installed before. The outermost one also
+    /// records when the statement began (spec R5.4, review F12); a nested one (a
+    /// SQL function body, a trigger, `CALL`) runs inside that statement's time.
     fn install(state: std::sync::Arc<crate::session::scoped::SessionScopedState>) -> Self {
-        Self(
-            SESSION_SCOPED_STATE.with(|c| c.borrow_mut().replace(state)),
-            std::marker::PhantomData,
-        )
+        let previous = SESSION_SCOPED_STATE.with(|c| c.borrow_mut().replace(state));
+        let outermost = previous.is_none();
+        if outermost {
+            STATEMENT_STARTED.with(|c| c.set(Some(std::time::Instant::now())));
+        }
+        Self(previous, outermost, std::marker::PhantomData)
     }
 
     /// Publish `state` ONLY when nothing is installed yet.
@@ -983,7 +998,17 @@ impl Drop for SessionScopedStateGuard {
     fn drop(&mut self) {
         let previous = self.0.take();
         SESSION_SCOPED_STATE.with(|c| *c.borrow_mut() = previous);
+        if self.1 {
+            STATEMENT_STARTED.with(|c| c.set(None));
+        }
     }
+}
+
+/// Spec R5.4 (review F12): when the statement running on this thread began, if an
+/// entry point recorded it (`STATEMENT_STARTED`). A lock wait's `statement_timeout`
+/// counts from here; `None` (engine-internal work) counts from the wait.
+pub(crate) fn statement_started_tls() -> Option<std::time::Instant> {
+    STATEMENT_STARTED.with(std::cell::Cell::get)
 }
 
 /// sprinter 6bc4a4040eb7 (phase B3): one session's backend state published for
@@ -1560,10 +1585,91 @@ struct CachedRows {
     epoch: ResultCacheEpoch,
 }
 
+#[cfg(feature = "internal-tests")]
+thread_local! {
+    static NEXT_HOT_CACHE_LOOKUP: std::cell::RefCell<Option<Box<dyn FnOnce(bool) + Send>>> = std::cell::RefCell::new(None);
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ResultCacheEpoch {
     local: u64,
     storage: u64,
+    generic_mutations: u64,
+}
+
+/// Spec R5.6: a cached plan and the layout epochs its planning recorded.
+#[derive(Clone)]
+struct StampedPlan {
+    plan: std::sync::Arc<sql::LogicalPlan>,
+    layout: storage::LayoutStamp,
+}
+
+/// Spec R5.6: the plan cache. A plan is served only while the layout epochs it was
+/// built under are current (one atomic load per table it read): a plan built before a
+/// schema change of one of its tables is a miss, and the statement plans again, so a
+/// plan never runs over rows of a layout it does not describe (`storage::layout_epochs`;
+/// it did: `count(u)` planned before `ADD COLUMN u` read `u` NULL in every row after
+/// it). A hit records its epochs into the statement's read set, as its planning would
+/// have (decision 2(c)).
+struct PlanCache {
+    plans: sharded_lru::ShardedLruCache<String, StampedPlan>,
+}
+
+impl PlanCache {
+    fn new(plans: sharded_lru::ShardedLruCache<String, StampedPlan>) -> Self {
+        Self { plans }
+    }
+
+    /// The plan cached under `key`, if its layout is current.
+    fn get(&self, key: &str) -> Option<std::sync::Arc<sql::LogicalPlan>> {
+        self.get_stamped(key).map(|stamped| stamped.plan)
+    }
+
+    /// [`Self::get`], with the plan's stamp, for a holder that pins it.
+    fn get_stamped(&self, key: &str) -> Option<StampedPlan> {
+        let stamped = self.plans.get(key)?;
+        if !stamped.layout.is_current() {
+            return None;
+        }
+        stamped.layout.record();
+        Some(stamped)
+    }
+
+    fn put(&self, key: String, plan: std::sync::Arc<sql::LogicalPlan>, layout: storage::LayoutStamp) {
+        self.plans.put(key, StampedPlan { plan, layout });
+    }
+
+    fn contains(&self, key: &str) -> bool {
+        self.plans.contains(key)
+    }
+
+    fn clear(&self) {
+        self.plans.clear();
+    }
+
+    fn epoch(&self) -> u64 {
+        self.plans.epoch()
+    }
+}
+
+/// Spec R5.6: a plan a prepared statement pinned (R5.W2), with the layout epochs it was
+/// built under. Used only while they are current, and recorded into the read set of the
+/// statement that uses it; otherwise the statement plans again.
+#[derive(Clone)]
+pub(crate) struct PinnedPlan {
+    pub(crate) plan: std::sync::Arc<sql::LogicalPlan>,
+    pub(crate) layout: storage::LayoutStamp,
+}
+
+impl PinnedPlan {
+    /// The plan, if its layout is current (its epochs recorded), else `None`.
+    fn current(&self) -> Option<std::sync::Arc<sql::LogicalPlan>> {
+        if !self.layout.is_current() {
+            return None;
+        }
+        self.layout.record();
+        Some(std::sync::Arc::clone(&self.plan))
+    }
 }
 
 pub struct EmbeddedDatabase {
@@ -1624,13 +1730,14 @@ pub struct EmbeddedDatabase {
     /// Active transactions per session. See [`SessionTxnSlot`] for why the
     /// transaction lives behind a per-session slot lock.
     session_transactions: std::sync::Arc<dashmap::DashMap<crate::session::SessionId, SessionTxnSlot>>,
-    /// Prepared statements storage (name -> plan)
-    prepared_statements: std::sync::Arc<parking_lot::RwLock<std::collections::HashMap<String, sql::LogicalPlan>>>,
+    /// SQL prepared statements, keyed by the connection backend and SQL name.
+    prepared_statements:
+        std::sync::Arc<parking_lot::RwLock<std::collections::HashMap<(i32, String), sql::LogicalPlan>>>,
     /// Original SQL for embedded prepared statements when available.
-    prepared_statement_sql: std::sync::Arc<parking_lot::RwLock<std::collections::HashMap<String, String>>>,
+    prepared_statement_sql: std::sync::Arc<parking_lot::RwLock<std::collections::HashMap<(i32, String), String>>>,
     /// Fast embedded PREPARE metadata for simple PK lookups.
     prepared_fast_selects:
-        std::sync::Arc<parking_lot::RwLock<std::collections::HashMap<String, PreparedFastSelectSpec>>>,
+        std::sync::Arc<parking_lot::RwLock<std::collections::HashMap<(i32, String), PreparedFastSelectSpec>>>,
     /// Database-level settings for embedded SQL entry points.
     session_settings: sql::SessionSettings,
     /// EMBEDDED single-session `search_path` current schema (first non-`public`,
@@ -1687,7 +1794,8 @@ pub struct EmbeddedDatabase {
     // reachable from another connection AND outlived the transaction that
     // established it. Do not reintroduce a handle-level stack.
     /// Plan cache: SQL string → `Arc<LogicalPlan>` (sharded LRU, skips parse+plan for repeated queries)
-    plan_cache: std::sync::Arc<sharded_lru::ShardedLruCache<String, std::sync::Arc<sql::LogicalPlan>>>,
+    /// Spec R5.6: each plan with the layout epochs it was built under ([`PlanCache`]).
+    plan_cache: std::sync::Arc<PlanCache>,
     /// Parse cache: SQL string → AST Statement (sharded LRU, skips SQL parsing for repeated queries)
     parse_cache: std::sync::Arc<sharded_lru::ShardedLruCache<String, sqlparser::ast::Statement>>,
     /// Query result cache: SQL text → cached results (invalidated on DML
@@ -1940,7 +2048,7 @@ impl Drop for EmbeddedDatabase {
         // standby's `LocalWriter`'s, which outlives this database (the applier
         // keeps applying), and its owner decides when the store is flushed. A
         // standby's close leaves the directory exactly as it found it.
-        let writes_at_close = !self.storage.is_physical_standby();
+        let writes_at_close = self.storage.engine_may_write() && self.storage.write_gate().is_open();
         let last_owner = std::sync::Arc::strong_count(&self.auto_refresh_worker) == 1;
         if writes_at_close && last_owner && self.storage.row_counter_flush_on_close() {
             if let Err(e) = self.storage.flush_all_row_counters() {
@@ -2103,6 +2211,13 @@ impl crate::replication::physical_applier::DerivedStateListener for EmbeddedData
 
     fn on_full_rebuild(&self) {
         self.reload_derived_registries();
+        self.invalidate_plan_cache();
+    }
+
+    /// Spec R5.6: before the run's layout change ends. The plan cache serves no plan of
+    /// an old layout anyway (its stamps), but a pinned or fast-path spec is dropped here
+    /// too, and the result cache with it.
+    fn on_layout_change(&self, _tables: &[String]) {
         self.invalidate_plan_cache();
     }
 }
@@ -2443,6 +2558,9 @@ struct FastSelectSpec {
     pk_col_idx: usize,
     schema: std::sync::Arc<Schema>,
     pk_data_type: DataType,
+    /// Spec R5.6: the layout epoch `schema` was read under. A spec whose table's
+    /// layout moved since is not used: it is built again.
+    layout: storage::LayoutStamp,
 }
 
 #[derive(Clone)]
@@ -3995,69 +4113,117 @@ impl EmbeddedDatabase {
         }
     }
 
-    fn try_handle_prepared_query_plan_with_schema(
+    fn prepared_statement_key(&self, name: &str) -> (i32, String) {
+        let backend =
+            session_scoped_state_tls().map_or_else(|| self.embedded_scoped.backend_pid(), |state| state.backend_pid());
+        (backend, name.to_string())
+    }
+
+    fn clear_prepared_statements_for_backend(&self, backend: i32) {
+        self.prepared_statements
+            .write()
+            .retain(|(owner, _), _| *owner != backend);
+        self.prepared_statement_sql
+            .write()
+            .retain(|(owner, _), _| *owner != backend);
+        self.prepared_fast_selects
+            .write()
+            .retain(|(owner, _), _| *owner != backend);
+    }
+
+    /// A prepared body cannot dispatch another SQL prepared utility or change
+    /// transaction boundaries. Besides being outside PREPARE's data-statement
+    /// contract, an EXECUTE body could recursively resolve its own registry key.
+    /// Validate the plan only: running it to discover its type may have effects.
+    fn validate_sql_prepared_body(plan: &sql::LogicalPlan) -> Result<()> {
+        if matches!(
+            plan,
+            sql::LogicalPlan::Prepare { .. }
+                | sql::LogicalPlan::Execute { .. }
+                | sql::LogicalPlan::Deallocate { .. }
+                | sql::LogicalPlan::StartTransaction
+                | sql::LogicalPlan::Commit
+                | sql::LogicalPlan::Rollback
+                | sql::LogicalPlan::Savepoint { .. }
+                | sql::LogicalPlan::ReleaseSavepoint { .. }
+                | sql::LogicalPlan::RollbackToSavepoint { .. }
+        ) {
+            return Err(Error::query_execution(
+                "PREPARE body cannot be a prepared-statement or transaction-control utility",
+            ));
+        }
+        Ok(())
+    }
+
+    /// One SQL utility dispatcher for text and bound, read and write funnels.
+    /// PREPARE retains its inner placeholders; only EXECUTE's argument expressions
+    /// are evaluated against the outer Bind values. The borrowed transaction is
+    /// forwarded so utility execution never re-locks an already borrowed slot.
+    fn try_handle_prepared_plan_with_params(
         &self,
         plan: &sql::LogicalPlan,
-    ) -> Result<Option<(Vec<Tuple>, std::sync::Arc<Schema>)>> {
+        outer_params: &[Value],
+        session_txn: Option<&storage::Transaction>,
+    ) -> Result<Option<(u64, Vec<Tuple>, std::sync::Arc<Schema>)>> {
         match plan {
-            sql::LogicalPlan::Prepare { name, statement, .. } => {
-                self.prepared_statements
-                    .write()
-                    .insert(name.clone(), *statement.clone());
-                self.prepared_statement_sql.write().remove(name);
-                self.prepared_fast_selects.write().remove(name);
-                Ok(Some((Vec::new(), Self::empty_result_schema())))
+            sql::LogicalPlan::Prepare {
+                name,
+                statement,
+                source_sql,
+                ..
+            } => {
+                if !outer_params.is_empty() {
+                    return Err(Error::query_execution("PREPARE does not accept outer bind parameters"));
+                }
+                Self::validate_sql_prepared_body(statement)?;
+                self.store_parsed_prepared_statement(name, statement, source_sql);
+                Ok(Some((0, Vec::new(), Self::empty_result_schema())))
             }
             sql::LogicalPlan::Execute { name, parameters } => {
                 let stored_plan = self.prepared_plan_or_lazy_fast_plan(name)?;
-
+                let evaluator = sql::Evaluator::with_parameters(Self::empty_result_schema(), outer_params.to_vec());
                 let empty_tuple = Tuple::new(vec![]);
-                let empty_schema = std::sync::Arc::new(Schema { columns: vec![] });
-                let evaluator = sql::Evaluator::new(empty_schema);
                 let param_values: Result<Vec<Value>> = parameters
                     .iter()
                     .map(|expr| evaluator.evaluate(expr, &empty_tuple))
                     .collect();
                 let param_values = param_values?;
-
-                let columns = stored_plan.schema();
-                if let Some(rows) = self.try_prepared_fast_select_rows(name, &param_values) {
-                    return Ok(Some((rows?, columns)));
-                }
-                let rows = if matches!(
-                    &stored_plan,
-                    sql::LogicalPlan::Insert { .. }
-                        | sql::LogicalPlan::InsertSelect { .. }
-                        | sql::LogicalPlan::Update { .. }
-                        | sql::LogicalPlan::Delete { .. }
-                        // CTAS is a WRITE that arrives through query-shaped
-                        // routes (`SELECT … INTO t`): it must be delegated to
-                        // the write executor, never to the read path.
-                        | sql::LogicalPlan::CreateTableAs { .. }
-                ) {
-                    self.execute_plan_with_params(&stored_plan, &param_values, None)?.1
+                if Self::plan_may_write(&stored_plan) {
+                    let columns = stored_plan.schema();
+                    let (count, rows) = self.run_prepared_plan(name, &stored_plan, |plan| {
+                        self.execute_plan_with_params(plan, &param_values, session_txn)
+                    })?;
+                    Ok(Some((count, rows, columns)))
                 } else {
-                    self.query_plan_with_params(&stored_plan, &param_values, None)?
-                };
-                Ok(Some((rows, columns)))
+                    let (rows, columns) = self.run_prepared_plan(name, &stored_plan, |plan| {
+                        self.query_plan_with_params_with_schema(plan, &param_values, session_txn)
+                    })?;
+                    Ok(Some((rows.len() as u64, rows, columns)))
+                }
             }
             sql::LogicalPlan::Deallocate { name } => {
-                if let Some(stmt_name) = name {
-                    if !self.remove_prepared_statement_state(stmt_name) {
+                if let Some(name) = name {
+                    if !self.remove_prepared_statement_state(name) {
                         return Err(Error::query_execution(format!(
                             "Prepared statement '{}' does not exist",
-                            stmt_name
+                            name
                         )));
                     }
                 } else {
-                    self.prepared_statements.write().clear();
-                    self.prepared_statement_sql.write().clear();
-                    self.prepared_fast_selects.write().clear();
+                    self.clear_prepared_statements_for_backend(self.prepared_statement_key("").0);
                 }
-                Ok(Some((Vec::new(), Self::empty_result_schema())))
+                Ok(Some((0, Vec::new(), Self::empty_result_schema())))
             }
             _ => Ok(None),
         }
+    }
+
+    fn try_handle_prepared_query_plan_with_schema(
+        &self,
+        plan: &sql::LogicalPlan,
+    ) -> Result<Option<(Vec<Tuple>, std::sync::Arc<Schema>)>> {
+        self.try_handle_prepared_plan_with_params(plan, &[], None)
+            .map(|handled| handled.map(|(_, rows, schema)| (rows, schema)))
     }
 
     fn try_handle_prepared_statement_sql_fast_with_schema(
@@ -4072,17 +4238,22 @@ impl EmbeddedDatabase {
             };
             if let Some(spec) = self.fast_prepared_select_spec(statement_sql) {
                 let spec = spec?;
-                self.prepared_fast_selects.write().insert(name.clone(), spec);
+                self.prepared_fast_selects
+                    .write()
+                    .insert(self.prepared_statement_key(&name), spec);
                 self.prepared_statement_sql
                     .write()
-                    .insert(name, statement_sql.to_string());
+                    .insert(self.prepared_statement_key(&name), statement_sql.to_string());
                 return Ok(Some((Vec::new(), Self::empty_result_schema())));
             }
             let plan = (*self.parameterized_plan_cached(statement_sql)?).clone();
-            self.prepared_statements.write().insert(name.clone(), plan);
+            Self::validate_sql_prepared_body(&plan)?;
+            self.prepared_statements
+                .write()
+                .insert(self.prepared_statement_key(&name), plan);
             self.prepared_statement_sql
                 .write()
-                .insert(name, statement_sql.to_string());
+                .insert(self.prepared_statement_key(&name), statement_sql.to_string());
             return Ok(Some((Vec::new(), Self::empty_result_schema())));
         }
 
@@ -4110,9 +4281,14 @@ impl EmbeddedDatabase {
                     // executor, never to the read path.
                     | sql::LogicalPlan::CreateTableAs { .. }
             ) {
-                self.execute_plan_with_params(&stored_plan, &params, None)?.1
+                self.run_prepared_plan(&name, &stored_plan, |plan| {
+                    self.execute_plan_with_params(plan, &params, None)
+                })?
+                .1
             } else {
-                self.query_plan_with_params(&stored_plan, &params, None)?
+                self.run_prepared_plan(&name, &stored_plan, |plan| {
+                    self.query_plan_with_params(plan, &params, None)
+                })?
             };
             return Ok(Some((rows, columns)));
         }
@@ -4120,9 +4296,7 @@ impl EmbeddedDatabase {
         if let Some(rest) = strip_prefix_icase(trimmed, "DEALLOCATE ") {
             let name = rest.trim();
             if name.eq_ignore_ascii_case("ALL") {
-                self.prepared_statements.write().clear();
-                self.prepared_statement_sql.write().clear();
-                self.prepared_fast_selects.write().clear();
+                self.clear_prepared_statements_for_backend(self.prepared_statement_key("").0);
                 return Ok(Some((Vec::new(), Self::empty_result_schema())));
             }
             if name.is_empty() {
@@ -4141,15 +4315,23 @@ impl EmbeddedDatabase {
     }
 
     fn prepared_plan_or_lazy_fast_plan(&self, name: &str) -> Result<sql::LogicalPlan> {
-        if let Some(plan) = self.prepared_statements.read().get(name).cloned() {
+        if let Some(plan) = self
+            .prepared_statements
+            .read()
+            .get(&self.prepared_statement_key(name))
+            .cloned()
+        {
             return Ok(plan);
         }
 
         let source_sql =
             if lock_census::pl_rwlock_read(lock_census::Site::StatementRegistry, &self.prepared_fast_selects)
-                .contains_key(name)
+                .contains_key(&self.prepared_statement_key(name))
             {
-                self.prepared_statement_sql.read().get(name).cloned()
+                self.prepared_statement_sql
+                    .read()
+                    .get(&self.prepared_statement_key(name))
+                    .cloned()
             } else {
                 None
             };
@@ -4162,19 +4344,119 @@ impl EmbeddedDatabase {
         };
 
         let plan = (*self.parameterized_plan_cached(&source_sql)?).clone();
-        self.prepared_statements.write().insert(name.to_string(), plan.clone());
+        self.prepared_statements
+            .write()
+            .insert(self.prepared_statement_key(name), plan.clone());
         Ok(plan)
     }
 
+    /// A `PREPARE` the parser planned (the forms `split_fast_prepare` leaves to it): its
+    /// plan, and its text when the parser rendered one (spec R5.6:
+    /// [`Self::run_prepared_plan`] plans it again from the text after a schema change).
+    fn store_parsed_prepared_statement(&self, name: &str, statement: &sql::LogicalPlan, source_sql: &str) {
+        self.prepared_statements
+            .write()
+            .insert(self.prepared_statement_key(name), statement.clone());
+        if source_sql.is_empty() {
+            self.prepared_statement_sql
+                .write()
+                .remove(&self.prepared_statement_key(name));
+        } else {
+            self.prepared_statement_sql
+                .write()
+                .insert(self.prepared_statement_key(name), source_sql.to_string());
+        }
+        self.prepared_fast_selects
+            .write()
+            .remove(&self.prepared_statement_key(name));
+    }
+
+    /// Spec R5.6: run prepared statement `name`'s `plan` with `run`. A plan of an older
+    /// layout of one of its tables, which the scan refuses while the statement's read set
+    /// is still valid (the schema change ended before the statement began), is planned
+    /// again from the statement's text, kept, and run once more, as PostgreSQL re-plans a
+    /// prepared statement after a schema change of its tables; and, as there, a plan
+    /// whose result type changed is refused (0A000, nothing run). With no text, or a read
+    /// set that moved (the statement's own retry plans it again), or after a durable
+    /// effect/sequence/advisory effect that cannot be repeated, the refusal stands.
+    fn run_prepared_plan<T>(
+        &self,
+        name: &str,
+        plan: &sql::LogicalPlan,
+        mut run: impl FnMut(&sql::LogicalPlan) -> Result<T>,
+    ) -> Result<T> {
+        match run(plan) {
+            Err(error)
+                if storage::layout_epochs::is_layout_changed(&error)
+                    && storage::layout_epochs::statement_still_valid()
+                    && storage::layout_epochs::statement_may_retry() =>
+            {
+                let Some(source_sql) = self
+                    .prepared_statement_sql
+                    .read()
+                    .get(&self.prepared_statement_key(name))
+                    .cloned()
+                else {
+                    return Err(error);
+                };
+                let fresh = (*self.parameterized_plan_cached(&source_sql)?).clone();
+                let (before, now) = (plan.schema(), fresh.schema());
+                let same = before.columns.len() == now.columns.len()
+                    && before
+                        .columns
+                        .iter()
+                        .zip(&now.columns)
+                        .all(|(before, now)| before.name == now.name && before.data_type == now.data_type);
+                if !same {
+                    return Err(Error::cached_plan_result_changed(
+                        &Self::render_prepared_shape(&before),
+                        &Self::render_prepared_shape(&now),
+                    ));
+                }
+                self.prepared_statements
+                    .write()
+                    .insert(self.prepared_statement_key(name), fresh.clone());
+                run(&fresh)
+            }
+            other => other,
+        }
+    }
+
+    /// A prepared statement's result columns, for [`Self::run_prepared_plan`]'s refusal.
+    fn render_prepared_shape(schema: &Schema) -> String {
+        schema
+            .columns
+            .iter()
+            .map(|column| format!("{} {:?}", column.name, column.data_type))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     fn remove_prepared_statement_state(&self, name: &str) -> bool {
-        let removed_plan = self.prepared_statements.write().remove(name).is_some();
-        let removed_sql = self.prepared_statement_sql.write().remove(name).is_some();
-        let removed_fast = self.prepared_fast_selects.write().remove(name).is_some();
+        let removed_plan = self
+            .prepared_statements
+            .write()
+            .remove(&self.prepared_statement_key(name))
+            .is_some();
+        let removed_sql = self
+            .prepared_statement_sql
+            .write()
+            .remove(&self.prepared_statement_key(name))
+            .is_some();
+        let removed_fast = self
+            .prepared_fast_selects
+            .write()
+            .remove(&self.prepared_statement_key(name))
+            .is_some();
         removed_plan || removed_sql || removed_fast
     }
 
     fn try_prepared_fast_select_rows(&self, name: &str, params: &[Value]) -> Option<Result<Vec<Tuple>>> {
-        let source_sql = self.prepared_statement_sql.read().get(name).cloned()?;
+        let source_sql = self
+            .prepared_statement_sql
+            .read()
+            .get(&self.prepared_statement_key(name))
+            .cloned()?;
         self.try_fast_select_params(&source_sql, params)
     }
 
@@ -4250,8 +4532,14 @@ impl EmbeddedDatabase {
             return None;
         }
         let spec = lock_census::pl_rwlock_read(lock_census::Site::StatementRegistry, &self.prepared_fast_selects)
-            .get(name)
+            .get(&self.prepared_statement_key(name))
             .cloned()?;
+        // Spec R5.6: a spec read under another layout of its table is not used; the
+        // general path plans the statement again.
+        if !spec.select.layout.is_current() {
+            return None;
+        }
+        spec.select.layout.record();
         let mut value = match params.get(spec.param_index - 1) {
             Some(value) => value.clone(),
             None => {
@@ -4632,6 +4920,55 @@ impl EmbeddedDatabase {
     /// ([`PHYSICAL_STANDBY_ADMITTED`]): the entry points a statement delegates
     /// to with the same `&str` then skip the parse.
     #[inline]
+    /// Spec R5.6 (decisions 2(d), (f), (g)): run one client statement under a layout
+    /// read set (`storage::layout_epochs`). Every resolution of a table's layout inside
+    /// it records the table's epoch; the read set is checked at the statement's first
+    /// durable effect (the write funnel refuses a write of a statement whose layout moved)
+    /// and, for a statement with none, here, before its rows go to the caller. A
+    /// statement whose layout moved under it is run again from the start, planned again,
+    /// with a backoff that doubles from 1 ms, for at most 100 ms in all; then, or at once
+    /// when it may not run again (inside an explicit transaction, past a durable write,
+    /// after a sequence value, an advisory lock or a procedure body), it fails 40001
+    /// "could not serialize access due to a concurrent schema change". The pauses are
+    /// taken off the async workers (`runtime_offload::off_worker`), so a waiting
+    /// statement never stalls the server. A nested execution joins the read set of the
+    /// statement it runs in, and only the outermost runs again. Same on a primary and
+    /// on a physical standby.
+    fn run_layout_statement<T>(&self, in_transaction: bool, mut body: impl FnMut() -> Result<T>) -> Result<T> {
+        let scope = storage::StatementScope::enter();
+        if !scope.is_outermost() {
+            return body();
+        }
+        let started = std::time::Instant::now();
+        let mut pause = storage::layout_epochs::FIRST_PAUSE;
+        loop {
+            scope.reset();
+            let failure = match body() {
+                Ok(value) => match scope.finish() {
+                    Ok(()) => return Ok(value),
+                    Err(failure) => failure,
+                },
+                // The read set's own error when it has one: the refusal may have come
+                // back wrapped (a commit's), and the caller's 40001 reads the original.
+                Err(error) if storage::layout_epochs::is_layout_changed(&error) => {
+                    scope.finish().err().unwrap_or(error)
+                }
+                Err(error) => return Err(error),
+            };
+            if in_transaction || !scope.retriable() {
+                storage::layout_epochs::count_refusal();
+                return Err(failure);
+            }
+            let Some(wait) = storage::layout_epochs::next_pause(started.elapsed(), pause) else {
+                storage::layout_epochs::count_refusal();
+                return Err(failure);
+            };
+            crate::runtime_offload::off_worker(|| std::thread::sleep(wait));
+            storage::layout_epochs::count_retry();
+            pause = pause.saturating_mul(2);
+        }
+    }
+
     fn admit_on_physical_standby(&self, sql: &str) -> Result<PhysicalStandbyAdmission> {
         if !self.storage.is_physical_standby() {
             return Ok(PhysicalStandbyAdmission { previous: None });
@@ -4853,6 +5190,7 @@ impl EmbeddedDatabase {
         ResultCacheEpoch {
             local: self.result_cache_epoch.load(std::sync::atomic::Ordering::Acquire),
             storage: self.storage.schema_generation(),
+            generic_mutations: self.storage.generic_mutation_generation(),
         }
     }
 
@@ -4889,6 +5227,11 @@ impl EmbeddedDatabase {
         // a ROLLBACK) had just corrected, and the cache serves it until the
         // next invalidation. See `result_cache_epoch`.
         if self.result_cache_epoch() != cache_epoch {
+            return;
+        }
+        // Spec R5.6: nor one computed while a table it read changed layout; the
+        // statement that computed it is refused or retried.
+        if !storage::layout_epochs::statement_still_valid() {
             return;
         }
         let cached = std::sync::Arc::new(CachedRows {
@@ -4939,7 +5282,8 @@ impl EmbeddedDatabase {
         // Allocation-free probe: the SQL is compared as `&str` and the
         // principal through the thread-local, so the pre-HDB-009 hot path
         // (`hot_sql == sql`, nothing allocated) is preserved exactly.
-        self.hot_result_cache_entry
+        let result = self
+            .hot_result_cache_entry
             .read()
             .as_ref()
             .and_then(|(hot_sql, entry)| {
@@ -4947,7 +5291,22 @@ impl EmbeddedDatabase {
                     && entry.epoch == self.result_cache_epoch()
                     && session_login_user_is(entry.login.as_deref()))
                 .then(|| std::sync::Arc::clone(&entry.rows))
-            })
+            });
+        #[cfg(feature = "internal-tests")]
+        {
+            let hook = NEXT_HOT_CACHE_LOOKUP.with(|next| next.borrow_mut().take());
+            if let Some(hook) = hook {
+                hook(result.is_some());
+            }
+        }
+        result
+    }
+
+    /// Observe the next actual hot result-cache decision on this thread.
+    #[cfg(feature = "internal-tests")]
+    #[doc(hidden)]
+    pub fn debug_next_hot_cache_lookup(&self, hook: impl FnOnce(bool) + Send + 'static) {
+        NEXT_HOT_CACHE_LOOKUP.with(|next| *next.borrow_mut() = Some(Box::new(hook)));
     }
 
     /// The result cache's admission gate, read AND write — the three funnels
@@ -5161,7 +5520,9 @@ impl EmbeddedDatabase {
         // SELECT f()` where f inserts into t. Under the transaction's owner they find its
         // locks as theirs. Its writes still commit by themselves, as they always have.
         let _bound_locks = txn.bind_existing_table_locks();
-        let result = body();
+        // Spec R5.6: the statement's layout read set is validated inside the boundary, so
+        // a schema change under it aborts the transaction (40001) like any other error.
+        let result = body().and_then(|value| storage::layout_epochs::validate_statement().map(|()| value));
         match &result {
             Err(_) => txn.mark_sql_aborted(),
             Ok(_) if Self::is_rollback_to_savepoint(sql) => txn.clear_sql_aborted(),
@@ -5221,7 +5582,8 @@ impl EmbeddedDatabase {
                 Self::refuse_if_transaction_failed(txn, sql)?;
             }
         }
-        let result = body();
+        // Spec R5.6: as in `run_statement_in_transaction`.
+        let result = body().and_then(|value| storage::layout_epochs::validate_statement().map(|()| value));
         // HDB-008: a BOUNDARY statement (`BEGIN` / `COMMIT` / `ROLLBACK`) is
         // never recorded. The params family has no transaction-control
         // interception, so `execute_params("COMMIT")` really does arrive here
@@ -5791,53 +6153,149 @@ impl EmbeddedDatabase {
         }
     }
 
-    /// True for a `SET CONSTRAINTS …` statement (any name list, DEFERRED or
-    /// IMMEDIATE). Handled on the embedded `execute()` path (library API + REPL);
-    /// the deferral switch it arms is honored by every FK-validating path,
-    /// embedded and wire, since `constraints_all_deferred` is process-scoped like
-    /// `fk_validation_mode`.
+    /// True for a SET CONSTRAINTS timing statement.
     pub(crate) fn is_set_constraints_statement(sql: &str) -> bool {
         sql.trim_start().to_ascii_uppercase().starts_with("SET CONSTRAINTS")
     }
 
-    /// Intercept `SET CONSTRAINTS { ALL | <name>[, …] } { DEFERRED | IMMEDIATE }`.
-    /// sqlparser 0.53 has no grammar for it and no engine path builds the
-    /// `SetConstraints` plan, so it was previously a silent no-op — a DEFERRABLE
-    /// FK stayed IMMEDIATE and the valid "insert child (deferred), then parent,
-    /// then COMMIT" sequence spuriously failed (foreign_key corpus fkpart9/10/11).
-    /// Nano's deferred-FK machinery already re-validates every queued check at
-    /// COMMIT (`validate_deferred_fk_checks`); the only missing piece was the
-    /// switch that arms it, which `constraints_all_deferred` now provides.
-    ///
-    /// The named-constraint list is ACCEPTED but treated as ALL: Nano's
-    /// auto-generated FK names (`fk_<t>_<c>__<ref>`) never match PostgreSQL's
-    /// (`<t>_<c>_fkey`), so per-name matching would silently no-op on ported SQL;
-    /// deferring the whole set is a safe superset because each deferred check is
-    /// still validated at COMMIT. Transaction-scoped — the flag is reset at the
-    /// next txn begin/commit/rollback.
+    /// Timing and pending checks belong to the owning transaction. Names select
+    /// only matching deferrable FKs; unsupported qualified names fail explicitly.
     fn try_handle_set_constraints(&self, sql: &str) -> Result<Option<u64>> {
         if !Self::is_set_constraints_statement(sql) {
             return Ok(None);
         }
-        let upper = sql.trim().trim_end_matches(';').trim().to_ascii_uppercase();
-        if upper.ends_with(" DEFERRED") {
-            self.constraints_all_deferred
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-            Ok(Some(0))
-        } else if upper.ends_with(" IMMEDIATE") {
-            self.constraints_all_deferred
-                .store(false, std::sync::atomic::Ordering::Relaxed);
-            // PostgreSQL parity: switching back to IMMEDIATE checks all pending
-            // deferred constraints NOW, so a violation surfaces here rather than
-            // at COMMIT. Validate against the current (global) transaction so the
-            // queued checks see this txn's own writes.
-            let txn_ref = self.current_transaction.lock();
-            self.validate_deferred_fk_checks(txn_ref.as_ref())?;
-            Ok(Some(0))
-        } else {
-            // No recognizable mode word — leave it for the normal path.
-            Ok(None)
+        let txn = self.lock_owned_global_txn();
+        let public_only = self.current_schema().is_none_or(|schema| schema == "public")
+            && self.current_search_path().iter().all(|schema| schema == "public");
+        self.try_handle_set_constraints_in_transaction(sql, txn.as_ref().and_then(|slot| slot.as_ref()), public_only)
+    }
+
+    pub(crate) fn try_handle_set_constraints_for_session(
+        &self,
+        session_id: crate::session::SessionId,
+        sql: &str,
+    ) -> Result<Option<u64>> {
+        if !Self::is_set_constraints_statement(sql) {
+            return Ok(None);
         }
+        // This helper is also called from cold protocol utility paths. Install
+        // this session's catalog/branch backend and read ITS schema explicitly.
+        let _context = self.session_statement_context_guard(session_id)?;
+        let public_only = self
+            .session_current_schema(session_id)?
+            .is_none_or(|schema| schema == "public")
+            && self
+                .session_search_path(session_id)?
+                .iter()
+                .all(|schema| schema == "public");
+        let slot = self.session_txn_slot(session_id);
+        let guard = slot.as_ref().map(|slot| slot.read());
+        self.try_handle_set_constraints_in_transaction(
+            sql,
+            guard.as_ref().and_then(|guard| guard.as_ref()),
+            public_only,
+        )
+    }
+
+    fn try_handle_set_constraints_in_transaction(
+        &self,
+        sql: &str,
+        txn: Option<&storage::Transaction>,
+        named_public_only: bool,
+    ) -> Result<Option<u64>> {
+        let result = (|| -> Result<Option<u64>> {
+            let statement = sql.trim().trim_end_matches(';').trim();
+            let upper = statement.to_ascii_uppercase();
+            let (deferred, suffix) = if upper.ends_with(" DEFERRED") {
+                (true, " DEFERRED")
+            } else if upper.ends_with(" IMMEDIATE") {
+                (false, " IMMEDIATE")
+            } else {
+                return Err(Error::query_execution("SET CONSTRAINTS requires DEFERRED or IMMEDIATE"));
+            };
+            let selection = statement["SET CONSTRAINTS".len()..statement.len() - suffix.len()].trim();
+            let names = if selection.eq_ignore_ascii_case("ALL") {
+                Vec::new()
+            } else {
+                if !named_public_only {
+                    return Err(Error::query_execution(
+                        "named SET CONSTRAINTS supports the default public search_path only",
+                    ));
+                }
+                use sqlparser::dialect::PostgreSqlDialect;
+                use sqlparser::parser::Parser;
+                use sqlparser::tokenizer::Token;
+                let dialect = PostgreSqlDialect {};
+                let mut parser = Parser::new(&dialect)
+                    .try_with_sql(selection)
+                    .map_err(|error| Error::query_execution(format!("SET CONSTRAINTS names: {error}")))?;
+                let identifiers = parser
+                    .parse_comma_separated(|parser| parser.parse_identifier(false))
+                    .map_err(|error| Error::query_execution(format!("SET CONSTRAINTS names: {error}")))?;
+                if parser.peek_token().token != Token::EOF {
+                    return Err(Error::query_execution(
+                        "SET CONSTRAINTS supports unqualified foreign-key names only",
+                    ));
+                }
+                let names: Vec<String> = identifiers
+                    .into_iter()
+                    .map(|name| {
+                        if name.quote_style.is_some() {
+                            name.value
+                        } else {
+                            name.value.to_ascii_lowercase()
+                        }
+                    })
+                    .collect();
+                let mut selected = Vec::new();
+                for name in &names {
+                    let mut matched = false;
+                    for table in self.storage.catalog().list_tables()? {
+                        // Public tables have bare catalog keys; other schemas
+                        // must never inherit an identically named FK override.
+                        if table.contains('.') && !table.starts_with("public.") {
+                            continue;
+                        }
+                        for fk in self.storage.catalog().load_table_constraints(&table)?.foreign_keys {
+                            if &fk.name == name {
+                                matched = true;
+                                if !fk.deferrable {
+                                    return Err(Error::constraint_violation(format!(
+                                        "Foreign key constraint '{name}' is not deferrable"
+                                    )));
+                                }
+                                selected.push(crate::fk_update::fk_timing_key(&fk));
+                            }
+                        }
+                    }
+                    if !matched {
+                        return Err(Error::query_execution(format!(
+                            "SET CONSTRAINTS name '{name}' does not identify a supported foreign key"
+                        )));
+                    }
+                }
+                selected.sort_unstable();
+                selected.dedup();
+                selected
+            };
+            // Outside a transaction SET CONSTRAINTS affects no future transaction.
+            if let Some(txn) = txn {
+                if !deferred {
+                    if let Err(error) = txn.validate_parent_fk_checks_named(&names) {
+                        txn.mark_sql_aborted();
+                        return Err(error);
+                    }
+                }
+                txn.set_fk_check_timing(&names, deferred);
+            }
+            Ok(Some(0))
+        })();
+        if result.is_err() {
+            if let Some(txn) = txn {
+                txn.mark_sql_aborted();
+            }
+        }
+        result
     }
 
     fn try_handle_trace_execute(&self, sql: &str) -> Result<Option<u64>> {
@@ -6112,19 +6570,7 @@ impl EmbeddedDatabase {
                 self.validate_deferred_fk_checks(Some(txn))
             };
             if let Err(e) = validation {
-                if let Some(txn) = txn_ref.take() {
-                    // Same ordering requirement as `rollback_internal_locked`:
-                    // the ART undo must be replayed before the gates that keep
-                    // a concurrent `COUNT(*)` off the index come down (the
-                    // fast-out below, and this transaction's census slot, which
-                    // its `Drop` clears).
-                    self.rollback_art_undo_log();
-                    self.clear_global_txn_owner();
-                    let _ = txn.rollback();
-                }
-                self.deferred_fk_checks.lock().clear();
-                self.constraints_all_deferred
-                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                let _ = self.abort_global_slot_locked(&mut txn_ref);
                 return Err(e);
             }
         }
@@ -6143,25 +6589,75 @@ impl EmbeddedDatabase {
                 txn.written_data_keys()
             };
             let commit_ts = self.storage.next_commit_timestamp(txn.has_tracked_writes());
-            txn.commit_with_timestamp(commit_ts)?;
-            if !written.is_empty() {
+            let attempt = storage::write_outcome::WriteAttempt::default();
+            let result = txn.commit_with_timestamp_settled(commit_ts, &attempt, |txn, outcome, succeeded| {
+                if self.commit_needs_index_undo(txn, outcome, succeeded) {
+                    self.rollback_art_undo_log();
+                } else {
+                    self.art_undo_log.write().clear();
+                }
+            });
+            if result.is_ok() && !written.is_empty() {
                 self.invalidate_row_cache_for(&written);
             }
-            // Clear ART undo log (changes are now committed)
-            self.art_undo_log.write().clear();
             self.deferred_fk_checks.lock().clear();
             self.constraints_all_deferred
                 .store(false, std::sync::atomic::Ordering::Relaxed);
             self.invalidate_result_cache();
-            // Increment LSN to track transaction commits
-            self.storage.increment_lsn();
+            // A consumed transaction ends scoped state even if its write or
+            // later durability wait failed. Only successful commits advance LSN.
+            if result.is_ok() {
+                self.storage.increment_lsn();
+            }
             // sprinter f4f5d450e816: the embedded twin of the session hook — a
             // `SET LOCAL application_name` on the handle's backend reverts here.
             self.embedded_scoped.end_transaction();
-            Ok(())
+            result
         } else {
             Err(Error::transaction("No active transaction to commit"))
         }
+    }
+
+    /// An error is not evidence that RocksDB rejected the group. Undo only a
+    /// proven pre-write refusal. An ambiguous native result fences rows/indexes
+    /// before the transaction's barrier, key claims and census are released.
+    fn commit_needs_index_undo(
+        &self,
+        txn: &storage::Transaction,
+        outcome: storage::write_outcome::WriteOutcome,
+        succeeded: bool,
+    ) -> bool {
+        use storage::write_outcome::WriteOutcome;
+        if !succeeded {
+            self.invalidate_result_cache();
+            if outcome == WriteOutcome::Unknown {
+                storage::write_outcome::quarantine_unknown_transaction(&self.storage, txn);
+            }
+        }
+        !succeeded && outcome == WriteOutcome::NotWritten
+    }
+
+    fn commit_owned_statement(&self, txn: storage::Transaction, txn_id: u64) -> Result<()> {
+        let attempt = storage::write_outcome::WriteAttempt::default();
+        txn.commit_settled(&attempt, |txn, outcome, succeeded| {
+            if self.commit_needs_index_undo(txn, outcome, succeeded) {
+                self.rollback_art_undo_for(txn_id);
+            } else {
+                let _ = self.take_raii_art_undo(txn_id);
+            }
+        })
+    }
+
+    /// A cascade whose indexes are maintained after commit cannot publish those
+    /// hooks after an error. Fence any possibly applied group until reopen.
+    fn commit_before_index_publication(&self, txn: storage::Transaction) -> Result<()> {
+        let attempt = storage::write_outcome::WriteAttempt::default();
+        txn.commit_settled(&attempt, |txn, outcome, succeeded| {
+            if !succeeded && outcome != storage::write_outcome::WriteOutcome::NotWritten {
+                self.invalidate_result_cache();
+                storage::write_outcome::quarantine_unknown_transaction(&self.storage, txn);
+            }
+        })
     }
 
     /// Internal method to rollback the current transaction
@@ -6467,8 +6963,11 @@ impl EmbeddedDatabase {
     fn savepoint_rollback_to(&self, txn: &storage::Transaction, name: &str) -> Result<()> {
         match txn.resolve_savepoint_target(name) {
             Some((snapshot, art_undo_len)) => {
-                txn.rollback_to_savepoint(&snapshot);
-                self.rollback_art_undo_to(txn, art_undo_len);
+                txn.rollback_to_savepoint_with_index_undo(&snapshot, || {
+                    self.rollback_art_undo_to(txn, art_undo_len);
+                });
+                // Spec R5.4 (review F9): after the index undo.
+                txn.release_row_locks_after_savepoint(&snapshot);
                 Ok(())
             }
             None => Err(Self::savepoint_not_found(name)),
@@ -6570,10 +7069,12 @@ impl EmbeddedDatabase {
         if self.vector_dml_gate(table_name) {
             for tuple in &rows {
                 if let Some(row_id) = tuple.row_id {
-                    let vops =
-                        self.storage
-                            .vector_indexes()
-                            .on_row_delete(table_name, row_id, Some(&schema), Some(tuple));
+                    let vops = self.storage.vector_indexes().on_row_delete_staged(
+                        table_name,
+                        row_id,
+                        Some(&schema),
+                        Some(tuple),
+                    );
                     self.push_vector_undo(txn, vops);
                 }
             }
@@ -6652,7 +7153,7 @@ impl EmbeddedDatabase {
                 }
                 ArtUndoOp::VectorUndo(ops) => {
                     for op in ops.iter().rev() {
-                        self.storage.vector_indexes().apply_undo(op);
+                        self.storage.vector_indexes().apply_undo_ram_only(op);
                     }
                 }
                 ArtUndoOp::StagedRowsInIndex { index_name, rows } => {
@@ -6672,6 +7173,11 @@ impl EmbeddedDatabase {
     /// transaction's undo log (same routing as ART entries). No-op for the
     /// common empty case.
     fn push_vector_undo(&self, txn: &storage::Transaction, ops: Vec<storage::VectorIndexUndoOp>) {
+        // A vector index can be created after BEGIN. Install the component
+        // context lazily, including when persistent eager hooks were excluded.
+        if !txn.has_vector_row_context() {
+            txn.set_vector_row_context(self.storage.vector_row_context());
+        }
         if !ops.is_empty() {
             self.push_art_undo(txn, ArtUndoOp::VectorUndo(ops));
         }
@@ -6933,6 +7439,9 @@ impl EmbeddedDatabase {
         params: &[Value],
         txn: &storage::Transaction,
     ) -> Result<u64> {
+        // Spec R5.6 (decision 2(f)): a procedure's body may run DDL and other effects a
+        // retry would repeat; a CALL is refused for a concurrent schema change instead.
+        storage::layout_epochs::note_side_effect("a procedure body ran");
         let schema = std::sync::Arc::new(Schema { columns: vec![] });
         let evaluator = sql::Evaluator::with_parameters(schema, params.to_vec());
 
@@ -7029,14 +7538,115 @@ impl EmbeddedDatabase {
             .unwrap_or(0)
     }
 
-    /// Spec R5.3: [`Self::delete_routine_meta`], staged into the statement's batch.
-    fn stage_routine_meta_drop(&self, prefix: &str, name: &str, ddl: &mut storage::DdlBatch<'_>) -> Result<()> {
-        for (suffix, _blob) in self.storage.meta_blobs_with_prefix(prefix)? {
-            if suffix.eq_ignore_ascii_case(name) {
-                ddl.delete(Self::routine_meta_key(prefix, &suffix));
+    /// Read only this routine's case aliases under the retained registry map
+    /// owner. A bounded raw iterator filters keys before copying/decoding any
+    /// payload, so unrelated routines' bodies never enter this cold DDL image.
+    fn routine_ddl_image(&self, prefix: &str, name: &str) -> Result<std::collections::BTreeMap<Vec<u8>, Vec<u8>>> {
+        let normalized = name.to_lowercase();
+        let db = self.storage.db();
+        let options = storage::time_travel::bounded_read_options(prefix.as_bytes());
+        let mut iter = db.raw_iterator_opt(options);
+        iter.seek(prefix.as_bytes());
+        let mut image = std::collections::BTreeMap::new();
+        while iter.valid() {
+            let key = iter
+                .key()
+                .ok_or_else(|| Error::storage("Missing routine metadata key"))?;
+            let Some(suffix) = key.strip_prefix(prefix.as_bytes()) else {
+                break;
+            };
+            let suffix = std::str::from_utf8(suffix)
+                .map_err(|error| Error::storage(format!("Invalid routine metadata name: {error}")))?;
+            if suffix.to_lowercase() == normalized {
+                let raw = iter
+                    .value()
+                    .ok_or_else(|| Error::storage("Missing routine metadata value"))?;
+                let plain = self.storage.decode_stored_ref(key, raw)?.into_owned();
+                image.insert(key.to_vec(), plain);
             }
+            iter.next();
+        }
+        iter.status()
+            .map_err(|error| Error::storage(format!("Cannot read routine DDL image: {error}")))?;
+        Ok(image)
+    }
+
+    /// Remove old case aliases in the same group. Exact-spelled DROP entries
+    /// also keep explicit logical replay compatible with its existing format.
+    fn stage_routine_alias_deletions(
+        &self,
+        prefix: &str,
+        before: &std::collections::BTreeMap<Vec<u8>, Vec<u8>>,
+        keep: Option<&[u8]>,
+        procedures: bool,
+        ddl: &mut storage::DdlBatch<'_>,
+    ) -> Result<()> {
+        for key in before.keys() {
+            if keep == Some(key.as_slice()) {
+                continue;
+            }
+            let suffix = key
+                .strip_prefix(prefix.as_bytes())
+                .and_then(|suffix| std::str::from_utf8(suffix).ok())
+                .ok_or_else(|| Error::storage("Invalid routine identity in a DDL image"))?;
+            ddl.delete(key);
+            ddl.log(if procedures {
+                storage::WalOperation::DropProcedure {
+                    name: suffix.to_string(),
+                }
+            } else {
+                storage::WalOperation::DropFunction {
+                    name: suffix.to_string(),
+                }
+            });
         }
         Ok(())
+    }
+
+    /// Callbacks signal only outcome flags: no registry re-entry while its
+    /// existing map write guard is held. Settle/fence and clear caches before
+    /// releasing that owner, and release it before any replication ACK wait.
+    #[allow(clippy::too_many_arguments)]
+    fn commit_routine_ddl<'a, T: serde::Serialize>(
+        &'a self,
+        mut edit: sql::functions::RoutineDdlEdit<'a, T>,
+        prefix: &'static str,
+        name: &str,
+        before: std::collections::BTreeMap<Vec<u8>, Vec<u8>>,
+        after: std::collections::BTreeMap<Vec<u8>, Vec<u8>>,
+        mut ddl: storage::DdlBatch<'a>,
+    ) -> Result<u64> {
+        let same_edit = before == after && edit.unchanged()?;
+        let settled = std::rc::Rc::new(std::cell::Cell::new(None));
+        let applied = std::rc::Rc::clone(&settled);
+        ddl.on_commit(move || applied.set(Some(true)));
+        let refused = std::rc::Rc::clone(&settled);
+        ddl.on_abort(move || refused.set(Some(false)));
+        let no_op = std::rc::Rc::clone(&settled);
+        let routine = name.to_string();
+        ddl.on_write_error(move || match self.routine_ddl_image(prefix, &routine) {
+            Ok(actual) if before != after && actual == after => Ok(true),
+            Ok(actual) if before != after && actual == before => Ok(false),
+            Ok(actual) if same_edit && actual == before => {
+                // Identical durable AND registry images require no RAM change.
+                // Do not claim a distinct BEFORE/AFTER application witness.
+                no_op.set(Some(false));
+                Err(Error::storage(
+                    "routine DDL is an exact metadata/registry no-op; application is indistinguishable",
+                ))
+            }
+            actual => Err(Error::storage(match actual {
+                Ok(_) => format!("routine '{routine}' witness is neither its distinct BEFORE nor AFTER image"),
+                Err(error) => format!("Cannot read routine '{routine}' outcome witness: {error}"),
+            })),
+        });
+        edit.begin_commit();
+        let result = ddl.commit();
+        edit.settle(settled.get());
+        self.invalidate_plan_cache();
+        drop(edit);
+        result?.wait_replicated();
+        Ok(0)
     }
 
     /// Delete every durable definition under `prefix` whose name matches `name`
@@ -7090,38 +7700,18 @@ impl EmbeddedDatabase {
         let definition = bincode::serialize(&stored_func)
             .map_err(|e| Error::internal(format!("Failed to serialize function '{}': {}", name, e)))?;
 
-        // The existence / OR REPLACE rule lives in the registry — one rule, one
-        // place. This is what produces `Function 'x' already exists`. Registered
-        // first, so the rule is decided atomically; spec R5.3: undone if the
-        // statement's group is not written (the replaced definition comes back).
-        let previous = self.function_registry.get_function(name);
-        self.function_registry.register_function(stored_func)?;
+        let edit = self.function_registry.begin_function_create(stored_func)?;
+        let before = self.routine_ddl_image(Self::FUNCTION_META_PREFIX, name)?;
+        let key = Self::routine_meta_key(Self::FUNCTION_META_PREFIX, name);
         let mut ddl = storage::DdlBatch::new(&self.storage);
-        {
-            let registry = &self.function_registry;
-            let routine = name.to_string();
-            ddl.on_abort(move || match previous {
-                Some(previous) => {
-                    let _ = registry.load_function(previous);
-                }
-                None => {
-                    let _ = registry.drop_function(&routine, true);
-                }
-            });
-        }
-
-        // Spec R5.3: the DURABLE definition and its logical-WAL entry, ONE write
-        // group. WAL replay writes this same key with these same bytes, so the two
-        // are idempotent; the definition is what makes a function survive a
-        // restart once the WAL has been checkpointed away. LOUD on failure: the
-        // statement fails and the registry is put back.
-        ddl.put(Self::routine_meta_key(Self::FUNCTION_META_PREFIX, name), &definition)?;
+        self.stage_routine_alias_deletions(Self::FUNCTION_META_PREFIX, &before, Some(&key), false, &mut ddl)?;
+        ddl.put(&key, &definition)?;
+        let after = std::collections::BTreeMap::from([(key, definition.clone())]);
         ddl.log(storage::WalOperation::CreateFunction {
             name: name.to_string(),
             definition,
         });
-        ddl.commit()?.wait_replicated();
-        Ok(0)
+        self.commit_routine_ddl(edit, Self::FUNCTION_META_PREFIX, name, before, after, ddl)
     }
 
     /// `CREATE [OR REPLACE] PROCEDURE`. See
@@ -7148,69 +7738,41 @@ impl EmbeddedDatabase {
         let definition = bincode::serialize(&stored_proc)
             .map_err(|e| Error::internal(format!("Failed to serialize procedure '{}': {}", name, e)))?;
 
-        let previous = self.function_registry.get_procedure(name);
-        self.function_registry.register_procedure(stored_proc)?;
+        let edit = self.function_registry.begin_procedure_create(stored_proc)?;
+        let before = self.routine_ddl_image(Self::PROCEDURE_META_PREFIX, name)?;
+        let key = Self::routine_meta_key(Self::PROCEDURE_META_PREFIX, name);
         let mut ddl = storage::DdlBatch::new(&self.storage);
-        {
-            let registry = &self.function_registry;
-            let routine = name.to_string();
-            ddl.on_abort(move || match previous {
-                Some(previous) => {
-                    let _ = registry.load_procedure(previous);
-                }
-                None => {
-                    let _ = registry.drop_procedure(&routine, true);
-                }
-            });
-        }
-        ddl.put(Self::routine_meta_key(Self::PROCEDURE_META_PREFIX, name), &definition)?;
+        self.stage_routine_alias_deletions(Self::PROCEDURE_META_PREFIX, &before, Some(&key), true, &mut ddl)?;
+        ddl.put(&key, &definition)?;
+        let after = std::collections::BTreeMap::from([(key, definition.clone())]);
         ddl.log(storage::WalOperation::CreateProcedure {
             name: name.to_string(),
             definition,
         });
-        ddl.commit()?.wait_replicated();
-        Ok(0)
+        self.commit_routine_ddl(edit, Self::PROCEDURE_META_PREFIX, name, before, after, ddl)
     }
 
-    /// `DROP FUNCTION [IF EXISTS]`. The registry decides whether the name exists
-    /// (and therefore whether a missing name is an error); the durable record is
-    /// removed either way, so a stale key left by an interrupted create can
-    /// never resurrect the function.
+    /// DROP owns the same map through the same-group removal of every spelling.
     fn execute_drop_function_plan(&self, name: &str, if_exists: bool) -> Result<u64> {
-        let previous = self.function_registry.get_function(name);
-        self.function_registry.drop_function(name, if_exists)?;
+        let edit = self.function_registry.begin_function_drop(name, if_exists)?;
+        let before = self.routine_ddl_image(Self::FUNCTION_META_PREFIX, name)?;
         let mut ddl = storage::DdlBatch::new(&self.storage);
-        if let Some(previous) = previous {
-            let registry = &self.function_registry;
-            ddl.on_abort(move || {
-                let _ = registry.load_function(previous);
-            });
+        self.stage_routine_alias_deletions(Self::FUNCTION_META_PREFIX, &before, None, false, &mut ddl)?;
+        if before.is_empty() {
+            ddl.log(storage::WalOperation::DropFunction { name: name.to_string() });
         }
-        // Spec R5.3: the durable removal and its logical-WAL entry, ONE write group
-        // (they used to be two, removal first so a crash between them left the
-        // definition gone rather than a logged drop over a surviving definition).
-        self.stage_routine_meta_drop(Self::FUNCTION_META_PREFIX, name, &mut ddl)?;
-        ddl.log(storage::WalOperation::DropFunction { name: name.to_string() });
-        ddl.commit()?.wait_replicated();
-        Ok(0)
+        self.commit_routine_ddl(edit, Self::FUNCTION_META_PREFIX, name, before, Default::default(), ddl)
     }
 
-    /// `DROP PROCEDURE [IF EXISTS]`. See
-    /// [`EmbeddedDatabase::execute_drop_function_plan`].
     fn execute_drop_procedure_plan(&self, name: &str, if_exists: bool) -> Result<u64> {
-        let previous = self.function_registry.get_procedure(name);
-        self.function_registry.drop_procedure(name, if_exists)?;
+        let edit = self.function_registry.begin_procedure_drop(name, if_exists)?;
+        let before = self.routine_ddl_image(Self::PROCEDURE_META_PREFIX, name)?;
         let mut ddl = storage::DdlBatch::new(&self.storage);
-        if let Some(previous) = previous {
-            let registry = &self.function_registry;
-            ddl.on_abort(move || {
-                let _ = registry.load_procedure(previous);
-            });
+        self.stage_routine_alias_deletions(Self::PROCEDURE_META_PREFIX, &before, None, true, &mut ddl)?;
+        if before.is_empty() {
+            ddl.log(storage::WalOperation::DropProcedure { name: name.to_string() });
         }
-        self.stage_routine_meta_drop(Self::PROCEDURE_META_PREFIX, name, &mut ddl)?;
-        ddl.log(storage::WalOperation::DropProcedure { name: name.to_string() });
-        ddl.commit()?.wait_replicated();
-        Ok(0)
+        self.commit_routine_ddl(edit, Self::PROCEDURE_META_PREFIX, name, before, Default::default(), ddl)
     }
 
     // ---- Trigger DDL, shared by BOTH executor families ----
@@ -7325,9 +7887,27 @@ impl EmbeddedDatabase {
         let mutation = if matches!(timing, sql::logical_plan::TriggerTiming::Before)
             && matches!(for_each, sql::logical_plan::TriggerFor::Row)
         {
-            function_name
+            let reads_insert_recipe = events
+                .iter()
+                .any(|event| matches!(event, sql::logical_plan::TriggerEvent::Insert));
+            if reads_insert_recipe {
+                if let Some(name) = function_name.as_deref() {
+                    // An unresolved routine is not an ordinary missing or
+                    // unsupported recipe. Refuse before registering a trigger.
+                    self.function_registry.function_exists_checked(name)?;
+                }
+            }
+            let mutation = function_name
                 .as_ref()
-                .and_then(|fname| self.build_trigger_row_mutation(fname, events))
+                .and_then(|fname| self.build_trigger_row_mutation(fname, events));
+            if reads_insert_recipe && mutation.is_none() {
+                if let Some(name) = function_name.as_deref() {
+                    // The routine may have been fenced between the precheck
+                    // and the Option builder's own negative lookup.
+                    self.function_registry.function_exists_checked(name)?;
+                }
+            }
+            mutation
         } else {
             None
         };
@@ -7620,12 +8200,13 @@ impl EmbeddedDatabase {
         let vector_gate = self.vector_dml_gate(table_name);
         let snapshot: Vec<Tuple> = if vector_gate { chunk.clone() } else { Vec::new() };
         let ids = self.insert_validated_tuples_in_transaction_ids(table_name, chunk, schema, txn)?;
+        self.defer_inserted_fk_rows(txn, table_name, &ids)?;
         if vector_gate {
             for (row_id, tuple) in ids.iter().zip(snapshot.iter()) {
                 let vops = self
                     .storage
                     .vector_indexes()
-                    .on_row_insert(table_name, *row_id, schema, tuple);
+                    .on_row_insert_staged(table_name, *row_id, schema, tuple);
                 self.push_vector_undo(txn, vops);
             }
         }
@@ -7841,7 +8422,7 @@ impl EmbeddedDatabase {
                     fk_col_values.insert(col.name.clone(), v.clone());
                 }
             }
-            self.check_fk_constraints_on_write(table_name, &fk_col_values, active_txn)?;
+            self.check_fk_constraints_on_write(table_name, &fk_col_values, active_txn, None)?;
         }
 
         // CHECK — same evaluate() and same result→bool mapping as the per-row
@@ -8470,7 +9051,7 @@ impl EmbeddedDatabase {
                 "UDF bridge was already installed on this database handle",
             ));
         }
-        sql::udf_bridge::install(&bridge);
+        sql::udf_bridge::install_on(&self.storage, &bridge);
         Ok(self)
     }
 
@@ -8643,13 +9224,12 @@ impl EmbeddedDatabase {
     /// because DDL is not transactional and a half-applied statement is what
     /// PostgreSQL never produces.
     ///
-    /// Spec R5.2 extends that to what an `ADD COLUMN` clause can refuse
-    /// ([`Self::prevalidate_added_columns`]). It is validation, not atomicity. Each
-    /// clause is still its own write group, so a crash between two clauses leaves
-    /// the earlier ones, a concurrent reader can see the first column without the
-    /// second, and a refusal that needs an earlier clause's effect still comes
-    /// after it: `ADD c INT DEFAULT 1 CHECK (c > 5)` is 23514 with `c` left behind.
-    /// One group for the whole statement closes all three in a later step.
+    /// Spec R5.5: the statement is ONE write group ([`Self::execute_alter_statement`]):
+    /// every clause is asked against the table as the clauses before it left it, in
+    /// memory, before anything is written, so a refusal by any clause leaves nothing
+    /// (`ADD c INT DEFAULT 1 CHECK (c > 5)` is 23514 with no `c`), a crash leaves the
+    /// statement whole or not at all, and a reader sees it before or after. The
+    /// whole-statement checks below stay: they answer before any clause's work.
     fn execute_alter_table_multi(
         &self,
         operations: &[sql::LogicalPlan],
@@ -8803,12 +9383,7 @@ impl EmbeddedDatabase {
                 }
             }
         }
-        self.prevalidate_added_columns(operations, txn)?;
-        let mut total_rows = 0u64;
-        for sub_plan in operations {
-            total_rows += self.execute_alter_table_op(sub_plan, txn)?;
-        }
-        Ok(total_rows)
+        self.execute_alter_statement(operations, txn)
     }
 
     fn execute_create_table_plan(&self, plan: &sql::LogicalPlan, original_sql: Option<&str>) -> Result<u64> {
@@ -9343,9 +9918,7 @@ impl EmbeddedDatabase {
             let (branch_name, if_exists) = sql::Parser::parse_drop_branch_sql(sql)?;
             sql::phase3::branching::BranchingParser::parse_drop_branch(branch_name, if_exists)?
         } else if sql::Parser::is_merge_branch(sql) {
-            // Parse MERGE DATABASE BRANCH statement
-            let (source, target, with_options) = sql::Parser::parse_merge_branch_sql(sql)?;
-            sql::phase3::branching::BranchingParser::parse_merge_branch(source, target, with_options.as_deref())?
+            Self::plan_merge_branch(sql)?
         } else if sql::Parser::is_use_branch(sql) {
             // Parse USE BRANCH statement
             let branch_name = sql::Parser::parse_use_branch_sql(sql)?;
@@ -9406,14 +9979,8 @@ impl EmbeddedDatabase {
             // Parse ALTER SEQUENCE [IF EXISTS] <name> <actions...> via the
             // custom pre-parse path (sqlparser 0.53 has no AlterSequence node).
             sql::LogicalPlan::AlterSequence(sql::Parser::parse_alter_sequence(sql)?)
-        } else if sql::Parser::is_alter_column_storage(sql) {
-            // Parse ALTER TABLE ALTER COLUMN SET STORAGE statement
-            let (table_name, column_name, storage_mode) = sql::Parser::parse_alter_column_storage(sql)?;
-            sql::LogicalPlan::AlterColumnStorage {
-                table_name,
-                column_name,
-                storage_mode,
-            }
+        } else if let Some(plan) = self.try_plan_alter_column_storage(sql)? {
+            plan
         } else if sql::Parser::is_alter_table_set_schema(sql) {
             // `ALTER TABLE [IF EXISTS] <name> SET SCHEMA <schema>` — sqlparser
             // 0.53 has no such op, so pre-parse it. Resolve the source name to
@@ -9492,6 +10059,10 @@ impl EmbeddedDatabase {
         Self::refuse_constraint_over_staged_rows(&plan, Some(txn))?;
         if let Some(rows) = self.create_index_over_staged_rows(&plan, Some(txn))? {
             return Ok(rows);
+        }
+
+        if let Some((count, _, _)) = self.try_handle_prepared_plan_with_params(&plan, &[], Some(txn))? {
+            return Ok(count);
         }
 
         // Execute plan based on type
@@ -9603,6 +10174,7 @@ impl EmbeddedDatabase {
                         .iter()
                         .any(|c| c.storage_mode == ColumnStorageMode::Columnar);
                 let mut pending_columnar: Vec<(u64, Tuple)> = Vec::new();
+                let mut fk_parent_updates: Vec<(u64, Tuple, Tuple)> = Vec::new();
                 // W2.0: a branch INSERT writes each row only to the `bdata:`
                 // overlay (via `branch_aware_data_key` below), so it must NOT
                 // mutate the process-wide, branch-blind ART secondary indexes —
@@ -9997,7 +10569,20 @@ impl EmbeddedDatabase {
                                         let existing_key =
                                             self.storage.branch_aware_data_key(table_name, existing_row_id);
                                         let mut existing_tuple: Tuple = match branch_existing {
-                                            Some(row) => row,
+                                            // Spec R5.4 (review F5): on a branch too, the
+                                            // row's write lock, then the row as the
+                                            // branch has it under the lock.
+                                            Some(row) => match &branch_view {
+                                                Some(view) => self.lock_branch_upsert_target(
+                                                    txn,
+                                                    view,
+                                                    table_name,
+                                                    &schema,
+                                                    existing_row_id,
+                                                    &row,
+                                                )?,
+                                                None => row,
+                                            },
                                             None => {
                                                 // Spec R5.4 (P12): the row's write lock
                                                 // first, so the image updated is the one
@@ -10134,6 +10719,12 @@ impl EmbeddedDatabase {
                                             Some(txn),
                                         )?;
 
+                                        fk_parent_updates.push((
+                                            existing_row_id,
+                                            pre_update_tuple.clone(),
+                                            existing_tuple.clone(),
+                                        ));
+
                                         // Write updated tuple back; columnar side-data is staged
                                         // grouped after the row loop (R3.3). Keep the row bytes
                                         // logical in the write set so read-your-own-writes returns
@@ -10209,7 +10800,8 @@ impl EmbeddedDatabase {
                                                     new_col_values.insert(col.name.clone(), v.clone());
                                                 }
                                             }
-                                            if let Err(e) = self.storage.art_indexes().on_delete(
+                                            if let Err(e) = self.remove_index_entries_held(
+                                                txn,
                                                 table_name,
                                                 existing_row_id,
                                                 &old_col_values,
@@ -10255,7 +10847,7 @@ impl EmbeddedDatabase {
                                         // R5.V1: re-index the row's vector if the DO UPDATE
                                         // changed it (undo on rollback).
                                         if let Some(old_tuple) = &vector_pre_update_tuple {
-                                            let vops = self.storage.vector_indexes().on_row_update(
+                                            let vops = self.storage.vector_indexes().on_row_update_staged(
                                                 table_name,
                                                 existing_row_id,
                                                 &schema,
@@ -10410,7 +11002,7 @@ impl EmbeddedDatabase {
                         // Pass the active txn so the parent-existence check
                         // sees in-flight inserts to the parent table within
                         // the same transaction (read-your-own-writes).
-                        self.check_fk_constraints_on_write(table_name, &col_values, Some(txn))?;
+                        self.check_fk_constraints_on_write(table_name, &col_values, Some(txn), Some(row_id))?;
 
                         // Columnar side-data is staged grouped after the row loop
                         // (R3.3); the row value stays logical for
@@ -10447,10 +11039,7 @@ impl EmbeddedDatabase {
                             // branch's own image. Never replicated.
                             view.insert_checked(Some(txn), table_name, &schema, row_id, &tuple)?;
                         } else {
-                            self.storage
-                                .art_indexes()
-                                .reserve_insert_tuple(table_name, row_id, &schema, &tuple)
-                                .map_err(|e| Error::constraint_violation(e.to_string()))?;
+                            self.claim_row_keys_in_transaction(txn, table_name, row_id, &schema, &tuple)?;
                             if let Err(e) = txn.put(key.clone(), val.clone()) {
                                 // The row never landed, so the claim is a phantom.
                                 let _ = self
@@ -10491,7 +11080,7 @@ impl EmbeddedDatabase {
                             let vops = self
                                 .storage
                                 .vector_indexes()
-                                .on_row_insert(table_name, row_id, &schema, &tuple);
+                                .on_row_insert_staged(table_name, row_id, &schema, &tuple);
                             self.push_vector_undo(txn, vops);
                         }
 
@@ -10577,6 +11166,9 @@ impl EmbeddedDatabase {
                         .stage_columnar_rows_grouped_in_transaction(table_name, &row_refs, &schema, txn, true)?;
                 }
 
+                if loop_result.is_ok() {
+                    self.apply_fk_parent_updates(txn, table_name, &schema, &fk_parent_updates)?;
+                }
                 // Return count (RETURNING clause results handled separately)
                 loop_result
             }
@@ -10603,10 +11195,10 @@ impl EmbeddedDatabase {
 
                 // Execute the source SELECT plan to get rows
                 let mut executor = sql::Executor::with_storage(&self.storage)
-                        .with_timeout(self.effective_statement_timeout_ms())
-                        // #100: the source SELECT must see rows this transaction staged
-                        // earlier (a chained INSERT … SELECT via a staging table).
-                        .with_transaction(txn);
+                    .with_timeout(self.effective_statement_timeout_ms())
+                    // #100: the source SELECT must see rows this transaction staged
+                    // earlier (a chained INSERT … SELECT via a staging table).
+                    .with_transaction(txn);
                 let source_rows = executor.execute(source_plan)?;
 
                 let catalog = self.storage.catalog();
@@ -10762,6 +11354,7 @@ impl EmbeddedDatabase {
                             Some(view) => {
                                 let (row_id, written) =
                                     self.branch_insert_row(view, Some(txn), table_name, &schema, tuple.clone())?;
+                                self.defer_inserted_fk_rows(txn, table_name, &[row_id])?;
                                 (row_id, Some(written))
                             }
                             None => (
@@ -10963,8 +11556,9 @@ impl EmbeddedDatabase {
                 // which the pre-B2 `scan_table_branch_aware` (committed only)
                 // could not give.
                 let branch_view = self.storage.branch_view()?;
-                // Spec R5.4 (P12): the table's change epoch, before its rows are read.
-                let row_epoch = self.storage.row_locks().table_epoch(table_name);
+                // Spec R5.4 (P12): the table's change epoch, before its rows are read
+                // (review F5: the branch level's, on a branch).
+                let row_epoch = self.row_epoch_for(branch_view.as_ref(), table_name);
                 let tuples = if let Some(view) = &branch_view {
                     view.scan(Some(txn), table_name, &schema)?
                 } else if merge_txn_writes {
@@ -10976,9 +11570,12 @@ impl EmbeddedDatabase {
                         &self.storage.row_shape(table_name, width)?,
                     )?
                 } else if let Some(pk_value) = Self::try_extract_pk_value(selection.as_ref(), &schema) {
+                    // Spec R5.4 (review F1): the row as stored, not the row cache's
+                    // copy — `lock_row_for_change` trusts what it is handed while the
+                    // epoch has not moved.
                     match self
                         .storage
-                        .get_row_by_typed_pk_with_schema(table_name, &pk_value, &schema)?
+                        .get_row_by_typed_pk_for_write_with_schema(table_name, &pk_value, &schema)?
                     {
                         Some(tuple) => vec![tuple],
                         None => vec![],
@@ -11001,7 +11598,9 @@ impl EmbeddedDatabase {
 
                 let row_matches = |row: &Tuple| -> Result<bool> {
                     Ok(match selection {
-                        Some(predicate) => matches!(evaluator.evaluate(predicate, row)?, Value::Boolean(true)),
+                        Some(predicate) => {
+                            matches!(evaluator.evaluate(predicate, row)?, Value::Boolean(true))
+                        }
                         None => true,
                     })
                 };
@@ -11010,8 +11609,15 @@ impl EmbeddedDatabase {
                     // Spec R5.4 (P12): locked for this transaction, then changed as
                     // committed under the lock (see the params family's arm).
                     let old_tuple = match (matches, &branch_view) {
-                        (true, None) => {
-                            match self.lock_row_for_change(txn, table_name, &schema, old_tuple, row_epoch)? {
+                        (true, view) => {
+                            match self.lock_row_for_change_on(
+                                txn,
+                                view.as_ref(),
+                                table_name,
+                                &schema,
+                                old_tuple,
+                                row_epoch,
+                            )? {
                                 LockedRow::Same(row) => row,
                                 LockedRow::Moved(row) => {
                                     matches = row_matches(&row)?;
@@ -11124,16 +11730,8 @@ impl EmbeddedDatabase {
                         // gate alongside FK / CHECK / UNIQUE below.
                         Self::enforce_rls_with_check(rls_guard.as_ref(), &new_tuple)?;
 
-                        // FK validation on UPDATE (Kanttban bug #6 fix).
-                        // Only validate if the assigned columns include
-                        // any FK column — otherwise skip the lookup.
-                        let mut new_col_values = std::collections::HashMap::with_capacity(schema.columns.len());
-                        for (i, col) in schema.columns.iter().enumerate() {
-                            if let Some(v) = new_tuple.values.get(i) {
-                                new_col_values.insert(col.name.clone(), v.clone());
-                            }
-                        }
-                        self.check_fk_constraints_on_write(table_name, &new_col_values, Some(txn))?;
+                        // Outgoing FK checks run against the finished staged
+                        // parent/child graph below, including self references.
 
                         for check in &table_constraints.check_constraints {
                             let check_result =
@@ -11268,11 +11866,7 @@ impl EmbeddedDatabase {
                                 new_col_values.insert(col.name.clone(), v.clone());
                             }
                         }
-                        if let Err(e) = self
-                            .storage
-                            .art_indexes()
-                            .on_delete(table_name, *row_id, &old_col_values)
-                        {
+                        if let Err(e) = self.remove_index_entries_held(txn, table_name, *row_id, &old_col_values) {
                             tracing::debug!("ART index update/delete-old for '{}': {}", table_name, e);
                         }
                         if let Err(e) = self
@@ -11295,7 +11889,7 @@ impl EmbeddedDatabase {
 
                     // R5.V1: eagerly maintain HNSW vector indexes (undo on rollback)
                     if self.vector_dml_gate(table_name) {
-                        let vops = self.storage.vector_indexes().on_row_update(
+                        let vops = self.storage.vector_indexes().on_row_update_staged(
                             table_name,
                             *row_id,
                             &schema,
@@ -11322,6 +11916,8 @@ impl EmbeddedDatabase {
                     // Invalidate row cache (stale after update)
                     self.storage.row_cache().invalidate(table_name, *row_id);
                 }
+
+                self.apply_fk_parent_updates(txn, table_name, &schema, &updates)?;
 
                 // Update storage quota tracking (UPDATEs may change storage size)
                 if let Some(context) = self.effective_tenant_context() {
@@ -11355,6 +11951,14 @@ impl EmbeddedDatabase {
                 let _ = returned_tuples; // RETURNING clause results handled separately
 
                 Ok(update_count)
+            }
+            sql::LogicalPlan::MergeBranch {
+                source,
+                target,
+                options,
+            } => {
+                self.execute_merge_branch_with_fk_policy(source, target, options)?;
+                Ok(0)
             }
             sql::LogicalPlan::Delete {
                 table_name,
@@ -11406,8 +12010,9 @@ impl EmbeddedDatabase {
                 // sprinter 6bc4a4040eb7 (B2): the branch view, with this
                 // transaction's staged branch writes (see the UPDATE arm).
                 let branch_view = self.storage.branch_view()?;
-                // Spec R5.4 (P12): the table's change epoch, before its rows are read.
-                let row_epoch = self.storage.row_locks().table_epoch(table_name);
+                // Spec R5.4 (P12): the table's change epoch, before its rows are read
+                // (review F5: the branch level's, on a branch).
+                let row_epoch = self.row_epoch_for(branch_view.as_ref(), table_name);
                 let tuples = if let Some(view) = &branch_view {
                     view.scan(Some(txn), table_name, &schema_arc)?
                 } else if merge_txn_writes {
@@ -11419,9 +12024,11 @@ impl EmbeddedDatabase {
                         &self.storage.row_shape(table_name, width)?,
                     )?
                 } else if let Some(pk_value) = Self::try_extract_pk_value(selection.as_ref(), &schema_arc) {
+                    // Spec R5.4 (review F1): storage, not the row cache (see the
+                    // UPDATE arm).
                     match self
                         .storage
-                        .get_row_by_typed_pk_with_schema(table_name, &pk_value, &schema_arc)?
+                        .get_row_by_typed_pk_for_write_with_schema(table_name, &pk_value, &schema_arc)?
                     {
                         Some(tuple) => vec![tuple],
                         None => vec![],
@@ -11445,7 +12052,9 @@ impl EmbeddedDatabase {
 
                 let row_matches = |row: &Tuple| -> Result<bool> {
                     Ok(match selection {
-                        Some(predicate) => matches!(evaluator.evaluate(predicate, row)?, Value::Boolean(true)),
+                        Some(predicate) => {
+                            matches!(evaluator.evaluate(predicate, row)?, Value::Boolean(true))
+                        }
                         None => true,
                     })
                 };
@@ -11454,8 +12063,15 @@ impl EmbeddedDatabase {
                     // Spec R5.4 (P12): locked for this transaction, then deleted as
                     // committed under the lock (see the params family's arm).
                     let tuple = match (matches, &branch_view) {
-                        (true, None) => {
-                            match self.lock_row_for_change(txn, table_name, &schema_arc, tuple, row_epoch)? {
+                        (true, view) => {
+                            match self.lock_row_for_change_on(
+                                txn,
+                                view.as_ref(),
+                                table_name,
+                                &schema_arc,
+                                tuple,
+                                row_epoch,
+                            )? {
                                 LockedRow::Same(row) => row,
                                 LockedRow::Moved(row) => {
                                     matches = row_matches(&row)?;
@@ -11509,17 +12125,6 @@ impl EmbeddedDatabase {
                         }
 
                         if let Some(row_id) = tuple.row_id {
-                            // Validate FK constraints - check if any other table references this row.
-                            // Shared with the params family (`execute_plan_with_params_inner`).
-                            self.enforce_referencing_fks_on_delete(
-                                table_name,
-                                &tuple,
-                                &schema_arc,
-                                &catalog,
-                                Some(txn),
-                                skip_fast_paths,
-                            )?;
-
                             row_ids_to_delete.push(row_id);
                             deleted_tuples.push((row_id, tuple.clone()));
 
@@ -11655,7 +12260,7 @@ impl EmbeddedDatabase {
                         // the key goes, so a MERGE BRANCH that looks under the tree's
                         // lock either sees this writer or sees the key.
                         txn.note_index_key_removal(table_name);
-                        if let Err(e) = self.storage.art_indexes().on_delete(table_name, *row_id, &col_values) {
+                        if let Err(e) = self.remove_index_entries_held(txn, table_name, *row_id, &col_values) {
                             tracing::debug!("ART index delete for table '{}': {}", table_name, e);
                         }
                         self.push_art_undo(
@@ -11671,7 +12276,7 @@ impl EmbeddedDatabase {
                     // R5.V1: eagerly drop the row from HNSW vector indexes
                     // (undo on rollback)
                     if self.vector_dml_gate(table_name) {
-                        let vops = self.storage.vector_indexes().on_row_delete(
+                        let vops = self.storage.vector_indexes().on_row_delete_staged(
                             table_name,
                             *row_id,
                             Some(&schema_arc),
@@ -11681,6 +12286,7 @@ impl EmbeddedDatabase {
                     }
                 }
 
+                self.apply_fk_parent_deletes(txn, table_name, &schema_arc, &deleted_tuples)?;
                 let _ = returned_tuples; // RETURNING clause results handled separately
 
                 Ok(delete_count)
@@ -11763,62 +12369,10 @@ impl EmbeddedDatabase {
                 column_name,
                 storage_mode,
             } => {
-                // ALTER TABLE t ALTER COLUMN c SET STORAGE mode
-                // Migrates existing data to the new storage format online
-
-                let catalog = self.storage.catalog();
-                let mut schema = catalog.get_table_schema(table_name)?;
-
-                // Find column index
-                let col_idx = schema
-                    .columns
-                    .iter()
-                    .position(|c| c.name == *column_name)
-                    .ok_or_else(|| {
-                        Error::query_execution(format!("Column '{}' not found in table '{}'", column_name, table_name))
-                    })?;
-
-                let col_ref = schema
-                    .get_column_at(col_idx)
-                    .ok_or_else(|| Error::internal("column index out of bounds"))?;
-                let old_mode = col_ref.storage_mode;
-                if old_mode == *storage_mode {
-                    // No change needed
-                    return Ok(0);
-                }
-                Self::refuse_ddl_over_staged_rows(Some(txn), "ALTER TABLE … SET STORAGE", table_name)?;
-
-                // Migrate existing data online
-                let column = col_ref.clone();
-                let rows_migrated =
-                    self.storage
-                        .migrate_column_storage(table_name, col_idx, &column, old_mode, *storage_mode)?;
-
-                // Update schema with new storage mode
-                schema
-                    .get_column_at_mut(col_idx)
-                    .ok_or_else(|| Error::internal("column index out of bounds"))?
-                    .storage_mode = *storage_mode;
-                catalog.update_table_schema(table_name, &schema)?;
-
-                // Log to WAL for replication
-                if let Err(e) = self
-                    .storage
-                    .log_alter_column_storage(table_name, column_name, storage_mode)
-                {
-                    tracing::warn!("Failed to log ALTER COLUMN STORAGE to WAL: {}", e);
-                }
-
-                tracing::info!(
-                    "Altered {}.{} storage from {:?} to {:?}, migrated {} rows",
-                    table_name,
-                    column_name,
-                    old_mode,
-                    storage_mode,
-                    rows_migrated
-                );
-
-                Ok(rows_migrated as u64)
+                // ALTER TABLE t ALTER COLUMN c SET STORAGE mode: every row's value moved
+                // to the new representation with the schema, in ONE write group (spec
+                // R5.5, `alter_column_storage`).
+                self.alter_column_storage(table_name, column_name, *storage_mode, Some(txn))
             }
             // TEXT family. The three column-shape arms used to be a verbatim
             // COPY of the bodies in `execute_alter_table_op` (which is what the
@@ -11828,58 +12382,28 @@ impl EmbeddedDatabase {
             // `db.execute()` and the PG extended protocol disagreeing about
             // whether a renamed column's UNIQUE is still enforced. One body each,
             // reached from both families.
-            sql::LogicalPlan::AlterTableAddColumn {
-                table_name,
-                column_def,
-                if_not_exists,
-            } => self.alter_table_add_column(table_name, column_def, *if_not_exists, Some(txn)),
-            sql::LogicalPlan::AlterTableDropColumn {
-                table_name,
-                column_name,
-                if_exists,
-                cascade,
-            } => self.alter_table_drop_column(table_name, column_name, *if_exists, *cascade, Some(txn)),
-            sql::LogicalPlan::AlterTableRenameColumn {
-                table_name,
-                old_column_name,
-                new_column_name,
-            } => self.alter_table_rename_column(table_name, old_column_name, new_column_name),
-            sql::LogicalPlan::AlterTableAlterColumnNullability {
-                table_name,
-                column_name,
-                nullable,
-            } => self.alter_table_set_column_nullability(table_name, column_name, *nullable),
+            //
+            // Spec R5.5: every clause of an ALTER TABLE — one, or several in a comma
+            // list (`AlterTableMulti`, below) — runs through `execute_alter_statement`,
+            // as ONE write group.
+            sql::LogicalPlan::AlterTableAddColumn { .. }
+            | sql::LogicalPlan::AlterTableDropColumn { .. }
+            | sql::LogicalPlan::AlterTableRenameColumn { .. }
+            | sql::LogicalPlan::AlterTableAlterColumnNullability { .. } => {
+                self.execute_alter_statement(std::slice::from_ref(&plan), Some(txn))
+            }
             sql::LogicalPlan::AlterTableRename {
                 table_name,
                 new_table_name,
-            } => {
-                let catalog = self.storage.catalog();
-                Self::refuse_ddl_over_staged_rows(Some(txn), "ALTER TABLE … RENAME TO", table_name)?;
-
-                // Check if new table name already exists, durably (R5 decision 11):
-                // this statement holds both names, and a cache is not the store.
-                if catalog.main_table_exists(new_table_name)?
-                    || self.storage.mv_catalog().view_exists(new_table_name)?
-                {
-                    return Err(Error::query_execution(format!(
-                        "Table '{}' already exists",
-                        new_table_name
-                    )));
-                }
-
-                // Rename table
-                self.storage.rename_table(table_name, new_table_name)?;
-
-                tracing::info!("Renamed table '{}' to '{}'", table_name, new_table_name);
-
-                Ok(0)
-            }
+            } => self.alter_table_rename_to(table_name, new_table_name, Some(txn)),
             sql::LogicalPlan::AlterTableSetSchema {
                 table_name,
                 new_schema,
                 if_exists,
             } => self.alter_table_set_schema(table_name, new_schema, *if_exists),
-            sql::LogicalPlan::AlterTableAddForeignKey { .. } => self.alter_table_add_foreign_key(&plan),
+            sql::LogicalPlan::AlterTableAddForeignKey { .. } => {
+                self.execute_alter_statement(std::slice::from_ref(&plan), Some(txn))
+            }
             sql::LogicalPlan::AlterTableAlterConstraintEnforcement {
                 table_name,
                 constraint_name,
@@ -11903,29 +12427,15 @@ impl EmbeddedDatabase {
                 catalog.save_table_constraints(table_name, &constraints)?;
                 Ok(0)
             }
-            // Every constraint arm delegates to ONE shared body each, so the
-            // params family (which routes the same plans through
+            // Every constraint arm delegates to ONE shared body, so the params
+            // family (which routes the same plans through
             // `execute_plan_with_params_inner`) runs identical code.
-            sql::LogicalPlan::AlterTableAddUnique {
-                table_name,
-                constraint_name,
-                columns,
-            } => self.alter_table_add_unique(table_name, constraint_name, columns),
-            sql::LogicalPlan::AlterTableAddPrimaryKey {
-                table_name,
-                constraint_name,
-                columns,
-            } => self.alter_table_add_primary_key(table_name, constraint_name, columns),
-            sql::LogicalPlan::AlterTableAddCheck {
-                table_name,
-                constraint_name,
-                expression,
-            } => self.alter_table_add_check(table_name, constraint_name, expression),
-            sql::LogicalPlan::AlterTableDropConstraint {
-                table_name,
-                constraint_name,
-                if_exists,
-            } => self.alter_table_drop_constraint(table_name, constraint_name, *if_exists),
+            sql::LogicalPlan::AlterTableAddUnique { .. }
+            | sql::LogicalPlan::AlterTableAddPrimaryKey { .. }
+            | sql::LogicalPlan::AlterTableAddCheck { .. }
+            | sql::LogicalPlan::AlterTableDropConstraint { .. } => {
+                self.execute_alter_statement(std::slice::from_ref(&plan), Some(txn))
+            }
             sql::LogicalPlan::AlterTableMulti { operations } => self.execute_alter_table_multi(operations, Some(txn)),
             // sprinter 37a5968e7698: the savepoint family, resolved against THIS
             // transaction's own stack (`txn`), which is the transaction the
@@ -12147,30 +12657,48 @@ impl EmbeddedDatabase {
             lock_manager,
             dirty_tracker,
             session_transactions: std::sync::Arc::new(dashmap::DashMap::new()),
-            prepared_statements: std::sync::Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
-            prepared_statement_sql: std::sync::Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
-            prepared_fast_selects: std::sync::Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
+            prepared_statements: std::sync::Arc::new(parking_lot::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
+            prepared_statement_sql: std::sync::Arc::new(parking_lot::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
+            prepared_fast_selects: std::sync::Arc::new(parking_lot::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
             session_settings: sql::SessionSettings::new(),
             current_schema: std::sync::Arc::new(parking_lot::RwLock::new(None)),
             search_path: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
             current_schema_set: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            embedded_scoped: crate::session::scoped::SessionScopedState::new_for_engine(engine_instance),
-            any_session_schema_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            plan_cache: std::sync::Arc::new(
-                sharded_lru::ShardedLruCache::new(std::num::NonZeroUsize::new(256).expect("256 is non-zero"))
-                    .with_site(lock_census::Site::PlanCache),
+            embedded_scoped: crate::session::scoped::SessionScopedState::new_for_engine(
+                engine_instance,
             ),
+            any_session_schema_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            )),
+            plan_cache: std::sync::Arc::new(PlanCache::new(
+                sharded_lru::ShardedLruCache::new(
+                    std::num::NonZeroUsize::new(256).expect("256 is non-zero"),
+                )
+                .with_site(lock_census::Site::PlanCache),
+            )),
             parse_cache: std::sync::Arc::new(
-                sharded_lru::ShardedLruCache::new(std::num::NonZeroUsize::new(512).expect("512 is non-zero"))
-                    .with_site(lock_census::Site::ParseCache),
+                sharded_lru::ShardedLruCache::new(
+                    std::num::NonZeroUsize::new(512).expect("512 is non-zero"),
+                )
+                .with_site(lock_census::Site::ParseCache),
             ),
             result_cache: std::sync::Arc::new(
-                sharded_lru::ShardedLruCache::new(std::num::NonZeroUsize::new(128).expect("128 is non-zero"))
-                    .with_site(lock_census::Site::ResultCache),
+                sharded_lru::ShardedLruCache::new(
+                    std::num::NonZeroUsize::new(128).expect("128 is non-zero"),
+                )
+                .with_site(lock_census::Site::ResultCache),
             ),
             result_cache_nonempty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             result_cache_epoch: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            seen_schema_generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(initial_schema_generation)),
+            seen_schema_generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+                initial_schema_generation,
+            )),
             hot_result_cache_entry: std::sync::Arc::new(parking_lot::RwLock::new(None)),
             last_fast_select_fingerprint: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             cache_admission: new_cache_admission(),
@@ -12191,10 +12719,16 @@ impl EmbeddedDatabase {
             open_raii_txns: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             session_txn_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             session_notices: std::sync::Arc::new(dashmap::DashMap::new()),
-            fk_validation_mode: std::sync::Arc::new(parking_lot::RwLock::new(FkValidationMode::Enforced)),
-            fk_validation_source: std::sync::Arc::new(parking_lot::RwLock::new(FkValidationSource::Engine)),
+            fk_validation_mode: std::sync::Arc::new(parking_lot::RwLock::new(
+                FkValidationMode::Enforced,
+            )),
+            fk_validation_source: std::sync::Arc::new(parking_lot::RwLock::new(
+                FkValidationSource::Engine,
+            )),
             deferred_fk_checks: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
-            constraints_all_deferred: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            constraints_all_deferred: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            )),
             cold_optimizer: std::sync::OnceLock::new(),
             udf_bridge: std::sync::OnceLock::new(),
         }
@@ -12281,30 +12815,48 @@ impl EmbeddedDatabase {
             lock_manager,
             dirty_tracker,
             session_transactions: std::sync::Arc::new(dashmap::DashMap::new()),
-            prepared_statements: std::sync::Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
-            prepared_statement_sql: std::sync::Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
-            prepared_fast_selects: std::sync::Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
+            prepared_statements: std::sync::Arc::new(parking_lot::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
+            prepared_statement_sql: std::sync::Arc::new(parking_lot::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
+            prepared_fast_selects: std::sync::Arc::new(parking_lot::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
             session_settings: sql::SessionSettings::new(),
             current_schema: std::sync::Arc::new(parking_lot::RwLock::new(None)),
             search_path: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
             current_schema_set: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            embedded_scoped: crate::session::scoped::SessionScopedState::new_for_engine(engine_instance),
-            any_session_schema_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            plan_cache: std::sync::Arc::new(
-                sharded_lru::ShardedLruCache::new(std::num::NonZeroUsize::new(256).expect("256 is non-zero"))
-                    .with_site(lock_census::Site::PlanCache),
+            embedded_scoped: crate::session::scoped::SessionScopedState::new_for_engine(
+                engine_instance,
             ),
+            any_session_schema_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            )),
+            plan_cache: std::sync::Arc::new(PlanCache::new(
+                sharded_lru::ShardedLruCache::new(
+                    std::num::NonZeroUsize::new(256).expect("256 is non-zero"),
+                )
+                .with_site(lock_census::Site::PlanCache),
+            )),
             parse_cache: std::sync::Arc::new(
-                sharded_lru::ShardedLruCache::new(std::num::NonZeroUsize::new(512).expect("512 is non-zero"))
-                    .with_site(lock_census::Site::ParseCache),
+                sharded_lru::ShardedLruCache::new(
+                    std::num::NonZeroUsize::new(512).expect("512 is non-zero"),
+                )
+                .with_site(lock_census::Site::ParseCache),
             ),
             result_cache: std::sync::Arc::new(
-                sharded_lru::ShardedLruCache::new(std::num::NonZeroUsize::new(128).expect("128 is non-zero"))
-                    .with_site(lock_census::Site::ResultCache),
+                sharded_lru::ShardedLruCache::new(
+                    std::num::NonZeroUsize::new(128).expect("128 is non-zero"),
+                )
+                .with_site(lock_census::Site::ResultCache),
             ),
             result_cache_nonempty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             result_cache_epoch: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            seen_schema_generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(initial_schema_generation)),
+            seen_schema_generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+                initial_schema_generation,
+            )),
             hot_result_cache_entry: std::sync::Arc::new(parking_lot::RwLock::new(None)),
             last_fast_select_fingerprint: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             cache_admission: new_cache_admission(),
@@ -12325,10 +12877,16 @@ impl EmbeddedDatabase {
             open_raii_txns: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             session_txn_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             session_notices: std::sync::Arc::new(dashmap::DashMap::new()),
-            fk_validation_mode: std::sync::Arc::new(parking_lot::RwLock::new(FkValidationMode::Enforced)),
-            fk_validation_source: std::sync::Arc::new(parking_lot::RwLock::new(FkValidationSource::Engine)),
+            fk_validation_mode: std::sync::Arc::new(parking_lot::RwLock::new(
+                FkValidationMode::Enforced,
+            )),
+            fk_validation_source: std::sync::Arc::new(parking_lot::RwLock::new(
+                FkValidationSource::Engine,
+            )),
             deferred_fk_checks: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
-            constraints_all_deferred: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            constraints_all_deferred: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            )),
             cold_optimizer: std::sync::OnceLock::new(),
             udf_bridge: std::sync::OnceLock::new(),
         }
@@ -12587,10 +13145,10 @@ impl EmbeddedDatabase {
             current_schema_set: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             embedded_scoped: crate::session::scoped::SessionScopedState::new_for_engine(engine_instance),
             any_session_schema_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            plan_cache: std::sync::Arc::new(
+            plan_cache: std::sync::Arc::new(PlanCache::new(
                 sharded_lru::ShardedLruCache::new(std::num::NonZeroUsize::new(256).expect("256 is non-zero"))
                     .with_site(lock_census::Site::PlanCache),
-            ),
+            )),
             parse_cache: std::sync::Arc::new(
                 sharded_lru::ShardedLruCache::new(std::num::NonZeroUsize::new(512).expect("512 is non-zero"))
                     .with_site(lock_census::Site::ParseCache),
@@ -12823,8 +13381,9 @@ impl EmbeddedDatabase {
             let _ = txn.rollback();
             return Err(e);
         }
-        txn.commit()?;
-        let _ = self.take_raii_art_undo(undo_txn_id);
+        let committed = self.commit_owned_statement(txn, undo_txn_id);
+        self.deferred_fk_checks.lock().clear();
+        committed?;
         self.deferred_fk_checks.lock().clear();
         self.invalidate_result_cache();
         self.storage.increment_lsn();
@@ -13401,7 +13960,7 @@ impl EmbeddedDatabase {
 
     pub fn execute(&self, sql: &str) -> Result<u64> {
         // sprinter ccebc95977f1: off the async worker serving the client (`runtime_offload`).
-        offload_statement(|| self.execute_body(sql))
+        offload_statement(|| self.run_layout_statement(self.in_transaction(), || self.execute_body(sql)))
     }
 
     /// The body of [`Self::execute`], which runs it through
@@ -13891,20 +14450,19 @@ impl EmbeddedDatabase {
                 match self.insert_validated_tuples_in_transaction(&spec.table_name, tuples, &spec.schema, &txn) {
                     Ok(inserted) => inserted,
                     Err(e) => {
-                        let _ = txn.rollback();
                         self.rollback_art_undo_for(undo_txn_id);
+                        let _ = txn.rollback();
                         self.deferred_fk_checks.lock().clear();
                         return Some(Err(e));
                     }
                 };
             if let Err(e) = self.validate_deferred_fk_checks(Some(&txn)) {
-                let _ = txn.rollback();
                 self.rollback_art_undo_for(undo_txn_id);
+                let _ = txn.rollback();
                 self.deferred_fk_checks.lock().clear();
                 return Some(Err(e));
             }
-            if let Err(e) = txn.commit() {
-                self.rollback_art_undo_for(undo_txn_id);
+            if let Err(e) = self.commit_owned_statement(txn, undo_txn_id) {
                 self.deferred_fk_checks.lock().clear();
                 return Some(Err(e));
             }
@@ -14203,7 +14761,7 @@ impl EmbeddedDatabase {
         // ENFORCED FKs are simply skipped downstream, matching the slow path,
         // so they stay eligible).
         constraints.foreign_keys.iter().all(|fk| {
-            !(fk.deferrable && fk.initially_deferred)
+            !fk.deferrable
                 && !matches!(
                     fk.enforcement,
                     sql::ConstraintEnforcement::Deferred | sql::ConstraintEnforcement::LockFree
@@ -15976,9 +16534,9 @@ impl EmbeddedDatabase {
         // releases them, while the eager ART entries are put back only by the
         // undo replay after it — so each ending takes a standalone hold first
         // and drops it after the replay (the session COMMIT's
-        // `write_census_hold` pattern). A failed commit applied nothing, so it
-        // replays the undo like a rollback (it used to discard it, leaving the
-        // statement's index changes behind).
+        // `write_census_hold` pattern). A proven pre-write refusal
+        // replays undo before releasing the owning transaction; applied errors
+        // retain committed keys and ambiguous native results fence the table.
         let census_hold = txn.write_census_hold();
         // Spec R5.4: and its row locks, so no writer of those rows goes ahead of
         // the index undo.
@@ -15987,8 +16545,8 @@ impl EmbeddedDatabase {
             Ok(count) => {
                 let commit_start = std::time::Instant::now();
                 if let Err(e) = self.validate_deferred_fk_checks(Some(&txn)) {
-                    let _ = txn.rollback();
                     self.rollback_art_undo_for(undo_txn_id);
+                    let _ = txn.rollback();
                     drop(census_hold);
                     drop(row_hold);
                     // The queued deferred checks belong to THIS (now rolled back)
@@ -15999,8 +16557,7 @@ impl EmbeddedDatabase {
                     self.deferred_fk_checks.lock().clear();
                     return Err(e);
                 }
-                if let Err(e) = txn.commit() {
-                    self.rollback_art_undo_for(undo_txn_id);
+                if let Err(e) = self.commit_owned_statement(txn, undo_txn_id) {
                     drop(census_hold);
                     drop(row_hold);
                     self.deferred_fk_checks.lock().clear();
@@ -16021,8 +16578,8 @@ impl EmbeddedDatabase {
                 Ok(count)
             }
             Err(e) => {
-                let _ = txn.rollback(); // Ignore rollback errors
                 self.rollback_art_undo_for(undo_txn_id);
+                let _ = txn.rollback(); // Ignore rollback errors
                 drop(census_hold);
                 drop(row_hold);
                 self.deferred_fk_checks.lock().clear();
@@ -16035,12 +16592,19 @@ impl EmbeddedDatabase {
     /// read before the planning, unless a schema statement moved it since: a reader
     /// that planned before a DROP and admitted after it would keep serving the dropped
     /// table. Looked at again after the insert, for a statement that cleared the cache
-    /// in between.
-    fn plan_cache_put_if_current(&self, key: String, plan: std::sync::Arc<sql::LogicalPlan>, generation: u64) {
-        if self.storage.schema_generation() != generation {
+    /// in between. Spec R5.6: `layout` is what the planning recorded, and the cache
+    /// serves the plan only while it is current ([`PlanCache`]).
+    fn plan_cache_put_if_current(
+        &self,
+        key: String,
+        plan: std::sync::Arc<sql::LogicalPlan>,
+        generation: u64,
+        layout: storage::LayoutStamp,
+    ) {
+        if self.storage.schema_generation() != generation || !layout.is_current() {
             return;
         }
-        self.plan_cache.put(key, plan);
+        self.plan_cache.put(key, plan, layout);
         if self.storage.schema_generation() != generation {
             self.plan_cache.clear();
         }
@@ -16137,37 +16701,6 @@ impl EmbeddedDatabase {
         }
     }
 
-    fn alter_table_set_column_nullability(&self, table_name: &str, column_name: &str, nullable: bool) -> Result<u64> {
-        let catalog = self.storage.catalog();
-        let mut schema = catalog.get_table_schema(table_name)?;
-        let col_idx = schema
-            .columns
-            .iter()
-            .position(|c| c.name == column_name)
-            .ok_or_else(|| {
-                Error::query_execution(format!(
-                    "Column '{}' does not exist in table '{}'",
-                    column_name, table_name
-                ))
-            })?;
-
-        let column = schema
-            .get_column_at_mut(col_idx)
-            .ok_or_else(|| Error::internal("column index out of bounds"))?;
-        if nullable && column.primary_key {
-            return Err(Error::query_execution(format!(
-                "Cannot drop NOT NULL from primary key column '{}'",
-                column_name
-            )));
-        }
-        if column.nullable == nullable {
-            return Ok(0);
-        }
-        column.nullable = nullable;
-        catalog.update_table_schema(table_name, &schema)?;
-        Ok(0)
-    }
-
     /// `ALTER TABLE [IF EXISTS] <name> SET SCHEMA <new_schema>` — move a table
     /// (or regular view) into another schema. Schema namespacing keys a table
     /// as `schema.table` (bare for `public`), so a schema move is a rename of
@@ -16256,418 +16789,31 @@ impl EmbeddedDatabase {
         Ok(0)
     }
 
-    /// `ALTER TABLE <t> ADD [CONSTRAINT <name>] UNIQUE (<cols>)`.
-    ///
-    /// ONE implementation, called by BOTH executor families (the text family's
-    /// `execute_in_transaction_inner` arm and the params family's
-    /// `execute_plan_with_params_inner` arm), so `db.execute()` and
-    /// `db.execute_params()` / the PG extended protocol cannot diverge on it.
-    ///
-    /// Order is load-bearing and matches PostgreSQL: the index is built and
-    /// BACKFILLED from the existing rows FIRST, and only if that succeeds is the
-    /// constraint recorded. A table that already holds duplicates therefore ends
-    /// with NO index and NO constraint record (23505), instead of a constraint
-    /// that claims to hold over data violating it.
-    ///
-    /// Durability comes from the constraint record: `Catalog::rebuild_all_indexes`
-    /// re-registers (and re-backfills) every table-level unique constraint at
-    /// open through `register_unique_constraint_indexes`, exactly as it does for
-    /// the composite constraints from v4.25.0.
+    /// `ALTER TABLE <t> ADD [CONSTRAINT <name>] UNIQUE (<cols>)` as a statement of its
+    /// own, for the dump's restore (both executor families reach the same body
+    /// through [`Self::execute_alter_statement`]): the index built and BACKFILLED
+    /// from the existing rows first, the constraint recorded only if that succeeds,
+    /// one write group (spec R5.5).
     fn alter_table_add_unique(
         &self,
         table_name: &str,
         constraint_name: &Option<String>,
         columns: &[String],
     ) -> Result<u64> {
-        if self.storage.is_branch_active() {
-            // Same rule as CREATE INDEX: index state lives on main, and a
-            // branch is supposed to be discardable.
-            return Err(Error::query_execution(
-                "ALTER TABLE … ADD CONSTRAINT … UNIQUE must run on the main branch",
-            ));
-        }
-        let catalog = self.storage.catalog();
-        let schema = catalog.get_table_schema(table_name)?;
-
-        // Resolve every named column to the catalog's own spelling: the ART
-        // index resolves its columns through `schema.get_column_index`, so a
-        // constraint recorded under a differently-cased name would build an
-        // index that silently never matches a row.
-        let mut resolved: Vec<String> = Vec::with_capacity(columns.len());
-        for col in columns {
-            let found = schema
-                .columns
-                .iter()
-                .find(|c| c.name.eq_ignore_ascii_case(col))
-                .ok_or_else(|| {
-                    Error::query_execution(format!(
-                        "column \"{}\" named in key does not exist in table \"{}\"",
-                        col, table_name
-                    ))
-                })?;
-            if resolved.iter().any(|c| c.eq_ignore_ascii_case(&found.name)) {
-                return Err(Error::query_execution(format!(
-                    "column \"{}\" appears twice in unique constraint",
-                    found.name
-                )));
-            }
-            resolved.push(found.name.clone());
-        }
-
-        let name = constraint_name
-            .clone()
-            .unwrap_or_else(|| format!("{}_{}_key", table_name, resolved.join("_")));
-
-        let mut constraints = catalog.load_table_constraints(table_name)?;
-        if constraints
-            .unique_constraints
-            .iter()
-            .any(|uc| uc.name.eq_ignore_ascii_case(&name))
-            || constraints
-                .foreign_keys
-                .iter()
-                .any(|fk| fk.name.eq_ignore_ascii_case(&name))
-            || constraints
-                .check_constraints
-                .iter()
-                .any(|ck| ck.name.eq_ignore_ascii_case(&name))
-        {
-            return Err(Error::query_execution(format!(
-                "constraint \"{}\" for relation \"{}\" already exists",
-                name, table_name
-            )));
-        }
-
-        let art = self.storage.art_indexes();
-        // Spec R5.3: the constraint record and its WAL entry are ONE write group, and
-        // the index that enforces it is registered HIDDEN (writers maintain it, the
-        // read path's index choice skips it) until that group is written: a reader
-        // never takes it while its backfill runs, and a statement that fails leaves
-        // neither.
-        let mut ddl = storage::DdlBatch::new(&self.storage);
-        // A column set already backed by a CONSTRAINT-OWNED PK/UNIQUE index (an
-        // inline UNIQUE, or a constraint added earlier) is already enforced;
-        // record the new constraint but do not register a second index for the
-        // same rule — `register_unique_constraint_indexes` applies the SAME
-        // test at open, so DDL and reopen build the same set. A user
-        // `CREATE UNIQUE INDEX` over the same columns does NOT count: a
-        // constraint riding on it would be unenforced the moment the user ran
-        // `DROP INDEX` (which `handle_drop_index` allows for a recorded name),
-        // so the constraint gets a tree of its own.
-        if !catalog.constraint_owned_unique_index_on(table_name, &resolved)? {
-            // The registry key is MINTED from (table, columns) and the user's
-            // constraint name rides along as a LABEL; `indexes` is one
-            // database-global map, while a constraint name is per-table.
-            //
-            // THE RETURNED NAME IS LOAD-BEARING. `backfill_unique_index` and
-            // the rollback `drop_index` below must both address the index that
-            // was actually registered: passing `name` after the key is minted
-            // would silently target a nonexistent index, leaving an EMPTY
-            // unique index over a table that may already hold duplicates — a
-            // brand-new fail-open.
-            let index_name = art
-                .create_constraint_unique_index_hidden(table_name, &resolved, Some(&name))
-                .map_err(|e| {
-                    Error::query_execution(format!("could not create unique constraint \"{}\": {}", name, e))
-                })?;
-            {
-                let shown = std::sync::Arc::clone(art);
-                let hidden = index_name.clone();
-                ddl.on_commit(move || shown.reveal_index(&hidden));
-                let dropped = std::sync::Arc::clone(art);
-                let unwritten = index_name.clone();
-                ddl.on_abort(move || {
-                    let _ = dropped.drop_index(&unwritten);
-                    dropped.reveal_index(&unwritten);
-                });
-            }
-            let tuples = self.storage.scan_table_with_schema(table_name, &schema)?;
-            if let Err(e) = art.backfill_unique_index(&index_name, &schema, &tuples) {
-                // The batch is dropped unwritten: its undo drops the index.
-                return Err(Error::constraint_violation(format!(
-                    "could not create unique constraint \"{}\" on relation \"{}\": {}",
-                    name, table_name, e
-                )));
-            }
-        }
-
-        constraints.add_unique(sql::UniqueConstraint::new(
-            name.clone(),
-            table_name.to_string(),
-            resolved.clone(),
-            false,
-        ));
-        catalog.stage_table_constraints(table_name, &constraints, &mut ddl)?;
-        ddl.commit()?.wait_replicated();
-        tracing::info!(
-            "Added UNIQUE constraint '{}' on {}({})",
-            name,
-            table_name,
-            resolved.join(", ")
-        );
-        Ok(0)
-    }
-
-    /// `ALTER TABLE <t> ADD [CONSTRAINT <name>] FOREIGN KEY … REFERENCES …`.
-    ///
-    /// Extracted from the text family's arm (unchanged apart from the DDL-time
-    /// target validation) so the params family can call the SAME body.
-    fn alter_table_add_foreign_key(&self, plan: &sql::LogicalPlan) -> Result<u64> {
-        let sql::LogicalPlan::AlterTableAddForeignKey {
-            table_name,
-            constraint_name,
-            columns,
-            references_table,
-            references_columns,
-            on_delete,
-            on_update,
-            deferrable,
-            initially_deferred,
-            enforcement,
-        } = plan
-        else {
-            return Err(Error::internal("alter_table_add_foreign_key called with another plan"));
+        let clause = sql::LogicalPlan::AlterTableAddUnique {
+            table_name: table_name.to_string(),
+            constraint_name: constraint_name.clone(),
+            columns: columns.to_vec(),
         };
-        // Validate the child table exists, and that the parent table AND the
-        // referenced columns do too (42P01 / 42703 — see
-        // `validate_fk_reference`; the bare `get_table_schema` here checked the
-        // parent TABLE but never its COLUMNS, so `REFERENCES parent(no_such_col)`
-        // was accepted and enforced nothing).
-        let catalog = self.storage.catalog();
-        let child_schema = catalog.get_table_schema(table_name)?;
-        Self::validate_fk_reference(&catalog, references_table, columns, references_columns)?;
-        // sprinter ad6a982e16d5: the REFERENCING (child) columns, checked
-        // against the child's own schema. The parent side has been validated
-        // since GH#27; this side never was, so `ALTER TABLE c ADD FOREIGN KEY
-        // (nosuch) REFERENCES p(id)` was accepted and persisted a constraint
-        // that enforces nothing (the write path resolves the referencing
-        // column by name and finds none). PostgreSQL's message and SQLSTATE
-        // (42703), the same one the referenced side reports.
-        //
-        // AFTER `validate_fk_reference`, so a statement wrong on both sides
-        // keeps GH#27's parent-first ordering. Note the ADD COLUMN shorthand
-        // (`ADD COLUMN p INT REFERENCES parent(id)`, planned as `[AddColumn,
-        // AddForeignKey]`) is safe: the sub-plans run in order, so the column
-        // exists in `child_schema` by the time this runs. That is also why
-        // `execute_alter_table_multi`'s pre-pass stays PARENT-side only.
-        for col in columns {
-            if !child_schema.columns.iter().any(|c| c.name.eq_ignore_ascii_case(col)) {
-                return Err(Self::fk_column_does_not_exist(col));
-            }
-        }
-        // sprinter 7a0a2ba2c8c3: an EXPLICIT constraint name must not collide
-        // with a constraint the table already has. PostgreSQL keeps ONE
-        // namespace per relation for FK / CHECK / UNIQUE / PRIMARY KEY names
-        // and reports `constraint "x" for relation "t" already exists` (42710
-        // duplicate_object); this accepted the duplicate and appended a second
-        // constraint under the same name, after which `ALTER TABLE … DROP
-        // CONSTRAINT x` (which matches by name) removed BOTH, and
-        // `information_schema.table_constraints` listed one name twice.
-        //
-        // Only an explicit name is checked. An OMITTED name is minted by
-        // `generate_unique_name` below, which already dedups against the FKs
-        // on this table.
-        if let Some(name) = constraint_name {
-            let existing = catalog.load_table_constraints(table_name)?;
-            let collides = existing
-                .foreign_keys
-                .iter()
-                .map(|c| c.name.as_str())
-                .chain(existing.check_constraints.iter().map(|c| c.name.as_str()))
-                .chain(existing.unique_constraints.iter().map(|c| c.name.as_str()))
-                // Case-insensitive, like `alter_table_drop_constraint`'s
-                // lookup: a name that DROP CONSTRAINT would match is a name
-                // this table already has.
-                .any(|existing_name| existing_name.eq_ignore_ascii_case(name));
-            if collides {
-                return Err(Error::query_execution(format!(
-                    "constraint \"{}\" for relation \"{}\" already exists",
-                    name, table_name
-                )));
-            }
-        }
-
-        let fk_name = constraint_name.clone().unwrap_or_else(|| {
-            // Dedup the auto-name against the FKs already on this table:
-            // the schema no longer disambiguates the generated name, so
-            // two FKs to like-named tables in different schemas would
-            // otherwise collide (see `generate_unique_name`).
-            let existing_fk_names: Vec<String> = catalog
-                .load_table_constraints(table_name)
-                .map(|c| c.foreign_keys.into_iter().map(|f| f.name).collect())
-                .unwrap_or_default();
-            sql::ForeignKeyConstraint::generate_unique_name(table_name, columns, references_table, &existing_fk_names)
-        });
-        // `REFERENCES parent` without a column list binds to the
-        // parent's PRIMARY KEY (PostgreSQL parity); resolve it against
-        // the already-resolved `references_table` key so enforcement
-        // probes the right columns. See `resolve_fk_referenced_columns`
-        // (validated above, so it cannot fail here).
-        let references_columns = Self::resolve_fk_referenced_columns(&catalog, references_table, references_columns)?;
-        let mut fk = sql::ForeignKeyConstraint::new(
-            fk_name,
-            table_name.clone(),
-            columns.clone(),
-            references_table.clone(),
-            references_columns,
-        );
-        if let Some(action) = on_delete {
-            fk = fk.on_delete(convert_logical_referential_action(action));
-        }
-        if let Some(action) = on_update {
-            fk = fk.on_update(convert_logical_referential_action(action));
-        }
-        if *deferrable {
-            fk = fk.deferrable(*initially_deferred);
-        }
-        fk = fk.with_enforcement(*enforcement);
-        catalog.add_foreign_key(fk)?;
-        Ok(0)
+        self.execute_alter_statement(std::slice::from_ref(&clause), None)
     }
 
-    /// `ALTER TABLE <t> DROP CONSTRAINT [IF EXISTS] <name>` — extracted from the
-    /// text family's arm so the params family can call the SAME body (see
-    /// `alter_table_add_unique` for why that matters: `ADD CONSTRAINT` and
-    /// `DROP CONSTRAINT` are a pair, and a family that can add but not drop is
-    /// worse than one that can do neither).
-    fn alter_table_drop_constraint(&self, table_name: &str, constraint_name: &str, if_exists: bool) -> Result<u64> {
-        let catalog = self.storage.catalog();
-        // Surface a clear error if the table itself is missing.
-        catalog.get_table_schema(table_name)?;
-        let mut constraints = catalog.load_table_constraints(table_name)?;
-        let before =
-            constraints.foreign_keys.len() + constraints.check_constraints.len() + constraints.unique_constraints.len();
-        // DROP CONSTRAINT names a single object; match it across FK,
-        // UNIQUE/PK, and CHECK by name (case-insensitive, PG-style).
-        constraints
-            .foreign_keys
-            .retain(|c| !c.name.eq_ignore_ascii_case(constraint_name));
-        constraints
-            .check_constraints
-            .retain(|c| !c.name.eq_ignore_ascii_case(constraint_name));
-        // Keep the removed UNIQUE constraints: their ART index has to go
-        // too. The index — not the constraint record — is what the write
-        // path probes, so leaving it registered means DROP CONSTRAINT
-        // reports success while the constraint keeps rejecting rows.
-        // This arm never dropped it (it reimplements the removal inline
-        // rather than calling `Catalog::drop_constraint`, whose
-        // index-dropping half consequently had no caller from SQL), so a
-        // dropped UNIQUE went on being enforced forever.
-        let removed_uniques: Vec<sql::UniqueConstraint> = constraints
-            .unique_constraints
-            .iter()
-            .filter(|c| c.name.eq_ignore_ascii_case(constraint_name))
-            .cloned()
-            .collect();
-        constraints
-            .unique_constraints
-            .retain(|c| !c.name.eq_ignore_ascii_case(constraint_name));
-        let after =
-            constraints.foreign_keys.len() + constraints.check_constraints.len() + constraints.unique_constraints.len();
-        if before == after {
-            // Nothing matched. IF EXISTS makes this a no-op (the shape
-            // a2h emits before a fresh load, where no FK exists yet);
-            // otherwise it is an error like PostgreSQL.
-            if if_exists {
-                return Ok(0);
-            }
-            return Err(Error::query_execution(format!(
-                "constraint \"{}\" of relation \"{}\" does not exist",
-                constraint_name, table_name
-            )));
-        }
-        catalog.save_table_constraints(table_name, &constraints)?;
-        catalog.drop_unique_constraint_indexes(table_name, &removed_uniques);
-        Ok(0)
-    }
-
-    /// `ALTER TABLE <t> ADD [CONSTRAINT <name>] PRIMARY KEY (<cols>)`, reached
-    /// only as the desugaring of `ADD COLUMN <c> … PRIMARY KEY`
-    /// (sprinter 885ffe24eab6).
-    ///
-    /// # What the three cases do, and why
-    ///
-    /// * **Table already has a primary key** → REFUSED, with PostgreSQL's own
-    ///   42P16 wording. Silently setting a second column's `primary_key` flag
-    ///   is not a no-op: `Catalog::rebuild_all_indexes` derives the PK index
-    ///   from EVERY flagged column, so at the next restart the table would come
-    ///   back with a COMPOSITE primary key nobody declared — a different table
-    ///   than the one that was shut down.
-    /// * **Table is not empty** → REFUSED. Every pre-existing row reads the new
-    ///   column's DEFAULT (`Catalog::add_columns`), i.e. NULL when there is none,
-    ///   so each would violate the key immediately; and a non-NULL default makes
-    ///   every row share one value, which violates it just as surely. PostgreSQL
-    ///   rejects both (`column "c" contains null values` /
-    ///   duplicate key), and Nano cannot do the one case PostgreSQL accepts —
-    ///   `ADD COLUMN id SERIAL PRIMARY KEY` — because SERIAL is filled at
-    ///   INSERT time, not by the ALTER.
-    /// * **No PK and no rows** → ACCEPTED, and the enforcing index is
-    ///   registered HERE. The schema flag alone is not enforcement: nothing
-    ///   probes it, so without this the PK would accept duplicates until the
-    ///   next restart re-derived an index from the flag — the "enforced by
-    ///   nothing while the catalog claims it exists" shape of the whole item.
-    ///
-    /// No `TableConstraints` record is written, deliberately: an inline
-    /// `CREATE TABLE t (id INT PRIMARY KEY)` records none either (only
-    /// table-level `PRIMARY KEY (…)` does), and introducing one here would make
-    /// the same declaration show up twice in catalog introspection depending on
-    /// which statement created it.
-    fn alter_table_add_primary_key(
-        &self,
-        table_name: &str,
-        constraint_name: &Option<String>,
-        columns: &[String],
-    ) -> Result<u64> {
-        if self.storage.is_branch_active() {
-            return Err(Error::query_execution(
-                "ALTER TABLE … ADD PRIMARY KEY must run on the main branch",
-            ));
-        }
-        let catalog = self.storage.catalog();
-        let schema = catalog.get_table_schema(table_name)?;
-        let mut resolved: Vec<String> = Vec::with_capacity(columns.len());
-        for col in columns {
-            let found = schema
-                .columns
-                .iter()
-                .find(|c| c.name.eq_ignore_ascii_case(col))
-                .ok_or_else(|| {
-                    Error::query_execution(format!(
-                        "column \"{}\" named in key does not exist in table \"{}\"",
-                        col, table_name
-                    ))
-                })?;
-            resolved.push(found.name.clone());
-        }
-        self.validate_add_primary_key_preconditions(table_name, &resolved)?;
-
-        let art = self.storage.art_indexes();
-        art.create_pk_index(table_name, &resolved).map_err(|e| {
-            Error::query_execution(format!(
-                "could not create the index enforcing PRIMARY KEY on {}({}): {} — \
-                 the constraint would not be enforced",
-                table_name,
-                resolved.join(", "),
-                e
-            ))
-        })?;
-        tracing::info!(
-            "Added PRIMARY KEY{} on {}({})",
-            constraint_name
-                .as_ref()
-                .map(|n| format!(" '{}'", n))
-                .unwrap_or_default(),
-            table_name,
-            resolved.join(", ")
-        );
-        Ok(0)
-    }
-
-    /// The refusal half of [`Self::alter_table_add_primary_key`], split out so
-    /// `execute_alter_table_multi` can run it BEFORE the column is added (GH#27's
-    /// validate-all-first rule: a rejected constraint must not leave the column
-    /// behind). `columns` may name a column that does not exist yet, so this
-    /// deliberately asks nothing about them.
+    /// The refusals of `ADD COLUMN … PRIMARY KEY` (sprinter 885ffe24eab6: a second
+    /// key, and a table with rows, whose every row would read NULL or the same
+    /// DEFAULT in it), asked by `execute_alter_table_multi` before any clause runs.
+    /// `columns` may name a column that does not exist yet, so this deliberately asks
+    /// nothing about them. The statement asks them again against what its earlier
+    /// clauses left (`alter_table::alter_add_primary_key`).
     fn validate_add_primary_key_preconditions(&self, table_name: &str, columns: &[String]) -> Result<()> {
         let catalog = self.storage.catalog();
         let schema = catalog.get_table_schema(table_name)?;
@@ -16697,68 +16843,6 @@ impl EmbeddedDatabase {
             )));
         }
         Ok(())
-    }
-
-    /// `ALTER TABLE <t> ADD [CONSTRAINT <name>] CHECK (<expr>)`, reached only as
-    /// the desugaring of `ADD COLUMN <c> … CHECK (…)` (sprinter 885ffe24eab6).
-    ///
-    /// The expression is stored the way `CREATE TABLE` stores one — a
-    /// serde_json `LogicalExpr`, which is what `parse_check_expression` reads
-    /// back — so a CHECK declared on ADD COLUMN and the identical CHECK
-    /// declared on CREATE TABLE are byte-identical records, enforced by the
-    /// same `validate_check_constraints` on every write path.
-    ///
-    /// Existing rows ARE validated first, as PostgreSQL validates them: the
-    /// constraint is recorded only if the data already satisfies it, so the
-    /// catalog never claims a rule the table violates. (On the ADD COLUMN path
-    /// the new column reads NULL in every existing row, and SQL's three-valued
-    /// logic makes an unknown CHECK pass — the same answer PostgreSQL gives.)
-    fn alter_table_add_check(
-        &self,
-        table_name: &str,
-        constraint_name: &Option<String>,
-        expression: &sql::LogicalExpr,
-    ) -> Result<u64> {
-        let catalog = self.storage.catalog();
-        let schema = catalog.get_table_schema(table_name)?;
-        let mut constraints = catalog.load_table_constraints(table_name)?;
-        let name = constraint_name
-            .clone()
-            .unwrap_or_else(|| Self::derived_check_constraint_name(table_name, expression, &constraints));
-        Self::reject_duplicate_constraint_name(&constraints, table_name, &name)?;
-
-        let body = serde_json::to_string(expression)
-            .map_err(|e| Error::query_execution(format!("could not store CHECK constraint \"{}\": {}", name, e)))?;
-
-        // Validate the rows already in the table, then record. Order matters
-        // for the same reason it does in `alter_table_add_unique`: a recorded
-        // constraint that the existing data violates is a catalog that lies.
-        let tuples = self.storage.scan_table_with_schema(table_name, &schema)?;
-        if !tuples.is_empty() {
-            let probe = sql::TableConstraints {
-                foreign_keys: Vec::new(),
-                unique_constraints: Vec::new(),
-                check_constraints: vec![sql::CheckConstraint::new(
-                    name.clone(),
-                    table_name.to_string(),
-                    body.clone(),
-                )],
-            };
-            for tuple in &tuples {
-                self.validate_check_constraints(&probe, &schema, &tuple.values)
-                    .map_err(|e| {
-                        Error::constraint_violation(format!(
-                            "check constraint \"{}\" of relation \"{}\" is violated by some row: {}",
-                            name, table_name, e
-                        ))
-                    })?;
-            }
-        }
-
-        constraints.add_check(sql::CheckConstraint::new(name.clone(), table_name.to_string(), body));
-        catalog.save_table_constraints(table_name, &constraints)?;
-        tracing::info!("Added CHECK constraint '{}' on {}", name, table_name);
-        Ok(0)
     }
 
     /// PostgreSQL's `{table}_{column}_check` for a column-level CHECK, with its
@@ -17072,6 +17156,13 @@ impl EmbeddedDatabase {
         if vectors.is_empty() {
             return Ok(());
         }
+        if matches!(
+            self.storage.vector_indexes().get_metadata(name)?.index_type,
+            storage::VectorIndexType::Persistent(_)
+        ) {
+            txn.set_vector_row_context(self.storage.vector_row_context());
+            return Ok(());
+        }
         self.storage.vector_indexes().insert_vectors_batch(name, &vectors)?;
         self.push_vector_undo(
             txn,
@@ -17114,526 +17205,65 @@ impl EmbeddedDatabase {
         Ok(values)
     }
 
-    /// Spec R5.2: everything an `ADD COLUMN` clause of a multi-clause `ALTER TABLE`
-    /// can refuse, asked in clause order before the first clause writes: a name
-    /// that is taken, by the table or by an earlier clause (42701); a default that
-    /// does not evaluate; NOT NULL with nothing to give the rows that exist
-    /// (23502); and for a volatile default, the staged rows under a savepoint
-    /// (0A000) and the rewrite itself, run into a scratch batch with the images the
-    /// real clause would write, and over the transaction's own staged rows (54000,
-    /// 23502, and any error of the expression).
-    ///
-    /// Those runs evaluate the default for real and throw the values away, so a
-    /// volatile default in a multi-clause statement runs twice per row: a
-    /// `nextval` consumes its values twice, and a function with a side effect has
-    /// it twice. A default that fails only on its second evaluation still fails in
-    /// its clause, after the earlier clauses wrote. A single clause needs none of
-    /// this: it refuses before its own write.
-    ///
-    /// The clauses are still written one group each. What this cannot promise is
-    /// said on `execute_alter_table_multi`.
-    fn prevalidate_added_columns(
-        &self,
-        operations: &[sql::LogicalPlan],
-        txn: Option<&storage::Transaction>,
-    ) -> Result<()> {
-        use sql::LogicalPlan as P;
-        use storage::row_shape::ColumnFill;
-
-        if operations.len() < 2 {
-            return Ok(());
-        }
-        let Some(table) = operations.iter().find_map(|op| match op {
-            P::AlterTableAddColumn { table_name, .. } => Some(table_name.as_str()),
-            _ => None,
-        }) else {
-            return Ok(());
-        };
-        let schema = self.storage.catalog().get_table_schema(table)?;
-        let old_width = schema.columns.len();
-        let mut names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
-        let own_rows = txn.is_some_and(|txn| txn.has_staged_rows(table));
-        let under_savepoint = own_rows && txn.is_some_and(storage::Transaction::has_savepoints);
-
-        let mut adds: Vec<(&str, &DataType, bool, ColumnFill)> = Vec::new();
-        let mut through_last_volatile = 0usize;
-        for operation in operations {
-            match operation {
-                P::AlterTableAddColumn {
-                    column_def,
-                    if_not_exists,
-                    ..
-                } => {
-                    if names.contains(&column_def.name) {
-                        if *if_not_exists {
-                            continue;
-                        }
-                        return Err(Error::query_execution(format!(
-                            "Column '{}' already exists in table '{}'",
-                            column_def.name, table
-                        )));
-                    }
-                    names.push(column_def.name.clone());
-                    let fill = ColumnFill::for_default(column_def.default.as_ref(), &column_def.data_type)?;
-                    match &fill {
-                        ColumnFill::Constant(Value::Null) => {
-                            if column_def.not_null && (own_rows || self.storage.table_has_rows(table)?) {
-                                return Err(Error::add_column_null_on_existing_rows(table, &column_def.name));
-                            }
-                        }
-                        ColumnFill::PerRow(_) => {
-                            if under_savepoint {
-                                return Err(Error::ddl_over_staged_rows(
-                                    "ALTER TABLE … ADD COLUMN with a volatile default, under a savepoint,",
-                                    table,
-                                ));
-                            }
-                            through_last_volatile = adds.len() + 1;
-                        }
-                        ColumnFill::Constant(_) => {}
-                    }
-                    adds.push((
-                        column_def.name.as_str(),
-                        &column_def.data_type,
-                        column_def.not_null,
-                        fill,
-                    ));
-                }
-                P::AlterTableDropColumn { column_name, .. } => {
-                    if under_savepoint {
-                        return Err(Error::ddl_over_staged_rows(
-                            "ALTER TABLE … DROP COLUMN under a savepoint",
-                            table,
-                        ));
-                    }
-                    names.retain(|name| name != column_name);
-                }
-                P::AlterTableRenameColumn {
-                    old_column_name,
-                    new_column_name,
-                    ..
-                } => {
-                    if let Some(name) = names.iter_mut().find(|name| name.as_str() == old_column_name.as_str()) {
-                        name.clone_from(new_column_name);
-                    }
-                }
-                _ => {}
-            }
-        }
-        if through_last_volatile > 0 {
-            let fills: Vec<(&str, &DataType, bool, &ColumnFill)> = adds
-                .iter()
-                .take(through_last_volatile)
-                .map(|(column, data_type, not_null, fill)| (*column, *data_type, *not_null, fill))
-                .collect();
-            if let Some(txn) = txn.filter(|_| own_rows) {
-                Self::own_row_fills(txn, table, &fills)?;
-            }
-            let mut scratch = rocksdb::WriteBatch::default();
-            self.storage.stage_added_column_rows(
-                table,
-                old_width,
-                &fills,
-                self.storage.config().storage.max_atomic_rewrite_bytes,
-                &mut scratch,
-            )?;
-        }
-        Ok(())
-    }
-
-    /// `ALTER TABLE <t> ADD COLUMN …` — ONE body for BOTH executor families.
-    ///
-    /// Spec R5.2, PostgreSQL 11's "missing value". A stable default (a literal, or
-    /// an expression of stable functions) is evaluated once, by the rule an INSERT
-    /// uses, and written with the schema in ONE group (`Catalog::add_columns`): no
-    /// row is rewritten, at any table size, and the row-shape funnel gives every
-    /// row older than the column that value (`storage::row_shape`). A volatile
-    /// default rewrites every row in that same group, up to
-    /// `[storage] max_atomic_rewrite_bytes`. Everything that can refuse does so
-    /// before anything is written; DDL is not transactional, so a statement inside
-    /// an explicit transaction is durable at once, and the transaction's own staged
-    /// rows are re-staged with the column's value, so what they commit (and log) is
-    /// as wide as the table they commit into. An image a `ROLLBACK TO` brings back
-    /// is narrow, and reads through the funnel like any other row older than the
-    /// column; a volatile default has no one value to answer with, so that is
-    /// refused under a savepoint.
-    fn alter_table_add_column(
-        &self,
-        table_name: &str,
-        column_def: &sql::logical_plan::ColumnDef,
-        if_not_exists: bool,
-        txn: Option<&storage::Transaction>,
-    ) -> Result<u64> {
-        use storage::row_shape::ColumnFill;
-
-        let catalog = self.storage.catalog();
-        let mut schema = catalog.get_table_schema(table_name)?;
-
-        if schema.columns.iter().any(|c| c.name == column_def.name) {
-            if if_not_exists {
-                return Ok(0);
-            }
-            return Err(Error::query_execution(format!(
-                "Column '{}' already exists in table '{}'",
-                column_def.name, table_name
-            )));
-        }
-
-        let new_column = Column {
-            name: column_def.name.clone(),
-            data_type: column_def.data_type.clone(),
-            nullable: !column_def.not_null,
-            primary_key: column_def.primary_key,
-            source_table: None,
-            source_table_name: Some(table_name.to_string()),
-            default_expr: Self::serialize_default_expr(&column_def.default),
-            unique: column_def.unique,
-            storage_mode: column_def.storage_mode,
-        };
-        let not_null = !new_column.nullable;
-
-        let fill = ColumnFill::for_default(column_def.default.as_ref(), &column_def.data_type)?;
-        let own_rows = txn.filter(|txn| txn.has_staged_rows(table_name));
-        let own_values = match own_rows {
-            Some(txn) => {
-                if not_null && matches!(fill, ColumnFill::Constant(Value::Null)) {
-                    return Err(Error::add_column_null_on_existing_rows(table_name, &column_def.name));
-                }
-                // A ROLLBACK TO would bring back images this statement cannot reach.
-                if matches!(fill, ColumnFill::PerRow(_)) && txn.has_savepoints() {
-                    return Err(Error::ddl_over_staged_rows(
-                        "ALTER TABLE … ADD COLUMN with a volatile default, under a savepoint,",
-                        table_name,
-                    ));
-                }
-                // Before anything is written: a volatile default can refuse on these
-                // rows as on any other (NULL in NOT NULL, an error of the expression).
-                Self::own_row_fills(
-                    txn,
-                    table_name,
-                    &[(column_def.name.as_str(), &column_def.data_type, not_null, &fill)],
-                )?
-            }
-            None => std::collections::HashMap::new(),
-        };
-
-        let old_width = schema.columns.len();
-        schema.columns.push(new_column);
-        let rewritten = catalog.add_columns(
-            table_name,
-            &schema,
-            old_width,
-            &[(column_def.name.as_str(), &column_def.data_type, not_null, &fill)],
-            true,
-        )?;
-
-        if let Some(txn) = own_rows {
-            let shape = self.storage.row_shape(table_name, old_width)?;
-            txn.restage_table_rows(table_name, |key, tuple| {
-                shape.apply(tuple);
-                let values = own_values.get(key).ok_or_else(|| {
-                    Error::internal("ALTER TABLE … ADD COLUMN: a row was staged during the statement")
-                })?;
-                tuple.values.extend(values.iter().cloned());
-                Ok(())
-            })?;
-        }
-
-        tracing::info!(
-            "Added column '{}' to table '{}', rewrote {} rows",
-            column_def.name,
-            table_name,
-            rewritten
-        );
-
-        Ok(rewritten)
-    }
-
-    /// `ALTER TABLE <t> DROP COLUMN …` — ONE body for BOTH executor families.
-    ///
-    /// # sprinter 0f258ed23d13
-    ///
-    /// This used to do `schema.columns.remove(idx)` and nothing else, so every
-    /// persisted constraint record naming the column survived it — a UNIQUE
-    /// whose column no longer exists, an inbound FOREIGN KEY pointing at a
-    /// vanished parent column, a CHECK over a missing identifier. None of them
-    /// error; they are simply skipped by whatever would have enforced them, so
-    /// the catalog kept advertising rules that nothing applied.
-    ///
-    /// ORDER IS LOAD-BEARING. Validation (`validate_drop_column_constraints`)
-    /// runs BEFORE the schema is touched, so a refused DROP leaves the table
-    /// exactly as it was; the record cleanup runs AFTER, so it can never delete
-    /// a constraint for a statement that then fails.
-    fn alter_table_drop_column(
-        &self,
-        table_name: &str,
-        column_name: &str,
-        if_exists: bool,
-        cascade: bool,
-        txn: Option<&storage::Transaction>,
-    ) -> Result<u64> {
-        let catalog = self.storage.catalog();
-        let mut schema = catalog.get_table_schema(table_name)?;
-
-        let col_idx = schema.columns.iter().position(|c| c.name == *column_name);
-
-        let Some(idx) = col_idx else {
-            if if_exists {
-                return Ok(0);
-            }
-            return Err(Error::query_execution(format!(
-                "Column '{}' does not exist in table '{}'",
-                column_name, table_name
-            )));
-        };
-
-        let is_pk = schema
-            .get_column_at(idx)
-            .ok_or_else(|| Error::internal("column index out of bounds"))?
-            .primary_key;
-        if is_pk && !cascade {
-            return Err(Error::query_execution(format!(
-                "Cannot drop primary key column '{}' without CASCADE",
-                column_name
-            )));
-        }
-
-        // Refuse BEFORE mutating anything (another table's FK depends on this
-        // column and no CASCADE was given).
-        catalog.validate_drop_column_constraints(table_name, column_name, cascade)?;
-
-        // Spec R5.2 (F5): the rows this transaction staged lose the column too, or
-        // they would commit one value too wide, every later column shifted by one.
-        // A ROLLBACK TO would bring back images this statement cannot reach.
-        let own_rows = txn.filter(|txn| txn.has_staged_rows(table_name));
-        if own_rows.is_some_and(storage::Transaction::has_savepoints) {
-            return Err(Error::ddl_over_staged_rows(
-                "ALTER TABLE … DROP COLUMN under a savepoint",
-                table_name,
-            ));
-        }
-
-        let was_columnar = schema
-            .get_column_at(idx)
-            .is_some_and(|c| c.storage_mode == ColumnStorageMode::Columnar);
-        schema.columns.remove(idx);
-        catalog.drop_column_from_schema(table_name, &schema, column_name)?;
-
-        let rows_updated = self.storage.drop_column_from_rows(table_name, idx)?;
-        if let Some(txn) = own_rows {
-            txn.restage_table_rows(table_name, |_, tuple| {
-                if idx < tuple.values.len() {
-                    tuple.values.remove(idx);
-                }
-                Ok(())
-            })?;
-        }
-        self.cleanup_columnar_after_drop_column(table_name, column_name, was_columnar, &schema)?;
-
-        // Retire every constraint record (and constraint-owned index) that
-        // named the column, on this table and on its children.
-        catalog.drop_column_from_constraints(table_name, column_name)?;
-
-        tracing::info!(
-            "Dropped column '{}' from table '{}', updated {} rows",
-            column_name,
-            table_name,
-            rows_updated
-        );
-
-        Ok(rows_updated as u64)
-    }
-
-    /// `ALTER TABLE <t> RENAME COLUMN <old> TO <new>` — ONE body for BOTH
-    /// executor families.
-    ///
-    /// # sprinter 0f258ed23d13
-    ///
-    /// This used to mutate `schema.columns[i].name` and stop. Two separate
-    /// things then went on naming the old column, and BOTH are enforcement:
-    ///
-    /// 1. the persisted `TableConstraints` record — so after a restart
-    ///    `register_unique_constraint_indexes` built a tree over a column the
-    ///    schema no longer had, every probe resolved it to `None`, and the
-    ///    UNIQUE silently accepted duplicates from then on;
-    /// 2. the LIVE ART index entries, whose `columns` are resolved by exact
-    ///    name on every write — so the same UNIQUE stopped being enforced
-    ///    IMMEDIATELY, in the process that ran the rename, with no restart
-    ///    needed at all.
-    ///
-    /// Validation first (a CHECK body that cannot be rewritten refuses the
-    /// statement), then the schema together with the `meta:index:`
-    /// definitions (one write group, spec P1.1b), then the constraint records,
-    /// then the live indexes. Refusing is recoverable; a silently unenforced
-    /// UNIQUE is not.
-    fn alter_table_rename_column(&self, table_name: &str, old_column_name: &str, new_column_name: &str) -> Result<u64> {
-        let catalog = self.storage.catalog();
-        let mut schema = catalog.get_table_schema(table_name)?;
-
-        if schema.columns.iter().any(|c| c.name == *new_column_name) {
-            return Err(Error::query_execution(format!(
-                "Column '{}' already exists in table '{}'",
-                new_column_name, table_name
-            )));
-        }
-
-        let col_idx = schema
-            .columns
-            .iter()
-            .position(|c| c.name == *old_column_name)
-            .ok_or_else(|| {
-                Error::query_execution(format!(
-                    "Column '{}' does not exist in table '{}'",
-                    old_column_name, table_name
-                ))
-            })?;
-
-        // Refuse BEFORE mutating anything.
-        catalog.validate_rename_column_constraints(table_name, old_column_name)?;
-
-        schema
-            .get_column_at_mut(col_idx)
-            .ok_or_else(|| Error::internal("column index out of bounds"))?
-            .name = new_column_name.to_string();
-
-        // Spec R5.3: ONE write group for the statement — the schema, every
-        // `meta:index:` definition naming the column (a definition left on the old
-        // name made the reopen register its index over a column that no longer
-        // exists, spec P1.1b), the missing value, every constraint record that
-        // names it (its own and other tables' foreign keys) and the identity
-        // record, each with its logical-WAL entry. Published after the write, the
-        // live ART entries first, then the schema, then the constraints, so the
-        // UNIQUE rule is never bound to a name the published schema does not have.
-        let mut ddl = storage::DdlBatch::new(&self.storage);
-        {
-            let storage = &self.storage;
-            let table = table_name.to_string();
-            let old = old_column_name.to_string();
-            let new = new_column_name.to_string();
-            ddl.on_commit(move || {
-                let repointed = storage.art_indexes().rename_column_in_indexes(&table, &old, &new);
-                if !repointed.is_empty() {
-                    tracing::debug!(
-                        "Repointed {} live index(es) of '{}' from column '{}' to '{}': {:?}",
-                        repointed.len(),
-                        table,
-                        old,
-                        new,
-                        repointed
-                    );
-                }
-            });
-        }
-        let rewritten =
-            catalog.stage_column_rename_in_schema(table_name, &schema, old_column_name, new_column_name, &mut ddl)?;
-        if !rewritten.is_empty() {
-            tracing::debug!(
-                "Rewrote {} index definition(s) of '{}' from column '{}' to '{}': {:?}",
-                rewritten.len(),
-                table_name,
-                old_column_name,
-                new_column_name,
-                rewritten
-            );
-        }
-        catalog.stage_column_rename_in_constraints(table_name, old_column_name, new_column_name, &mut ddl)?;
-        ddl.commit()?.wait_replicated();
-
-        tracing::info!(
-            "Renamed column '{}' to '{}' in table '{}'",
-            old_column_name,
-            new_column_name,
-            table_name
-        );
-
-        Ok(0)
-    }
-
-    /// Execute a single ALTER TABLE operation from its logical plan.
-    ///
-    /// This is used by the `AlterTableMulti` handler to execute each sub-operation
-    /// sequentially, and also serves as the shared implementation for ALTER TABLE
-    /// execution across different code paths.
+    /// Execute a single ALTER TABLE operation from its logical plan — the params
+    /// family's arm. Spec R5.5: every clause runs through
+    /// [`Self::execute_alter_statement`], the one body both families share, as ONE
+    /// write group; `RENAME TO` through [`Self::alter_table_rename_to`].
     fn execute_alter_table_op(&self, plan: &sql::LogicalPlan, txn: Option<&storage::Transaction>) -> Result<u64> {
         match plan {
-            sql::LogicalPlan::AlterTableAddColumn {
-                table_name,
-                column_def,
-                if_not_exists,
-            } => self.alter_table_add_column(table_name, column_def, *if_not_exists, txn),
-            sql::LogicalPlan::AlterTableDropColumn {
-                table_name,
-                column_name,
-                if_exists,
-                cascade,
-            } => self.alter_table_drop_column(table_name, column_name, *if_exists, *cascade, txn),
-            sql::LogicalPlan::AlterTableRenameColumn {
-                table_name,
-                old_column_name,
-                new_column_name,
-            } => self.alter_table_rename_column(table_name, old_column_name, new_column_name),
-            sql::LogicalPlan::AlterTableAlterColumnNullability {
-                table_name,
-                column_name,
-                nullable,
-            } => self.alter_table_set_column_nullability(table_name, column_name, *nullable),
-            // The constraint sub-operations, so the COMMA-LIST spelling
-            // (`ALTER TABLE t ADD COLUMN c INT, ADD CONSTRAINT k UNIQUE (c)`,
-            // which plans as one `AlterTableMulti`) applies them instead of
-            // failing on the sub-plan with "called with non-ALTER plan".
-            sql::LogicalPlan::AlterTableAddUnique {
-                table_name,
-                constraint_name,
-                columns,
-            } => self.alter_table_add_unique(table_name, constraint_name, columns),
-            // sprinter 885ffe24eab6: the two constraint spellings that
-            // `ADD COLUMN … PRIMARY KEY` / `… CHECK (…)` desugar into. Both
-            // families reach them through this one dispatcher.
-            sql::LogicalPlan::AlterTableAddPrimaryKey {
-                table_name,
-                constraint_name,
-                columns,
-            } => self.alter_table_add_primary_key(table_name, constraint_name, columns),
-            sql::LogicalPlan::AlterTableAddCheck {
-                table_name,
-                constraint_name,
-                expression,
-            } => self.alter_table_add_check(table_name, constraint_name, expression),
-            sql::LogicalPlan::AlterTableDropConstraint {
-                table_name,
-                constraint_name,
-                if_exists,
-            } => self.alter_table_drop_constraint(table_name, constraint_name, *if_exists),
-            sql::LogicalPlan::AlterTableAddForeignKey { .. } => self.alter_table_add_foreign_key(plan),
             sql::LogicalPlan::AlterTableRename {
                 table_name,
                 new_table_name,
-            } => {
-                let catalog = self.storage.catalog();
-                Self::refuse_ddl_over_staged_rows(txn, "ALTER TABLE … RENAME TO", table_name)?;
-
-                // Durably (R5 decision 11): this statement holds both names, and a
-                // cache is not the store.
-                if catalog.main_table_exists(new_table_name)?
-                    || self.storage.mv_catalog().view_exists(new_table_name)?
-                {
-                    return Err(Error::query_execution(format!(
-                        "Table '{}' already exists",
-                        new_table_name
-                    )));
-                }
-
-                self.storage.rename_table(table_name, new_table_name)?;
-
-                tracing::info!("Renamed table '{}' to '{}'", table_name, new_table_name);
-
-                Ok(0)
+            } => self.alter_table_rename_to(table_name, new_table_name, txn),
+            sql::LogicalPlan::AlterTableAddColumn { .. }
+            | sql::LogicalPlan::AlterTableDropColumn { .. }
+            | sql::LogicalPlan::AlterTableRenameColumn { .. }
+            | sql::LogicalPlan::AlterTableAlterColumnNullability { .. }
+            | sql::LogicalPlan::AlterTableAddUnique { .. }
+            | sql::LogicalPlan::AlterTableAddPrimaryKey { .. }
+            | sql::LogicalPlan::AlterTableAddCheck { .. }
+            | sql::LogicalPlan::AlterTableDropConstraint { .. }
+            | sql::LogicalPlan::AlterTableAddForeignKey { .. } => {
+                self.execute_alter_statement(std::slice::from_ref(plan), txn)
             }
             _ => Err(Error::internal(format!(
                 "execute_alter_table_op called with non-ALTER plan: {:?}",
                 plan.plan_type_name()
             ))),
         }
+    }
+
+    /// `ALTER TABLE <t> RENAME TO <new>` — ONE body for BOTH executor families. The
+    /// rename is one write group (spec R5.3, `Catalog::rename_table`). Spec R5.5: the
+    /// new name's history starts at the rename (`storage::table_layout`), and the
+    /// transaction it runs in is told so, so its own reads of the table at its older
+    /// snapshot are not refused for a cut it made itself.
+    fn alter_table_rename_to(
+        &self,
+        table_name: &str,
+        new_table_name: &str,
+        txn: Option<&storage::Transaction>,
+    ) -> Result<u64> {
+        let catalog = self.storage.catalog();
+        Self::refuse_ddl_over_staged_rows(txn, "ALTER TABLE … RENAME TO", table_name)?;
+
+        // Durably (R5 decision 11): this statement holds both names, and a cache is
+        // not the store.
+        if catalog.main_table_exists(new_table_name)? || self.storage.mv_catalog().view_exists(new_table_name)? {
+            return Err(Error::query_execution(format!(
+                "Table '{}' already exists",
+                new_table_name
+            )));
+        }
+
+        self.storage.rename_table(table_name, new_table_name)?;
+        if let Some(txn) = txn {
+            txn.note_own_history_cut(new_table_name);
+        }
+
+        tracing::info!("Renamed table '{}' to '{}'", table_name, new_table_name);
+
+        Ok(0)
     }
 
     /// Fast path for simple INSERT statements.
@@ -17886,33 +17516,6 @@ impl EmbeddedDatabase {
         }
 
         Some(self.insert_validated_tuples_in_transaction(&spec.table_name, tuples, &spec.schema, txn))
-    }
-
-    /// R3.3: after `ALTER TABLE … DROP COLUMN` of a `STORAGE COLUMNAR`
-    /// column, drop its `col:`/`colz:`/`colzm:` side-data (a later column
-    /// re-created under the same name must not read stale batches) and, when
-    /// the table no longer has ANY columnar column, purge the live-row
-    /// presence sidecar — presence stops being maintained for row-only
-    /// tables, so a stale manifest must not survive a future re-columnarize.
-    fn cleanup_columnar_after_drop_column(
-        &self,
-        table_name: &str,
-        column_name: &str,
-        was_columnar: bool,
-        schema_after: &Schema,
-    ) -> Result<()> {
-        if !was_columnar {
-            return Ok(());
-        }
-        storage::ColumnarStore::drop_column(&self.storage.db(), self.storage.write_gate(), table_name, column_name)?;
-        if !schema_after
-            .columns
-            .iter()
-            .any(|c| c.storage_mode == ColumnStorageMode::Columnar)
-        {
-            storage::ColumnarStore::purge_presence(&self.storage.db(), self.storage.write_gate(), table_name)?;
-        }
-        Ok(())
     }
 
     fn tuple_column_values(schema: &Schema, tuple: &Tuple) -> std::collections::HashMap<String, Value> {
@@ -18230,17 +17833,25 @@ impl EmbeddedDatabase {
             } else {
                 storage::RowState::NotStored
             };
-            match self
-                .storage
-                .art_indexes()
-                .on_insert_tuple_collect_index_values(table_name, row_id, schema, &tuple, row_state)
-            {
-                Ok(values) => values,
-                Err(e) if constraints_prechecked => {
-                    storage::StorageEngine::note_index_maintenance_failure(table_name, row_id, &e);
-                    Self::tuple_column_values(schema, &tuple)
+            // Spec R5.4 (review F3): a key another open transaction took out is waited
+            // for (`StorageEngine::wait_out_key_hold`), then claimed again.
+            loop {
+                match self.storage.art_indexes().on_insert_tuple_collect_index_values_as(
+                    table_name,
+                    row_id,
+                    schema,
+                    &tuple,
+                    row_state,
+                    Some(txn.transaction_id()),
+                ) {
+                    Ok(Ok(values)) => break values,
+                    Ok(Err(hold)) => self.storage.wait_out_key_hold(table_name, &hold, Some(txn))?,
+                    Err(e) if constraints_prechecked => {
+                        storage::StorageEngine::note_index_maintenance_failure(table_name, row_id, &e);
+                        break Self::tuple_column_values(schema, &tuple);
+                    }
+                    Err(e) => return Err(Error::constraint_violation(e.to_string())),
                 }
-                Err(e) => return Err(Error::constraint_violation(e.to_string())),
             }
         };
 
@@ -18288,7 +17899,7 @@ impl EmbeddedDatabase {
             let vops = self
                 .storage
                 .vector_indexes()
-                .on_row_insert(table_name, row_id, schema, &tuple);
+                .on_row_insert_staged(table_name, row_id, schema, &tuple);
             self.push_vector_undo(txn, vops);
         }
 
@@ -18930,20 +18541,15 @@ impl EmbeddedDatabase {
                 }
             }
 
-            if let Err(e) = self.storage.art_indexes().on_delete_tuple(
-                &target.table_name,
-                target.row_id,
-                &target.schema,
-                existing_row,
-            ) {
-                tracing::debug!("ART index delete for table '{}': {}", target.table_name, e);
-            }
-
             let mut col_values = std::collections::HashMap::with_capacity(target.schema.columns.len());
             for (i, col) in target.schema.columns.iter().enumerate() {
                 if let Some(v) = existing_row.values.get(i) {
                     col_values.insert(col.name.clone(), v.clone());
                 }
+            }
+            // Spec R5.4 (review F3): its PRIMARY KEY / UNIQUE keys held for `txn`.
+            if let Err(e) = self.remove_index_entries_held(txn, &target.table_name, target.row_id, &col_values) {
+                tracing::debug!("ART index delete for table '{}': {}", target.table_name, e);
             }
             self.push_art_undo(
                 txn,
@@ -18956,7 +18562,7 @@ impl EmbeddedDatabase {
 
             // R5.V1: eagerly drop the row from HNSW vector indexes (undo on rollback)
             if self.vector_dml_gate(&target.table_name) {
-                let vops = self.storage.vector_indexes().on_row_delete(
+                let vops = self.storage.vector_indexes().on_row_delete_staged(
                     &target.table_name,
                     target.row_id,
                     Some(&target.schema),
@@ -19029,20 +18635,31 @@ impl EmbeddedDatabase {
         // exclusive access for recency bookkeeping, so even a sharded cache
         // serializes on one hot key). Check this slot before building the LRU
         // key so the 1T point-lookup path avoids one allocation per query.
+        // Spec R5.6: a spec is used only while its table's layout epoch is the one its
+        // schema was read under (one atomic load), and records it into the
+        // statement's read set; otherwise it is built again.
         if let Some(spec) = self.hot_fast_select_spec.read().as_ref().and_then(|spec| {
-            (spec.table_name == table_name && spec.pk_col == pk_col).then(|| std::sync::Arc::clone(spec))
+            (spec.table_name == table_name && spec.pk_col == pk_col && spec.layout.is_current())
+                .then(|| std::sync::Arc::clone(spec))
         }) {
+            spec.layout.record();
             return Some(Ok(spec));
         }
 
         let cache_key = Self::fast_select_cache_key(table_name, pk_col);
-        if let Some(spec) = self.fast_select_cache.get(&cache_key) {
+        if let Some(spec) = self
+            .fast_select_cache
+            .get(&cache_key)
+            .filter(|spec| spec.layout.is_current())
+        {
+            spec.layout.record();
             *self.hot_fast_select_spec.write() = Some(std::sync::Arc::clone(&spec));
             return Some(Ok(spec));
         }
 
         let catalog = self.storage.catalog();
-        let schema = match catalog.get_table_schema(table_name) {
+        let (schema, layout) = storage::layout_epochs::collect_stamp(|| catalog.get_table_schema(table_name));
+        let schema = match schema {
             Ok(schema) => std::sync::Arc::new(schema),
             Err(_) => return None,
         };
@@ -19068,6 +18685,7 @@ impl EmbeddedDatabase {
             pk_col_idx,
             schema,
             pk_data_type,
+            layout,
         });
         self.fast_select_cache
             .put(cache_key.clone(), std::sync::Arc::clone(&spec));
@@ -19286,11 +18904,7 @@ impl EmbeddedDatabase {
         {
             let old_col_values = Self::tuple_column_values(schema, pre_image);
             let new_col_values = Self::tuple_column_values(schema, updated);
-            if let Err(e) = self
-                .storage
-                .art_indexes()
-                .on_delete(table_name, row_id, &old_col_values)
-            {
+            if let Err(e) = self.remove_index_entries_held(txn, table_name, row_id, &old_col_values) {
                 tracing::debug!("ART index on-conflict/delete-old for '{}': {}", table_name, e);
             }
             if let Err(e) = self
@@ -19311,14 +18925,71 @@ impl EmbeddedDatabase {
             );
         }
         if self.vector_dml_gate(table_name) {
-            let vops =
-                self.storage
-                    .vector_indexes()
-                    .on_row_update(table_name, row_id, schema, Some(pre_image), updated);
+            let vops = self.storage.vector_indexes().on_row_update_staged(
+                table_name,
+                row_id,
+                schema,
+                Some(pre_image),
+                updated,
+            );
             self.push_vector_undo(txn, vops);
         }
         self.storage.row_cache().invalidate(table_name, row_id);
         Ok(())
+    }
+
+    /// Claim row `row_id`'s PRIMARY KEY / UNIQUE keys for `txn` before it is staged
+    /// (sprinter 5a78b8288153). Spec R5.4 (review F3): a key another open transaction
+    /// took out (its uncommitted DELETE, or its UPDATE that moved the value) is not
+    /// free: wait for that transaction (`StorageEngine::wait_out_key_hold`) and claim
+    /// again — after its commit the key is free, after its rollback it is a 23505, as
+    /// in PostgreSQL. It used to be claimed at once, and after that ROLLBACK two rows
+    /// shared one primary key. A key `txn` took out itself is its to claim again.
+    fn claim_row_keys_in_transaction(
+        &self,
+        txn: &storage::Transaction,
+        table_name: &str,
+        row_id: u64,
+        schema: &Schema,
+        tuple: &Tuple,
+    ) -> Result<()> {
+        loop {
+            match self.storage.art_indexes().reserve_insert_tuple_as(
+                table_name,
+                row_id,
+                schema,
+                tuple,
+                Some(txn.transaction_id()),
+            ) {
+                Ok(None) => return Ok(()),
+                Ok(Some(hold)) => self.storage.wait_out_key_hold(table_name, &hold, Some(txn))?,
+                Err(e) => return Err(Error::constraint_violation(e.to_string())),
+            }
+        }
+    }
+
+    /// Spec R5.4 (review F3): take row `row_id`'s index entries out for `txn`, which
+    /// may still roll back, holding its PRIMARY KEY / UNIQUE keys until it ends
+    /// (`ArtIndexManager::on_delete_holding`): a writer of one of those keys waits for
+    /// `txn` instead of taking the key (two rows with one primary key after `txn`'s
+    /// ROLLBACK) or finding nothing (a lost UPDATE or DELETE). `txn` holds the row
+    /// locked already. Its commit lets the holds go, before its row locks; its
+    /// rollback's restore lifts each with the key it puts back.
+    fn remove_index_entries_held(
+        &self,
+        txn: &storage::Transaction,
+        table_name: &str,
+        row_id: u64,
+        col_values: &std::collections::HashMap<String, Value>,
+    ) -> storage::ArtResult<()> {
+        if txn.first_index_key_hold() {
+            let art = std::sync::Arc::clone(self.storage.art_indexes());
+            let owner = txn.transaction_id();
+            txn.after_commit(move || art.release_holds_of(owner));
+        }
+        self.storage
+            .art_indexes()
+            .on_delete_holding(table_name, row_id, col_values, txn.transaction_id())
     }
 
     /// Spec R5.4 (P12): lock `row` (main's, read by this statement after it loaded
@@ -19360,6 +19031,104 @@ impl EmbeddedDatabase {
             return Err(Error::concurrent_update(table_name));
         }
         Ok(LockedRow::Moved(latest))
+    }
+
+    /// Spec R5.4 (review F5): the change epoch a statement loads before it reads the
+    /// rows of `table` it may change: main's table's, or on a branch the branch level's
+    /// ([`storage::row_locks::RowLocks::table_epoch_on_level`]).
+    fn row_epoch_for(&self, view: Option<&storage::BranchView<'_>>, table_name: &str) -> u64 {
+        match view {
+            Some(view) => self
+                .storage
+                .row_locks()
+                .table_epoch_on_level(view.branch_id(), table_name),
+            None => self.storage.row_locks().table_epoch(table_name),
+        }
+    }
+
+    /// [`Self::lock_row_for_change`] of main's row, or on a branch
+    /// [`Self::lock_branch_row_for_change`].
+    fn lock_row_for_change_on(
+        &self,
+        txn: &storage::Transaction,
+        view: Option<&storage::BranchView<'_>>,
+        table_name: &str,
+        schema: &Schema,
+        row: Tuple,
+        epoch: u64,
+    ) -> Result<LockedRow> {
+        match view {
+            Some(view) => self.lock_branch_row_for_change(txn, view, table_name, schema, row, epoch),
+            None => self.lock_row_for_change(txn, table_name, schema, row, epoch),
+        }
+    }
+
+    /// Spec R5.4 (review F5): [`Self::lock_row_for_change`] on a branch. The rows a
+    /// branch's sessions change are the branch's own and the ones it inherits, read
+    /// through the branch view and written to its level; two of its sessions
+    /// incrementing one row lost up to 81% of the increments, with no error. Locked by
+    /// level and row ([`storage::Transaction::lock_branch_row`]); a row the level's
+    /// change epoch says moved is read again through the view (its committed image,
+    /// or this transaction's staged one).
+    fn lock_branch_row_for_change(
+        &self,
+        txn: &storage::Transaction,
+        view: &storage::BranchView<'_>,
+        table_name: &str,
+        schema: &Schema,
+        row: Tuple,
+        epoch: u64,
+    ) -> Result<LockedRow> {
+        let Some(row_id) = row.row_id else {
+            return Ok(LockedRow::Same(row));
+        };
+        let level = view.branch_id();
+        txn.lock_branch_row(level, table_name, row_id)?;
+        if !self
+            .storage
+            .row_locks()
+            .changed_since_on_level(level, table_name, epoch)
+        {
+            return Ok(LockedRow::Same(row));
+        }
+        let Some(mut latest) = view.get(Some(txn), table_name, row_id, schema)? else {
+            return Ok(LockedRow::Gone);
+        };
+        latest.row_id = Some(row_id);
+        if latest.values == row.values {
+            return Ok(LockedRow::Same(row));
+        }
+        if txn.validates_writes() {
+            return Err(Error::concurrent_update(table_name));
+        }
+        Ok(LockedRow::Moved(latest))
+    }
+
+    /// Spec R5.4 (review F5): a branch `ON CONFLICT DO UPDATE`'s conflicting row
+    /// `row_id`, which the branch's arbitration read before any lock: its write lock
+    /// on the branch level, held by `txn`, then the row as the branch has it now (or
+    /// as `txn` staged it). A row deleted meanwhile is a serialization failure, as on
+    /// main.
+    fn lock_branch_upsert_target(
+        &self,
+        txn: &storage::Transaction,
+        view: &storage::BranchView<'_>,
+        table_name: &str,
+        schema: &Schema,
+        row_id: u64,
+        read: &Tuple,
+    ) -> Result<Tuple> {
+        txn.lock_branch_row(view.branch_id(), table_name, row_id)?;
+        match view.get(Some(txn), table_name, row_id, schema)? {
+            Some(mut row) => {
+                row.row_id = Some(row_id);
+                if row.values != read.values && txn.validates_writes() {
+                    return Err(Error::concurrent_update(table_name));
+                }
+                Ok(row)
+            }
+            None => Err(Error::concurrent_update(table_name)),
+        }
     }
 
     /// Spec R5.4 (P12): the row a fast PK write read before it took the row's lock,
@@ -20731,9 +20500,37 @@ impl EmbeddedDatabase {
         planner.expr_to_logical(&expr)
     }
 
+    /// One SET STORAGE plan for both executor families. Resolve the parsed name
+    /// against this statement's session, and record the schema read in any open
+    /// layout-stamp collector (including a Parse-time prepared-plan pin).
+    fn try_plan_alter_column_storage(&self, sql: &str) -> Result<Option<sql::LogicalPlan>> {
+        let Some((table, column, storage_mode)) = sql::Parser::try_parse_alter_column_storage(sql)? else {
+            return Ok(None);
+        };
+        let catalog = self.storage.catalog();
+        let table_name = sql::Planner::with_catalog(&catalog)
+            .with_current_schema(self.current_schema())
+            .with_search_path(self.current_search_path())
+            .resolve_table_ref(&table);
+        // The target's layout belongs to the pin even under the default public
+        // search_path, where name resolution itself needs no catalog probe.
+        catalog.get_table_schema(&table_name)?;
+        Ok(Some(sql::LogicalPlan::AlterColumnStorage {
+            table_name,
+            column_name: sql::Planner::normalize_ident(&column),
+            storage_mode,
+        }))
+    }
+
     /// Parse and plan a parameterized statement with a cache key that cannot
     /// collide with the non-parameterized `query()` plan cache entries.
     fn parameterized_plan_cached(&self, sql: &str) -> Result<std::sync::Arc<sql::LogicalPlan>> {
+        self.parameterized_plan_stamped(sql).map(|stamped| stamped.plan)
+    }
+
+    /// [`Self::parameterized_plan_cached`], with the layout epochs the plan was built
+    /// under (spec R5.6), for a prepared statement that pins it.
+    fn parameterized_plan_stamped(&self, sql: &str) -> Result<StampedPlan> {
         // Under a non-`public` `search_path`, bare names resolve against a
         // per-session schema. The plan cache is keyed by SQL text only and
         // shared across every session, so a plan built for one schema must
@@ -20743,8 +20540,8 @@ impl EmbeddedDatabase {
         let schema_active = self.current_schema_is_set();
         let cache_key = format!("\0params\0{sql}");
         if !schema_active {
-            if let Some(plan) = self.plan_cache.get(&cache_key) {
-                return Ok(plan);
+            if let Some(stamped) = self.plan_cache.get_stamped(&cache_key) {
+                return Ok(stamped);
             }
         }
 
@@ -20757,18 +20554,36 @@ impl EmbeddedDatabase {
         if let Some(plan) = Self::try_plan_pg_create_procedure(sql)? {
             let plan = std::sync::Arc::new(plan);
             if !schema_active {
-                self.plan_cache.put(cache_key, std::sync::Arc::clone(&plan));
+                self.plan_cache
+                    .put(cache_key, std::sync::Arc::clone(&plan), storage::LayoutStamp::empty());
             }
-            return Ok(plan);
+            return Ok(StampedPlan {
+                plan,
+                layout: storage::LayoutStamp::empty(),
+            });
         }
         // Spec R5.3: the text family's pre-parses of the DDL sqlparser has no grammar
         // for and the executor runs: `REFRESH`, `DROP` and `ALTER MATERIALIZED VIEW`,
         // `ALTER SEQUENCE`. Sent over the extended protocol (or REST), each failed to
         // parse. Not cached (rare DDL).
         if let Some(plan) = Self::try_preparse_executor_ddl(sql)? {
-            return Ok(std::sync::Arc::new(plan));
+            return Ok(StampedPlan {
+                plan: std::sync::Arc::new(plan),
+                layout: storage::LayoutStamp::empty(),
+            });
         }
 
+        // Spec R5.6: what the planning resolves, with its layout epochs.
+        let collector = storage::layout_epochs::StampCollector::start();
+        // SET STORAGE has no sqlparser AST. Plan it before the ordinary parser,
+        // retaining the target layout in the same prepared-plan stamp. Rare DDL
+        // is not admitted to the SQL-keyed cache.
+        if let Some(plan) = self.try_plan_alter_column_storage(sql)? {
+            return Ok(StampedPlan {
+                plan: std::sync::Arc::new(plan),
+                layout: collector.finish(),
+            });
+        }
         let plan_generation = self.storage.schema_generation();
         let (statement, _) = self.parse_cached(sql)?;
         let catalog = self.storage.catalog();
@@ -20777,6 +20592,7 @@ impl EmbeddedDatabase {
             .with_current_schema(self.current_schema())
             .with_search_path(self.current_search_path());
         let plan = std::sync::Arc::new(planner.statement_to_plan(statement)?);
+        let layout = collector.finish();
         // sprinter 1703dba8e82d: RE-READ the gate after planning, never only
         // before it. `CREATE TEMPORARY TABLE t` is the first statement of a
         // connection's temp life — the gate is necessarily false when it is
@@ -20786,17 +20602,27 @@ impl EmbeddedDatabase {
         // would publish one connection's private target to every other
         // connection that sends the same statement text.
         if !schema_active && !self.current_schema_is_set() {
-            self.plan_cache_put_if_current(cache_key, std::sync::Arc::clone(&plan), plan_generation);
+            self.plan_cache_put_if_current(cache_key, std::sync::Arc::clone(&plan), plan_generation, layout.clone());
         }
-        Ok(plan)
+        Ok(StampedPlan { plan, layout })
+    }
+
+    /// Pure custom grammar shared by text, params and prepared wire planning.
+    /// Branch existence, policy and final-image checks belong to Execute.
+    fn plan_merge_branch(sql: &str) -> Result<sql::LogicalPlan> {
+        let (source, target, options) = sql::Parser::parse_merge_branch_sql(sql)?;
+        sql::BranchingParser::parse_merge_branch(source, target, options.as_deref())
     }
 
     /// Spec R5.3: the params family's share of the text family's pre-parses
     /// (`execute_in_transaction_inner_body`): the statements sqlparser has no grammar
     /// for whose plan the `Executor` runs, so the params family's catch-all reaches
     /// it. A cheap first-word gate keeps the hot path to one comparison.
-    fn try_preparse_executor_ddl(sql: &str) -> Result<Option<sql::LogicalPlan>> {
+    pub(crate) fn try_preparse_executor_ddl(sql: &str) -> Result<Option<sql::LogicalPlan>> {
         let head = sql.trim_start();
+        if starts_with_icase(head, "MERGE") && sql::Parser::is_merge_branch(sql) {
+            return Ok(Some(Self::plan_merge_branch(sql)?));
+        }
         if starts_with_icase(head, "REFRESH") && sql::Parser::is_refresh_materialized_view(sql) {
             let (name, concurrent, incremental) = sql::Parser::parse_refresh_materialized_view_sql(sql)?;
             return Ok(Some(sql::LogicalPlan::RefreshMaterializedView {
@@ -20991,11 +20817,31 @@ impl EmbeddedDatabase {
     /// statement needs to pin the plan and later detect invalidation.
     /// The plan is exactly `parameterized_plan_cached` output: no extra
     /// optimizer passes run here (R5.W3 is explicitly out of scope; the
-    /// 3.37.3 index-probe behavior must not be bypassed).
-    pub(crate) fn wire_parameterized_plan(&self, sql: &str) -> Result<(std::sync::Arc<sql::LogicalPlan>, u64)> {
+    /// 3.37.3 index-probe behavior must not be bypassed). Spec R5.6: with the layout
+    /// epochs the plan was built under, which the pin is checked against at every use.
+    pub(crate) fn wire_parameterized_plan(&self, sql: &str) -> Result<(PinnedPlan, u64)> {
         let epoch = self.plan_cache.epoch();
-        let plan = self.parameterized_plan_cached(sql)?;
-        Ok((plan, epoch))
+        let stamped = self.parameterized_plan_stamped(sql)?;
+        Ok((
+            PinnedPlan {
+                plan: stamped.plan,
+                layout: stamped.layout,
+            },
+            epoch,
+        ))
+    }
+
+    /// Parse-time planning of custom wire syntax under this connection's catalog
+    /// context. This synchronous scope performs no statement execution, admission
+    /// charge, or utility dispatch; its !Send guards end before the handler awaits.
+    pub(crate) fn wire_parameterized_plan_for_session(
+        &self,
+        session_id: crate::session::SessionId,
+        sql: &str,
+    ) -> Result<(PinnedPlan, u64)> {
+        let _session = self.session_statement_context_guard(session_id)?;
+        let _schema = self.session_schema_override_guard(session_id);
+        self.wire_parameterized_plan(sql)
     }
 
     /// Execute a SQL statement with parameters (SAFE - prevents SQL injection)
@@ -21062,12 +20908,7 @@ impl EmbeddedDatabase {
     /// lookup is replaced by the pinned plan. The plan is the unmodified
     /// `parameterized_plan_cached` output, so DML keeps the exact planning
     /// behavior (no extra optimizer passes — see the W3 caveat).
-    fn execute_params_inner(
-        &self,
-        sql: &str,
-        params: &[Value],
-        plan_override: Option<&std::sync::Arc<sql::LogicalPlan>>,
-    ) -> Result<u64> {
+    fn execute_params_inner(&self, sql: &str, params: &[Value], plan_override: Option<&PinnedPlan>) -> Result<u64> {
         // sprinter ccebc95977f1: off the async worker serving the client (`runtime_offload`).
         offload_statement(|| -> Result<u64> {
             // Spec P1.4: reads only on a physical standby (`admit_on_physical_standby`).
@@ -21083,7 +20924,10 @@ impl EmbeddedDatabase {
             // failed-transaction boundary is applied here, at the entry point,
             // where parse and plan errors are still inside it. Free (one atomic
             // load) whenever no text-`BEGIN` transaction is open.
-            self.run_global_statement(sql, || self.execute_params_inner_unguarded(sql, params, plan_override))
+            // Spec R5.6: one statement under a layout read set.
+            self.run_layout_statement(self.in_transaction(), || {
+                self.run_global_statement(sql, || self.execute_params_inner_unguarded(sql, params, plan_override))
+            })
         })
     }
 
@@ -21093,7 +20937,7 @@ impl EmbeddedDatabase {
         &self,
         sql: &str,
         params: &[Value],
-        plan_override: Option<&std::sync::Arc<sql::LogicalPlan>>,
+        plan_override: Option<&PinnedPlan>,
     ) -> Result<u64> {
         // Reflect an embedded `SET search_path` into the evaluator's thread-local
         // (see `embedded_current_schema_guard`). Free on the default path; a
@@ -21135,6 +20979,9 @@ impl EmbeddedDatabase {
         // that bails in nanoseconds on anything else; on the wire path the
         // `_for_session` wrapper has already consumed every session-scoped
         // statement before reaching here.
+        if let Some(count) = self.try_handle_set_constraints(sql)? {
+            return Ok(count);
+        }
         if let Some((rows, _schema)) = self.try_handle_params_family_setting_statement(sql)? {
             return Ok(rows.len() as u64);
         }
@@ -21153,7 +21000,12 @@ impl EmbeddedDatabase {
         }
 
         let plan = match plan_override {
-            Some(p) => std::sync::Arc::clone(p),
+            // Spec R5.6: a pin built under another layout of a table it reads is not
+            // used; the statement plans again.
+            Some(p) => match p.current() {
+                Some(plan) => plan,
+                None => self.parameterized_plan_cached(sql)?,
+            },
             None => self.parameterized_plan_cached(sql)?,
         };
 
@@ -21204,7 +21056,12 @@ impl EmbeddedDatabase {
 
     /// The body of [`execute_many_params`](Self::execute_many_params), inside
     /// the HDB-008 boundary.
+    /// Spec R5.6: [`Self::execute_many_params_attempt`] under a layout read set.
     fn execute_many_params_inner(&self, sql: &str, rows: &[Vec<Value>]) -> Result<u64> {
+        self.run_layout_statement(self.in_transaction(), || self.execute_many_params_attempt(sql, rows))
+    }
+
+    fn execute_many_params_attempt(&self, sql: &str, rows: &[Vec<Value>]) -> Result<u64> {
         // sprinter d03de7fc3b22: charge this CLIENT statement against the active
         // tenant's `max_qps`. Every family's entry point charges — there is no
         // funnel all of them pass through — and the returned guard makes every
@@ -21309,7 +21166,19 @@ impl EmbeddedDatabase {
     /// The body of
     /// [`execute_params_returning`](Self::execute_params_returning), inside
     /// the HDB-008 boundary.
+    /// Spec R5.6: [`Self::execute_params_returning_attempt`] under a layout read set.
     fn execute_params_returning_inner(
+        &self,
+        sql: &str,
+        params: &[Value],
+        expected: Option<ExpectedResultShape<'_>>,
+    ) -> Result<(u64, Vec<Tuple>)> {
+        self.run_layout_statement(self.in_transaction(), || {
+            self.execute_params_returning_attempt(sql, params, expected)
+        })
+    }
+
+    fn execute_params_returning_attempt(
         &self,
         sql: &str,
         params: &[Value],
@@ -21351,6 +21220,9 @@ impl EmbeddedDatabase {
         let (handled, _branch_scope) = self.branch_statement_gate(sql, self.global_txn_visible())?;
         if let Some((rows, _schema)) = handled {
             return Ok((0, rows));
+        }
+        if let Some(count) = self.try_handle_set_constraints(sql)? {
+            return Ok((count, Vec::new()));
         }
         let plan = self.parameterized_plan_cached(sql)?;
 
@@ -21836,22 +21708,21 @@ impl EmbeddedDatabase {
         let result = self.execute_plan_with_params_inner(plan, params, Some(&txn), original_sql, expected);
         // sprinter 6bc4a4040eb7 (B2 follow-up): keep this statement's removal
         // census slots until its index undo has run, however it ends — see
-        // `execute_with_implicit_transaction`. A failed commit replays the undo
-        // like a rollback. Spec R5.4: its row locks too.
+        // `execute_with_implicit_transaction`. Commit settlement classifies pre-write versus applied
+        // failures before releasing the transaction. Spec R5.4: its row locks too.
         let census_hold = txn.write_census_hold();
         let row_hold = txn.row_locks_hold();
         match result {
             Ok(out) => {
                 if let Err(e) = self.validate_deferred_fk_checks(Some(&txn)) {
-                    let _ = txn.rollback();
                     self.rollback_art_undo_for(undo_txn_id);
+                    let _ = txn.rollback();
                     drop(census_hold);
                     drop(row_hold);
                     self.deferred_fk_checks.lock().clear();
                     return Err(e);
                 }
-                if let Err(e) = txn.commit() {
-                    self.rollback_art_undo_for(undo_txn_id);
+                if let Err(e) = self.commit_owned_statement(txn, undo_txn_id) {
                     drop(census_hold);
                     drop(row_hold);
                     self.deferred_fk_checks.lock().clear();
@@ -21865,8 +21736,8 @@ impl EmbeddedDatabase {
                 Ok(out)
             }
             Err(e) => {
-                let _ = txn.rollback();
                 self.rollback_art_undo_for(undo_txn_id);
+                let _ = txn.rollback();
                 drop(census_hold);
                 drop(row_hold);
                 self.deferred_fk_checks.lock().clear();
@@ -21883,6 +21754,9 @@ impl EmbeddedDatabase {
         original_sql: Option<&str>,
         expected: Option<ExpectedResultShape<'_>>,
     ) -> Result<(u64, Vec<Tuple>)> {
+        if self.params_main_dml_needs_implicit_transaction(plan, session_txn) {
+            return self.execute_plan_with_params_in_implicit_transaction(plan, params, original_sql, expected);
+        }
         // Invalidate SQL metadata caches on DDL that reaches the executor
         // through the parameterized / extended-protocol funnel. This is the
         // SECOND of the two DDL routes: the non-parameterized (text) path gates
@@ -22005,6 +21879,16 @@ impl EmbeddedDatabase {
             sql::LogicalPlan::CreateTable { .. } => {
                 Ok((self.execute_create_table_plan(plan, original_sql)?, Vec::new()))
             }
+            sql::LogicalPlan::AlterColumnStorage {
+                table_name,
+                column_name,
+                storage_mode,
+            } => {
+                let rows = self.with_params_ddl_txn(session_txn, |txn| {
+                    self.alter_column_storage(table_name, column_name, *storage_mode, txn)
+                })?;
+                Ok((rows, Vec::new()))
+            }
             sql::LogicalPlan::AlterTableAddColumn { .. }
             | sql::LogicalPlan::AlterTableDropColumn { .. }
             | sql::LogicalPlan::AlterTableRenameColumn { .. }
@@ -22034,6 +21918,7 @@ impl EmbeddedDatabase {
                 let catalog = self.storage.catalog();
                 let schema = catalog.get_table_schema(table_name)?;
                 let table_constraints = catalog.load_table_constraints(table_name)?;
+                let mut fk_parent_updates: Vec<(u64, Tuple, Tuple)> = Vec::new();
 
                 // Create evaluator with parameters
                 let evaluator =
@@ -22245,6 +22130,21 @@ impl EmbeddedDatabase {
                             .check_unique_constraints(table_name, &col_values_map)
                             .map_err(|e| e.to_string()),
                     };
+                    // Spec R5.4 (review F6): PostgreSQL's speculative insertion, the one
+                    // the text family runs (`upsert_conflict_settled`). This family took
+                    // its first look as final: a second upsert of a new key lost the race
+                    // to insert it (23505), or found its row not there yet (40001).
+                    let conflict = match active_txn {
+                        Some(txn) => self.upsert_conflict_settled(
+                            table_name,
+                            &col_values_map,
+                            on_conflict,
+                            branch_view.is_some(),
+                            txn,
+                            conflict,
+                        )?,
+                        None => conflict,
+                    };
 
                     match (conflict, on_conflict) {
                         (Ok(()), _) => {
@@ -22267,7 +22167,7 @@ impl EmbeddedDatabase {
                             // falls back to a committed-snapshot scan,
                             // which is correct for the autocommit /
                             // implicit-tx surface this path serves.
-                            self.check_fk_constraints_on_write(table_name, &col_values_map, active_txn)?;
+                            self.check_fk_constraints_on_write(table_name, &col_values_map, active_txn, None)?;
                             // RLS WITH CHECK on the new row — an ERROR on violation,
                             // never a filter (ROADMAP_V5 §1.1). Sits next to the
                             // FK/CHECK gates, before anything is staged or written.
@@ -22320,6 +22220,7 @@ impl EmbeddedDatabase {
                                         staged_col_values.insert(col.name.clone(), v.clone());
                                     }
                                 }
+                                self.defer_inserted_fk_rows(txn, table_name, &[row_id])?;
                                 if !self.storage.is_branch_active() {
                                     // R3.3: grouped staging marks presence too
                                     // (single-row INSERT).
@@ -22355,10 +22256,7 @@ impl EmbeddedDatabase {
                                 // are intercepted by that probe), so their
                                 // semantics are untouched.
                                 if on_main {
-                                    self.storage
-                                        .art_indexes()
-                                        .reserve_insert_tuple(table_name, row_id, &schema, &staged)
-                                        .map_err(|e| Error::constraint_violation(e.to_string()))?;
+                                    self.claim_row_keys_in_transaction(txn, table_name, row_id, &schema, &staged)?;
                                 }
                                 if let Some(view) = &branch_view {
                                     // B2: claim, check over the branch's view
@@ -22527,7 +22425,20 @@ impl EmbeddedDatabase {
                             // the branch view's (branch). `old_tuple_for_art` is
                             // the pre-image the ART diff / UNIQUE re-check uses.
                             let (mut updated_tuple, old_tuple_for_art): (Tuple, Tuple) = match branch_existing {
-                                Some(mut row) => {
+                                Some(row) => {
+                                    // Spec R5.4 (review F5): the branch row's write lock,
+                                    // then the row as the branch has it under the lock.
+                                    let mut row = match (&branch_view, active_txn) {
+                                        (Some(view), Some(txn)) => self.lock_branch_upsert_target(
+                                            txn,
+                                            view,
+                                            table_name,
+                                            &schema,
+                                            existing_row_id,
+                                            &row,
+                                        )?,
+                                        _ => row,
+                                    };
                                     self.storage.shape_row(table_name, schema.columns.len(), &mut row)?;
                                     (row.clone(), row)
                                 }
@@ -22710,6 +22621,7 @@ impl EmbeddedDatabase {
                                     )?;
                                 }
                             }
+                            fk_parent_updates.push((existing_row_id, old_tuple_for_art.clone(), updated_tuple.clone()));
                             drop(fast_row_lock.take());
 
                             if let Some(p) = &returning_projection {
@@ -22722,6 +22634,9 @@ impl EmbeddedDatabase {
                             return Err(Error::constraint_violation(e.to_string()));
                         }
                     }
+                }
+                if let Some(txn) = active_txn {
+                    self.apply_fk_parent_updates(txn, table_name, &schema, &fk_parent_updates)?;
                 }
                 Ok((count, returned_tuples))
             }
@@ -22876,7 +22791,10 @@ impl EmbeddedDatabase {
                         continue;
                     }
                     if let Some(view) = &branch_view {
-                        let (_, written) = self.branch_insert_row(view, active_txn, table_name, &schema, tuple)?;
+                        let (row_id, written) = self.branch_insert_row(view, active_txn, table_name, &schema, tuple)?;
+                        if let Some(txn) = active_txn {
+                            self.defer_inserted_fk_rows(txn, table_name, &[row_id])?;
+                        }
                         if let Some(p) = &returning_projection {
                             returned_tuples.push(p.project(&written)?);
                         }
@@ -22993,8 +22911,9 @@ impl EmbeddedDatabase {
                 // the transaction's staged branch writes (the merge below keys
                 // on main's `data:` and could never find a branch row).
                 let branch_view = self.storage.branch_view()?;
-                // Spec R5.4 (P12): the table's change epoch, before its rows are read.
-                let row_epoch = self.storage.row_locks().table_epoch(table_name);
+                // Spec R5.4 (P12): the table's change epoch, before its rows are read
+                // (review F5: the branch level's, on a branch).
+                let row_epoch = self.row_epoch_for(branch_view.as_ref(), table_name);
                 let base_tuples = match &branch_view {
                     Some(view) => view.scan(active_txn, table_name, &schema)?,
                     None => self.storage.scan_table_branch_aware(table_name)?,
@@ -23027,7 +22946,9 @@ impl EmbeddedDatabase {
 
                 let row_matches = |row: &Tuple| -> Result<bool> {
                     Ok(match selection {
-                        Some(predicate) => matches!(evaluator.evaluate(predicate, row)?, Value::Boolean(true)),
+                        Some(predicate) => {
+                            matches!(evaluator.evaluate(predicate, row)?, Value::Boolean(true))
+                        }
                         None => true,
                     })
                 };
@@ -23037,8 +22958,15 @@ impl EmbeddedDatabase {
                     // transaction first, and changed as committed under the lock: a
                     // concurrent writer's commit is never thrown away.
                     let tuple = match (matches, active_txn, &branch_view) {
-                        (true, Some(txn), None) => {
-                            match self.lock_row_for_change(txn, table_name, &schema, tuple, row_epoch)? {
+                        (true, Some(txn), view) => {
+                            match self.lock_row_for_change_on(
+                                txn,
+                                view.as_ref(),
+                                table_name,
+                                &schema,
+                                tuple,
+                                row_epoch,
+                            )? {
                                 LockedRow::Same(row) => row,
                                 LockedRow::Moved(row) => {
                                     matches = row_matches(&row)?;
@@ -23120,7 +23048,9 @@ impl EmbeddedDatabase {
                                 new_col_values.insert(col.name.clone(), v.clone());
                             }
                         }
-                        self.check_fk_constraints_on_write(table_name, &new_col_values, active_txn)?;
+                        if active_txn.is_none() {
+                            self.check_fk_constraints_on_write(table_name, &new_col_values, active_txn, None)?;
+                        }
                         self.validate_check_constraints(&table_constraints, &schema, &tuple.values)?;
 
                         // UNIQUE / PRIMARY KEY enforcement — the params family
@@ -23197,11 +23127,7 @@ impl EmbeddedDatabase {
                                     new_col_values.insert(col.name.clone(), v.clone());
                                 }
                             }
-                            if let Err(e) = self
-                                .storage
-                                .art_indexes()
-                                .on_delete(table_name, *row_id, &old_col_values)
-                            {
+                            if let Err(e) = self.remove_index_entries_held(txn, table_name, *row_id, &old_col_values) {
                                 tracing::debug!("ART index update/delete-old for '{}': {}", table_name, e);
                             }
                             if let Err(e) = self
@@ -23226,7 +23152,7 @@ impl EmbeddedDatabase {
                         // on_row_update itself skips when the indexed vector
                         // column is unchanged.
                         if self.vector_dml_gate(table_name) {
-                            let vops = self.storage.vector_indexes().on_row_update(
+                            let vops = self.storage.vector_indexes().on_row_update_staged(
                                 table_name,
                                 *row_id,
                                 &schema,
@@ -23238,87 +23164,23 @@ impl EmbeddedDatabase {
 
                         self.storage.row_cache().invalidate(table_name, *row_id);
                     }
+                    self.apply_fk_parent_updates(txn, table_name, &schema, &updates)?;
                     updates.len() as u64
                 } else {
-                    // AUTOCOMMIT params-family UPDATE (no session transaction):
-                    // `update_tuples_branch_aware` writes the row, the versions,
-                    // the WAL record, the MV/SMFI deltas and the HNSW vector
-                    // index — but it does NOT touch the ART indexes, and it is
-                    // the ONLY write funnel that does not. Every row updated
-                    // through it (an UPDATE with RETURNING, or with a non-PK
-                    // predicate, on the extended protocol / REST) therefore left
-                    // stale ART entries behind: `WHERE unique_col = <old value>`
-                    // kept resolving to the row and `WHERE unique_col = <new
-                    // value>` could not find it, and — once UNIQUE is actually
-                    // enforced on UPDATE — the stale entry rejected the row's
-                    // OWN value as a duplicate ("toggle a UNIQUE column through
-                    // NULL and back" failed on round 1 with 23505).
-                    //
-                    // Maintained here rather than inside the storage funnel
-                    // because this is where the logical pre-image lives: the
-                    // funnel only receives the new tuples, and the pre-image it
-                    // could re-read is the STORED form (dictionary / columnar
-                    // references), whose encoded index keys are not the row's.
-                    //
-                    // Same shape as the transactional branch above: gated on an
-                    // indexed column actually changing (R0.2), skipped entirely
-                    // on a branch (W2.0 — the row lands in `bdata:` and the
-                    // shared ART is branch-blind). No undo log: an autocommit
-                    // statement has no ROLLBACK to undo it.
-                    let on_branch = self.storage.is_branch_active();
-                    let mut art_maintenance: Vec<(
-                        u64,
-                        std::collections::HashMap<String, Value>,
-                        std::collections::HashMap<String, Value>,
-                    )> = Vec::new();
-                    if !on_branch {
-                        for (row_id, old_tuple, tuple) in &updates {
-                            if !self
-                                .storage
-                                .art_indexes()
-                                .tuple_update_affects_indexes(table_name, &schema, old_tuple, tuple)
-                            {
-                                continue;
-                            }
-                            let mut old_col_values = std::collections::HashMap::with_capacity(schema.columns.len());
-                            let mut new_col_values = std::collections::HashMap::with_capacity(schema.columns.len());
-                            for (i, col) in schema.columns.iter().enumerate() {
-                                if let Some(v) = old_tuple.values.get(i) {
-                                    old_col_values.insert(col.name.clone(), v.clone());
-                                }
-                                if let Some(v) = tuple.values.get(i) {
-                                    new_col_values.insert(col.name.clone(), v.clone());
-                                }
-                            }
-                            art_maintenance.push((*row_id, old_col_values, new_col_values));
-                        }
-                    }
-                    let updates: Vec<(u64, Tuple)> = updates
-                        .into_iter()
-                        .map(|(row_id, _old_tuple, tuple)| (row_id, tuple))
-                        .collect();
-                    let written = self.storage.update_tuples_branch_aware(table_name, updates)?;
-                    // After the row is durable, so a concurrent probe can never
-                    // be pointed at a row that is not there yet.
-                    for (row_id, old_col_values, new_col_values) in &art_maintenance {
-                        if let Err(e) = self
-                            .storage
-                            .art_indexes()
-                            .on_delete(table_name, *row_id, old_col_values)
-                        {
-                            tracing::debug!("ART index update/delete-old for '{}': {}", table_name, e);
-                        }
-                        if let Err(e) = self
-                            .storage
-                            .art_indexes()
-                            .on_insert(table_name, *row_id, new_col_values)
-                        {
-                            tracing::debug!("ART index update/insert-new for '{}': {}", table_name, e);
-                        }
-                    }
-                    written
+                    // The storage statement owns current preimages, ART claims,
+                    // commit settlement and derived publication for direct callers too.
+                    let updates = updates.into_iter().map(|(row_id, _old, new)| (row_id, new)).collect();
+                    self.storage.update_tuples_branch_aware(table_name, updates)?
                 };
                 Ok((count, returned_tuples))
+            }
+            sql::LogicalPlan::MergeBranch {
+                source,
+                target,
+                options,
+            } => {
+                self.execute_merge_branch_with_fk_policy(source, target, options)?;
+                Ok((0, Vec::new()))
             }
             sql::LogicalPlan::Delete {
                 table_name,
@@ -23359,8 +23221,9 @@ impl EmbeddedDatabase {
                 // sprinter 6bc4a4040eb7 (B2): the branch view with the
                 // transaction's staged branch writes on a branch.
                 let branch_view = self.storage.branch_view()?;
-                // Spec R5.4 (P12): the table's change epoch, before its rows are read.
-                let row_epoch = self.storage.row_locks().table_epoch(table_name);
+                // Spec R5.4 (P12): the table's change epoch, before its rows are read
+                // (review F5: the branch level's, on a branch).
+                let row_epoch = self.row_epoch_for(branch_view.as_ref(), table_name);
                 let base_tuples = match &branch_view {
                     Some(view) => view.scan(active_txn, table_name, &schema)?,
                     None => self.storage.scan_table_branch_aware(table_name)?,
@@ -23393,7 +23256,9 @@ impl EmbeddedDatabase {
 
                 let row_matches = |row: &Tuple| -> Result<bool> {
                     Ok(match selection {
-                        Some(predicate) => matches!(evaluator.evaluate(predicate, row)?, Value::Boolean(true)),
+                        Some(predicate) => {
+                            matches!(evaluator.evaluate(predicate, row)?, Value::Boolean(true))
+                        }
                         None => true,
                     })
                 };
@@ -23403,8 +23268,15 @@ impl EmbeddedDatabase {
                     // transaction first, and changed as committed under the lock: a
                     // concurrent writer's commit is never thrown away.
                     let tuple = match (matches, active_txn, &branch_view) {
-                        (true, Some(txn), None) => {
-                            match self.lock_row_for_change(txn, table_name, &schema, tuple, row_epoch)? {
+                        (true, Some(txn), view) => {
+                            match self.lock_row_for_change_on(
+                                txn,
+                                view.as_ref(),
+                                table_name,
+                                &schema,
+                                tuple,
+                                row_epoch,
+                            )? {
                                 LockedRow::Same(row) => row,
                                 LockedRow::Moved(row) => {
                                     matches = row_matches(&row)?;
@@ -23425,7 +23297,7 @@ impl EmbeddedDatabase {
                         // so a RESTRICT violation aborts the statement without
                         // any row being staged — mirrors the text family's
                         // ordering in `execute_in_transaction_inner`.
-                        if tuple.row_id.is_some() {
+                        if tuple.row_id.is_some() && active_txn.is_none() {
                             self.enforce_referencing_fks_on_delete(
                                 table_name,
                                 &tuple,
@@ -23469,7 +23341,13 @@ impl EmbeddedDatabase {
                         if let Some(txn) = active_txn {
                             txn.note_index_key_removal(table_name);
                         }
-                        if let Err(e) = self.storage.art_indexes().on_delete(table_name, *row_id, &col_values) {
+                        // Spec R5.4 (review F3): held for the transaction, which may
+                        // still roll back.
+                        let removed = match active_txn {
+                            Some(txn) => self.remove_index_entries_held(txn, table_name, *row_id, &col_values),
+                            None => self.storage.art_indexes().on_delete(table_name, *row_id, &col_values),
+                        };
+                        if let Err(e) = removed {
                             tracing::debug!("ART index delete for table '{}': {}", table_name, e);
                         }
                         if let Some(txn) = active_txn {
@@ -23487,7 +23365,7 @@ impl EmbeddedDatabase {
                             // `delete_tuples_branch_aware`, whose engine-side hook
                             // covers them — only the txn write-set path needs this.
                             if self.vector_dml_gate(table_name) {
-                                let vops = self.storage.vector_indexes().on_row_delete(
+                                let vops = self.storage.vector_indexes().on_row_delete_staged(
                                     table_name,
                                     *row_id,
                                     Some(&schema),
@@ -23524,6 +23402,7 @@ impl EmbeddedDatabase {
                         txn.delete(key.clone())?;
                         self.storage.row_cache().invalidate(table_name, *row_id);
                     }
+                    self.apply_fk_parent_deletes(txn, table_name, &schema, &deleted_tuples)?;
                     row_ids_to_delete.len() as u64
                 } else {
                     self.storage.delete_tuples_branch_aware(table_name, row_ids_to_delete)?
@@ -23612,44 +23491,12 @@ impl EmbeddedDatabase {
                 }
                 Ok((0, Vec::new()))
             }
-            // Prepared statement support
-            sql::LogicalPlan::Prepare { name, statement, .. } => {
-                // Store the prepared statement
-                self.prepared_statements
-                    .write()
-                    .insert(name.clone(), *statement.clone());
-                self.prepared_statement_sql.write().remove(name);
-                self.prepared_fast_selects.write().remove(name);
-                Ok((0, Vec::new()))
-            }
-            sql::LogicalPlan::Execute { name, parameters } => {
-                let plan = self.prepared_plan_or_lazy_fast_plan(name)?;
-                let empty_tuple = Tuple::new(vec![]);
-                let empty_schema = std::sync::Arc::new(Schema { columns: vec![] });
-                let evaluator = sql::Evaluator::new(empty_schema);
-                let param_values: Result<Vec<Value>> = parameters
-                    .iter()
-                    .map(|expr| evaluator.evaluate(expr, &empty_tuple))
-                    .collect();
-                self.execute_plan_with_params(&plan, &param_values?, session_txn)
-            }
-            sql::LogicalPlan::Deallocate { name } => {
-                if let Some(ref stmt_name) = name {
-                    // Remove specific prepared statement
-                    if !self.remove_prepared_statement_state(stmt_name) {
-                        return Err(Error::query_execution(format!(
-                            "Prepared statement '{}' does not exist",
-                            stmt_name
-                        )));
-                    }
-                } else {
-                    // DEALLOCATE ALL - remove all prepared statements
-                    self.prepared_statements.write().clear();
-                    self.prepared_statement_sql.write().clear();
-                    self.prepared_fast_selects.write().clear();
-                }
-                Ok((0, Vec::new()))
-            }
+            sql::LogicalPlan::Prepare { .. }
+            | sql::LogicalPlan::Execute { .. }
+            | sql::LogicalPlan::Deallocate { .. } => self
+                .try_handle_prepared_plan_with_params(plan, params, session_txn)?
+                .map(|(count, rows, _)| (count, rows))
+                .ok_or_else(|| Error::query_execution("SQL prepared utility was not handled")),
             sql::LogicalPlan::Call { name, args } => {
                 // Params family. Before this arm existed, `CALL` fell to the
                 // catch-all below, which built a `sql::Executor` — and an
@@ -23930,7 +23777,7 @@ impl EmbeddedDatabase {
     /// ```
     pub fn query(&self, sql: &str, _params: &[&dyn std::fmt::Display]) -> Result<Vec<Tuple>> {
         // sprinter ccebc95977f1: off the async worker serving the client (`runtime_offload`).
-        offload_statement(|| self.query_body(sql, _params))
+        offload_statement(|| self.run_layout_statement(self.in_transaction(), || self.query_body(sql, _params)))
     }
 
     /// The body of [`Self::query`], which runs it through
@@ -24323,7 +24170,8 @@ impl EmbeddedDatabase {
         }
 
         // Cache miss: parse, plan, optimize, cache, execute
-        // 1. Parse SQL (with cache)
+        // 1. Parse SQL (with cache). Spec R5.6: the planning's layout epochs.
+        let collector = storage::layout_epochs::StampCollector::start();
         let plan_generation = self.storage.schema_generation();
         let parse_start = std::time::Instant::now();
         let (statement, _parse_cached) = self.parse_cached(sql)?;
@@ -24341,6 +24189,7 @@ impl EmbeddedDatabase {
             .with_current_schema(self.current_schema())
             .with_search_path(self.current_search_path());
         let plan = planner.statement_to_plan(statement)?;
+        let layout = collector.finish();
         tracing::debug!(
             phase = "plan",
             duration_us = plan_start.elapsed().as_micros() as u64,
@@ -24396,7 +24245,7 @@ impl EmbeddedDatabase {
         let admit = !schema_active && !is_non_deterministic && main_ddl.is_none() && self.cache_admits(sql);
         let plan_arc = std::sync::Arc::new(plan);
         if admit {
-            self.plan_cache_put_if_current(sql.to_string(), plan_arc.clone(), plan_generation);
+            self.plan_cache_put_if_current(sql.to_string(), plan_arc.clone(), plan_generation, layout);
         }
 
         // 5. Apply RLS policies + 6. Execute.
@@ -24453,12 +24302,30 @@ impl EmbeddedDatabase {
             return None;
         }
 
+        // The wire's top-level probe runs outside a layout statement scope. Pair
+        // the rows and schema under one visibility epoch: DDL can invalidate and
+        // repopulate both caches between these two lookups.
+        let cache_epoch = self.result_cache_epoch();
         let cached_results = self.cached_query_result(sql)?;
+        self.complete_cached_query_with_schema(sql, cached_results, cache_epoch)
+    }
+
+    /// Complete a cache probe after retrieving its rows. Kept separate so the
+    /// regression test can stop at precisely the boundary between the two cache
+    /// reads and reproduce a DDL plus repopulation there without a timing race.
+    fn complete_cached_query_with_schema(
+        &self,
+        sql: &str,
+        cached_results: std::sync::Arc<Vec<Tuple>>,
+        cache_epoch: ResultCacheEpoch,
+    ) -> Option<(std::sync::Arc<Vec<Tuple>>, std::sync::Arc<Schema>)> {
         let arc_plan = self.plan_cache.get(sql)?;
         // The cached plan's own schema: the cached and the uncached branch now
         // describe a result identically (GH#23).
         let columns = arc_plan.schema();
-
+        if self.result_cache_epoch() != cache_epoch {
+            return None;
+        }
         Some((cached_results, columns))
     }
 
@@ -24581,6 +24448,8 @@ impl EmbeddedDatabase {
         let plan_arc = if let Some(cached) = self.plan_cache.get(&nsql) {
             cached
         } else {
+            // Spec R5.6: the planning's layout epochs.
+            let collector = storage::layout_epochs::StampCollector::start();
             let plan_generation = self.storage.schema_generation();
             let (statement, _) = match self.parse_cached(&nsql) {
                 Ok(v) => v,
@@ -24595,13 +24464,14 @@ impl EmbeddedDatabase {
                 Ok(p) => p,
                 Err(e) => return Some(Err(e)),
             };
+            let layout = collector.finish();
             let plan = match self.cold_optimizer().optimize_recursive(plan) {
                 Ok(p) => p,
                 Err(e) => return Some(Err(e)),
             };
             let plan_arc = std::sync::Arc::new(plan);
             if self.cache_admits(&nsql) {
-                self.plan_cache_put_if_current(nsql.clone(), plan_arc.clone(), plan_generation);
+                self.plan_cache_put_if_current(nsql.clone(), plan_arc.clone(), plan_generation, layout);
             }
             plan_arc
         };
@@ -24694,18 +24564,22 @@ impl EmbeddedDatabase {
         if let Some(result) = handled {
             return Ok(result);
         }
-        if let Some(result) = self.try_fast_select_with_schema(sql) {
-            return result;
-        }
-        // sprinter ccebc95977f1: a BOUNDED read — one primary-key probe, no user
-        // code — is answered here, on the async worker; everything else below
-        // (the interceptors, planning, the executor) runs off it, in one handoff
-        // (`runtime_offload`). The guards above stay installed: the offloaded
-        // closure runs on this same thread.
-        if let Some(result) = self.try_bounded_point_read_with_schema(sql) {
-            return result;
-        }
-        offload_statement(|| self.query_with_schema_general(sql, cache_epoch))
+        // Spec R5.6: one statement under a layout read set, the bounded reads included
+        // (a retry's pause is taken off the worker).
+        self.run_layout_statement(self.in_transaction(), || {
+            if let Some(result) = self.try_fast_select_with_schema(sql) {
+                return result;
+            }
+            // sprinter ccebc95977f1: a BOUNDED read — one primary-key probe, no user
+            // code — is answered here, on the async worker; everything else below
+            // (the interceptors, planning, the executor) runs off it, in one handoff
+            // (`runtime_offload`). The guards above stay installed: the offloaded
+            // closure runs on this same thread.
+            if let Some(result) = self.try_bounded_point_read_with_schema(sql) {
+                return result;
+            }
+            offload_statement(|| self.query_with_schema_general(sql, cache_epoch))
+        })
     }
 
     /// The general path of [`Self::query_with_schema`], run off the async
@@ -24773,11 +24647,14 @@ impl EmbeddedDatabase {
         // aren't recognised by sqlparser; mirror the pre-detect that
         // `execute_in_transaction_inner` already does so the query path
         // produces rows instead of "Statement not yet supported".
+        // Spec R5.6: the cold branch below plans under this collector.
+        let collector = storage::layout_epochs::StampCollector::start();
         let plan_generation = self.storage.schema_generation();
         let cached_plan = if schema_active { None } else { self.plan_cache.get(sql) };
         let plan = if sql::Parser::is_show_branches(sql) {
             sql::LogicalPlan::ShowBranches
         } else if let Some(arc_plan) = cached_plan {
+            drop(collector);
             if let Some(result) = self.try_handle_prepared_query_plan_with_schema(&arc_plan)? {
                 return Ok(result);
             }
@@ -24816,6 +24693,7 @@ impl EmbeddedDatabase {
                 .with_search_path(self.current_search_path());
             planner.statement_to_plan(statement)?
         };
+        let layout = collector.finish();
 
         if let Some(result) = self.try_handle_prepared_query_plan_with_schema(&plan)? {
             return Ok(result);
@@ -24845,7 +24723,12 @@ impl EmbeddedDatabase {
         // refcount bump) rather than deep-cloning the whole LogicalPlan.
         let plan_arc = std::sync::Arc::new(plan);
         if admit && !is_show_branches {
-            self.plan_cache_put_if_current(sql.to_string(), std::sync::Arc::clone(&plan_arc), plan_generation);
+            self.plan_cache_put_if_current(
+                sql.to_string(),
+                std::sync::Arc::clone(&plan_arc),
+                plan_generation,
+                layout,
+            );
         }
 
         let mut executor =
@@ -25276,6 +25159,7 @@ impl EmbeddedDatabase {
         // backend-pid lookup needs. One relaxed atomic load on every disconnect
         // that never created a temp table.
         if let Ok(backend_pid) = self.session_backend_pid(session_id) {
+            self.clear_prepared_statements_for_backend(backend_pid);
             sql::temp_tables::drop_backend_temp_tables(&self.storage, backend_pid);
         }
         self.session_manager.destroy_session(session_id)
@@ -25447,6 +25331,7 @@ impl EmbeddedDatabase {
         // W2.5: commit raises per-table committed-write watermarks in-band so
         // concurrent in-transaction readers can fast-path unchanged tables.
         txn.set_write_watermarks(self.storage.write_watermarks_arc());
+        txn.set_vector_row_context(self.storage.vector_row_context());
         // R0.2: record commits always; validate (first-committer-wins) for
         // RepeatableRead/Serializable. ReadCommitted keeps PostgreSQL's
         // blind-write semantics.
@@ -25650,11 +25535,14 @@ impl EmbeddedDatabase {
             let _commit_hold = txn.write_census_hold();
             // Spec R5.1: and the table locks, for the same window.
             let _commit_locks = txn.table_locks_hold();
-            if let Err(e) = txn.commit_with_timestamp(commit_ts) {
-                // Failed commit (e.g. R0.2 serialization failure) behaves
-                // like ROLLBACK: undo eager ART mutations, clear the
-                // session's transaction state, count the abort.
-                self.finish_session_art_undo(session_id, true);
+            let attempt = storage::write_outcome::WriteAttempt::default();
+            if let Err(e) = txn.commit_with_timestamp_settled(commit_ts, &attempt, |txn, outcome, succeeded| {
+                let undo = self.commit_needs_index_undo(txn, outcome, succeeded);
+                self.finish_session_art_undo(session_id, undo);
+            }) {
+                self.deferred_fk_checks.lock().clear();
+                self.constraints_all_deferred
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
                 self.invalidate_result_cache();
                 session.active_txn = None;
                 session.stats.transactions_aborted += 1;
@@ -25773,7 +25661,11 @@ impl EmbeddedDatabase {
     /// Number of rows affected by the statement
     pub fn execute_in_session(&self, session_id: crate::session::SessionId, sql: &str) -> Result<u64> {
         // sprinter ccebc95977f1: off the async worker serving the client (`runtime_offload`).
-        offload_statement(|| self.execute_in_session_body(session_id, sql))
+        offload_statement(|| {
+            self.run_layout_statement(self.session_has_open_transaction(session_id), || {
+                self.execute_in_session_body(session_id, sql)
+            })
+        })
     }
 
     /// The body of [`Self::execute_in_session`], which runs it through
@@ -25898,6 +25790,7 @@ impl EmbeddedDatabase {
             // W2.5: commit raises per-table committed-write watermarks in-band so
             // concurrent in-transaction readers can fast-path unchanged tables.
             txn.set_write_watermarks(self.storage.write_watermarks_arc());
+            txn.set_vector_row_context(self.storage.vector_row_context());
             // R0.2: implicit single-statement session transactions record
             // their commits so explicit transactions can validate against
             // them; they never validate (statement-atomic, RC semantics).
@@ -25929,7 +25822,11 @@ impl EmbeddedDatabase {
                         txn.written_data_keys()
                     };
                     let commit_ts = self.storage.next_commit_timestamp(txn.has_tracked_writes());
-                    txn.commit_with_timestamp(commit_ts)?;
+                    let attempt = storage::write_outcome::WriteAttempt::default();
+                    txn.commit_with_timestamp_settled(commit_ts, &attempt, |txn, outcome, succeeded| {
+                        let undo = self.commit_needs_index_undo(txn, outcome, succeeded);
+                        self.finish_session_art_undo(session_id, undo);
+                    })?;
                     if !written.is_empty() {
                         self.invalidate_row_cache_for(&written);
                     }
@@ -25938,8 +25835,8 @@ impl EmbeddedDatabase {
                     Ok(count)
                 }
                 Err(e) => {
-                    let _ = txn.rollback();
                     self.finish_session_art_undo(session_id, true);
+                    let _ = txn.rollback();
                     Err(e)
                 }
             }
@@ -25968,7 +25865,11 @@ impl EmbeddedDatabase {
         _params: &[&dyn std::fmt::Display],
     ) -> Result<Vec<Tuple>> {
         // sprinter ccebc95977f1: off the async worker serving the client (`runtime_offload`).
-        offload_statement(|| self.query_in_session_body(session_id, sql, _params))
+        offload_statement(|| {
+            self.run_layout_statement(self.session_has_open_transaction(session_id), || {
+                self.query_in_session_body(session_id, sql, _params)
+            })
+        })
     }
 
     /// The body of [`Self::query_in_session`], which runs it through
@@ -26207,8 +26108,11 @@ impl EmbeddedDatabase {
         let Some(txn) = guard.as_ref() else {
             return;
         };
-        txn.rollback_to_savepoint(&savepoint.write_set_snapshot);
-        self.rollback_art_undo_to(txn, savepoint.art_undo_len);
+        txn.rollback_to_savepoint_with_index_undo(&savepoint.write_set_snapshot, || {
+            self.rollback_art_undo_to(txn, savepoint.art_undo_len);
+        });
+        // Spec R5.4 (review F9): the failed statement's row locks, after the index undo.
+        txn.release_row_locks_after_savepoint(&savepoint.write_set_snapshot);
     }
 
     /// W3.3 autocommit statement-retry policy (from `[locks]` config). Read by
@@ -27047,7 +26951,11 @@ impl EmbeddedDatabase {
     /// Execute a statement on behalf of a wire-protocol session.
     pub fn execute_for_session(&self, session_id: crate::session::SessionId, sql: &str) -> Result<u64> {
         // sprinter ccebc95977f1: off the async worker serving the client (`runtime_offload`).
-        offload_statement(|| self.execute_for_session_body(session_id, sql))
+        offload_statement(|| {
+            self.run_layout_statement(self.session_has_open_transaction(session_id), || {
+                self.execute_for_session_body(session_id, sql)
+            })
+        })
     }
 
     /// The body of [`Self::execute_for_session`], which runs it through
@@ -27113,7 +27021,7 @@ impl EmbeddedDatabase {
         // extended protocol (and any in-transaction SET) reaches here, where the
         // in-transaction planner has no grammar for it — so arm it directly on
         // the process-wide switch before that path.
-        if let Some(count) = self.try_handle_set_constraints(sql)? {
+        if let Some(count) = self.try_handle_set_constraints_for_session(session_id, sql)? {
             return Ok(count);
         }
         // Resolve bare names against THIS session's schema for the rest of the
@@ -27234,7 +27142,7 @@ impl EmbeddedDatabase {
         // sprinter ccebc95977f1: inside a session transaction a read takes the
         // general path (planning + the executor), off the async worker in one
         // handoff (`runtime_offload`); the guards above stay on this thread.
-        offload_statement(|| self.query_with_schema_in_session_txn(session_id, sql))
+        offload_statement(|| self.run_layout_statement(true, || self.query_with_schema_in_session_txn(session_id, sql)))
     }
 
     /// The in-transaction half of [`Self::query_with_schema_for_session`], run
@@ -27304,7 +27212,11 @@ impl EmbeddedDatabase {
         sql: &str,
     ) -> Result<(u64, Vec<Tuple>)> {
         // sprinter ccebc95977f1: off the async worker serving the client (`runtime_offload`).
-        offload_statement(|| self.execute_returning_for_session_body(session_id, sql))
+        offload_statement(|| {
+            self.run_layout_statement(self.session_has_open_transaction(session_id), || {
+                self.execute_returning_for_session_body(session_id, sql)
+            })
+        })
     }
 
     /// The body of [`Self::execute_returning_for_session`], which runs it through
@@ -27363,7 +27275,7 @@ impl EmbeddedDatabase {
         }
         // `SET CONSTRAINTS` arms transaction-scoped FK deferral (see
         // `execute_for_session`); it never returns rows.
-        if let Some(count) = self.try_handle_set_constraints(sql)? {
+        if let Some(count) = self.try_handle_set_constraints_for_session(session_id, sql)? {
             return Ok((count, Vec::new()));
         }
         let _schema_override = self.session_schema_override_guard(session_id);
@@ -27460,7 +27372,11 @@ impl EmbeddedDatabase {
         expected: Option<ExpectedResultShape<'_>>,
     ) -> Result<(u64, Vec<Tuple>)> {
         // sprinter ccebc95977f1: off the async worker serving the client (`runtime_offload`).
-        offload_statement(|| self.execute_params_returning_for_session_body(session_id, sql, params, expected))
+        offload_statement(|| {
+            self.run_layout_statement(self.session_has_open_transaction(session_id), || {
+                self.execute_params_returning_for_session_body(session_id, sql, params, expected)
+            })
+        })
     }
 
     /// The body of [`Self::execute_params_returning_for_session`], which runs it through
@@ -27530,7 +27446,7 @@ impl EmbeddedDatabase {
         }
         // `SET CONSTRAINTS` arms transaction-scoped FK deferral (see
         // `execute_for_session`); it never returns rows.
-        if let Some(count) = self.try_handle_set_constraints(sql)? {
+        if let Some(count) = self.try_handle_set_constraints_for_session(session_id, sql)? {
             return Ok((count, Vec::new()));
         }
         // Resolve bare names against THIS session's schema for both the
@@ -27588,7 +27504,7 @@ impl EmbeddedDatabase {
         session_id: crate::session::SessionId,
         sql: &str,
         params: &[Value],
-        plan: &std::sync::Arc<sql::LogicalPlan>,
+        plan: &PinnedPlan,
     ) -> Result<u64> {
         self.execute_params_for_session_inner(session_id, sql, params, Some(plan))
     }
@@ -27598,10 +27514,14 @@ impl EmbeddedDatabase {
         session_id: crate::session::SessionId,
         sql: &str,
         params: &[Value],
-        plan_override: Option<&std::sync::Arc<sql::LogicalPlan>>,
+        plan_override: Option<&PinnedPlan>,
     ) -> Result<u64> {
         // sprinter ccebc95977f1: off the async worker serving the client (`runtime_offload`).
-        offload_statement(|| self.execute_params_for_session_inner_body(session_id, sql, params, plan_override))
+        offload_statement(|| {
+            self.run_layout_statement(self.session_has_open_transaction(session_id), || {
+                self.execute_params_for_session_inner_body(session_id, sql, params, plan_override)
+            })
+        })
     }
 
     /// The body of [`Self::execute_params_for_session_inner`], which runs it through
@@ -27611,7 +27531,7 @@ impl EmbeddedDatabase {
         session_id: crate::session::SessionId,
         sql: &str,
         params: &[Value],
-        plan_override: Option<&std::sync::Arc<sql::LogicalPlan>>,
+        plan_override: Option<&PinnedPlan>,
     ) -> Result<u64> {
         // Spec P1.4: reads only on a physical standby (`admit_on_physical_standby`).
         let _standby = self.admit_on_physical_standby(sql)?;
@@ -27672,7 +27592,7 @@ impl EmbeddedDatabase {
         // `SET CONSTRAINTS` arms transaction-scoped FK deferral (see
         // `execute_for_session`) — arm it before the in-transaction planner,
         // which has no grammar for it.
-        if let Some(count) = self.try_handle_set_constraints(sql)? {
+        if let Some(count) = self.try_handle_set_constraints_for_session(session_id, sql)? {
             return Ok(count);
         }
         let _schema_override = self.session_schema_override_guard(session_id);
@@ -27697,7 +27617,11 @@ impl EmbeddedDatabase {
         // boundary.
         self.run_statement_in_transaction(&txn, sql, || {
             let plan = match plan_override {
-                Some(p) => std::sync::Arc::clone(p),
+                // Spec R5.6: as in `execute_params_inner_unguarded`.
+                Some(p) => match p.current() {
+                    Some(plan) => plan,
+                    None => self.parameterized_plan_cached(sql)?,
+                },
                 None => self.parameterized_plan_cached(sql)?,
             };
             if let Some(result) = self.try_session_txn_fast_insert_params(sql, &plan, params, &txn) {
@@ -27726,7 +27650,7 @@ impl EmbeddedDatabase {
         session_id: crate::session::SessionId,
         sql: &str,
         params: &[Value],
-        plan: &std::sync::Arc<sql::LogicalPlan>,
+        plan: &PinnedPlan,
     ) -> Result<Vec<Tuple>> {
         self.query_params_for_session_inner(session_id, sql, params, Some(plan))
     }
@@ -27736,7 +27660,7 @@ impl EmbeddedDatabase {
         session_id: crate::session::SessionId,
         sql: &str,
         params: &[Value],
-        plan_override: Option<&std::sync::Arc<sql::LogicalPlan>>,
+        plan_override: Option<&PinnedPlan>,
     ) -> Result<Vec<Tuple>> {
         // Spec P1.4: reads only on a physical standby (`admit_on_physical_standby`).
         let _standby = self.admit_on_physical_standby(sql)?;
@@ -27790,7 +27714,11 @@ impl EmbeddedDatabase {
             return self.query_params_inner(sql, params, plan_override);
         }
         // sprinter ccebc95977f1: see `query_with_schema_for_session`.
-        offload_statement(|| self.query_params_in_session_txn(session_id, sql, params, plan_override))
+        offload_statement(|| {
+            self.run_layout_statement(true, || {
+                self.query_params_in_session_txn(session_id, sql, params, plan_override)
+            })
+        })
     }
 
     /// The in-transaction half of [`Self::query_params_for_session_inner`],
@@ -27800,7 +27728,7 @@ impl EmbeddedDatabase {
         session_id: crate::session::SessionId,
         sql: &str,
         params: &[Value],
-        plan_override: Option<&std::sync::Arc<sql::LogicalPlan>>,
+        plan_override: Option<&PinnedPlan>,
     ) -> Result<Vec<Tuple>> {
         let slot = self
             .session_txn_slot(session_id)
@@ -27814,7 +27742,11 @@ impl EmbeddedDatabase {
         // HDB-008: plan + execute inside the failed-transaction boundary.
         self.run_statement_in_transaction(&txn, sql, || {
             let plan = match plan_override {
-                Some(p) => std::sync::Arc::clone(p),
+                // Spec R5.6: as in `execute_params_inner_unguarded`.
+                Some(p) => match p.current() {
+                    Some(plan) => plan,
+                    None => self.parameterized_plan_cached(sql)?,
+                },
                 None => self.parameterized_plan_cached(sql)?,
             };
 
@@ -27862,7 +27794,11 @@ impl EmbeddedDatabase {
         params: &[Value],
     ) -> Result<(Vec<Tuple>, std::sync::Arc<Schema>)> {
         // sprinter ccebc95977f1: off the async worker serving the client (`runtime_offload`).
-        offload_statement(|| self.query_params_with_schema_for_session_body(session_id, sql, params))
+        offload_statement(|| {
+            self.run_layout_statement(self.session_has_open_transaction(session_id), || {
+                self.query_params_with_schema_for_session_body(session_id, sql, params)
+            })
+        })
     }
 
     /// The body of [`Self::query_params_with_schema_for_session`], which runs it through
@@ -28108,7 +28044,7 @@ impl EmbeddedDatabase {
         &self,
         sql: &str,
         params: &[Value],
-        plan_override: Option<&std::sync::Arc<sql::LogicalPlan>>,
+        plan_override: Option<&PinnedPlan>,
     ) -> Result<Vec<Tuple>> {
         // Spec P1.4: reads only on a physical standby (`admit_on_physical_standby`).
         let _standby = self.admit_on_physical_standby(sql)?;
@@ -28122,7 +28058,10 @@ impl EmbeddedDatabase {
         // boundary. `query_plan_with_params` attaches the global transaction
         // itself, so the statement genuinely runs inside it and its failure
         // must abort it.
-        self.run_global_statement(sql, || self.query_params_inner_unguarded(sql, params, plan_override))
+        // Spec R5.6: one statement under a layout read set.
+        self.run_layout_statement(self.in_transaction(), || {
+            self.run_global_statement(sql, || self.query_params_inner_unguarded(sql, params, plan_override))
+        })
     }
 
     /// The body of [`query_params_inner`](Self::query_params_inner), inside
@@ -28131,7 +28070,7 @@ impl EmbeddedDatabase {
         &self,
         sql: &str,
         params: &[Value],
-        plan_override: Option<&std::sync::Arc<sql::LogicalPlan>>,
+        plan_override: Option<&PinnedPlan>,
     ) -> Result<Vec<Tuple>> {
         // Spec 03: advisory-lock owner for a params-family statement with no
         // session. A no-op under `query_params_for_session_inner`.
@@ -28179,6 +28118,9 @@ impl EmbeddedDatabase {
         // on the process-global registry) — from the params family, the entry
         // point the REST layer and every server-side binding driver reach. A
         // prefix check that costs nothing on a SELECT.
+        if self.try_handle_set_constraints(sql)?.is_some() {
+            return Ok(Vec::new());
+        }
         if let Some((rows, _schema)) = self.try_handle_params_family_setting_statement(sql)? {
             return Ok(rows);
         }
@@ -28203,8 +28145,9 @@ impl EmbeddedDatabase {
         // protocol, or in the plan cache — that is ONE primary-key probe
         // (`plan_is_bounded_point_read`) runs here, on the async worker; planning
         // and every other plan run off it (`runtime_offload`), in one handoff.
-        let ready_plan = match plan_override {
-            Some(p) => Some(std::sync::Arc::clone(p)),
+        // Spec R5.6: a pin is ready only while its layout is current.
+        let ready_plan = match plan_override.and_then(PinnedPlan::current) {
+            Some(plan) => Some(plan),
             None => self.cached_parameterized_plan(sql),
         };
         match ready_plan {
@@ -28321,6 +28264,9 @@ impl EmbeddedDatabase {
         params: &[Value],
         session_txn: Option<&storage::Transaction>,
     ) -> Result<Vec<Tuple>> {
+        if let Some((_, rows, _)) = self.try_handle_prepared_plan_with_params(plan, params, session_txn)? {
+            return Ok(rows);
+        }
         // R1.2 (Hole 5 closure): filter here, once, so every caller — the
         // in-transaction branches of `query()` / `query_in_session` /
         // `query_*_for_session`, `Transaction::query`, the PREPARE/EXECUTE
@@ -28370,6 +28316,9 @@ impl EmbeddedDatabase {
         params: &[Value],
         session_txn: Option<&storage::Transaction>,
     ) -> Result<(Vec<Tuple>, std::sync::Arc<Schema>)> {
+        if let Some((_, rows, columns)) = self.try_handle_prepared_plan_with_params(plan, params, session_txn)? {
+            return Ok((rows, columns));
+        }
         let plan = self.rls_filtered_plan(plan)?;
         let mut _txn_guard = None;
         let active_txn: Option<&storage::Transaction> = match session_txn {
@@ -28433,7 +28382,18 @@ impl EmbeddedDatabase {
     /// The body of
     /// [`query_params_with_schema`](Self::query_params_with_schema), inside
     /// the HDB-008 boundary.
+    /// Spec R5.6: [`Self::query_params_with_schema_attempt`] under a layout read set.
     fn query_params_with_schema_inner(
+        &self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<(Vec<Tuple>, std::sync::Arc<Schema>)> {
+        self.run_layout_statement(self.in_transaction(), || {
+            self.query_params_with_schema_attempt(sql, params)
+        })
+    }
+
+    fn query_params_with_schema_attempt(
         &self,
         sql: &str,
         params: &[Value],
@@ -28492,6 +28452,10 @@ impl EmbeddedDatabase {
             let plan = planner.statement_to_plan(statement)?;
             self.apply_rls_to_plan(plan)?
         };
+
+        if let Some((_, rows, columns)) = self.try_handle_prepared_plan_with_params(&plan, params, None)? {
+            return Ok((rows, columns));
+        }
 
         if matches!(
             &plan,
@@ -28849,16 +28813,8 @@ impl EmbeddedDatabase {
                 let val = bincode::serialize(&tuple)
                     .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
                 let key = self.storage.branch_aware_data_key(table_name, row_id);
-                self.storage.put(&key, &val)?;
-            }
-
-            // R5.V1: maintain HNSW vector indexes. Like the ART update below,
-            // this direct-write bulk path is not transactional (no undo).
-            if self.vector_dml_gate(table_name) {
-                let _ = self
-                    .storage
-                    .vector_indexes()
-                    .on_row_insert(table_name, row_id, &schema, &tuple);
+                self.storage
+                    .put_bulk_row(table_name, row_id, &schema, &tuple, &key, &val)?;
             }
 
             art_updates.push((row_id, col_values));
@@ -29868,6 +29824,54 @@ impl EmbeddedDatabase {
         self.execute(&format!("MERGE BRANCH {source} INTO {target}"))
     }
 
+    fn merge_fk_policy(&self) -> storage::branch_catalog::MergeFkPolicy {
+        use storage::branch_catalog::MergeFkPolicy;
+        if *self.fk_validation_source.read() == FkValidationSource::Proxy
+            || *self.fk_validation_mode.read() == FkValidationMode::Off
+        {
+            MergeFkPolicy::Bypass
+        } else if *self.fk_validation_mode.read() == FkValidationMode::Audit {
+            MergeFkPolicy::Audit
+        } else {
+            MergeFkPolicy::Enforced
+        }
+    }
+
+    fn execute_merge_branch_with_fk_policy(
+        &self,
+        source: &str,
+        target: &str,
+        options: &[sql::logical_plan::MergeOption],
+    ) -> Result<storage::MergeResult> {
+        use sql::logical_plan::MergeOption;
+        if options
+            .iter()
+            .any(|option| matches!(option, MergeOption::ConflictResolution(_)))
+        {
+            return Err(Error::execution("MERGE BRANCH conflict_resolution is not implemented: merges are last-writer-wins and conflicts are never detected. Remove the option to merge with those semantics."));
+        }
+        let drop_source = options
+            .iter()
+            .find_map(|option| match option {
+                MergeOption::DeleteBranchAfter(value) => Some(*value),
+                _ => None,
+            })
+            .unwrap_or(false);
+        let result = self.storage.merge_branch_with_fk_policy(
+            source,
+            target,
+            storage::MergeStrategy::default(),
+            drop_source,
+            self.merge_fk_policy(),
+        );
+        self.invalidate_plan_cache();
+        let result = result?;
+        if drop_source && result.completed {
+            self.storage.drop_branch(source, false)?;
+        }
+        Ok(result)
+    }
+
     /// Merge branch `source` into branch `target` by NAME, whatever branch the
     /// calling session is on — the engine's MERGE, the one `MERGE BRANCH`
     /// runs (last-writer-wins, the source's rows win), with the same cache
@@ -29877,9 +29881,13 @@ impl EmbeddedDatabase {
     /// key format SQL never writes, and merged 0 rows).
     pub fn merge_branch_into(&self, source: &str, target: &str) -> Result<storage::MergeResult> {
         self.refuse_write_on_physical_standby("merge_branch")?;
-        let result = self
-            .storage
-            .merge_branch(source, target, storage::MergeStrategy::default());
+        let result = self.storage.merge_branch_with_fk_policy(
+            source,
+            target,
+            storage::MergeStrategy::default(),
+            false,
+            self.merge_fk_policy(),
+        );
         // As `plan_invalidates_sql_caches` does for `MERGE BRANCH`: the merge
         // wrote rows outside every DML-path invalidation.
         self.invalidate_plan_cache();
@@ -30479,41 +30487,42 @@ impl EmbeddedDatabase {
             return Self::branch_cascade_delete(&view, active_txn, table_name, &schema, fk_columns, parent_values);
         }
 
+        // Spec R5.4 (review F4): the child table's change epoch, before its rows are read.
+        let row_epoch = self.storage.row_locks().table_epoch(table_name);
         // Find all rows that reference the parent row
-        let tuples = self.storage.scan_table(table_name)?;
+        let committed = self.storage.scan_table_with_schema(table_name, &schema)?;
+        let tuples = if let Some(txn) = active_txn {
+            let shape = self.storage.row_shape(table_name, schema.columns.len())?;
+            txn.merge_with_write_set_shaped(table_name, committed, &shape)?
+        } else {
+            committed
+        };
         let mut rows_to_delete: Vec<(u64, Tuple)> = Vec::new();
 
         for tuple in tuples {
-            let mut matches = true;
-            for (fk_col, parent_val) in fk_columns.iter().zip(parent_values.iter()) {
-                let col_idx = schema.columns.iter().position(|c| &c.name == fk_col);
-                if let Some(idx) = col_idx {
-                    match tuple.values.get(idx) {
-                        Some(val) if val == parent_val => {}
-                        _ => {
-                            matches = false;
-                            break;
-                        }
-                    }
-                } else {
-                    matches = false;
-                    break;
-                }
-            }
-
-            if matches {
+            if Self::row_references_parent(&schema, &tuple, fk_columns, parent_values) {
                 if let Some(row_id) = tuple.row_id {
                     rows_to_delete.push((row_id, tuple));
                 }
             }
         }
 
-        // R3.3: null columnar slots + clear presence bits grouped per batch.
-        let cascade_row_ids: Vec<u64> = rows_to_delete.iter().map(|(row_id, _)| *row_id).collect();
-
         // Enclosing transaction: stage the cascade INTO it so COMMIT/ROLLBACK
         // (and ROLLBACK TO SAVEPOINT) cover parent and children as one unit.
         if let Some(txn) = active_txn {
+            // Spec R5.4 (review F4): each child's write lock, and the child as
+            // committed under it, as any DELETE takes them.
+            let rows_to_delete = self.lock_cascade_children(
+                txn,
+                table_name,
+                &schema,
+                fk_columns,
+                parent_values,
+                rows_to_delete,
+                row_epoch,
+            )?;
+            // R3.3: null columnar slots + clear presence bits grouped per batch.
+            let cascade_row_ids: Vec<u64> = rows_to_delete.iter().map(|(row_id, _)| *row_id).collect();
             // ART + HNSW maintenance first, mirroring the params-family
             // ordinary DELETE arm: apply eagerly against the live index and
             // push a compensating undo op onto the SAME transaction, because
@@ -30536,7 +30545,7 @@ impl EmbeddedDatabase {
                             col_values.insert(col.name.clone(), v.clone());
                         }
                     }
-                    if let Err(e) = self.storage.art_indexes().on_delete(table_name, *row_id, &col_values) {
+                    if let Err(e) = self.remove_index_entries_held(txn, table_name, *row_id, &col_values) {
                         tracing::debug!("ART index delete for cascade table '{}': {}", table_name, e);
                     }
                     // `ArtUndoOp::RestoreDeleted` replays as
@@ -30561,10 +30570,12 @@ impl EmbeddedDatabase {
             // path below, which also runs this unconditionally.
             if self.vector_dml_gate(table_name) {
                 for (row_id, tuple) in &rows_to_delete {
-                    let vops =
-                        self.storage
-                            .vector_indexes()
-                            .on_row_delete(table_name, *row_id, Some(&schema), Some(tuple));
+                    let vops = self.storage.vector_indexes().on_row_delete_staged(
+                        table_name,
+                        *row_id,
+                        Some(&schema),
+                        Some(tuple),
+                    );
                     self.push_vector_undo(txn, vops);
                 }
             }
@@ -30594,6 +30605,18 @@ impl EmbeddedDatabase {
         // nothing can roll this back.
         let txn = self.storage.begin_autocommit_transaction()?;
         let _wal_capture = txn.begin_statement_wal_capture();
+        // Spec R5.4 (review F4): the children's locks, held by this transaction until
+        // its commit is applied.
+        let rows_to_delete = self.lock_cascade_children(
+            &txn,
+            table_name,
+            &schema,
+            fk_columns,
+            parent_values,
+            rows_to_delete,
+            row_epoch,
+        )?;
+        let cascade_row_ids: Vec<u64> = rows_to_delete.iter().map(|(row_id, _)| *row_id).collect();
         self.storage
             .stage_columnar_deletes_grouped_in_transaction(table_name, &cascade_row_ids, &schema, &txn)?;
         for (row_id, _) in &rows_to_delete {
@@ -30603,7 +30626,8 @@ impl EmbeddedDatabase {
             // Log to WAL for crash recovery
             self.storage.log_data_delete(table_name, &key)?;
         }
-        txn.commit()?;
+        let census = txn.write_census_hold();
+        self.commit_before_index_publication(txn)?;
 
         for (row_id, tuple) in rows_to_delete {
             // W2.0: on a branch this cascade wrote only branch-aware tombstones
@@ -30631,7 +30655,54 @@ impl EmbeddedDatabase {
             self.storage.row_cache().invalidate(table_name, row_id);
         }
 
+        drop(census);
         Ok(())
+    }
+
+    /// Does child row `tuple` hold `parent_values` in its `fk_columns`?
+    fn row_references_parent(schema: &Schema, tuple: &Tuple, fk_columns: &[String], parent_values: &[Value]) -> bool {
+        fk_columns.iter().zip(parent_values.iter()).all(|(fk_col, parent_val)| {
+            schema
+                .columns
+                .iter()
+                .position(|c| &c.name == fk_col)
+                .and_then(|idx| tuple.values.get(idx))
+                .is_some_and(|val| val == parent_val)
+        })
+    }
+
+    /// Spec R5.4 (review F4): an ON DELETE CASCADE / SET NULL changes child rows like
+    /// any DELETE / UPDATE does: under each child's write lock, held by `txn` until it
+    /// ends, and over the child as committed then. It took none, so a child updated by
+    /// an open transaction was deleted under it and written back by that transaction's
+    /// COMMIT: an orphan, its parent gone. Now the cascade waits for that transaction;
+    /// a child it deleted meanwhile is not touched again, and one it moved to another
+    /// parent is left to that parent (`LockedRow`, read with the child table's
+    /// `row_epoch`, loaded before the children were read).
+    #[allow(clippy::too_many_arguments)]
+    fn lock_cascade_children(
+        &self,
+        txn: &storage::Transaction,
+        table_name: &str,
+        schema: &Schema,
+        fk_columns: &[String],
+        parent_values: &[Value],
+        children: Vec<(u64, Tuple)>,
+        row_epoch: u64,
+    ) -> Result<Vec<(u64, Tuple)>> {
+        let mut locked = Vec::with_capacity(children.len());
+        for (row_id, child) in children {
+            match self.lock_row_for_change(txn, table_name, schema, child, row_epoch)? {
+                LockedRow::Same(row) => locked.push((row_id, row)),
+                LockedRow::Moved(row) => {
+                    if Self::row_references_parent(schema, &row, fk_columns, parent_values) {
+                        locked.push((row_id, row));
+                    }
+                }
+                LockedRow::Gone => {}
+            }
+        }
+        Ok(locked)
     }
 
     /// SET NULL: Set FK columns to NULL in all rows that reference the given values
@@ -30665,32 +30736,30 @@ impl EmbeddedDatabase {
             return Self::branch_set_null(&view, active_txn, table_name, &schema, fk_columns, parent_values);
         }
 
+        // Spec R5.4 (review F4): the child table's change epoch, before its rows are read.
+        let row_epoch = self.storage.row_locks().table_epoch(table_name);
         // Find all rows that reference the parent row
-        let tuples = self.storage.scan_table(table_name)?;
-        let mut rows_to_update: Vec<(u64, Tuple)> = Vec::new();
-
+        let committed = self.storage.scan_table_with_schema(table_name, &schema)?;
+        let tuples = if let Some(txn) = active_txn {
+            let shape = self.storage.row_shape(table_name, schema.columns.len())?;
+            txn.merge_with_write_set_shaped(table_name, committed, &shape)?
+        } else {
+            committed
+        };
+        let mut referencing: Vec<(u64, Tuple)> = Vec::new();
         for tuple in tuples {
-            let mut matches = true;
-            for (fk_col, parent_val) in fk_columns.iter().zip(parent_values.iter()) {
-                let col_idx = schema.columns.iter().position(|c| &c.name == fk_col);
-                if let Some(idx) = col_idx {
-                    match tuple.values.get(idx) {
-                        Some(val) if val == parent_val => {}
-                        _ => {
-                            matches = false;
-                            break;
-                        }
-                    }
-                } else {
-                    matches = false;
-                    break;
+            if Self::row_references_parent(&schema, &tuple, fk_columns, parent_values) {
+                if let Some(row_id) = tuple.row_id {
+                    referencing.push((row_id, tuple));
                 }
             }
-
-            if matches {
-                if let Some(row_id) = tuple.row_id {
-                    // Create updated tuple with FK columns set to NULL
-                    let mut new_values = tuple.values.clone();
+        }
+        // The FK columns NULLed, over each child as its lock found it.
+        let null_fk_columns = |locked: Vec<(u64, Tuple)>| -> Vec<(u64, Tuple)> {
+            locked
+                .into_iter()
+                .map(|(row_id, tuple)| {
+                    let mut new_values = tuple.values;
                     for fk_col in fk_columns {
                         if let Some(idx) = schema.columns.iter().position(|c| &c.name == fk_col) {
                             if let Some(slot) = new_values.get_mut(idx) {
@@ -30698,11 +30767,10 @@ impl EmbeddedDatabase {
                             }
                         }
                     }
-                    let new_tuple = Tuple::new(new_values);
-                    rows_to_update.push((row_id, new_tuple));
-                }
-            }
-        }
+                    (row_id, Tuple::new(new_values))
+                })
+                .collect()
+        };
 
         // Enclosing transaction: stage the SET NULL INTO it so it rolls back
         // with the parent DELETE. No ART/HNSW/row-cache maintenance is added
@@ -30711,6 +30779,17 @@ impl EmbeddedDatabase {
         // entry; that is a separate pre-existing gap, and the two branches stay
         // symmetric about it.
         if let Some(txn) = active_txn {
+            // Spec R5.4 (review F4): each child's write lock, and the child as
+            // committed under it, as any UPDATE takes them.
+            let rows_to_update = null_fk_columns(self.lock_cascade_children(
+                txn,
+                table_name,
+                &schema,
+                fk_columns,
+                parent_values,
+                referencing,
+                row_epoch,
+            )?);
             // R3.3 / W2.0 carve-out, unchanged from the autocommit path below.
             if !self.storage.is_branch_active() {
                 let row_refs: Vec<(u64, &Tuple)> =
@@ -30736,6 +30815,17 @@ impl EmbeddedDatabase {
         // per touched batch (UPDATE — presence untouched).
         let txn = self.storage.begin_autocommit_transaction()?;
         let _wal_capture = txn.begin_statement_wal_capture();
+        // Spec R5.4 (review F4): the children's locks, held by this transaction until
+        // its commit is applied.
+        let rows_to_update = null_fk_columns(self.lock_cascade_children(
+            &txn,
+            table_name,
+            &schema,
+            fk_columns,
+            parent_values,
+            referencing,
+            row_epoch,
+        )?);
         if !self.storage.is_branch_active() {
             let row_refs: Vec<(u64, &Tuple)> = rows_to_update.iter().map(|(row_id, tuple)| (*row_id, tuple)).collect();
             self.storage
@@ -30749,7 +30839,7 @@ impl EmbeddedDatabase {
             // Log to WAL for crash recovery
             self.storage.log_data_update(table_name, &key, &val)?;
         }
-        txn.commit()?;
+        self.commit_before_index_publication(txn)?;
 
         Ok(())
     }
@@ -30833,7 +30923,9 @@ impl EmbeddedDatabase {
     /// site needs an extra branch.
     fn rls_row_visible(guard: Option<&RlsWriteGuard>, tuple: &Tuple) -> Result<bool> {
         let Some(guard) = guard else { return Ok(true) };
-        let Some(using) = &guard.using else { return Ok(true) };
+        let Some(using) = &guard.using else {
+            return Ok(true);
+        };
         guard.evaluator.evaluate(using, tuple)
     }
 
@@ -30971,13 +31063,26 @@ impl EmbeddedDatabase {
         Ok(())
     }
 
-    /// Spec R5.1: an `ON CONFLICT DO UPDATE` is about to update the row the index names,
-    /// and that row may have gone: a statement deleting it takes the row out before its
-    /// index entry, and another's uncommitted insert has its entry before its row. Then
-    /// there is nothing to update yet. Look again, a few times over a few milliseconds:
-    /// the key is free, and this row is an insert, or the row has landed, and it is an
-    /// update. Past that the DO UPDATE reports the row missing, as it would have.
-    /// Returns the verdict to go on; one probe of the store, and only on a conflict.
+    /// Spec R5.4 (review F6): PostgreSQL's speculative insertion, for main's
+    /// `INSERT … ON CONFLICT`. Returns the verdict to go on: `Ok` (no conflict: insert)
+    /// or the conflict, which DO UPDATE then applies to a row that is committed (or
+    /// staged by this transaction) and locked by `txn`.
+    ///
+    /// 1. The statement holds the value of every unique key it arbitrates on
+    ///    ([`Self::lock_upsert_arbiter_keys`]) until its transaction ends: a second
+    ///    upsert of the same value waits here for the first to commit or roll back,
+    ///    then looks again. Two upserts of one NEW key used to race: both found it
+    ///    free, one inserted, the other's insert failed 23505; or the other found the
+    ///    first's key before its row and gave 40001.
+    /// 2. DO UPDATE: the conflicting row's write lock, waiting for its writer, then the
+    ///    row. A row deleted meanwhile frees its key: look again (an insert now). A key
+    ///    whose row is not there yet (a plain INSERT's claim, before its row lands) is
+    ///    looked at again every millisecond, up to `lock_timeout` (55P03 then). Was:
+    ///    twenty looks over 20 ms, then 40001.
+    ///
+    /// The verdict is taken again under the locks, so an `Err` handed in may come back
+    /// `Ok` and the reverse. On a branch (the branch view arbitrates) and without
+    /// `ON CONFLICT`, the verdict as it came.
     fn upsert_conflict_settled(
         &self,
         table_name: &str,
@@ -30985,30 +31090,86 @@ impl EmbeddedDatabase {
         on_conflict: &Option<sql::logical_plan::OnConflictAction>,
         on_branch: bool,
         txn: &storage::Transaction,
-        mut verdict: std::result::Result<(), String>,
+        verdict: std::result::Result<(), String>,
     ) -> Result<std::result::Result<(), String>> {
-        const LOOKS: u32 = 20;
-        const BETWEEN_LOOKS: std::time::Duration = std::time::Duration::from_millis(1);
-        let Some(sql::logical_plan::OnConflictAction::DoUpdate { conflict_target, .. }) = on_conflict else {
-            return Ok(verdict);
+        let (conflict_target, do_update) = match on_conflict {
+            Some(sql::logical_plan::OnConflictAction::DoUpdate { conflict_target, .. }) => (conflict_target, true),
+            Some(sql::logical_plan::OnConflictAction::DoNothing { conflict_target }) => (conflict_target, false),
+            None => return Ok(verdict),
         };
         if on_branch {
             return Ok(verdict);
         }
-        for _ in 0..LOOKS {
+        let mut look_again = self.lock_upsert_arbiter_keys(txn, table_name, col_values, conflict_target.as_deref())?;
+        // Review F3: an arbiter key another open transaction took out (its DELETE, its
+        // key-moving UPDATE) is that transaction's until it ends: wait for it. After
+        // its commit the key is free (an insert), after its rollback the row is back
+        // (an update). Was: the key looked free, the insert went ahead, and the
+        // rollback left two rows with one primary key.
+        while let Some(hold) = self.storage.art_indexes().held_key_for(
+            table_name,
+            col_values,
+            conflict_target.as_deref(),
+            txn.transaction_id(),
+        ) {
+            self.storage.wait_out_key_hold(table_name, &hold, Some(txn))?;
+            look_again = true;
+        }
+        // The locks may have waited for another writer of the same value: the
+        // verdict is taken again under them.
+        let verdict = if look_again {
+            self.storage
+                .art_indexes()
+                .check_unique_constraints(table_name, col_values)
+                .map_err(|e| e.to_string())
+        } else {
+            verdict
+        };
+        if !do_update {
+            return Ok(verdict);
+        }
+        self.upsert_conflict_row_locked(table_name, col_values, conflict_target.as_deref(), txn, verdict)
+    }
+
+    /// Step 2 of [`Self::upsert_conflict_settled`]: a DO UPDATE's conflicting row,
+    /// locked by `txn` and there to update, or no conflict any more.
+    fn upsert_conflict_row_locked(
+        &self,
+        table_name: &str,
+        col_values: &std::collections::HashMap<String, Value>,
+        conflict_target: Option<&[String]>,
+        txn: &storage::Transaction,
+        mut verdict: std::result::Result<(), String>,
+    ) -> Result<std::result::Result<(), String>> {
+        const BETWEEN_LOOKS: std::time::Duration = std::time::Duration::from_millis(1);
+        let started = std::time::Instant::now();
+        let mut lock_timeout: Option<std::time::Duration> = None;
+        loop {
             if verdict.is_ok() {
-                break;
+                return Ok(verdict);
             }
             let Some(conflict) =
                 self.storage
                     .art_indexes()
-                    .find_unique_conflict(table_name, col_values, conflict_target.as_deref())
+                    .find_unique_conflict(table_name, col_values, conflict_target)
             else {
-                break;
+                // A conflict on another constraint: the caller re-raises it.
+                return Ok(verdict);
             };
+            // Waits for the row's writer (an UPDATE, a DELETE, another upsert's DO
+            // UPDATE). Held until `txn` ends, as the DO UPDATE's lock.
+            txn.lock_row(table_name, conflict.row_id)?;
             let key = self.storage.branch_aware_data_key(table_name, conflict.row_id);
             if txn.get_latest(&key)?.is_some() || self.storage.get(&key)?.is_some() {
-                break;
+                return Ok(verdict);
+            }
+            // Deleted since the conflict was found (its key is free: look again), or
+            // a claim whose row has not landed yet.
+            let timeout =
+                *lock_timeout.get_or_insert_with(|| self.storage.table_locks().row_lock_bounds().lock_timeout);
+            let waited = started.elapsed();
+            if waited >= timeout {
+                return Err(Error::row_lock_timeout(table_name, conflict.row_id, waited));
             }
             std::thread::sleep(BETWEEN_LOOKS);
             verdict = self
@@ -31017,40 +31178,60 @@ impl EmbeddedDatabase {
                 .check_unique_constraints(table_name, col_values)
                 .map_err(|e| e.to_string());
         }
-        Ok(verdict)
     }
 
-    /// Spec R5.1: the tables a DELETE on `table_name` writes through its foreign keys'
-    /// ON DELETE CASCADE and SET NULL, as far as they reach, without `table_name` itself.
-    ///
-    /// The params family commits each child's cascade on its own, so a child found held
-    /// half way would fail the statement after an earlier child's rows had gone: a 55P03
-    /// that has to mean "it changed nothing", so the statement takes them all before it
-    /// begins. A cascade one level deep is all the engine runs today; going on down the
-    /// chain costs nothing unless a table has such a chain, and only over-locks then.
-    pub(crate) fn cascade_lock_tables(&self, table_name: &str) -> Result<Vec<String>> {
-        if *self.fk_validation_mode.read() == FkValidationMode::Off
-            || *self.fk_validation_source.read() == FkValidationSource::Proxy
-        {
-            return Ok(Vec::new());
-        }
-        let catalog = self.storage.catalog();
-        let mut found: Vec<String> = Vec::new();
-        let mut to_look_at = vec![table_name.to_string()];
-        while let Some(parent) = to_look_at.pop() {
-            for fk in catalog.get_referencing_fks(&parent)? {
-                let writes_child = fk.enforcement == sql::ConstraintEnforcement::Immediate
-                    && matches!(
-                        fk.on_delete,
-                        sql::constraints::ReferentialAction::Cascade | sql::constraints::ReferentialAction::SetNull
-                    );
-                if writes_child && fk.table_name != table_name && !found.contains(&fk.table_name) {
-                    found.push(fk.table_name.clone());
-                    to_look_at.push(fk.table_name);
+    /// Spec R5.4 (review F6): lock, for `txn` and until it ends, the value of every
+    /// unique key an `INSERT … ON CONFLICT` arbitrates on — the `ON CONFLICT (cols)`
+    /// target's, or with no target (and MySQL's `ON DUPLICATE KEY UPDATE`) every
+    /// PRIMARY KEY / UNIQUE key of the table — in the registry's order, so two upserts
+    /// take them in one order. A value with a NULL in it never conflicts and is not
+    /// locked. `Ok(true)` when anything was locked (the verdict must be taken again).
+    fn lock_upsert_arbiter_keys(
+        &self,
+        txn: &storage::Transaction,
+        table_name: &str,
+        col_values: &std::collections::HashMap<String, Value>,
+        conflict_target: Option<&[String]>,
+    ) -> Result<bool> {
+        let mut locked = false;
+        for columns in self.storage.art_indexes().unique_column_sets(table_name) {
+            if let Some(target) = conflict_target {
+                let same_set = columns.len() == target.len()
+                    && columns
+                        .iter()
+                        .all(|column| target.iter().any(|t| t.eq_ignore_ascii_case(column)));
+                if !same_set {
+                    continue;
                 }
             }
+            let mut values = Vec::with_capacity(columns.len());
+            for column in &columns {
+                match col_values.get(column) {
+                    Some(Value::Null) | None => break,
+                    Some(value) => values.push(value.clone()),
+                }
+            }
+            if values.len() != columns.len() {
+                continue;
+            }
+            let mut encoded = Vec::with_capacity(64);
+            for column in &columns {
+                encoded.extend_from_slice(column.as_bytes());
+                encoded.push(0);
+            }
+            encoded.push(1);
+            encoded.extend_from_slice(&storage::ArtIndexManager::encode_key(&values));
+            txn.lock_unique_value(table_name, &encoded)?;
+            locked = true;
         }
-        Ok(found)
+        Ok(locked)
+    }
+
+    /// Every table whose FK relationship a parent DELETE can invalidate.
+    /// RESTRICT/NO ACTION also need child exclusion: a new referencing INSERT
+    /// must not slip between the child probe and the parent's commit.
+    pub(crate) fn cascade_lock_tables(&self, table_name: &str) -> Result<Vec<String>> {
+        self.fk_delete_lock_tables(table_name)
     }
 
     /// Is the unique conflict a row provokes on the constraint the
@@ -31417,7 +31598,9 @@ impl EmbeddedDatabase {
                 new_col_values.insert(col.name.clone(), v.clone());
             }
         }
-        self.check_fk_constraints_on_write(table_name, &new_col_values, active_txn)?;
+        if active_txn.is_none() {
+            self.check_fk_constraints_on_write(table_name, &new_col_values, active_txn, None)?;
+        }
         self.validate_check_constraints(table_constraints, schema, &updated_tuple.values)?;
         // ON CONFLICT handles one conflicting row at a time, so the
         // intra-statement dedup state starts empty for every conflicting row.
@@ -31603,6 +31786,7 @@ impl EmbeddedDatabase {
         table_name: &str,
         col_values: &std::collections::HashMap<String, Value>,
         active_txn: Option<&storage::Transaction>,
+        row_id: Option<u64>,
     ) -> Result<()> {
         let catalog = self.storage.catalog();
         let constraints = match catalog.load_table_constraints(table_name) {
@@ -31642,16 +31826,17 @@ impl EmbeddedDatabase {
             if any_null {
                 continue;
             }
-            let should_defer = active_txn.is_some()
-                && (mode == FkValidationMode::Deferred
-                    || self.constraints_all_deferred.load(std::sync::atomic::Ordering::Relaxed)
+            let should_defer = active_txn.is_some_and(|txn| {
+                mode == FkValidationMode::Deferred
                     || fk.enforcement == sql::ConstraintEnforcement::Deferred
-                    || (fk.deferrable && fk.initially_deferred));
+                    || txn.defers_fk_check(fk)
+            });
             if should_defer {
-                self.deferred_fk_checks.lock().push(PendingFkCheck {
-                    fk: fk.clone(),
-                    parent_values,
-                });
+                if let (Some(txn), Some(row_id)) = (active_txn, row_id) {
+                    self.defer_updated_fk(txn, fk, row_id)?;
+                }
+                // INSERT SELECT / params preflight learns its identity at the
+                // staging funnel and queues the immutable obligation there.
                 continue;
             }
             let parent_exists = self.check_referencing_rows_exist(
@@ -31680,6 +31865,12 @@ impl EmbeddedDatabase {
     }
 
     fn validate_deferred_fk_checks(&self, active_txn: Option<&storage::Transaction>) -> Result<()> {
+        // Transaction-owned child/parent obligations are independent of the
+        // legacy queue below. Refuse while the caller still owns the transaction
+        // and its eager ART undo, before announcing an in-flight commit timestamp.
+        if let Some(txn) = active_txn {
+            txn.preflight_parent_fk_checks()?;
+        }
         let checks = {
             let checks = self.deferred_fk_checks.lock();
             if checks.is_empty() {
@@ -31743,8 +31934,17 @@ impl EmbeddedDatabase {
     }
 
     fn record_fk_violation(&self, fk: &sql::ForeignKeyConstraint, parent_values: &[Value]) -> Result<()> {
+        Self::record_fk_violation_with(&self.storage, *self.fk_validation_mode.read(), fk, parent_values)
+    }
+
+    fn record_fk_violation_with(
+        storage: &storage::StorageEngine,
+        mode: FkValidationMode,
+        fk: &sql::ForeignKeyConstraint,
+        parent_values: &[Value],
+    ) -> Result<()> {
         let table_name = "pg_log_violations";
-        let catalog = self.storage.catalog();
+        let catalog = storage.catalog();
         if catalog.get_table_schema(table_name).is_err() {
             let schema = Schema::new(vec![
                 Column::new("constraint_name", DataType::Text),
@@ -31770,9 +31970,9 @@ impl EmbeddedDatabase {
                     .collect::<Vec<_>>()
                     .join(","),
             ),
-            Value::String(self.fk_validation_mode.read().as_str().to_string()),
+            Value::String(mode.as_str().to_string()),
         ]);
-        let _ = self.storage.insert_tuple(table_name, tuple);
+        let _ = storage.insert_tuple(table_name, tuple);
         Ok(())
     }
 
@@ -32910,6 +33110,15 @@ impl Transaction<'_> {
             self.tx.rollback()?;
             return Err(gone);
         }
+        // Deferred constraints must fail while the transaction's write census,
+        // table locks and eager ART undo are all still owned here. In particular,
+        // do not announce a commit timestamp for a pre-write refusal.
+        if let Err(error) = self.tx.preflight_parent_fk_checks() {
+            let undo = self.db.take_raii_art_undo(txn_id);
+            self.db.replay_art_undo(undo);
+            self.tx.rollback()?;
+            return Err(error);
+        }
         // R0.2: fresh commit timestamp (see commit_internal).
         // R1.3-p2: commit runs the row-cache fence itself when wired.
         let written = if self.tx.has_row_cache() {
@@ -32920,26 +33129,24 @@ impl Transaction<'_> {
         let commit_ts = self.db.storage.next_commit_timestamp(self.tx.has_tracked_writes());
         // Spec R5.1: nobody else in the table until the undo below has run.
         let _commit_locks = self.tx.table_locks_hold();
-        if let Err(e) = self.tx.commit_with_timestamp(commit_ts) {
-            // A failed commit behaves like ROLLBACK — the transaction is
-            // consumed either way, and its eager ART mutations are still in the
-            // index. Same rule the session path applies
-            // (`commit_transaction_for_session`'s `finish_session_art_undo(…, true)`
-            // on a failed `commit_with_timestamp`).
-            let undo = self.db.take_raii_art_undo(txn_id);
-            self.db.replay_art_undo(undo);
-            return Err(e);
-        }
-        // sprinter 8a9b60eeef87, second half: the eager ART mutations are now
-        // COMMITTED, so their undo entries must be DROPPED, not kept. Getting
-        // this wrong is worse than the bug the first half fixes — a later
-        // rollback would replay a committed transaction's ops and strip keys
-        // from rows that are really there. Exactly what the session path does on
-        // COMMIT (`finish_session_art_undo(session_id, false)`).
-        self.db.raii_art_undo.remove(&txn_id);
+        let db = self.db;
+        let attempt = storage::write_outcome::WriteAttempt::default();
+        self.tx
+            .commit_with_timestamp_settled(commit_ts, &attempt, |txn, outcome, succeeded| {
+                if db.commit_needs_index_undo(txn, outcome, succeeded) {
+                    let undo = db.take_raii_art_undo(txn_id);
+                    db.replay_art_undo(undo);
+                } else {
+                    db.raii_art_undo.remove(&txn_id);
+                }
+            })?;
         if !written.is_empty() {
             self.db.invalidate_row_cache_for(&written);
         }
+        // The handle's SQL cache can have been warmed while this RAII owner
+        // staged its rows. Its successful commit must invalidate it just like
+        // global/session/batch commits, before the API returns success.
+        self.db.invalidate_result_cache();
         Ok(())
     }
 
@@ -33039,7 +33246,9 @@ impl Transaction<'_> {
         // issued after an earlier failure is refused with 25P02 instead of
         // running as if nothing had happened.
         self.db.run_statement_in_transaction(&self.tx, sql, || {
-            self.db.execute_in_transaction_no_fast_path(sql, &self.tx)
+            // Spec R5.6: a read set for the statement; validated at the boundary.
+            self.db
+                .run_layout_statement(true, || self.db.execute_in_transaction_no_fast_path(sql, &self.tx))
         })
     }
 
@@ -33098,8 +33307,9 @@ impl Transaction<'_> {
         // sprinter ccebc95977f1: off the async worker, like every other entry
         // point (this one reaches no `EmbeddedDatabase` entry point).
         offload_statement(|| {
-            self.db
-                .run_statement_in_transaction(&self.tx, sql, || self.query_inner(sql))
+            self.db.run_statement_in_transaction(&self.tx, sql, || {
+                self.db.run_layout_statement(true, || self.query_inner(sql))
+            })
         })
     }
 
@@ -34218,6 +34428,43 @@ mod tests {
         let (rows, columns) = db.query_with_columns(sql).unwrap();
         assert_eq!(columns, vec!["id".to_string(), "val".to_string()]);
         assert_eq!(rows.len(), 3);
+    }
+
+    #[test]
+    fn cached_wire_rows_are_not_paired_with_a_schema_repopulated_after_ddl() {
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE paired_cache (id INT PRIMARY KEY, val INT)")
+            .unwrap();
+        db.execute("INSERT INTO paired_cache VALUES (1, 10)").unwrap();
+        let sql = "SELECT * FROM paired_cache WHERE val IS NOT NULL";
+        for _ in 0..3 {
+            db.query_with_columns(sql).unwrap();
+        }
+        let epoch = db.result_cache_epoch();
+        let old_rows = db.cached_query_result(sql).expect("the row lookup hit before DDL");
+        assert_eq!(old_rows.len(), 1);
+        assert_eq!(old_rows[0].values.len(), 2);
+
+        // A second statement changes the shape and warms a CURRENT plan and rows
+        // before the suspended wire probe asks for its schema.
+        db.execute("ALTER TABLE paired_cache ADD COLUMN extra INT DEFAULT 99")
+            .unwrap();
+        for _ in 0..3 {
+            db.query_with_columns(sql).unwrap();
+        }
+        let (current_rows, current_schema) = db.try_cached_query_with_schema(sql).expect("the current pair hits");
+        assert_eq!(current_rows.len(), 1);
+        assert_eq!(current_schema.columns.len(), 3);
+        assert_eq!(current_rows[0].values.len(), 3);
+        assert_eq!(current_rows[0].values[2], Value::Int4(99));
+        assert!(
+            db.complete_cached_query_with_schema(sql, old_rows, epoch).is_none(),
+            "a probe spanning DDL must miss instead of serving old rows under the new schema"
+        );
+        assert!(
+            db.try_cached_query_with_schema(sql).is_some(),
+            "the valid current pair remains usable"
+        );
     }
 
     /// A cache warmed *after* a DDL must survive the next cached read.
@@ -42958,50 +43205,21 @@ mod tests {
 
     #[test]
     fn test_fk_cascade_update() {
-        // ON UPDATE CASCADE: updating the parent PK should cascade to children
-        // Note: HeliosDB may not enforce ON UPDATE actions during UPDATE statements.
-        // This test documents actual behavior.
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE fk_cu_parent (id INT PRIMARY KEY, name TEXT)")
-            .unwrap();
-        db.execute(
-            "CREATE TABLE fk_cu_child (
-                id INT PRIMARY KEY,
-                parent_id INT,
-                FOREIGN KEY (parent_id) REFERENCES fk_cu_parent(id) ON UPDATE CASCADE
-            )",
-        )
-        .unwrap();
-
-        db.execute("INSERT INTO fk_cu_parent VALUES (1, 'Alice')").unwrap();
+        db.execute("CREATE TABLE fk_cu_parent (id INT PRIMARY KEY)").unwrap();
+        db.execute("CREATE TABLE fk_cu_child (id INT PRIMARY KEY, parent_id INT REFERENCES fk_cu_parent(id) ON UPDATE CASCADE)").unwrap();
+        db.execute("INSERT INTO fk_cu_parent VALUES (1)").unwrap();
         db.execute("INSERT INTO fk_cu_child VALUES (100, 1)").unwrap();
-
-        // Update parent PK from 1 to 10
-        match db.execute("UPDATE fk_cu_parent SET id = 10 WHERE id = 1") {
-            Ok(_) => {
-                // Check if cascade happened (child parent_id updated to 10)
-                let child_rows = db
-                    .query("SELECT parent_id FROM fk_cu_child WHERE id = 100", &[])
-                    .unwrap();
-                assert_eq!(child_rows.len(), 1, "Child should still exist");
-                match child_rows[0].get(0).unwrap() {
-                    Value::Int4(v) => {
-                        if *v == 10 {
-                            // CASCADE UPDATE was enforced
-                        } else {
-                            // CASCADE UPDATE not enforced during UPDATE (documented behavior)
-                            // The child still has old FK value
-                            assert_eq!(*v, 1, "Without cascade enforcement, child should retain old FK value");
-                        }
-                    }
-                    other => panic!("Expected Int4 for parent_id, got {:?}", other),
-                }
-            }
-            Err(e) => {
-                // The UPDATE itself might fail if PK uniqueness or other issues arise
-                println!("UPDATE parent PK with ON UPDATE CASCADE result: {}", e);
-            }
-        }
+        db.execute("UPDATE fk_cu_parent SET id = 10 WHERE id = 1").unwrap();
+        let child = db
+            .query("SELECT parent_id FROM fk_cu_child WHERE id = 100", &[])
+            .unwrap();
+        assert_eq!(child.len(), 1);
+        assert_eq!(child[0].values, vec![Value::Int4(10)]);
+        assert!(db
+            .query("SELECT id FROM fk_cu_parent WHERE id = 1", &[])
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -46066,3 +46284,163 @@ mod tests {
         }
     }
 }
+
+/// Spec R5.6: a plan built under one layout of a table is never run over the table's
+/// rows after a schema change of it. Both reproduce the merged-tree review's M3 on one
+/// node: `count(u)` planned before `ADD COLUMN u` (an aggregate's argument is not
+/// resolved at plan time) and served after it decoded no column of the new layout and
+/// counted `u` NULL in every row.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+mod layout_epoch_tests {
+    use super::*;
+
+    #[test]
+    fn custom_wire_planning_resolves_the_sessions_target_without_executing_it() {
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE SCHEMA storage_session").unwrap();
+        db.execute("CREATE TABLE storage_session.only_here (id INT PRIMARY KEY, v TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO storage_session.only_here VALUES (1, 'logical')")
+            .unwrap();
+        let session = db.create_wire_session("planner").unwrap();
+        db.execute_params_for_session(session, "SET search_path TO storage_session, public", &[])
+            .unwrap();
+        let before = db.storage.db().latest_sequence_number();
+        let (pinned, _) = db
+            .wire_parameterized_plan_for_session(session, "ALTER TABLE only_here ALTER COLUMN v SET STORAGE DICTIONARY")
+            .unwrap();
+        assert_eq!(pinned.layout.tables(), vec!["storage_session.only_here"]);
+        assert!(pinned.layout.is_current());
+        assert!(matches!(
+            pinned.plan.as_ref(),
+            sql::LogicalPlan::AlterColumnStorage { table_name, column_name, storage_mode }
+                if table_name == "storage_session.only_here" && column_name == "v" && *storage_mode == ColumnStorageMode::Dictionary
+        ));
+        assert_eq!(db.storage.db().latest_sequence_number(), before);
+        assert_eq!(
+            db.storage
+                .catalog()
+                .get_table_schema("storage_session.only_here")
+                .unwrap()
+                .columns[1]
+                .storage_mode,
+            ColumnStorageMode::Default
+        );
+        db.execute("ALTER TABLE storage_session.only_here ADD COLUMN extra INT")
+            .unwrap();
+        assert!(!pinned.layout.is_current());
+    }
+
+    #[test]
+    fn a_set_storage_pin_records_its_target_and_replans_after_a_layout_change() {
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE storage_pin (id INT PRIMARY KEY, v TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO storage_pin VALUES (1, 'logical')").unwrap();
+        let statement = "ALTER TABLE storage_pin ALTER COLUMN v SET STORAGE DICTIONARY";
+        let (pinned, _) = db.wire_parameterized_plan(statement).unwrap();
+        assert_eq!(pinned.layout.tables(), vec!["storage_pin"]);
+        assert!(pinned.layout.is_current());
+        db.execute("ALTER TABLE storage_pin ADD COLUMN extra INT DEFAULT 7")
+            .unwrap();
+        assert!(!pinned.layout.is_current());
+        db.execute_params_inner(statement, &[], Some(&pinned)).unwrap();
+        assert_eq!(
+            db.storage.catalog().get_table_schema("storage_pin").unwrap().columns[1].storage_mode,
+            ColumnStorageMode::Dictionary
+        );
+        assert_eq!(
+            db.query_params("SELECT v, extra FROM storage_pin", &[]).unwrap()[0].values,
+            vec![Value::String("logical".into()), Value::Int4(7)]
+        );
+    }
+
+    const COUNT_U: &str = "SELECT count(*), count(u) FROM pin";
+
+    fn table_of_three() -> EmbeddedDatabase {
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE pin (id INT PRIMARY KEY, a INT)").unwrap();
+        db.execute("INSERT INTO pin VALUES (1, 1), (2, 2), (3, 3)").unwrap();
+        db
+    }
+
+    fn counts(rows: &[Tuple]) -> (Value, Value) {
+        (rows[0].values[0].clone(), rows[0].values[1].clone())
+    }
+
+    /// The extended protocol's pinned plan (R5.W2): pinned at Parse, before the column
+    /// existed, executed after a volatile `ADD COLUMN`. Before R5.6 the pin was reused
+    /// until the plan cache was cleared, and on a standby that was the end of the run's
+    /// publication: `(3, 0)`.
+    #[test]
+    fn a_plan_pinned_before_add_column_is_planned_again() {
+        let db = table_of_three();
+        let (pinned, _) = db.wire_parameterized_plan(COUNT_U).unwrap();
+        assert!(pinned.layout.is_current());
+        db.execute("ALTER TABLE pin ADD COLUMN u UUID DEFAULT gen_random_uuid()")
+            .unwrap();
+        assert!(!pinned.layout.is_current(), "the pin's table changed layout");
+        let rows = db.query_params_inner(COUNT_U, &[], Some(&pinned)).unwrap();
+        assert_eq!(counts(&rows), (Value::Int8(3), Value::Int8(3)));
+    }
+
+    /// A plan admitted to the plan cache before a schema change and still there after it
+    /// (a planner that read the old schema and admitted late; on a standby, every plan
+    /// until the run's listener cleared the cache) is a miss, and the statement plans
+    /// again.
+    #[test]
+    fn a_plan_cached_before_add_column_is_not_served_after_it() {
+        let db = table_of_three();
+        let stamped = db.parameterized_plan_stamped(COUNT_U).unwrap();
+        db.execute("ALTER TABLE pin ADD COLUMN u TEXT DEFAULT 'x'").unwrap();
+        db.plan_cache
+            .put(format!("\0params\0{COUNT_U}"), stamped.plan, stamped.layout);
+        assert!(db.cached_parameterized_plan(COUNT_U).is_none(), "stale: a miss");
+        let rows = db.query_params(COUNT_U, &[]).unwrap();
+        assert_eq!(counts(&rows), (Value::Int8(3), Value::Int8(3)));
+        let rows = db.query(COUNT_U, &[]).unwrap();
+        assert_eq!(counts(&rows), (Value::Int8(3), Value::Int8(3)));
+    }
+
+    /// The scan's own guard: a plan of another layout of its table, however it got here,
+    /// is refused (40001), never run.
+    #[test]
+    fn a_plan_of_another_layout_is_refused_by_the_scan() {
+        let db = table_of_three();
+        let stamped = db.parameterized_plan_stamped(COUNT_U).unwrap();
+        db.execute("ALTER TABLE pin ADD COLUMN u UUID DEFAULT gen_random_uuid()")
+            .unwrap();
+        let mut executor = sql::Executor::with_storage(&db.storage);
+        let error = executor.execute(&stamped.plan).unwrap_err();
+        assert!(storage::layout_epochs::is_layout_changed(&error), "{error}");
+        assert_eq!(
+            crate::protocol::postgres::handler::sqlstate_for_error(&error),
+            crate::network::protocol::sqlstate::SERIALIZATION_FAILURE,
+            "{error}"
+        );
+    }
+
+    /// Decision 2(e): a statement's own schema change does not refuse the statement, and
+    /// the write funnel moved the table's epoch once for it.
+    #[test]
+    fn a_schema_statement_moves_its_tables_epoch_and_is_not_refused_for_it() {
+        let db = table_of_three();
+        let before = db.storage.layout_epochs().current("pin");
+        db.execute("ALTER TABLE pin ADD COLUMN u UUID DEFAULT gen_random_uuid()")
+            .unwrap();
+        let after = db.storage.layout_epochs().current("pin");
+        assert!(after > before, "{before} -> {after}");
+        assert!(!db.storage.layout_epochs().in_flight("pin"));
+    }
+}
+
+#[cfg(test)]
+mod direct_executor_truncate_tests;
+
+#[cfg(all(test, feature = "internal-tests"))]
+mod direct_copy_native_outcome_tests;
+
+#[cfg(all(test, feature = "vector-search"))]
+#[path = "direct_cache_publication_tests.rs"]
+mod direct_cache_publication_tests;

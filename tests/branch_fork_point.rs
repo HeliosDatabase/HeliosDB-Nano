@@ -1076,18 +1076,19 @@ fn as_of_before_a_truncate_returns_the_rows() {
     }
 }
 
-/// The delete events change `AS OF`, and nothing else an ordinary user reads: a transaction
-/// that holds an older snapshot scans the rows that exist now, as it always did, and its
-/// writes are built on that.
+/// A transaction that holds an older snapshot reads a row deleted after it, through the
+/// row's delete event, as `AS OF` does (4.42.0 pre-release review, item F7: it used to
+/// read the rows that exist now, so a REPEATABLE READ transaction saw the delete). The
+/// delete itself is untouched: a new snapshot does not see the row.
 #[test]
-fn a_transactions_snapshot_scan_reads_what_it_always_read() {
+fn a_transactions_snapshot_scan_reads_a_row_deleted_after_it() {
     let db = EmbeddedDatabase::new_in_memory().unwrap();
     seed(&db);
     let reader = db.create_session("reader", IsolationLevel::RepeatableRead).unwrap();
     db.begin_transaction_for_session(reader).unwrap();
     assert_eq!(db.query_in_session(reader, "SELECT id FROM t", &[]).unwrap().len(), 3);
     db.execute("DELETE FROM t WHERE id = 1").unwrap();
-    assert_eq!(db.query_in_session(reader, "SELECT id FROM t", &[]).unwrap().len(), 2);
+    assert_eq!(db.query_in_session(reader, "SELECT id FROM t", &[]).unwrap().len(), 3);
     db.rollback_transaction_for_session(reader).unwrap();
     db.destroy_session(reader).unwrap();
     assert_eq!(rows(&db, Family::Text, "SELECT id FROM t").len(), 2);
@@ -1389,6 +1390,143 @@ fn forks_among_a_stream_of_alters_keep_definition_and_rows_together() {
     altering.join().unwrap();
 }
 
+/// A frozen schema has no dependency on main's subsequent layout changes.
+/// The same held main epoch must still refuse a real main-table read.
+#[test]
+fn a_frozen_branch_reads_while_main_layout_is_in_flight_but_main_is_refused() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    db.execute("CREATE TABLE independent (id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    db.execute("INSERT INTO independent VALUES (1, 10), (2, 20)").unwrap();
+    fork(&db, "frozen_schema");
+    db.execute("ALTER TABLE independent ADD COLUMN later INT DEFAULT 7")
+        .unwrap();
+    let (ready_tx, ready_rx) = mpsc::sync_channel(0);
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let epochs = Arc::clone(db.storage.layout_epochs());
+    let changing = std::thread::spawn(move || {
+        let change = epochs.debug_begin_change(&["independent"]);
+        ready_tx.send(()).unwrap();
+        let _ = release_rx.recv();
+        drop(change);
+    });
+    ready_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+    for family in FAMILIES {
+        for _ in 0..2 {
+            let found = rows_on(&db, "frozen_schema", family, "SELECT * FROM independent ORDER BY id");
+            assert_eq!(found.len(), 2);
+            assert_eq!(
+                found.iter().map(|row| row.values.clone()).collect::<Vec<_>>(),
+                vec![
+                    vec![Value::Int4(1), Value::Int4(10)],
+                    vec![Value::Int4(2), Value::Int4(20)],
+                ]
+            );
+        }
+    }
+    let error = db.query("SELECT * FROM independent", &[]).unwrap_err();
+    assert!(
+        heliosdb_nano::storage::layout_epochs::is_layout_changed(&error),
+        "{error}"
+    );
+    release_tx.send(()).unwrap();
+    changing.join().unwrap();
+    assert_eq!(rows(&db, Family::Text, "SELECT * FROM independent")[0].values.len(), 3);
+}
+
+/// Discarding main's epoch does not discard a branch's own schema boundary:
+/// its own DDL and its parent's freezing DDL still wait for the reader's drain.
+#[test]
+fn own_and_parent_branch_ddl_wait_for_the_branch_statement_before_changing_its_definition() {
+    for ancestor in [false, true] {
+        let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+        db.execute("CREATE TABLE drain_schema (id INT PRIMARY KEY, v INT)")
+            .unwrap();
+        db.execute("INSERT INTO drain_schema VALUES (1, 10), (2, 20)").unwrap();
+        fork(&db, "parent_schema");
+        if ancestor {
+            on(
+                &db,
+                "parent_schema",
+                Family::Text,
+                "ALTER TABLE drain_schema ADD COLUMN parent_value INT DEFAULT 5",
+                &[],
+            );
+            db.execute("CREATE BRANCH reader_schema FROM parent_schema").unwrap();
+        }
+        let reader_name = if ancestor { "reader_schema" } else { "parent_schema" };
+        let reader_id = branch_id(&db, reader_name);
+        let expected_width = if ancestor { 3 } else { 2 };
+        let (ready_tx, ready_rx) = mpsc::sync_channel(0);
+        let (query_tx, query_rx) = mpsc::channel::<()>();
+        let (answer_tx, answer_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let reader_db = Arc::clone(&db);
+        let reader = std::thread::spawn(move || {
+            reader_db
+                .with_request_branch_scope(reader_name, || {
+                    let binding = reader_db
+                        .storage
+                        .active_branch()
+                        .expect("the reader is bound to its branch");
+                    let _read_hold = reader_db.storage.enter_branch(binding.as_ref())?;
+                    ready_tx.send(()).unwrap();
+                    query_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+                    let rows = reader_db.query("SELECT * FROM drain_schema ORDER BY id", &[])?;
+                    answer_tx.send(rows).unwrap();
+                    release_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+                    Ok(())
+                })
+                .unwrap();
+        });
+        ready_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        let (done_tx, done_rx) = mpsc::channel();
+        let writer_db = Arc::clone(&db);
+        let writer = std::thread::spawn(move || {
+            let result = writer_db.with_request_branch_scope("parent_schema", || {
+                writer_db.execute("ALTER TABLE drain_schema ADD COLUMN after_reader INT DEFAULT 7")
+            });
+            done_tx.send(result).unwrap();
+        });
+        let started = std::time::Instant::now();
+        while !db.storage.branch_drain_state(reader_id).exclusive {
+            assert!(
+                done_rx.try_recv().is_err(),
+                "DDL finished before the reader released its branch"
+            );
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "DDL did not reach the reader's drain"
+            );
+            std::thread::yield_now();
+        }
+        query_tx.send(()).unwrap();
+        let found = answer_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert_eq!(found.len(), 2);
+        assert!(found.iter().all(|row| row.values.len() == expected_width));
+        assert_eq!(pairs(&found), vec![(1, 10), (2, 20)]);
+        assert!(
+            done_rx.try_recv().is_err(),
+            "DDL cannot complete inside that read scope"
+        );
+        release_tx.send(()).unwrap();
+        reader.join().unwrap();
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        writer.join().unwrap();
+        let after = rows_on(&db, reader_name, Family::Text, "SELECT * FROM drain_schema ORDER BY id");
+        assert!(after
+            .iter()
+            .all(|row| row.values.len() == expected_width + usize::from(!ancestor)));
+        assert_eq!(pairs(&after), vec![(1, 10), (2, 20)]);
+        assert!(rows(&db, Family::Text, "SELECT * FROM drain_schema")
+            .iter()
+            .all(|row| row.values.len() == 2));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // A commit over the chunk size holds its stripes through the apply
 // ---------------------------------------------------------------------------
@@ -1561,23 +1699,18 @@ fn anchor_refusal(db: &EmbeddedDatabase, anchor: u64) -> String {
     err
 }
 
-/// The review's F3, and the statements like it: a branch anchored before them is refused
-/// (0A000 by its marker), naming the table and saying why. Before, it held `a`'s values
-/// under `b`, and a merge carried them to main.
+/// The review's F3, and the statements like it: a branch anchored before a change of the
+/// table's history is refused (0A000 by its marker), naming the table and saying why. A
+/// rename of the table leaves its rows' history with the old name. Storage migrations
+/// keep logical history and are covered by the positive tests below.
 #[test]
 fn an_anchor_before_a_change_old_versions_cannot_be_read_under_is_refused() {
-    for (statement, named, why) in [
-        ("ALTER TABLE r DROP COLUMN a", "\"r\"", "column dropped"),
-        ("ALTER TABLE r RENAME COLUMN a TO z", "\"r\"", "renamed"),
-        ("ALTER TABLE r RENAME TO r2", "\"r2\"", "was renamed"),
-        (
-            "ALTER TABLE r ALTER COLUMN s SET STORAGE DICTIONARY",
-            "\"r\"",
-            "other storage",
-        ),
-    ] {
+    for (setup, statement, named, why) in [(None, "ALTER TABLE r RENAME TO r2", "\"r2\"", "was renamed")] {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         shaped(&db);
+        if let Some(setup) = setup {
+            db.execute(setup).unwrap();
+        }
         tick(&db, 1);
         let anchor = last_scn(&db);
         db.execute(statement).unwrap();
@@ -1595,6 +1728,51 @@ fn an_anchor_before_a_change_old_versions_cannot_be_read_under_is_refused() {
     }
 }
 
+/// The review's F3 the other way (spec R5.5): a branch anchored before a `DROP COLUMN`, a
+/// `RENAME COLUMN` or a move into a stored representation reads each row as it was, every
+/// value under its own column, by the table's layout record, as `AS OF` on main does. It
+/// used to be refused (and before that, it held `a`'s values under `b`).
+#[test]
+fn an_anchor_before_a_column_change_reads_the_rows_as_they_were() {
+    for (statement, read, want) in [
+        (
+            "ALTER TABLE r DROP COLUMN a",
+            "SELECT id, b FROM r",
+            vec![(1, 200), (2, 201), (3, 202)],
+        ),
+        (
+            "ALTER TABLE r RENAME COLUMN a TO z",
+            "SELECT id, z FROM r",
+            vec![(1, 100), (2, 101), (3, 102)],
+        ),
+        (
+            "ALTER TABLE r ALTER COLUMN s SET STORAGE DICTIONARY",
+            "SELECT id, b FROM r",
+            vec![(1, 200), (2, 201), (3, 202)],
+        ),
+    ] {
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        shaped(&db);
+        tick(&db, 1);
+        let anchor = last_scn(&db);
+        db.execute(statement).unwrap();
+        // Changed on main after the anchor, so the branch has copies to hold.
+        db.execute("BEGIN").unwrap();
+        db.execute("UPDATE r SET b = 999 WHERE id = 1").unwrap();
+        db.execute("COMMIT").unwrap();
+        db.execute(&format!("CREATE BRANCH asof FROM main AS OF SCN {anchor}"))
+            .unwrap_or_else(|e| panic!("{statement}: {e}"));
+        assert_eq!(pairs(&rows_on(&db, "asof", Family::Text, read)), want, "{statement}");
+        // Main's own AS OF of the same time agrees.
+        let as_of = format!("{read} AS OF SCN {anchor}");
+        assert_eq!(
+            pairs(&rows(&db, Family::Text, &as_of)),
+            want,
+            "{statement}: main's AS OF"
+        );
+    }
+}
+
 /// What an old version CAN be read under stays as it was: added columns are NULL on the
 /// branch, and a table dropped or created since is what it was.
 #[test]
@@ -1608,19 +1786,32 @@ fn an_anchor_before_an_added_column_or_a_new_table_still_works() {
     db.execute(&format!("CREATE BRANCH ok1 FROM main AS OF SCN {anchor}"))
         .unwrap();
     assert_eq!(rows_on(&db, "ok1", Family::Text, "SELECT id FROM r").len(), 3);
+    // Spec R5.5: a rename of a column moves no position; the anchor reads by the layout
+    // record, as `AS OF` does.
     db.execute("ALTER TABLE r RENAME COLUMN added TO added_too").unwrap();
-    assert!(db
-        .execute(&format!("CREATE BRANCH no FROM main AS OF SCN {anchor}"))
-        .is_err());
+    db.execute(&format!("CREATE BRANCH renamed_col FROM main AS OF SCN {anchor}"))
+        .unwrap();
+    assert_eq!(
+        rows_on(
+            &db,
+            "renamed_col",
+            Family::Text,
+            "SELECT id FROM r WHERE added_too IS NULL"
+        )
+        .len(),
+        3
+    );
     db.execute("DROP TABLE r").unwrap();
     db.execute("CREATE TABLE r (id INT PRIMARY KEY)").unwrap();
     db.execute(&format!("CREATE BRANCH ok2 FROM main AS OF SCN {anchor}"))
         .expect("a drop takes the record with the table");
 }
 
-/// A later anchor reads a version from before the statement too, for a row not written
-/// since. The row is what it is now if nothing changed it after the anchor; if something
-/// did, what it was cannot be read, and the anchor is refused.
+/// A later anchor reads the rows as they were at it. Spec R5.5: `DROP COLUMN` writes a
+/// version of every row at its timestamp, so past it no row's version at the anchor is
+/// older than the change. A row changed after the anchor is read as it was (it used to be
+/// refused, its version at the anchor being from before the statement), and so is one
+/// not changed since; a row created after the anchor is not there.
 #[test]
 fn an_anchor_after_such_a_change_holds_the_rows_as_they_were_or_is_refused() {
     let db = EmbeddedDatabase::new_in_memory().unwrap();
@@ -1655,43 +1846,105 @@ fn an_anchor_after_such_a_change_holds_the_rows_as_they_were_or_is_refused() {
         .unwrap();
     assert_eq!(b_on("later_rows"), at_anchor);
 
-    // Changed after the anchor, whose version at it is from before the statement.
+    // Changed after the anchor, last changed before it by the statement itself: its
+    // version at the anchor is the statement's.
     db.execute("BEGIN").unwrap();
     db.execute("UPDATE r SET b = 444 WHERE id = 1").unwrap();
     db.execute("COMMIT").unwrap();
-    let err = anchor_refusal(&db, anchor);
-    assert!(err.contains("\"r\""), "{err}");
-    // Past that write it reads again.
+    db.execute(&format!("CREATE BRANCH moved FROM main AS OF SCN {anchor}"))
+        .unwrap();
+    assert_eq!(b_on("moved"), at_anchor);
+    let as_of = format!("SELECT id, b FROM r AS OF SCN {anchor}");
+    assert_eq!(
+        pairs(&rows(&db, Family::Text, &as_of)),
+        at_anchor,
+        "main's AS OF agrees"
+    );
+    // Past that write it reads it.
     tick(&db, 2);
     db.execute(&format!("CREATE BRANCH past FROM main AS OF SCN {}", last_scn(&db)))
         .unwrap();
     assert_eq!(b_on("past"), vec![(1, 444), (2, 333), (3, 202), (4, 204)]);
 }
 
-/// A rename leaves a table's versions behind: a row written since has none at an anchor
-/// between. One that existed at the rename is refused, one created since is not there.
+/// A first change after rename now captures a logical preimage. An anchor after
+/// rename reconstructs that old row and excludes a new row. A legacy image that
+/// actually lost the preimage still refuses rather than silently dropping it.
 #[test]
 fn an_anchor_after_a_rename_tells_rows_it_left_behind_from_rows_created_since() {
-    let db = EmbeddedDatabase::new_in_memory().unwrap();
-    shaped(&db);
-    db.execute("ALTER TABLE r RENAME TO r2").unwrap();
-    tick(&db, 1);
-    let anchor = last_scn(&db);
-    db.execute("INSERT INTO r2 VALUES (4, 103, 203, 'w')").unwrap();
-    db.execute(&format!("CREATE BRANCH created FROM main AS OF SCN {anchor}"))
-        .unwrap();
-    assert_eq!(
-        ids(&rows_on(&db, "created", Family::Text, "SELECT id FROM r2")),
-        vec![1, 2, 3]
-    );
-    db.execute("BEGIN").unwrap();
-    db.execute("UPDATE r2 SET b = 999 WHERE id = 1").unwrap();
-    db.execute("COMMIT").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let anchor = {
+        let db = on_disk(dir.path());
+        shaped(&db);
+        db.execute("ALTER TABLE r RENAME TO r2").unwrap();
+        tick(&db, 1);
+        let anchor = last_scn(&db);
+        db.execute("INSERT INTO r2 VALUES (4, 103, 203, 'w')").unwrap();
+        db.execute(&format!("CREATE BRANCH created FROM main AS OF SCN {anchor}"))
+            .unwrap();
+        assert_eq!(
+            ids(&rows_on(&db, "created", Family::Text, "SELECT id FROM r2")),
+            vec![1, 2, 3]
+        );
+        db.execute("BEGIN").unwrap();
+        db.execute("UPDATE r2 SET b = 999 WHERE id = 1").unwrap();
+        db.execute("COMMIT").unwrap();
+        db.execute(&format!("CREATE BRANCH retained FROM main AS OF SCN {anchor}"))
+            .unwrap();
+        let expected = vec![(1, 200), (2, 201), (3, 202)];
+        for branch in ["created", "retained"] {
+            assert_eq!(
+                pairs(&rows_on(&db, branch, Family::Text, "SELECT id, b FROM r2")),
+                expected
+            );
+        }
+        assert_eq!(
+            pairs(&rows(
+                &db,
+                Family::Text,
+                &format!("SELECT id, b FROM r2 AS OF SCN {anchor}")
+            )),
+            expected
+        );
+        assert_eq!(
+            pairs(&rows(&db, Family::Text, "SELECT id, b FROM r2")),
+            vec![(1, 999), (2, 201), (3, 202), (4, 203)]
+        );
+        // Model an old store that retained the later update but never wrote
+        // the rename destination's logical prehistory. Reopen discards every
+        // cached historical answer, so the refusal must come from durable data.
+        let mut legacy = rocksdb::WriteBatch::default();
+        let preimage_index = format!("v_idx:r2:1:{:020}", u64::MAX);
+        assert!(db.storage.db().get(b"v:r2:1:0").unwrap().is_some());
+        assert!(db.storage.db().get(preimage_index.as_bytes()).unwrap().is_some());
+        legacy.delete(b"v:r2:1:0");
+        legacy.delete(preimage_index.as_bytes());
+        // Isolated legacy-store corruption, with no concurrent statement. The
+        // normal row writer detector must remain armed for every product path.
+        db.storage.debug_plant_rows(|| {
+            db.storage
+                .write_gate()
+                .write(db.storage.db().as_ref(), legacy, None)
+                .unwrap();
+        });
+        anchor
+    };
+    let db = on_disk(dir.path());
     let err = anchor_refusal(&db, anchor);
-    assert!(err.contains("\"r2\"") && err.contains("was renamed"), "{err}");
+    assert!(
+        err.contains(BRANCH_ANCHOR_UNREADABLE_MARKER) && err.contains("\"r2\"") && err.contains("was renamed"),
+        "{err}"
+    );
+    assert_eq!(
+        pairs(&rows_on(&db, "retained", Family::Text, "SELECT id, b FROM r2")),
+        vec![(1, 200), (2, 201), (3, 202)],
+        "a materialized branch keeps its own preimage after main's legacy history loss"
+    );
 }
 
-/// The record is durable, with the statement, and no key of an unknown family.
+/// The records are durable, with the statement, and no key of an unknown family. Spec
+/// R5.5: after a reopen an anchor before the `DROP COLUMN` still reads each value under
+/// its own column (the layout record, not a cache, says what the drop moved).
 #[test]
 fn a_shape_record_survives_a_reopen() {
     let dir = tempfile::tempdir().unwrap();
@@ -1702,21 +1955,22 @@ fn a_shape_record_survives_a_reopen() {
         let anchor = db.storage.current_timestamp();
         db.execute("ALTER TABLE r DROP COLUMN a").unwrap();
         assert_eq!(keys_with_prefix(&db, "meta:table_shape:r").len(), 1);
+        assert_eq!(keys_with_prefix(&db, "meta:table_layout:r").len(), 1);
         anchor
     };
     let db = on_disk(dir.path());
-    let refused = db
-        .storage
+    db.storage
         .create_branch_at_snapshot("x", Some("main"), Some(anchor), Default::default())
-        .expect_err("refused")
-        .to_string();
-    assert!(
-        refused.contains(BRANCH_ANCHOR_UNREADABLE_MARKER) && refused.contains("\"r\""),
-        "{refused}"
+        .expect("read by the layout record");
+    assert_eq!(
+        pairs(&rows_on(&db, "x", Family::Text, "SELECT id, b FROM r")),
+        vec![(1, 200), (2, 201), (3, 202)]
     );
-    // A drop takes it.
+    // A drop takes them.
+    db.execute("DROP BRANCH x").unwrap();
     db.execute("DROP TABLE r").unwrap();
     assert!(keys_with_prefix(&db, "meta:table_shape:r").is_empty());
+    assert!(keys_with_prefix(&db, "meta:table_layout:r").is_empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -2136,12 +2390,9 @@ fn an_anchor_before_a_refresh_reads_the_view_as_it_was() {
     }
 }
 
-/// A refresh that still replaces the data table (one with an index of its own, which the
-/// in-place refresh leaves to the old path) keeps no history of the rows it replaced: a
-/// branch anchored before it is refused, naming the view; past the refresh it reads what
-/// the view held.
+/// Compatible refreshes now retain indexed backing tables and their history.
 #[test]
-fn an_anchor_before_a_replacing_refresh_is_refused_naming_the_view() {
+fn an_anchor_before_an_indexed_compatible_refresh_reads_the_view_and_keeps_its_index() {
     for concurrent in [false, true] {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         shaped(&db);
@@ -2152,12 +2403,68 @@ fn an_anchor_before_a_replacing_refresh_is_refused_naming_the_view() {
         db.execute("CREATE INDEX m_v ON __mv_m (v)").unwrap();
         tick(&db, 1);
         let anchor = last_scn(&db);
+        db.execute("UPDATE src SET v = v + 10").unwrap();
+        db.execute("INSERT INTO src VALUES (3, 30)").unwrap();
         db.execute(if concurrent {
             "REFRESH MATERIALIZED VIEW CONCURRENTLY m"
         } else {
             "REFRESH MATERIALIZED VIEW m"
         })
         .unwrap();
+        db.execute(&format!("CREATE BRANCH indexed_before FROM main AS OF SCN {anchor}"))
+            .unwrap();
+        assert_eq!(
+            pairs(&rows_on(&db, "indexed_before", Family::Text, "SELECT id, v FROM m")),
+            vec![(1, 1), (2, 2)]
+        );
+        assert_eq!(
+            pairs(&rows(&db, Family::Text, "SELECT id, v FROM m")),
+            vec![(1, 11), (2, 12), (3, 30)]
+        );
+        assert_eq!(
+            rows(
+                &db,
+                Family::Text,
+                "SELECT indexname FROM pg_indexes WHERE indexname = 'm_v'"
+            )
+            .len(),
+            1
+        );
+        assert_eq!(
+            ids(&rows(&db, Family::Text, "SELECT id FROM __mv_m WHERE v = 11")),
+            vec![1]
+        );
+        assert!(rows(&db, Family::Text, "SELECT id FROM __mv_m WHERE v = 1").is_empty());
+    }
+}
+
+/// A real output-shape replacement discards old history: a branch anchored
+/// before it refuses naming the view; an anchor after it reads the new shape.
+#[test]
+fn an_anchor_before_a_replacing_refresh_is_refused_naming_the_view() {
+    for concurrent in [false, true] {
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        shaped(&db);
+        db.execute("CREATE TABLE src (id INT8 PRIMARY KEY, v INT8)").unwrap();
+        db.execute("INSERT INTO src VALUES (1, 1), (2, 2)").unwrap();
+        db.execute("CREATE MATERIALIZED VIEW m AS SELECT * FROM src").unwrap();
+        db.execute("CREATE INDEX m_v ON __mv_m (v)").unwrap();
+        tick(&db, 1);
+        let anchor = last_scn(&db);
+        db.execute("ALTER TABLE src ADD COLUMN extra INT8 DEFAULT 7").unwrap();
+        let replacement_schema = db.storage.catalog().get_table_schema("src").unwrap();
+        let replacement_rows = rows(&db, Family::Text, "SELECT * FROM src");
+        if concurrent {
+            db.storage
+                .mv_catalog()
+                .store_view_data_concurrent("m", replacement_rows, &replacement_schema)
+                .unwrap();
+        } else {
+            db.storage
+                .mv_catalog()
+                .store_view_data("m", replacement_rows, &replacement_schema)
+                .unwrap();
+        }
         let err = anchor_refusal(&db, anchor);
         assert!(
             err.contains(BRANCH_ANCHOR_UNREADABLE_MARKER) && err.contains("materialized view \"m\""),
@@ -2171,6 +2478,14 @@ fn an_anchor_before_a_replacing_refresh_is_refused_naming_the_view() {
             pairs(&rows_on(&db, "past", Family::Text, "SELECT id, v FROM m")),
             vec![(1, 1), (2, 2)],
             "[concurrent {concurrent}]"
+        );
+        assert_eq!(
+            rows_on(&db, "past", Family::Text, "SELECT extra FROM m")
+                .into_iter()
+                .map(|row| int(row.values.first()))
+                .collect::<Vec<_>>(),
+            vec![7, 7],
+            "the accepted later anchor uses the replacement's new shape"
         );
     }
 }

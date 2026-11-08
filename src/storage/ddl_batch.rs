@@ -39,7 +39,12 @@
 //!   purge_version_history_locked`): written in bounded chunks under a name that is no
 //!   table, recorded by the statement's own batch (`meta:history_purge:`);
 //! * persistent HNSW (decision 8): its own batch, BEFORE the definition that makes it
-//!   reachable; a dangling id is filtered on read.
+//!   reachable; a dangling id is filtered on read;
+//! * what a volatile `ADD COLUMN` default does while it is evaluated, once per row
+//!   ([`VOLATILE_DEFAULT_EFFECTS`], spec R5.5): `nextval` makes its sequence's
+//!   high-water durable before it serves a value from it (R5 design §2.3: a value
+//!   served from a block whose high-water rode an unwritten group would be served
+//!   again after a crash). The values themselves ride the statement's group.
 
 use std::cell::Cell;
 use std::marker::PhantomData;
@@ -51,11 +56,17 @@ use rocksdb::WriteBatch;
 use super::engine::{DdlWrite, StorageEngine};
 use super::wal::WalOperation;
 use super::write_gate::WriteGate;
+use super::write_outcome::{WriteAttempt, WriteOutcome};
 use crate::{Error, Result};
 
 /// The allow-list reason of a columnar read's lazy backfill (`storage::columnar`).
 pub const COLUMNAR_LAZY_BACKFILL: &str =
     "a columnar read's lazy backfill of derived side data (presence, zone stats, a v2 re-encoding)";
+
+/// The allow-list reason of a volatile default's evaluation inside `ALTER TABLE` (spec
+/// R5.5): a sequence's high-water is durable before the value it serves.
+pub const VOLATILE_DEFAULT_EFFECTS: &str =
+    "a volatile default's own effects while it is evaluated (a sequence's high-water, before the values it serves)";
 
 /// Batches open anywhere in this process: the gate looks at its thread-local marker
 /// only while this is not zero.
@@ -79,6 +90,11 @@ thread_local! {
     /// `internal-tests`: the next commit on this thread fails before it writes.
     #[cfg(feature = "internal-tests")]
     static FAIL_NEXT_COMMIT: Cell<bool> = const { Cell::new(false) };
+    /// A real group lands, then its result reports an uncertain failure.
+    #[cfg(feature = "internal-tests")]
+    static FAIL_NEXT_APPLIED_COMMIT: Cell<bool> = const { Cell::new(false) };
+    #[cfg(feature = "internal-tests")]
+    static AFTER_APPLIED_COMMIT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
 /// The identity of a gate in the marker.
@@ -225,12 +241,70 @@ fn report_side_write(what: &str, caller: &'static Location<'static>) {
 }
 
 /// `internal-tests` builds only: the next [`DdlBatch::commit`] on this thread fails
-/// before it writes anything, as a failed RocksDB write would (spec R5.3,
+/// before it writes anything (spec R5.3,
 /// `ddl_commit_failure_publishes_nothing`).
 #[cfg(feature = "internal-tests")]
 #[doc(hidden)]
 pub fn debug_fail_next_commit() {
     FAIL_NEXT_COMMIT.with(|fail| fail.set(true));
+}
+
+/// Model a native write/durability error whose group reached storage, before
+/// normal in-memory publication. Unlike `debug_fail_next_commit`, this is not
+/// evidence that undoing eager state is safe.
+#[cfg(feature = "internal-tests")]
+#[doc(hidden)]
+pub fn debug_fail_next_applied_commit() {
+    FAIL_NEXT_APPLIED_COMMIT.with(|fail| fail.set(true));
+}
+
+#[cfg(feature = "internal-tests")]
+thread_local! {
+    static NEXT_BEFORE_NATIVE_COMMIT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
+/// Arm a native fault at this DDL's owning write, after derived graph builds.
+#[cfg(feature = "internal-tests")]
+#[doc(hidden)]
+pub fn debug_next_before_native_commit(hook: impl FnOnce() + 'static) {
+    NEXT_BEFORE_NATIVE_COMMIT.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+/// Observe the actual native-OK owning group without injecting a failure.
+#[cfg(feature = "internal-tests")]
+#[doc(hidden)]
+pub fn debug_next_after_native_commit(hook: impl FnOnce() + 'static) {
+    AFTER_APPLIED_COMMIT.with(|next| *next.borrow_mut() = Some(Box::new(hook)));
+}
+
+/// As above, with a handshake at the real applied boundary for corruption and
+/// publication-order controls. The hook never runs if the write is refused.
+#[cfg(feature = "internal-tests")]
+#[doc(hidden)]
+pub fn debug_fail_next_applied_commit_with(hook: impl FnOnce() + 'static) {
+    debug_fail_next_applied_commit();
+    AFTER_APPLIED_COMMIT.with(|next| *next.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(feature = "internal-tests")]
+fn take_applied_hook() -> Option<Box<dyn FnOnce()>> {
+    AFTER_APPLIED_COMMIT.with(|next| next.borrow_mut().take())
+}
+
+#[cfg(not(feature = "internal-tests"))]
+fn take_applied_hook() -> Option<Box<dyn FnOnce()>> {
+    None
+}
+
+#[cfg(feature = "internal-tests")]
+fn take_applied_failure() -> bool {
+    FAIL_NEXT_APPLIED_COMMIT.with(Cell::take)
+}
+
+#[cfg(not(feature = "internal-tests"))]
+const fn take_applied_failure() -> bool {
+    false
 }
 
 #[cfg(feature = "internal-tests")]
@@ -260,6 +334,14 @@ pub struct DdlBatch<'e> {
     operations: Vec<WalOperation>,
     on_commit: Vec<Deferred<'e>>,
     on_abort: Vec<Deferred<'e>>,
+    /// Settle ALL owned write resources before any registry publication/undo.
+    after_write: Vec<Box<dyn FnOnce(bool) + 'e>>,
+    persistent_handles: Option<super::vector_index::PersistentRetirementHandles>,
+    persistent_retirements: std::collections::HashSet<String>,
+    /// A caller's strict durable witness, for a native error that may have applied.
+    error_application: Option<Box<dyn FnOnce() -> Result<bool> + 'e>>,
+    affected_tables: std::collections::BTreeSet<String>,
+    caller_reconciles_unknown: bool,
     /// `internal-tests` crash points of spec R1 §4, fired right after the write.
     exits: Vec<(&'static str, String)>,
     /// Guards the statement's funnels took that must outlive the write (a
@@ -280,6 +362,12 @@ impl<'e> DdlBatch<'e> {
             operations: Vec::new(),
             on_commit: Vec::new(),
             on_abort: Vec::new(),
+            after_write: Vec::new(),
+            persistent_handles: None,
+            persistent_retirements: std::collections::HashSet::new(),
+            error_application: None,
+            affected_tables: std::collections::BTreeSet::new(),
+            caller_reconciles_unknown: false,
             exits: Vec::new(),
             held_for_write: Vec::new(),
             held_for_publication: Vec::new(),
@@ -294,6 +382,7 @@ impl<'e> DdlBatch<'e> {
 
     /// Stage a put of `value`, sealed as `StorageEngine::put` seals it.
     pub fn put(&mut self, key: impl AsRef<[u8]>, value: &[u8]) -> Result<()> {
+        self.note_layout_key(key.as_ref());
         let stored = super::tde::seal(self.engine.key_manager_ref(), value)?;
         self.batch.put(key, stored.as_ref());
         Ok(())
@@ -302,12 +391,27 @@ impl<'e> DdlBatch<'e> {
     /// Stage a put of a value already in its stored form (read raw, or sealed by the
     /// caller for this very key).
     pub fn put_stored(&mut self, key: impl AsRef<[u8]>, stored: &[u8]) {
+        self.note_layout_key(key.as_ref());
         self.batch.put(key, stored);
     }
 
     /// Stage a delete.
     pub fn delete(&mut self, key: impl AsRef<[u8]>) {
+        self.note_layout_key(key.as_ref());
         self.batch.delete(key);
+    }
+
+    pub(crate) fn affect_table(&mut self, table: &str) {
+        self.affected_tables.insert(table.to_string());
+    }
+
+    fn note_layout_key(&mut self, key: &[u8]) {
+        if let Some(super::layout_epochs::LayoutKey::Tables(table, other)) = super::layout_epochs::layout_key(key) {
+            self.affect_table(table);
+            if let Some(other) = other {
+                self.affect_table(other);
+            }
+        }
     }
 
     /// The batch itself, for the funnels that stage into a `WriteBatch`.
@@ -318,18 +422,129 @@ impl<'e> DdlBatch<'e> {
     /// Log `operation` with the change: sealed into the batch at commit, under LSNs
     /// reserved then (nothing during the logical WAL's replay, or with no logical WAL).
     pub fn log(&mut self, operation: WalOperation) {
+        match &operation {
+            WalOperation::Insert { table, .. }
+            | WalOperation::Update { table, .. }
+            | WalOperation::Delete { table, .. }
+            | WalOperation::Truncate { table }
+            | WalOperation::CreateTable { table, .. }
+            | WalOperation::DropTable { table }
+            | WalOperation::AlterColumnStorage { table, .. }
+            | WalOperation::CreateIndex { table, .. }
+            | WalOperation::CreateTrigger { table, .. }
+            | WalOperation::AddConstraint { table, .. }
+            | WalOperation::DropConstraint { table, .. }
+            | WalOperation::AlterTableSchema { table, .. }
+            | WalOperation::SetColumnMissing { table, .. } => self.affect_table(table),
+            WalOperation::RenameTable { old_table, new_table } => {
+                self.affect_table(old_table);
+                self.affect_table(new_table);
+            }
+            WalOperation::CreateMaterializedView { name, .. }
+            | WalOperation::DropMaterializedView { name }
+            | WalOperation::RefreshMaterializedView { name, .. } => {
+                self.affect_table(name);
+                self.affect_table(&super::materialized_view::MaterializedViewCatalog::mv_data_table_name(
+                    name,
+                ));
+            }
+            WalOperation::DropTrigger { table: Some(table), .. } => self.affect_table(table),
+            _ => {}
+        }
         self.operations.push(operation);
     }
 
-    /// Run `publish` after the write, in the order queued; never after a failed one.
+    /// Run `publish` in order after success or strictly proven application.
     pub fn on_commit(&mut self, publish: impl FnOnce() + 'e) {
         self.on_commit.push(Box::new(publish));
     }
 
-    /// Run `undo` if the batch is not written (a failed write, or dropped without a
-    /// commit), in the reverse order queued.
+    /// Run `undo` only for a proven unwritten group, or an unwritten drop.
+    /// A native error alone cannot justify reversing eager derived state.
     pub fn on_abort(&mut self, undo: impl FnOnce() + 'e) {
         self.on_abort.push(Box::new(undo));
+    }
+
+    /// Acquire topology planning before dictionary/zone-stats guards when a
+    /// later stage will purge persistent indexes. Does not mark any purge staged.
+    pub(crate) fn prepare_persistent_retirements(&mut self) {
+        let engine = self.engine;
+        self.persistent_handles
+            .get_or_insert_with(|| engine.vector_indexes().snapshot_persistent_retirement_handles());
+    }
+
+    pub(crate) fn begin_persistent_retirement(&mut self, name: &str) -> bool {
+        // Capture registry state before acquiring the first lease, then reuse
+        // only these owned handles throughout a multi-table/cascading batch.
+        self.prepare_persistent_retirements();
+        self.persistent_retirements.insert(name.to_string())
+    }
+
+    #[cfg(feature = "vector-persist")]
+    pub(crate) fn persistent_retirement_handles(&self) -> Result<&super::vector_index::PersistentRetirementHandles> {
+        self.persistent_handles
+            .as_ref()
+            .ok_or_else(|| Error::internal("persistent retirement was not prepared"))
+    }
+
+    /// Release/settle an owned write resource before ANY normal publication
+    /// or abort callback. `true` means the write reported success; `false`
+    /// includes uncertain native errors and an unwritten drop. Used by leased
+    /// persistent graph purges: no callback may take a registry while another
+    /// table in this batch still holds a graph write lease.
+    pub(crate) fn after_write_before_publication(&mut self, settle: impl FnOnce(bool) + 'e) {
+        self.after_write.push(Box::new(settle));
+    }
+
+    /// On a reported write error, determine whether this atomic group applied.
+    /// A true result requires a unique same-group stamp or an AFTER value whose
+    /// BEFORE value differed, observed under the caller's retained exclusive lock.
+    /// False requires the exact BEFORE value. An unreadable/unexpected state must
+    /// fence and retire unusable derived state before returning Err. Such an Err
+    /// runs neither publication nor blind abort undo. The original write error is
+    /// still returned after a proven application and its normal publication.
+    pub(crate) fn on_write_error(&mut self, witness: impl FnOnce() -> Result<bool> + 'e) {
+        assert!(
+            self.error_application.is_none(),
+            "one application witness per DDL group"
+        );
+        self.error_application = Some(Box::new(witness));
+    }
+
+    /// A changed catalog record is a same-group outcome witness under the
+    /// statement's retained exclusive table lock. Values are plaintext, as
+    /// returned by StorageEngine::get; no row payload is copied.
+    pub(crate) fn watch_catalog_change(
+        &mut self,
+        table: &str,
+        key: Vec<u8>,
+        before: Option<Vec<u8>>,
+        after: Option<Vec<u8>>,
+    ) {
+        self.affect_table(table);
+        let table = table.to_string();
+        let engine = self.engine;
+        self.on_write_error(move || {
+            let observed = engine.get(&key);
+            match observed {
+                Ok(value) if before != after && value == after => Ok(true),
+                Ok(value) if before != after && value == before => Ok(false),
+                outcome => {
+                    let reason = match outcome {
+                        Ok(_) => "DDL catalog witness is neither a distinct BEFORE nor AFTER value".to_string(),
+                        Err(error) => format!("Cannot read DDL catalog witness: {error}"),
+                    };
+                    Err(engine.quarantine_generic_indexes(&table, &reason))
+                }
+            }
+        });
+    }
+
+    /// MV population retains its claim/census and reconciles actual durable
+    /// rows immediately after commit returns Err. It must not be fenced before
+    /// that owner can prove that an uncertain group left the old image intact.
+    pub(crate) fn reconcile_unknown_in_caller(&mut self) {
+        self.caller_reconciles_unknown = true;
     }
 
     /// `internal-tests`: end the process right after the write, before anything is
@@ -377,14 +592,27 @@ impl<'e> DdlBatch<'e> {
         self.batch.size_in_bytes()
     }
 
-    /// Write the statement's group, then publish. On a failed write nothing is
-    /// published and the queued undo runs; the error is returned.
+    /// A lower-bound preflight before a persistent graph's separate derived
+    /// builds. The final gate still caps the complete sealed/WAL/B4 group.
+    pub(crate) fn check_staged_budget(&self) -> Result<()> {
+        self.engine.write_gate().refuse_oversized(&self.batch)
+    }
+
+    /// Write the group, settle resources, then publish or undo. An optional
+    /// strict application witness handles a possibly-applied native error before
+    /// choosing callbacks; the original write error is always retained.
     pub(crate) fn commit(mut self) -> Result<DdlWrite> {
         let batch = std::mem::take(&mut self.batch);
         let operations = std::mem::take(&mut self.operations);
         let on_commit = std::mem::take(&mut self.on_commit);
         let on_abort = std::mem::take(&mut self.on_abort);
+        let after_write = std::mem::take(&mut self.after_write);
+        let error_application = self.error_application.take();
         let exits = std::mem::take(&mut self.exits);
+        // Spec R5.6: the layout change the write makes ends after the publication
+        // below, not at the write: until then a reader's epoch is in flight.
+        let publication = super::layout_epochs::PublicationScope::enter();
+        let attempt = WriteAttempt::default();
         let written = if take_injected_failure() {
             Err(Error::storage(
                 "the schema statement's write group was not written (internal-tests: debug_fail_next_commit)",
@@ -393,29 +621,101 @@ impl<'e> DdlBatch<'e> {
             Ok(DdlWrite::nothing())
         } else {
             let _committing = Committing::enter();
-            self.engine.write_ddl_batch_ops(operations, batch)
+            let applied_failure = take_applied_failure();
+            let applied_hook = take_applied_hook();
+            #[cfg(feature = "internal-tests")]
+            if let Some(hook) = NEXT_BEFORE_NATIVE_COMMIT.with(|slot| slot.borrow_mut().take()) {
+                hook();
+            }
+            self.engine
+                .write_ddl_batch_ops_observed(operations, batch, &attempt)
+                .and_then(|written| {
+                    if let Some(hook) = applied_hook {
+                        hook();
+                    }
+                    if applied_failure {
+                        Err(Error::storage(
+                            "injected schema durability failure after the group applied",
+                        ))
+                    } else {
+                        Ok(written)
+                    }
+                })
         };
+        // Preserve the strongest crash boundary: the native group succeeded,
+        // but no guard/resource or in-memory publication has been settled yet.
+        if written.is_ok() {
+            for (point, table) in &exits {
+                super::engine::exit_after_ddl_write(point, table);
+            }
+        }
         // The statement's durable write is made (or failed): what runs from here is
         // no longer inside it.
         drop(self.marker.take());
+        self.release_for_write();
+        for settle in after_write {
+            settle(written.is_ok());
+        }
+        // Release the lifecycle planning lease only after every graph lease,
+        // and before any existing callback takes a manager registry.
+        drop(self.persistent_handles.take());
         let outcome = match written {
             Ok(written) => {
-                for (point, table) in &exits {
-                    super::engine::exit_after_ddl_write(point, table);
-                }
-                self.release_for_write();
                 for publish in on_commit {
                     publish();
                 }
                 Ok(written)
             }
             Err(error) => {
-                for undo in on_abort.into_iter().rev() {
-                    undo();
+                let applied = match attempt.outcome() {
+                    WriteOutcome::NotWritten => Ok(false),
+                    outcome => match error_application {
+                        Some(witness) => witness(),
+                        None if outcome == WriteOutcome::Applied => Ok(true),
+                        None => {
+                            if !self.caller_reconciles_unknown {
+                                // Fence EVERY member before retirement of
+                                // the first can wait on a backend lease.
+                                for table in &self.affected_tables {
+                                    self.engine.layout_epochs().quarantine(table);
+                                    self.engine.write_gate().quarantine_table(
+                                        table,
+                                        "DDL native write outcome is unknown; reopen to reconcile",
+                                    );
+                                    self.engine.data_write_attempt_publication(table.clone())();
+                                }
+                                for table in &self.affected_tables {
+                                    self.engine.quarantine_generic_indexes(
+                                        table,
+                                        "DDL native write outcome is unknown; reopen to reconcile",
+                                    );
+                                }
+                            }
+                            Err(Error::storage(
+                                "DDL native write outcome requires actual-state reconciliation",
+                            ))
+                        }
+                    },
+                };
+                match applied {
+                    Ok(true) => {
+                        for publish in on_commit {
+                            publish();
+                        }
+                    }
+                    Ok(false) => {
+                        for undo in on_abort.into_iter().rev() {
+                            undo();
+                        }
+                    }
+                    Err(unresolved) => {
+                        tracing::error!("DDL write outcome could not be reconciled: {unresolved}");
+                    }
                 }
                 Err(error)
             }
         };
+        drop(publication);
         self.release_held();
         outcome
     }
@@ -424,6 +724,11 @@ impl<'e> DdlBatch<'e> {
 impl Drop for DdlBatch<'_> {
     fn drop(&mut self) {
         // After a commit every list is empty: this runs for a batch dropped unwritten.
+        self.release_for_write();
+        for settle in std::mem::take(&mut self.after_write) {
+            settle(false);
+        }
+        drop(self.persistent_handles.take());
         self.on_commit.clear();
         drop(self.marker.take());
         for undo in std::mem::take(&mut self.on_abort).into_iter().rev() {
@@ -444,6 +749,67 @@ mod tests {
         opts.create_if_missing(true);
         let db = rocksdb::DB::open(&opts, dir.path()).expect("open");
         (dir, db)
+    }
+
+    #[test]
+    fn resources_settle_before_publication_or_undo_on_success_refusal_and_unwritten_drop() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        struct HeldEvent(Rc<RefCell<Vec<&'static str>>>, &'static str);
+        impl Drop for HeldEvent {
+            fn drop(&mut self) {
+                self.0.borrow_mut().push(self.1);
+            }
+        }
+        for mode in ["success", "refused", "unwritten"] {
+            let db = crate::EmbeddedDatabase::new_in_memory().unwrap();
+            let events = Rc::new(RefCell::new(Vec::new()));
+            let mut ddl = DdlBatch::new(&db.storage);
+            ddl.put_stored(b"idxsnapv:resource-phase", &[1; 128]);
+            ddl.hold_until_written(HeldEvent(Rc::clone(&events), "write-guard"));
+            ddl.hold_until_published(HeldEvent(Rc::clone(&events), "publication-guard"));
+            for label in ["resource-one", "resource-two"] {
+                let events = Rc::clone(&events);
+                ddl.after_write_before_publication(move |success| {
+                    assert_eq!(success, mode == "success");
+                    events.borrow_mut().push(label);
+                });
+            }
+            let committed = Rc::clone(&events);
+            ddl.on_commit(move || committed.borrow_mut().push("commit"));
+            let aborted = Rc::clone(&events);
+            ddl.on_abort(move || aborted.borrow_mut().push("abort"));
+            let before = db.storage.db().latest_sequence_number();
+            match mode {
+                "success" => {
+                    ddl.commit().unwrap().wait_replicated();
+                }
+                "refused" => {
+                    db.storage.debug_set_write_group_ceiling(Some(32));
+                    assert!(ddl.commit().is_err());
+                    db.storage.debug_set_write_group_ceiling(None);
+                }
+                "unwritten" => drop(ddl),
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                &*events.borrow(),
+                &[
+                    "write-guard",
+                    "resource-one",
+                    "resource-two",
+                    if mode == "success" { "commit" } else { "abort" },
+                    "publication-guard"
+                ]
+            );
+            assert_eq!(
+                db.storage.db().get(b"idxsnapv:resource-phase").unwrap().is_some(),
+                mode == "success"
+            );
+            if mode != "success" {
+                assert_eq!(db.storage.db().latest_sequence_number(), before);
+            }
+        }
     }
 
     /// The detector fires on a write of the marked gate that is not the batch's own

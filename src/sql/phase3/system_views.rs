@@ -3719,6 +3719,10 @@ fn pg_table_oid_by_name(tables: &[String], table_name: &str) -> Option<i32> {
         .map(pg_table_oid)
 }
 
+/// Spec R5.3 (review F11): how many more builds `pg_indexes` makes looking for two
+/// consecutive ones that agree before it answers with the last.
+const PG_INDEXES_READ_ATTEMPTS: usize = 3;
+
 fn sorted_art_indexes(storage: &StorageEngine) -> Vec<(String, String, ArtIndexType, Vec<String>)> {
     let mut indexes = storage.art_indexes().list_indexes();
     // sprinter 6bc4a4040eb7 (B3 fix pass): main's index of a table the session's
@@ -5300,13 +5304,38 @@ impl SystemViewRegistry {
     /// kind PrimaryKey / Unique / ForeignKey are skipped because the schema-
     /// derived rows above already cover the first two and PostgreSQL has no
     /// index row for a bare FK.
+    ///
+    /// Spec R5.3 (review F11): one consistent set. The user indexes came from the
+    /// in-memory ART registry while the tables came from the durable catalog, so
+    /// while a `RENAME TO` or a `DROP TABLE` published its change (the durable
+    /// group first, the registry after it) a reader saw a table with part of its
+    /// index set. Both now come from the durable catalog — the `meta:index:`
+    /// definitions change in the same write group as the `meta:table:` records —
+    /// and only for tables in the same listing; and the view is built again until
+    /// two builds agree, so a statement that commits between its reads is not
+    /// half seen ([`PG_INDEXES_READ_ATTEMPTS`]).
     fn execute_pg_indexes(storage: &StorageEngine) -> Result<Vec<Tuple>> {
+        let mut last = Self::build_pg_indexes(storage)?;
+        for _ in 0..PG_INDEXES_READ_ATTEMPTS {
+            let again = Self::build_pg_indexes(storage)?;
+            if again == last {
+                return Ok(again);
+            }
+            last = again;
+        }
+        Ok(last)
+    }
+
+    /// One read of [`Self::execute_pg_indexes`].
+    fn build_pg_indexes(storage: &StorageEngine) -> Result<Vec<Tuple>> {
         let catalog = storage.catalog();
         let mut rows = Vec::new();
+        let tables = catalog.list_tables()?;
+        let listed: HashSet<&str> = tables.iter().map(String::as_str).collect();
 
-        for table_key in catalog.list_tables()? {
-            let (schema_name, bare_table) = crate::sql::Planner::split_schema_key(&table_key);
-            let Ok(tschema) = catalog.get_table_schema(&table_key) else {
+        for table_key in &tables {
+            let (schema_name, bare_table) = crate::sql::Planner::split_schema_key(table_key);
+            let Ok(tschema) = catalog.get_table_schema(table_key) else {
                 continue;
             };
             let pk_cols: Vec<String> = tschema
@@ -5350,17 +5379,31 @@ impl SystemViewRegistry {
             }
         }
 
-        for (index_name, table_key, index_type, columns) in sorted_art_indexes(storage) {
-            if index_type != ArtIndexType::Manual {
+        // The user's plain ART indexes (`CREATE INDEX`), from their durable
+        // definitions: the ones the registry would list as Manual (an ART-family
+        // definition that is not UNIQUE), of a table in this listing and not
+        // redefined by the session's branch. An index still being built has no
+        // definition until its group is written, exactly when it becomes visible.
+        let mut manual: Vec<(String, String, String)> = Vec::new();
+        for (index_name, definition) in catalog.list_index_definitions()? {
+            if crate::storage::index_family(definition.index_type.as_deref()) != Some(crate::storage::IndexFamily::Art)
+            {
                 continue;
             }
+            if crate::sql::executor::ddl::unique_index_columns(&definition.options, &definition.column_name).is_some() {
+                continue;
+            }
+            if !listed.contains(definition.table_name.as_str()) || catalog.branch_overrides(&definition.table_name) {
+                continue;
+            }
+            manual.push((definition.table_name, index_name, definition.column_name));
+        }
+        manual.sort();
+        for (table_key, index_name, column) in manual {
             let (schema_name, bare_table) = crate::sql::Planner::split_schema_key(&table_key);
             let indexdef = format!(
                 "CREATE INDEX {} ON {}.{} USING btree ({})",
-                index_name,
-                schema_name,
-                bare_table,
-                columns.join(", ")
+                index_name, schema_name, bare_table, column
             );
             rows.push(Tuple::new(vec![
                 Value::String(schema_name),
@@ -5374,8 +5417,13 @@ impl SystemViewRegistry {
         // sprinter cec8ab163448: sorted, and through the SHARED indexdef
         // builder the `\d` / `\di` wire shapes also use — `list_all_metadata`
         // walks a HashMap, so the row order (and therefore the pg_class OID
-        // derived from the same position) used to vary call to call.
+        // derived from the same position) used to vary call to call. Spec R5.3:
+        // only for a table in this listing (a dropped table's graph is torn down
+        // after its group).
         for metadata in sorted_vector_indexes(storage) {
+            if !listed.contains(metadata.table_name.as_str()) {
+                continue;
+            }
             let (schema_name, bare_table) = crate::sql::Planner::split_schema_key(&metadata.table_name);
             rows.push(Tuple::new(vec![
                 Value::String(schema_name),
