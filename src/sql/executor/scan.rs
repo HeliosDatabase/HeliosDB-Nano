@@ -12,6 +12,52 @@ use crate::{DataType, Error, Result, Schema, Tuple, Value};
 use std::collections::HashSet;
 use std::sync::Arc;
 
+#[cfg(test)]
+struct ScanLayoutCheckHook {
+    table: &'static str,
+    call: Box<dyn FnOnce() -> Result<()>>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static NEXT_SCAN_LAYOUT_CHECK: std::cell::RefCell<Option<ScanLayoutCheckHook>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+/// Arm one real scan on this thread, after its schema/key selection and before
+/// row fetch. Test closures run outside the hook's RefCell borrow.
+#[cfg(test)]
+fn next_after_scan_layout_check(table: &'static str, call: impl FnOnce() -> Result<()> + 'static) -> Result<()> {
+    NEXT_SCAN_LAYOUT_CHECK.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_some() {
+            return Err(Error::internal("a scan-layout test hook is already armed"));
+        }
+        *slot = Some(ScanLayoutCheckHook {
+            table,
+            call: Box::new(call),
+        });
+        Ok(())
+    })
+}
+
+#[cfg(test)]
+fn after_scan_layout_check(table: &str) -> Result<()> {
+    let next = NEXT_SCAN_LAYOUT_CHECK.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.as_ref().is_some_and(|hook| hook.table == table) {
+            slot.take()
+        } else {
+            None
+        }
+    });
+    if let Some(hook) = next {
+        (hook.call)()?;
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ScanDecodeHint {
     Prefix(usize),
@@ -509,6 +555,10 @@ pub(super) fn try_index_point_lookup_for_scan(
     {
         return Ok(None);
     }
+    // The point shortcut has selected its key and row IDs under the plan's
+    // schema, but has not fetched a row or acquired its storage scan lock.
+    #[cfg(test)]
+    after_scan_layout_check(table_name)?;
     let mut tuples = Vec::with_capacity(row_ids.len());
     for row_id in row_ids {
         if let Some(tuple) = storage.get_row_by_id(table_name, row_id, schema.as_ref())? {
@@ -2230,6 +2280,8 @@ pub(super) fn handle_scan(executor: &Executor, plan: &LogicalPlan) -> Result<Box
                 }
             };
             refuse_plan_of_another_layout(storage, table_name, &actual_table_name, plan_schema, &schema)?;
+            #[cfg(test)]
+            after_scan_layout_check(table_name)?;
 
             // Handle time-travel or transactional queries
             let tuples = if let Some(txn) = executor.transaction() {
@@ -2577,6 +2629,8 @@ pub(super) fn handle_filtered_scan(executor: &Executor, plan: &LogicalPlan) -> R
                 }
             };
             refuse_plan_of_another_layout(storage, table_name, &actual_table_name, plan_schema, &schema)?;
+            #[cfg(test)]
+            after_scan_layout_check(table_name)?;
 
             // Analyze the predicate for storage-level pushdown
             let analyzed_predicates = if let Some(ref pred) = materialized_predicate {
@@ -3640,3 +3694,7 @@ mod tests {
         assert_eq!(compute_scan_prefix_hint(&plan), Some(("w".to_string(), 1)));
     }
 }
+
+#[cfg(test)]
+#[path = "../../layout_error_retry_tests.rs"]
+mod layout_error_retry_tests;
