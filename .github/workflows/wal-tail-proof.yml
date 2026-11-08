@@ -1,0 +1,104 @@
+name: Paired physical WAL-tail proof (no publish)
+on:
+  push:
+    branches: ['ci/4420-wal-tail-proof-*']
+permissions:
+  contents: read
+jobs:
+  proof:
+    name: ${{ matrix.role }} exact four native regressions
+    runs-on: ubuntu-24.04
+    timeout-minutes: 80
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - role: baseline
+            product: e3ffa71f782af58464e47e7fddb1f2c07457cf07
+          - role: fixed
+            product: 24787ceebc36e4809495dbef7d1b7f3978209ad9
+    steps:
+      - name: Preserve Git source bytes
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          path: controller
+          persist-credentials: false
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ matrix.product }}
+          path: product
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - name: Install native build prerequisites
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang libclang-dev pkg-config libssl-dev cmake ninja-build
+          dpkg-query -W -f='${Package}\t${Version}\n' > "$RUNNER_TEMP/wal-tail-proof-packages.txt"
+      - name: Verify fixed controller and model
+        working-directory: controller
+        run: |
+          python3 - <<'PYBOOT'
+          import hashlib
+          from pathlib import Path
+          pairs = {
+              '.github/4420-wal-tail-proof/controller.py': '79342f5efbe0a64e57d2efc06e1f88be6dd64a7487aa415e0b169448cc7927ec',
+              '.github/4420-wal-tail-proof/model.json': '793da1fda43a58666f1fb154d053e7313dd590c6db44dca32a078d51ef065deb',
+          }
+          for name, wanted in pairs.items():
+              if hashlib.sha256(Path(name).read_bytes()).hexdigest() != wanted:
+                  raise SystemExit('paired-proof bootstrap mismatch: ' + name)
+          PYBOOT
+      - name: Build, list and execute the exact four native tests
+        env:
+          NANO_WAL_TAIL_PROOF_ROLE: ${{ matrix.role }}
+        run: |
+          set -euo pipefail
+          sudo install -d -o "$(id -un)" -g "$(id -gn)" /home/gpc/HDB/sprint/coordination
+          touch /home/gpc/HDB/sprint/coordination/build.lock
+          nano_layout_unit="nano-wal-tail-proof-${GITHUB_RUN_ID}-${NANO_WAL_TAIL_PROOF_ROLE}"
+          sudo systemd-run --unit "$nano_layout_unit" --wait --pipe --collect \
+            -p User="$(id -un)" -p Group="$(id -gn)" \
+            -p WorkingDirectory="$GITHUB_WORKSPACE/controller" \
+            -p MemoryMax=24G -p MemorySwapMax=0 -p KillMode=control-group \
+            -p RuntimeMaxSec=3900 -p TimeoutStopSec=30 \
+            --setenv="PATH=$PATH" --setenv="CARGO_HOME=$HOME/.cargo" \
+            --setenv="RUSTUP_HOME=$HOME/.rustup" --setenv=RUSTUP_TOOLCHAIN=1.95.0 \
+            --setenv="GITHUB_SHA=$GITHUB_SHA" \
+            --setenv=PYTHONDONTWRITEBYTECODE=1 --setenv=PYTHONUNBUFFERED=1 \
+            python3 .github/4420-wal-tail-proof/controller.py \
+              --controller "$GITHUB_WORKSPACE/controller" --product "$GITHUB_WORKSPACE/product" \
+              --role "$NANO_WAL_TAIL_PROOF_ROLE" --out "$RUNNER_TEMP/wal-tail-proof-$NANO_WAL_TAIL_PROOF_ROLE" \
+              --model-sha256 793da1fda43a58666f1fb154d053e7313dd590c6db44dca32a078d51ef065deb
+      - name: Preserve raw focused proof (including expected-red baseline)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wal-tail-proof-${{ matrix.role }}-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/wal-tail-proof-packages.txt
+            ${{ runner.temp }}/wal-tail-proof-${{ matrix.role }}/*.json
+            ${{ runner.temp }}/wal-tail-proof-${{ matrix.role }}/*.stdout
+            ${{ runner.temp }}/wal-tail-proof-${{ matrix.role }}/*.stderr
+            ${{ runner.temp }}/wal-tail-proof-${{ matrix.role }}/native-libtest.elf
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 14
+  both-roles:
+    name: Both focused role proofs required (no release acceptance)
+    if: always()
+    needs: proof
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Reject a partial or invalid pair
+        env:
+          PROOF_RESULT: ${{ needs.proof.result }}
+        run: |
+          test "$PROOF_RESULT" = success
