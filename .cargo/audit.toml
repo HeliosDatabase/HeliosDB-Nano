@@ -3,6 +3,16 @@
 
 [advisories]
 ignore = [
+    # These four maintenance-only IDs already have documented exceptions in
+    # deny.toml. Align both tools without weakening `cargo audit --deny warnings`;
+    # see docs/SECURITY_MAINTENANCE_EXCEPTIONS.md for reasons and removal work.
+    "RUSTSEC-2025-0141", # bincode: on-disk codec; format migration required
+    "RUSTSEC-2025-0134", # rustls-pemfile: rustls-pki-types migration tracked
+    "RUSTSEC-2025-0119", # number_prefix: indicatif display-only dependency
+    "RUSTSEC-2024-0449", # unsafe-libyaml: compiled-in OpenAPI / EXPLAIN YAML
+    # NEW maintenance exception adopted2026-11-08 for optional Tokenizers -> paste;
+    # tracked12d7fb448cd0. Paired with deny.toml, not a vulnerability exemption.
+    "RUSTSEC-2024-0436",
     # rkyv 0.7.46 (out-of-bounds read validating Rc/Arc archives) is in
     # Cargo.lock only as rust_decimal 1.40's optional `rkyv` dependency. No
     # feature of this workspace enables it, so it is never compiled:
