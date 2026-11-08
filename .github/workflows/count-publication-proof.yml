@@ -1,0 +1,108 @@
+name: COUNT publication baseline/fix proof (no publish)
+on:
+  push:
+    branches: ['ci/4420-count-publication-*']
+permissions:
+  contents: read
+jobs:
+  proof:
+    name: ${{ matrix.role }} / ${{ matrix.config }} exact COUNT native regressions
+    runs-on: ubuntu-24.04
+    timeout-minutes: 110
+    strategy:
+      fail-fast: false
+      matrix:
+        role: [baseline, fixed]
+        config: [default, internal-tests]
+        include:
+          - role: baseline
+            product: 9dc744636d06a94eca6e025e420279d2b098d05c
+          - role: fixed
+            product: c6d1b0f9b5f99d0f06cd72e65ce9eb2164b554e2
+    steps:
+      - name: Preserve Git source bytes
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          path: controller
+          persist-credentials: false
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ matrix.product }}
+          path: product
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - name: Install native build prerequisites
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang libclang-dev pkg-config libssl-dev cmake ninja-build
+          dpkg-query -W -f='${Package}\t${Version}\n' > "$RUNNER_TEMP/count-proof-packages.txt"
+      - name: Verify fixed controller and model
+        working-directory: controller
+        run: |
+          python3 - <<'PYBOOT'
+          import hashlib
+          from pathlib import Path
+          pairs = {
+              '.github/4420-count-proof/controller.py': '9b4d4a53e7e95da201f2d96fca4854a226c92b7196fdc1688983350ae9bc711b',
+              '.github/4420-count-proof/model.json': 'b126a88aeedb0d748e44c290a2e65b671b2108f4d057482ff2b79b4cb80c5d81',
+          }
+          for name, wanted in pairs.items():
+              if hashlib.sha256(Path(name).read_bytes()).hexdigest() != wanted:
+                  raise SystemExit('paired-proof bootstrap mismatch: ' + name)
+          PYBOOT
+      - name: Build, list and execute the exact five native tests / 88 cases
+        env:
+          NANO_COUNT_PROOF_ROLE: ${{ matrix.role }}
+          NANO_COUNT_PROOF_CONFIG: ${{ matrix.config }}
+        run: |
+          set -euo pipefail
+          sudo install -d -o "$(id -un)" -g "$(id -gn)" /home/gpc/HDB/sprint/coordination
+          touch /home/gpc/HDB/sprint/coordination/build.lock
+          nano_count_unit="nano-count-proof-${GITHUB_RUN_ID}-${NANO_COUNT_PROOF_ROLE}-${NANO_COUNT_PROOF_CONFIG}"
+          sudo systemd-run --unit "$nano_count_unit" --wait --pipe --collect \
+            -p User="$(id -un)" -p Group="$(id -gn)" \
+            -p WorkingDirectory="$GITHUB_WORKSPACE/controller" \
+            -p MemoryMax=24G -p MemorySwapMax=0 -p KillMode=control-group \
+            -p RuntimeMaxSec=5700 -p TimeoutStopSec=30 \
+            --setenv="PATH=$PATH" --setenv="CARGO_HOME=$HOME/.cargo" \
+            --setenv="RUSTUP_HOME=$HOME/.rustup" --setenv=RUSTUP_TOOLCHAIN=1.95.0 \
+            --setenv="GITHUB_SHA=$GITHUB_SHA" \
+            --setenv=PYTHONDONTWRITEBYTECODE=1 --setenv=PYTHONUNBUFFERED=1 \
+            python3 .github/4420-count-proof/controller.py \
+              --controller "$GITHUB_WORKSPACE/controller" --product "$GITHUB_WORKSPACE/product" \
+              --role "$NANO_COUNT_PROOF_ROLE" --config "$NANO_COUNT_PROOF_CONFIG" \
+              --out "$RUNNER_TEMP/count-proof-$NANO_COUNT_PROOF_ROLE-$NANO_COUNT_PROOF_CONFIG" \
+              --model-sha256 b126a88aeedb0d748e44c290a2e65b671b2108f4d057482ff2b79b4cb80c5d81
+      - name: Preserve raw focused proof (including expected-red baseline)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: count-publication-proof-${{ matrix.role }}-${{ matrix.config }}-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/count-proof-packages.txt
+            ${{ runner.temp }}/count-proof-${{ matrix.role }}-${{ matrix.config }}/*.json
+            ${{ runner.temp }}/count-proof-${{ matrix.role }}-${{ matrix.config }}/*.stdout
+            ${{ runner.temp }}/count-proof-${{ matrix.role }}-${{ matrix.config }}/*.stderr
+            ${{ runner.temp }}/count-proof-${{ matrix.role }}-${{ matrix.config }}/native-libtest.elf
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 14
+  both-roles:
+    name: All four focused role/config proofs required (no release acceptance)
+    if: always()
+    needs: proof
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Reject a partial or invalid pair
+        env:
+          PROOF_RESULT: ${{ needs.proof.result }}
+        run: |
+          test "$PROOF_RESULT" = success
