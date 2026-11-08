@@ -1,0 +1,137 @@
+name: Native release binaries (no publish)
+
+on:
+  push:
+    branches: ['ci/4420-binary-preflight-*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: binary-preflight-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: never
+  PREFLIGHT_EXPECTED_SHA256: ed47e15814dd3d39b072f5fb98aa632b85cd4b11177277e2796aee7cf3991038
+  PREFLIGHT_HELPER_SHA256: ea23902c06733505a8cbf093f61d88c3f93162fc48f415257b76d3b319a8fa84
+
+jobs:
+  native-binaries:
+    name: Native binary (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            os: macos-15
+          - target: x86_64-pc-windows-msvc
+            os: windows-2022
+    steps:
+      - name: Keep exact bytes before checkout
+        shell: bash
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+          git config --global core.longpaths true
+      - name: Use canonical Git symlink text (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          git config --global core.symlinks false
+          echo 'GIT_CONFIG_COUNT=1' >> "$GITHUB_ENV"
+          echo 'GIT_CONFIG_KEY_0=core.symlinks' >> "$GITHUB_ENV"
+          echo 'GIT_CONFIG_VALUE_0=false' >> "$GITHUB_ENV"
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Verify frozen helper and source manifest
+        shell: bash
+        run: |
+          python -c 'import hashlib,os,pathlib; pairs=[(".github/scripts/binary_preflight.py","PREFLIGHT_HELPER_SHA256"),(".github/binary-preflight-source28.json","PREFLIGHT_EXPECTED_SHA256")]; assert all(hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest()==os.environ[k] for p,k in pairs), "preflight input pin mismatch"'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: binary-preflight-${{ matrix.target }}
+      - name: Install build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libclang-dev pkg-config libssl-dev
+      - name: Point bindgen at preinstalled LLVM (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: echo 'LIBCLANG_PATH=C:\Program Files\LLVM\bin' >> "$GITHUB_ENV"
+      - name: Preserve verified released macOS minimum (11.0)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: echo 'MACOSX_DEPLOYMENT_TARGET=11.0' >> "$GITHUB_ENV"
+      - name: Verify source, build native release binary, execute version, package
+        shell: bash
+        run: python .github/scripts/binary_preflight.py build --target '${{ matrix.target }}'
+      - name: Preserve target evidence (including failures)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-preflight-${{ matrix.target }}
+          path: .preflight-out/${{ matrix.target }}/
+          if-no-files-found: error
+          include-hidden-files: true
+          overwrite: true
+          retention-days: 14
+
+  all-four:
+    name: All four native binaries and checksums
+    needs: native-binaries
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Keep exact bytes before checkout
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+          git config --global core.longpaths true
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Verify frozen helper and source manifest
+        run: |
+          python -c 'import hashlib,os,pathlib; pairs=[(".github/scripts/binary_preflight.py","PREFLIGHT_HELPER_SHA256"),(".github/binary-preflight-source28.json","PREFLIGHT_EXPECTED_SHA256")]; assert all(hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest()==os.environ[k] for p,k in pairs), "preflight input pin mismatch"'
+      - name: Download exactly this run's target artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: binary-preflight-*
+          path: .preflight-download
+          merge-multiple: false
+      - name: Require all targets, exact source and all archive receipts
+        env:
+          MATRIX_RESULT: ${{ needs.native-binaries.result }}
+        run: python .github/scripts/binary_preflight.py aggregate --artifacts .preflight-download --output .preflight-summary --matrix-result "$MATRIX_RESULT"
+      - name: Upload complete nonpublished binary set
+        uses: actions/upload-artifact@v4
+        with:
+          name: all-four-native-binaries
+          path: .preflight-summary/
+          if-no-files-found: error
+          include-hidden-files: true
+          overwrite: true
+          retention-days: 14
