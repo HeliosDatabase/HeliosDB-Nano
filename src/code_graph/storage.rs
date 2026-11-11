@@ -1277,13 +1277,20 @@ fn bootstrap_tables(db: &EmbeddedDatabase) -> Result<()> {
     // file_id-indexed deletes drop that to single-millisecond range
     // and are also the load-bearing index for the cross-file
     // resolver's UPDATE-by-file_id path. Idempotent.
-    let _ = db.execute("CREATE INDEX IF NOT EXISTS idx_hdb_code_symbols_file_id ON _hdb_code_symbols(file_id)");
-    let _ = db.execute("CREATE INDEX IF NOT EXISTS idx_hdb_code_symbol_refs_file_id ON _hdb_code_symbol_refs(file_id)");
-    let _ =
-        db.execute("CREATE INDEX IF NOT EXISTS idx_hdb_code_symbol_refs_to_symbol ON _hdb_code_symbol_refs(to_symbol)");
-    let _ = db.execute(
+    // Secondary CREATE INDEX is deliberately unsupported on a branch.
+    // These four nonunique indexes are main-only performance aids; branch
+    // PK/FK semantics come from the table definitions above. Issuing this
+    // known refusal inside a caller transaction would abort it even if the
+    // error were ignored. All main-side bootstrap errors must propagate.
+    if db.current_branch() != "main" {
+        return Ok(());
+    }
+    db.execute("CREATE INDEX IF NOT EXISTS idx_hdb_code_symbols_file_id ON _hdb_code_symbols(file_id)")?;
+    db.execute("CREATE INDEX IF NOT EXISTS idx_hdb_code_symbol_refs_file_id ON _hdb_code_symbol_refs(file_id)")?;
+    db.execute("CREATE INDEX IF NOT EXISTS idx_hdb_code_symbol_refs_to_symbol ON _hdb_code_symbol_refs(to_symbol)")?;
+    db.execute(
         "CREATE INDEX IF NOT EXISTS idx_hdb_code_symbol_refs_from_symbol ON _hdb_code_symbol_refs(from_symbol)",
-    );
+    )?;
     Ok(())
 }
 
