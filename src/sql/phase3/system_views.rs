@@ -8,9 +8,57 @@
 //! - pg_current_scn() - Current System Change Number
 //! - pg_compare_branches() - Compare two branches
 
+#[cfg(test)]
+#[path = "../../catalog_columns_scope_tests.rs"]
+mod catalog_columns_scope_tests;
+
 use crate::storage::{art_index::ArtIndexType, StorageEngine};
 use crate::{Column, ColumnStorageMode, DataType, Error, Result, Schema, Tuple, Value};
 use std::collections::{HashMap, HashSet};
+
+#[cfg(test)]
+struct ColumnsSchemaHook {
+    table: &'static str,
+    call: Box<dyn FnOnce() -> Result<()>>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static NEXT_COLUMNS_SCHEMA: std::cell::RefCell<Option<ColumnsSchemaHook>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+#[cfg(test)]
+fn next_after_columns_schema(table: &'static str, call: impl FnOnce() -> Result<()> + 'static) -> Result<()> {
+    NEXT_COLUMNS_SCHEMA.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_some() {
+            return Err(Error::internal("a columns-schema test hook is already armed"));
+        }
+        *slot = Some(ColumnsSchemaHook {
+            table,
+            call: Box::new(call),
+        });
+        Ok(())
+    })
+}
+
+#[cfg(test)]
+fn after_columns_schema(table: &str) -> Result<()> {
+    let next = NEXT_COLUMNS_SCHEMA.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.as_ref().is_some_and(|hook| hook.table == table) {
+            slot.take()
+        } else {
+            None
+        }
+    });
+    if let Some(hook) = next {
+        (hook.call)()?;
+    }
+    Ok(())
+}
 
 /// System view registry
 pub struct SystemViewRegistry {
@@ -4189,7 +4237,7 @@ impl SystemViewRegistry {
             "sqlite_master" => Self::execute_sqlite_master(storage),
             "pg_index" => Self::execute_pg_index(storage),
             "pg_constraint" => Self::execute_pg_constraint(storage),
-            "information_schema.columns" => Self::execute_information_schema_columns(storage),
+            "information_schema.columns" => Self::execute_information_schema_columns(storage, None),
             // Compression monitoring views
             "heliosdb_compression_stats" => Self::execute_heliosdb_compression_stats(storage),
             "heliosdb_pattern_stats" => Self::execute_heliosdb_pattern_stats(storage),
@@ -4232,6 +4280,18 @@ impl SystemViewRegistry {
                 Ok(vec![])
             }
         }
+    }
+
+    /// Execute `information_schema.columns` for one proven bare table name.
+    /// The caller still evaluates the complete SQL predicate over these rows;
+    /// this only avoids resolving unrelated table layouts while materializing
+    /// the system view.
+    pub(crate) fn execute_information_schema_columns_for_table(
+        &self,
+        storage: &StorageEngine,
+        table_name: &str,
+    ) -> Result<Vec<Tuple>> {
+        Self::execute_information_schema_columns(storage, Some(table_name))
     }
 
     /// Bridge to the legacy SystemViewRegistry's pg_tables
@@ -5692,12 +5752,15 @@ impl SystemViewRegistry {
     /// Execute information_schema.columns() system view
     ///
     /// Returns ANSI SQL standard view of all table columns
-    fn execute_information_schema_columns(storage: &StorageEngine) -> Result<Vec<Tuple>> {
+    fn execute_information_schema_columns(storage: &StorageEngine, table_filter: Option<&str>) -> Result<Vec<Tuple>> {
         let catalog = storage.catalog();
         let tables = catalog.list_tables()?;
         let mut results = Vec::new();
 
         for table_name in tables.iter() {
+            if table_filter.is_some_and(|filter| crate::sql::Planner::split_schema_key(table_name).1 != filter) {
+                continue;
+            }
             // Schema namespacing: `table_name` is the raw storage key (used for
             // the schema/identity lookups below); the introspection ROW shows
             // the real schema and the bare table name.
@@ -5705,6 +5768,8 @@ impl SystemViewRegistry {
             let identity_cols = catalog.list_identity_columns(table_name).unwrap_or_default();
             match catalog.get_table_schema(table_name) {
                 Ok(schema) => {
+                    #[cfg(test)]
+                    after_columns_schema(table_name)?;
                     for (col_idx, column) in schema.columns.iter().enumerate() {
                         let is_nullable = if column.nullable { "YES" } else { "NO" };
                         let data_type = format!("{:?}", column.data_type);

@@ -936,54 +936,58 @@ pub(super) fn handle_drop_table(
     executor: &Executor,
     table_name: &str,
     if_exists: bool,
+    cascade: bool,
 ) -> Result<Box<dyn PhysicalOperator>> {
-    if let Some(storage) = executor.storage() {
-        drop_table_and_partition_children(storage, table_name, if_exists)?;
-        // Return empty result set for DDL
-        Ok(empty_ddl_result(executor))
-    } else {
-        Err(Error::query_execution("No storage engine available"))
-    }
+    handle_drop_tables(executor, &[(table_name, if_exists, cascade)])
 }
 
-/// Drop `table_name` and, recursively, its registered Stage-0 partition
-/// children. `if_exists` governs only the top-level target; the cascade drops
-/// children with IF-EXISTS semantics (a child dropped directly earlier is
-/// simply absent). Every table is staged through the same `Catalog::
-/// stage_drop_table` funnel a plain DROP uses.
-///
-/// Spec R5.3: ONE write group for the whole cascade — the parent, every child and
-/// grandchild, their columnar sidecars and every `DropTable` entry. A failure part
-/// way (a child's read refuses its drop) leaves nothing dropped; a crash leaves all
-/// or none, and no reader or standby sees a parent gone with its partitions still
-/// there.
-fn drop_table_and_partition_children(
-    storage: &crate::storage::StorageEngine,
-    table_name: &str,
-    if_exists: bool,
-) -> Result<()> {
+/// Table-only comma lists share one target set and owning native group. An
+/// incoming FK owned by another target disappears with that table, so it is
+/// not a RESTRICT dependency outside the statement.
+pub(super) fn handle_drop_tables(
+    executor: &Executor,
+    requested: &[(&str, bool, bool)],
+) -> Result<Box<dyn PhysicalOperator>> {
+    let storage = executor
+        .storage()
+        .ok_or_else(|| Error::query_execution("No storage engine available"))?;
+    let _txn_locks = executor
+        .transaction()
+        .map(crate::storage::Transaction::bind_table_locks);
+    storage.refuse_main_catalog_write_on_branch("DROP TABLE")?;
     let catalog = storage.catalog();
-
-    // Resolve existence first so error semantics match a plain DROP exactly.
-    if catalog.get_table_schema(table_name).is_err() {
-        if !if_exists {
-            return Err(Error::query_execution(format!("Table '{}' does not exist", table_name)));
-        }
-        // IF EXISTS on a missing table: nothing to drop or cascade. A missing
-        // table cannot carry live registry links in normal operation.
-        return Ok(());
+    let targets = catalog.collect_main_drop_targets(requested)?;
+    if targets.is_empty() {
+        return Ok(empty_ddl_result(executor));
     }
-
     let mut ddl = crate::storage::DdlBatch::new(storage);
-    let mut dropped: Vec<String> = Vec::new();
-    stage_table_and_partition_children_drop(&catalog, table_name, &mut ddl, &mut dropped)?;
+    catalog.stage_drop_table_dependencies(&targets, &mut ddl)?;
+    let all: Vec<String> = targets.iter().map(|(name, _)| name.clone()).collect();
+    // A partition registered between discovery and parent ownership belongs
+    // to this drop too. Refuse this attempt before its first native write;
+    // the existing layout retry can rediscover the complete target set.
+    for table in &all {
+        for child in catalog.partition_children(table)? {
+            if catalog.main_table_exists(&child)? && !all.contains(&child) {
+                return Err(crate::storage::layout_epochs::layout_changed(table));
+            }
+        }
+    }
+    let mut dropped = Vec::new();
+    for table in &all {
+        if !catalog.main_table_exists(table)? {
+            if requested
+                .iter()
+                .any(|(name, if_exists, _)| *name == table.as_str() && !*if_exists)
+            {
+                return Err(Error::query_execution(format!("Table '{}' does not exist", table)));
+            }
+            continue;
+        }
+        catalog.stage_drop_table_after_dependencies(table, &all, &mut ddl)?;
+        dropped.push(table.clone());
+    }
     catalog.stage_dropped_tables_sidecar_purge(&dropped, &mut ddl);
-    // sprinter 29ecb34e3245: purge each dropped table's storage-level pushdown
-    // structures (bloom filters + zone maps), after the write. Keeping them past
-    // the drop is a leak AND a wrong-answer hazard: a bloom filter is an
-    // authoritative "no such value in this table" answer, so a stale one left
-    // behind by `DROP TABLE t` would prune real rows out of a later `CREATE TABLE
-    // t` with different data. Every cascaded partition child is purged too.
     {
         let tables = dropped.clone();
         ddl.on_commit(move || {
@@ -992,39 +996,15 @@ fn drop_table_and_partition_children(
             }
         });
     }
+    let label = match requested {
+        [(name, _, _)] => format!("DROP TABLE '{}'", name),
+        _ => "DROP TABLE".to_string(),
+    };
     ddl.commit()
-        .map_err(|e| Error::storage(format!("DROP TABLE '{}': batch delete failed: {}", table_name, e)))?
+        .map_err(|e| Error::storage(format!("{}: batch delete failed: {}", label, e)))?
         .wait_replicated();
     catalog.finish_dropped_table_history(&dropped);
-    Ok(())
-}
-
-/// Stage the drop of `table_name` and, recursively, of the partition children the
-/// registry names, into `ddl`; `dropped` collects every table staged.
-fn stage_table_and_partition_children_drop<'d>(
-    catalog: &crate::storage::Catalog<'d>,
-    table_name: &str,
-    ddl: &mut crate::storage::DdlBatch<'d>,
-    dropped: &mut Vec<String>,
-) -> Result<()> {
-    // It deletes the table's IDENTITY record (KanttBan #23) and its partition
-    // registry links in the same write group as everything else it owns (spec
-    // P1.1b), and hands back the children the registry named — detaching this
-    // table from its own parent, if it is itself a partition child and that parent
-    // is not being dropped with it, rides the same group.
-    let children = catalog.stage_drop_table(table_name, dropped.as_slice(), ddl)?;
-    dropped.push(table_name.to_string());
-    // Cascade to partition children (dependents); empty for a non-partition
-    // table. Each recursion repeats the same funnel + registry cleanup, so
-    // sub-partitioned children unwind fully. A child dropped directly earlier is
-    // simply absent.
-    for child in children {
-        if dropped.contains(&child) || !catalog.main_table_exists(&child)? {
-            continue;
-        }
-        stage_table_and_partition_children_drop(catalog, &child, ddl, dropped)?;
-    }
-    Ok(())
+    Ok(empty_ddl_result(executor))
 }
 
 /// Handle TRUNCATE logical plan node

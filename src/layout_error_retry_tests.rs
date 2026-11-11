@@ -9,6 +9,8 @@ type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
 const TABLE: &str = "layout_error_rows";
 const WAIT: Duration = Duration::from_secs(20);
 const QUERY: &str = "SELECT id FROM layout_error_rows WHERE v = 'v5'";
+const KNN_QUERY: &str =
+    "SELECT id FROM layout_error_rows WHERE emb IS NOT NULL ORDER BY emb <-> '[0.5,0.25,0.25,0.1562]' LIMIT 3";
 const VOLATILE_QUERY: &str = "SELECT id FROM layout_error_rows WHERE nextval('layout_error_once') > 0 AND v = 'v5'";
 
 fn fixture(history: bool) -> Result<Arc<EmbeddedDatabase>> {
@@ -218,6 +220,71 @@ fn a_sequence_side_effect_refuses_changed_layout_without_repeating_it() -> TestR
     for history in [false, true] {
         for params in [false, true] {
             overlap(params, false, history, true)?;
+        }
+    }
+    Ok(())
+}
+
+fn knn_overlap(params: bool, history: bool) -> TestResult {
+    let db = fixture(history)?;
+    let (arrived_tx, arrived_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let reader_db = Arc::clone(&db);
+    let reader = std::thread::spawn(move || {
+        let armed = super::next_after_scan_layout_check(TABLE, move || {
+            arrived_tx
+                .send(())
+                .map_err(|error| Error::internal(format!("KNN scan arrival: {error}")))?;
+            release_rx
+                .recv_timeout(WAIT)
+                .map_err(|error| Error::internal(format!("KNN scan release: {error}")))?;
+            Ok(())
+        });
+        if let Err(error) = armed {
+            return (Err(error), 0);
+        }
+        let mut attempts = 0;
+        let result = reader_db.run_layout_statement(false, || {
+            attempts += 1;
+            query(&reader_db, params, KNN_QUERY)
+        });
+        (result, attempts)
+    });
+    if let Err(error) = arrived_rx.recv_timeout(WAIT) {
+        let _released = release_tx.send(());
+        let outcome = reader
+            .join()
+            .map_err(|_| std::io::Error::other("KNN reader panicked before scan arrival"))?;
+        return Err(std::io::Error::other(format!(
+            "real KNN scan did not reach its seam: {error}; outcome {outcome:?}"
+        ))
+        .into());
+    }
+    let writer_db = Arc::clone(&db);
+    let (written_tx, written_rx) = mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        let result = writer_db.execute("ALTER TABLE layout_error_rows DROP COLUMN mid");
+        let _sent = written_tx.send(result);
+    });
+    let changed = written_rx.recv_timeout(WAIT);
+    let _released = release_tx.send(());
+    let read_joined = reader.join();
+    let write_joined = writer.join();
+    let (result, attempts) = read_joined.map_err(|_| std::io::Error::other("KNN reader panicked"))?;
+    write_joined.map_err(|_| std::io::Error::other("KNN DDL writer panicked"))?;
+    changed??;
+    let rows = result?;
+    assert_eq!(rows.len(), 1, "fresh KNN layout retains the one seeded row");
+    assert_eq!(attempts, 2, "a moved layout gets exactly one safe KNN re-plan");
+    eprintln!("layout-vector-error-cell params={params} history={history} attempts={attempts}");
+    Ok(())
+}
+
+#[test]
+fn stale_knn_operand_error_replans_only_after_layout_validation_fails() -> TestResult {
+    for history in [false, true] {
+        for params in [false, true] {
+            knn_overlap(params, history)?;
         }
     }
     Ok(())

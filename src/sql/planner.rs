@@ -2010,10 +2010,14 @@ impl<'a> Planner<'a> {
                             name: Self::normalize_nontable_name(name),
                             if_exists,
                         },
-                        sqlparser::ast::ObjectType::Table => LogicalPlan::DropTable {
-                            name: self.resolve_table_ref(name),
-                            if_exists,
-                        },
+                        sqlparser::ast::ObjectType::Table => {
+                            let name = self.resolve_table_ref(name);
+                            if cascade {
+                                LogicalPlan::DropTableCascade { name, if_exists }
+                            } else {
+                                LogicalPlan::DropTable { name, if_exists }
+                            }
+                        }
                         sqlparser::ast::ObjectType::Database => LogicalPlan::DropDatabase {
                             name: Self::normalize_nontable_name(name),
                             if_exists,

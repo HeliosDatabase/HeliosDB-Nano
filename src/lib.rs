@@ -2835,6 +2835,7 @@ impl EmbeddedDatabase {
                 // plans and Describe metadata serving the pre-CREATE shape.
                 | sql::LogicalPlan::CreateTableAs { .. }
                 | sql::LogicalPlan::DropTable { .. }
+                | sql::LogicalPlan::DropTableCascade { .. }
                 // The COMMA-LIST form of every drop — `DROP TABLE a, b`,
                 // `DROP INDEX a, b`, `DROP VIEW a, b` — plans as ONE `DropMulti`
                 // wrapping the individual drop nodes (planner.rs), and this
@@ -4965,7 +4966,10 @@ impl EmbeddedDatabase {
                 Err(error)
                     if !error.is_applied_publication_failure()
                         && match &error {
-                            Error::QueryExecution(message) => message.starts_with("Cannot compare "),
+                            Error::QueryExecution(message) => {
+                                message.starts_with("Cannot compare ")
+                                    || message.starts_with("Vector distance operators require vector operands")
+                            }
                             Error::TypeConversion(_) => true,
                             _ => false,
                         } =>
@@ -8515,11 +8519,15 @@ impl EmbeddedDatabase {
 
     fn dropped_table_names(plan: &sql::LogicalPlan) -> Vec<String> {
         match plan {
-            sql::LogicalPlan::DropTable { name, .. } => vec![name.clone()],
+            sql::LogicalPlan::DropTable { name, .. } | sql::LogicalPlan::DropTableCascade { name, .. } => {
+                vec![name.clone()]
+            }
             sql::LogicalPlan::DropMulti { drops } => drops
                 .iter()
                 .filter_map(|drop| match drop {
-                    sql::LogicalPlan::DropTable { name, .. } => Some(name.clone()),
+                    sql::LogicalPlan::DropTable { name, .. } | sql::LogicalPlan::DropTableCascade { name, .. } => {
+                        Some(name.clone())
+                    }
                     _ => None,
                 })
                 .collect(),

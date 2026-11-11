@@ -2777,6 +2777,219 @@ impl<'a> Catalog<'a> {
     where
         'a: 'd,
     {
+        let mut targets: Vec<(String, bool)> = dropping.iter().map(|name| (name.clone(), false)).collect();
+        if !targets.iter().any(|(name, _)| name == table_name) {
+            targets.push((table_name.to_string(), false));
+        }
+        self.stage_drop_table_dependencies(&targets, ddl)?;
+        self.stage_drop_table_after_dependencies(table_name, dropping, ddl)
+    }
+
+    /// Resolve all requested and partition targets before the statement takes
+    /// its first owner. Both the SQL guard and the native batch use this set.
+    pub(crate) fn collect_main_drop_targets(&self, requested: &[(&str, bool, bool)]) -> Result<Vec<(String, bool)>> {
+        let mut targets = Vec::new();
+        for (name, if_exists, cascade) in requested {
+            if !self.main_table_exists(name)? {
+                if *if_exists {
+                    continue;
+                }
+                return Err(Error::query_execution(format!("Table '{}' does not exist", name)));
+            }
+            if !targets.iter().any(|(seen, _): &(String, bool)| seen.as_str() == *name) {
+                targets.push(((*name).to_string(), *cascade));
+            }
+        }
+        let mut next = 0;
+        while let Some((name, cascade)) = targets.get(next).cloned() {
+            next += 1;
+            for child in self.partition_children(&name)? {
+                if self.main_table_exists(&child)? && !targets.iter().any(|(seen, _)| seen == &child) {
+                    targets.push((child, cascade));
+                }
+            }
+        }
+        Ok(targets)
+    }
+
+    pub(crate) fn main_drop_table_owners(&self, targets: &[(String, bool)]) -> Result<Vec<String>> {
+        self.drop_table_dependency_locks(targets).map(|(tables, _)| tables)
+    }
+
+    /// A constraint-changing statement retains existing FK parents as well
+    /// as any new parent named by its plan. Resolve these before its first
+    /// exclusive guard; a late expansion is refused by the staging funnel.
+    pub(crate) fn main_constraint_result_owners(&self, tables: Vec<String>) -> Result<Vec<String>> {
+        let mut owners = tables.clone();
+        for table in tables {
+            if let Some(bytes) = self.storage.get(&Self::table_constraints_key(&table))? {
+                let constraints: crate::sql::TableConstraints = bincode::deserialize(&bytes)
+                    .map_err(|error| Error::storage(format!("Constraint owners of '{}': {}", table, error)))?;
+                owners.extend(constraints.foreign_keys.into_iter().map(|fk| fk.references_table));
+            }
+        }
+        owners.sort_unstable();
+        owners.dedup();
+        Ok(owners)
+    }
+
+    /// The guard precedes its statement scope in the returned tuple, so
+    /// ownership is released before that scope restores TLS or waits for ACKs.
+    fn main_constraint_owner_guard(
+        &self,
+        mut owners: Vec<String>,
+    ) -> Result<(
+        super::branch_catalog::MainDdlGuard,
+        super::table_locks::StatementLockScope<'a>,
+    )> {
+        owners.sort_unstable();
+        owners.dedup();
+        let locks: &'a super::table_locks::TableLocks = self.storage.table_locks().as_ref();
+        let scope = locks.statement_scope();
+        for table in &owners {
+            self.storage.check_table_readable(table)?;
+        }
+        if locks.current_statement_holds_any()
+            && owners
+                .iter()
+                .any(|table| !locks.current_statement_holds_exclusively(super::table_locks::MAIN_LEVEL, table))
+        {
+            return Err(super::layout_epochs::layout_changed(
+                owners.first().map_or("constraints", String::as_str),
+            ));
+        }
+        let names: Vec<&str> = owners.iter().map(String::as_str).collect();
+        let guard = self.storage.main_catalog_write(&names, "ALTER TABLE constraints")?;
+        Ok((guard, scope))
+    }
+
+    /// All known owners a table drop can change, including the surviving
+    /// child's other FK parents required by the common metadata writer.
+    fn drop_table_dependency_locks(
+        &self,
+        targets: &[(String, bool)],
+    ) -> Result<(Vec<String>, Vec<(String, crate::sql::TableConstraints)>)> {
+        // Outcome-unknown metadata may be durable while its caches still hold
+        // BEFORE. Dependency discovery must prove the actual stored graph.
+        let mut records = Vec::new();
+        let mut tables: Vec<String> = targets.iter().map(|(name, _)| name.clone()).collect();
+        for (owner, bytes) in self.storage.meta_blobs_with_prefix("table_constraints:")? {
+            let constraints: crate::sql::TableConstraints = bincode::deserialize(&bytes)
+                .map_err(|error| Error::storage(format!("DROP TABLE constraint graph '{}': {}", owner, error)))?;
+            if constraints.foreign_keys.iter().any(|fk| fk.table_name != owner) {
+                return Err(Error::storage(format!(
+                    "DROP TABLE constraint graph '{}' has a different FK owner",
+                    owner
+                )));
+            }
+            if targets.iter().any(|(name, _)| name == &owner)
+                || constraints
+                    .foreign_keys
+                    .iter()
+                    .any(|fk| targets.iter().any(|(name, _)| name == &fk.references_table))
+            {
+                tables.push(owner.clone());
+                tables.extend(constraints.foreign_keys.iter().map(|fk| fk.references_table.clone()));
+            }
+            records.push((owner, constraints));
+        }
+        tables.sort_unstable();
+        tables.dedup();
+        for table in &tables {
+            self.storage.check_table_readable(table)?;
+        }
+        Ok((tables, records))
+    }
+
+    /// RESTRICT checks and CASCADE's surviving-child FK removals belong to
+    /// the same native group as every target. Discover, lock in sorted order,
+    /// then re-read under ownership before replacing any child definition.
+    pub(crate) fn stage_drop_table_dependencies<'d>(
+        &self,
+        targets: &[(String, bool)],
+        ddl: &mut super::DdlBatch<'d>,
+    ) -> Result<()>
+    where
+        'a: 'd,
+    {
+        self.storage.refuse_main_catalog_write_on_branch("DROP TABLE")?;
+        let (locked, _) = self.drop_table_dependency_locks(targets)?;
+        let scope = self.storage.table_locks().statement_scope();
+        // Embedded SQL acquired this full set at its first guard. If discovery
+        // expanded meanwhile, do not add a smaller owner behind that subset.
+        // Direct catalog callers with no held owner acquire the full set once.
+        let locks = self.storage.table_locks();
+        if locks.current_statement_holds_any()
+            && locked
+                .iter()
+                .any(|name| !locks.current_statement_holds_exclusively(super::table_locks::MAIN_LEVEL, name))
+        {
+            let table = targets.first().map_or("DROP TABLE", |(name, _)| name.as_str());
+            return Err(super::layout_epochs::layout_changed(table));
+        }
+        ddl.hold_until_published(scope);
+        let names: Vec<&str> = locked.iter().map(String::as_str).collect();
+        let guard = self.storage.main_catalog_write(&names, "DROP TABLE")?;
+        ddl.hold_until_published(guard);
+        let (current, records) = self.drop_table_dependency_locks(targets)?;
+        if current.iter().any(|name| locked.binary_search(name).is_err()) {
+            let table = targets.first().map_or("DROP TABLE", |(name, _)| name.as_str());
+            return Err(super::layout_epochs::layout_changed(table));
+        }
+        let mut updates = Vec::new();
+        for (child, mut constraints) in records {
+            if targets.iter().any(|(name, _)| name == &child) {
+                continue;
+            }
+            let mut removed = false;
+            for fk in &constraints.foreign_keys {
+                if let Some((table, cascade)) = targets.iter().find(|(name, _)| name == &fk.references_table) {
+                    if !cascade {
+                        return Err(Error::table_drop_has_dependents(table, &fk.name, &child));
+                    }
+                    removed = true;
+                }
+            }
+            if removed {
+                let retired: Vec<_> = constraints
+                    .foreign_keys
+                    .iter()
+                    .filter(|fk| targets.iter().any(|(name, _)| name == &fk.references_table))
+                    .cloned()
+                    .collect();
+                constraints
+                    .foreign_keys
+                    .retain(|fk| !targets.iter().any(|(name, _)| name == &fk.references_table));
+                updates.push((child, constraints, retired));
+            }
+        }
+        // All dependency refusals precede even buffered mutation. AddConstraint
+        // precedes DropTable in the logical stream too; physical publication
+        // sees the complete constraint set and drop in this one native group.
+        for (child, constraints, retired) in updates {
+            self.stage_table_constraints(&child, &constraints, ddl)?;
+            ddl.delete(super::index_snapshot::art_snapshot_marker_key(&child));
+            let storage = self.storage;
+            ddl.on_commit(move || {
+                for fk in retired {
+                    storage.art_indexes().retire_fk_index_ram_only(&fk);
+                }
+            });
+        }
+        Ok(())
+    }
+
+    /// The common dependency preflight already owns and validated the whole
+    /// drop set. Keep the existing table-record/derived-state settlement here.
+    pub(crate) fn stage_drop_table_after_dependencies<'d>(
+        &self,
+        table_name: &str,
+        dropping: &[String],
+        ddl: &mut super::DdlBatch<'d>,
+    ) -> Result<Vec<String>>
+    where
+        'a: 'd,
+    {
         // sprinter 6bc4a4040eb7 (phase B3): MAIN's catalog only. `DROP TABLE`
         // on a branch writes a tombstone in the branch's catalog overlay
         // (`branch_schema.rs`) and never reaches here; this used to drop MAIN's
@@ -2861,6 +3074,9 @@ impl<'a> Catalog<'a> {
             // persistent graph's keyspace is purged here, after the group that
             // removed its definition (decision 8's order).
             for (index_name, definition) in &definitions {
+                if matches!(index_family(definition.index_type.as_deref()), Some(IndexFamily::Art)) {
+                    continue;
+                }
                 if let Err(e) = teardown_index_structures(storage, index_name, definition.index_type.as_deref()) {
                     tracing::warn!(
                         "DROP TABLE '{}': index '{}' could not be torn down ({}); its catalog definition is \
@@ -2871,11 +3087,9 @@ impl<'a> Catalog<'a> {
                     );
                 }
             }
-            // Then every ART index of the table, after the per-definition teardown
-            // (which would otherwise find none and warn for every ordinary index).
-            if let Err(e) = storage.art_indexes().drop_table_indexes(&table) {
-                tracing::warn!("Failed to drop ART indexes for table '{}': {}", table, e);
-            }
+            // The owning group already deleted this table's idxsnapv marker.
+            // Ordinary drop_index would emit a second durable invalidation.
+            storage.art_indexes().retire_table_indexes_ram_only(&table);
             if let Err(e) = storage.statistics_cache().invalidate(&table) {
                 tracing::warn!("DROP TABLE '{}': failed to invalidate its statistics: {}", table, e);
             }
@@ -5884,6 +6098,18 @@ impl<'a> Catalog<'a> {
         if old.eq_ignore_ascii_case(new) {
             return Ok(());
         }
+        let targets = [(table.to_string(), false)];
+        let owners = self.main_drop_table_owners(&targets)?;
+        ddl.hold_until_published(self.main_constraint_owner_guard(owners)?);
+        let current = self.main_drop_table_owners(&targets)?;
+        if current.iter().any(|name| {
+            !self
+                .storage
+                .table_locks()
+                .current_statement_holds_exclusively(super::table_locks::MAIN_LEVEL, name)
+        }) {
+            return Err(super::layout_epochs::layout_changed(table));
+        }
 
         // --- this table's own record -------------------------------------
         let mut constraints = self.load_table_constraints(table)?;
@@ -7937,8 +8163,40 @@ impl<'a> Catalog<'a> {
     {
         // sprinter 6bc4a4040eb7 (B3 second fix pass): a table an unfinished merge
         // holds is refused (55006), whatever route got here. Held until the write.
-        let guard = self.storage.enter_main_ddl(&[table_name])?;
+        let scope = self.storage.table_locks().statement_scope();
+        let mut tables: Vec<&str> = constraints
+            .foreign_keys
+            .iter()
+            .map(|fk| fk.references_table.as_str())
+            .collect();
+        tables.push(table_name);
+        let locks = self.storage.table_locks();
+        if locks.current_statement_holds_any()
+            && tables
+                .iter()
+                .any(|table| !locks.current_statement_holds_exclusively(super::table_locks::MAIN_LEVEL, table))
+        {
+            return Err(super::layout_epochs::layout_changed(table_name));
+        }
+        ddl.hold_until_published(scope);
+        let guard = self.storage.main_catalog_write(&tables, "ALTER TABLE constraints")?;
         ddl.hold_until_published(guard);
+        // A public metadata writer may have waited behind DROP/RENAME. It
+        // must not recreate an incoming edge after that parent disappeared.
+        // A CREATE's self-reference names its own not-yet-published schema.
+        for fk in &constraints.foreign_keys {
+            if fk.references_table != table_name {
+                let parent = self.main_table_schema(&fk.references_table)?;
+                for column in &fk.references_columns {
+                    if parent.get_column_index(column).is_none() {
+                        return Err(Error::query_execution(format!(
+                            "Column '{}' not found in referenced table '{}'",
+                            column, fk.references_table
+                        )));
+                    }
+                }
+            }
+        }
         let value = bincode::serialize(constraints)
             .map_err(|e| Error::storage(format!("Failed to serialize table constraints: {}", e)))?;
         ddl.put(Self::table_constraints_key(table_name), &value)?;
@@ -8023,6 +8281,8 @@ impl<'a> Catalog<'a> {
     where
         'a: 'd,
     {
+        let owners = self.main_constraint_result_owners(vec![fk.table_name.clone(), fk.references_table.clone()])?;
+        ddl.hold_until_published(self.main_constraint_owner_guard(owners)?);
         let mut constraints = self.load_table_constraints(&fk.table_name)?;
         constraints.add_foreign_key(fk.clone());
         self.stage_table_constraints(&fk.table_name, &constraints, ddl)?;
@@ -8206,6 +8466,8 @@ impl<'a> Catalog<'a> {
 
     /// Drop a specific constraint by name
     pub fn drop_constraint(&self, table_name: &str, constraint_name: &str) -> Result<bool> {
+        let owners = self.main_constraint_result_owners(vec![table_name.to_string()])?;
+        let _ownership = self.main_constraint_owner_guard(owners)?;
         let mut constraints = self.load_table_constraints(table_name)?;
         let initial_fk_len = constraints.foreign_keys.len();
         let initial_unique_len = constraints.unique_constraints.len();

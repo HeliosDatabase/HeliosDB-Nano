@@ -2469,6 +2469,58 @@ pub(super) fn handle_scan(executor: &Executor, plan: &LogicalPlan) -> Result<Box
 ///
 /// This handles scans with storage-level predicate pushdown, using bloom filters,
 /// zone maps, and SIMD-accelerated filtering for improved performance.
+fn exact_information_schema_table_name(
+    predicate: &LogicalExpr,
+    table_name: &str,
+    alias: Option<&str>,
+    parameters: &[Value],
+) -> Option<String> {
+    fn matches_table_column(expr: &LogicalExpr, table_name: &str, alias: Option<&str>) -> bool {
+        let LogicalExpr::Column { table, name } = expr else {
+            return false;
+        };
+        if !name.eq_ignore_ascii_case("table_name") {
+            return false;
+        }
+        table.as_deref().is_none_or(|qualifier| {
+            qualifier.eq_ignore_ascii_case(table_name)
+                || qualifier.eq_ignore_ascii_case("columns")
+                || alias.is_some_and(|alias| qualifier.eq_ignore_ascii_case(alias))
+        })
+    }
+
+    fn string_value(expr: &LogicalExpr, parameters: &[Value]) -> Option<String> {
+        match expr {
+            LogicalExpr::Literal(Value::String(value)) => Some(value.clone()),
+            LogicalExpr::Parameter { index } => parameters.get(index.checked_sub(1)?).and_then(|value| match value {
+                Value::String(value) => Some(value.clone()),
+                _ => None,
+            }),
+            _ => None,
+        }
+    }
+
+    match predicate {
+        LogicalExpr::BinaryExpr {
+            left,
+            op: crate::sql::logical_plan::BinaryOperator::And,
+            right,
+        } => exact_information_schema_table_name(left, table_name, alias, parameters)
+            .or_else(|| exact_information_schema_table_name(right, table_name, alias, parameters)),
+        LogicalExpr::BinaryExpr {
+            left,
+            op: crate::sql::logical_plan::BinaryOperator::Eq,
+            right,
+        } if matches_table_column(left, table_name, alias) => string_value(right, parameters),
+        LogicalExpr::BinaryExpr {
+            left,
+            op: crate::sql::logical_plan::BinaryOperator::Eq,
+            right,
+        } if matches_table_column(right, table_name, alias) => string_value(left, parameters),
+        _ => None,
+    }
+}
+
 pub(super) fn handle_filtered_scan(executor: &Executor, plan: &LogicalPlan) -> Result<Box<dyn PhysicalOperator>> {
     if let LogicalPlan::FilteredScan {
         table_name,
@@ -2584,7 +2636,17 @@ pub(super) fn handle_filtered_scan(executor: &Executor, plan: &LogicalPlan) -> R
                 col.source_table_name = Some(table_name.clone());
             }
             let schema_arc = Arc::new(schema);
-            let tuples = registry.execute(table_name, storage)?;
+            let filtered_columns_table = if table_name == "information_schema.columns" {
+                materialized_predicate.as_ref().and_then(|predicate| {
+                    exact_information_schema_table_name(predicate, table_name, alias.as_deref(), executor.parameters())
+                })
+            } else {
+                None
+            };
+            let tuples = match filtered_columns_table.as_deref() {
+                Some(table_filter) => registry.execute_information_schema_columns_for_table(storage, table_filter)?,
+                None => registry.execute(table_name, storage)?,
+            };
             let tuples = if let Some(pred) = &materialized_predicate {
                 filter_tuples_with_evaluator(tuples, schema_arc.clone(), pred, executor.parameters())?
             } else {

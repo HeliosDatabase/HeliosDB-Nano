@@ -1424,6 +1424,10 @@ pub enum LogicalPlan {
         /// The predicate every row must satisfy.
         expression: LogicalExpr,
     },
+
+    /// `DROP TABLE ... CASCADE`. Append-only: persisted plans encode the
+    /// existing `DropTable` variant's fields and positional discriminant.
+    DropTableCascade { name: String, if_exists: bool },
 }
 
 /// Function/Procedure parameter
@@ -2477,7 +2481,7 @@ impl LogicalPlan {
             // NOT force this arm — a missing one degrades every CTAS trace to
             // "Other" silently.
             Self::CreateTableAs { .. } => "CreateTableAs",
-            Self::DropTable { .. } => "DropTable",
+            Self::DropTable { .. } | Self::DropTableCascade { .. } => "DropTable",
             Self::CreateIndex { .. } => "CreateIndex",
             Self::CreateSequence { .. } => "CreateSequence",
             Self::AlterSequence(_) => "AlterSequence",
@@ -2611,7 +2615,7 @@ impl LogicalPlan {
             // result set. The source query's schema — which becomes the new
             // table's shape — is read from `query` at execution time.
             LogicalPlan::CreateTableAs { .. } => Arc::new(Schema { columns: vec![] }),
-            LogicalPlan::DropTable { .. } => Arc::new(Schema { columns: vec![] }),
+            LogicalPlan::DropTable { .. } | LogicalPlan::DropTableCascade { .. } => Arc::new(Schema { columns: vec![] }),
             LogicalPlan::DropMulti { .. } => Arc::new(Schema { columns: vec![] }),
             LogicalPlan::Truncate { .. } => {
                 // Truncate doesn't have output schema

@@ -1542,7 +1542,97 @@ impl ArtIndexManager {
         Ok(())
     }
 
-    /// Drop all indexes for a table (called on DROP TABLE)
+    /// Retire one owned FK after its metadata and snapshot-marker changes
+    /// already committed. No invalidation hook or global snapshot-clean flip:
+    /// the owner batch deleted this table's marker, while another table's
+    /// next mutation must still invalidate its own previously clean dump.
+    pub(crate) fn retire_fk_index_ram_only(&self, fk: &crate::sql::ForeignKeyConstraint) -> bool {
+        self.retire_owned_index_ram_only(&fk.name, &fk.table_name, Some(fk))
+    }
+
+    /// A fenced table's RAM indexes are unusable. The caller publishes its
+    /// layout/gate/data fences first; retirement must not perform a durable
+    /// compensating marker write after an uncertain native outcome.
+    pub(crate) fn retire_table_indexes_ram_only(&self, table: &str) {
+        let names: Vec<String> = self
+            .indexes
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .iter()
+            .filter(|(_, entry)| entry.table == table)
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in names {
+            self.retire_owned_index_ram_only(&name, table, None);
+        }
+    }
+
+    fn retire_owned_index_ram_only(
+        &self,
+        name: &str,
+        table: &str,
+        fk: Option<&crate::sql::ForeignKeyConstraint>,
+    ) -> bool {
+        let removed = {
+            let mut indexes = self.indexes.write().unwrap_or_else(|error| error.into_inner());
+            let Some(entry) = indexes.get(name) else { return false };
+            if entry.table != table {
+                return false;
+            }
+            if let Some(fk) = fk {
+                if entry.index_type != ArtIndexType::ForeignKey || entry.columns != fk.columns {
+                    return false;
+                }
+                let infos = self.fk_info.read().unwrap_or_else(|error| error.into_inner());
+                if !infos.get(name).is_some_and(|info| {
+                    info.table == table
+                        && info.columns == fk.columns
+                        && info.ref_table == fk.references_table
+                        && info.ref_columns == fk.references_columns
+                }) {
+                    return false;
+                }
+            }
+            indexes.remove(name)
+        };
+        let Some(entry) = removed else { return false };
+        self.table_index_remove(table, name);
+        // Remove only the old TABLE's leaf entry. A different table may have
+        // reclaimed the global name after the atomic registry removal.
+        match entry.index_type {
+            ArtIndexType::PrimaryKey => {
+                let mut indexes = self.pk_indexes.write().unwrap_or_else(|error| error.into_inner());
+                if indexes.get(table).is_some_and(|current| current == name) {
+                    indexes.remove(table);
+                }
+            }
+            ArtIndexType::ForeignKey => {
+                let mut indexes = self.fk_indexes.write().unwrap_or_else(|error| error.into_inner());
+                if let Some(names) = indexes.get_mut(table) {
+                    names.retain(|current| current != name);
+                }
+                drop(indexes);
+                let mut infos = self.fk_info.write().unwrap_or_else(|error| error.into_inner());
+                if infos
+                    .get(name)
+                    .is_some_and(|info| info.table == table && info.columns == entry.columns)
+                {
+                    infos.remove(name);
+                }
+            }
+            ArtIndexType::Unique => {
+                let mut indexes = self.unique_indexes.write().unwrap_or_else(|error| error.into_inner());
+                if let Some(names) = indexes.get_mut(table) {
+                    names.retain(|current| current != name);
+                }
+            }
+            ArtIndexType::Manual => {}
+        }
+        self.stats.remove_index(entry.index_type);
+        true
+    }
+
+    /// Drop all indexes for a table (called on DROP TABLE).
     pub fn drop_table_indexes(&self, table: &str) -> ArtResult<()> {
         let mut to_drop = Vec::new();
 

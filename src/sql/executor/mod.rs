@@ -3777,6 +3777,31 @@ impl<'a> Executor<'a> {
             LogicalPlan::FilteredScan { .. } => scan::handle_filtered_scan(self, plan),
             LogicalPlan::TableFunction { .. } => scan::handle_table_function(self, plan),
             LogicalPlan::Filter { input, predicate } => {
+                // `information_schema.columns` materialises table layouts, so
+                // keep a proven table_name equality attached to its scan. A
+                // generic Filter over the unfiltered system view would resolve
+                // every table schema before discarding all but one table's
+                // rows, creating unrelated layout dependencies during DDL.
+                if let LogicalPlan::Scan {
+                    table_name,
+                    alias,
+                    schema,
+                    projection,
+                    as_of,
+                } = input.as_ref()
+                {
+                    if table_name == "information_schema.columns" {
+                        let filtered = LogicalPlan::FilteredScan {
+                            table_name: table_name.clone(),
+                            alias: alias.clone(),
+                            schema: schema.clone(),
+                            projection: projection.clone(),
+                            predicate: Some(predicate.clone()),
+                            as_of: as_of.clone(),
+                        };
+                        return scan::handle_filtered_scan(self, &filtered);
+                    }
+                }
                 // Try ART index-based point lookup for Filter(Scan) equality predicates.
                 if let Some(result) = scan::try_index_point_lookup_for_scan(self, input, predicate)? {
                     return Ok(result);
@@ -4965,7 +4990,7 @@ impl<'a> Executor<'a> {
                     // the error so a genuine failure is still reported.
                     let mut first_err: Option<Error> = None;
                     for member in members {
-                        if let Err(e) = ddl::handle_drop_table(self, &member, true) {
+                        if let Err(e) = ddl::handle_drop_table(self, &member, true, true) {
                             if first_err.is_none() {
                                 first_err = Some(e);
                             }
@@ -5058,7 +5083,8 @@ impl<'a> Executor<'a> {
                     .with_timeout(self.timeout_ctx()),
                 ))
             }
-            LogicalPlan::DropTable { name, if_exists } => ddl::handle_drop_table(self, name, *if_exists),
+            LogicalPlan::DropTable { name, if_exists } => ddl::handle_drop_table(self, name, *if_exists, false),
+            LogicalPlan::DropTableCascade { name, if_exists } => ddl::handle_drop_table(self, name, *if_exists, true),
             // DROP INDEX. Placed in the SHARED `plan_to_operator` (exactly like
             // DROP TABLE and DROP ROLE) so that `db.execute()` and
             // `db.execute_params()` — the latter being what the PostgreSQL
@@ -5067,7 +5093,18 @@ impl<'a> Executor<'a> {
             // namespace only and can never touch a relation.
             LogicalPlan::DropIndex { name, if_exists } => ddl::handle_drop_index(self, name, *if_exists),
             LogicalPlan::DropMulti { drops } => {
-                // Execute each drop in sequence. DDL side effects happen during
+                let tables: Option<Vec<_>> = drops
+                    .iter()
+                    .map(|drop| match drop {
+                        LogicalPlan::DropTable { name, if_exists } => Some((name.as_str(), *if_exists, false)),
+                        LogicalPlan::DropTableCascade { name, if_exists } => Some((name.as_str(), *if_exists, true)),
+                        _ => None,
+                    })
+                    .collect();
+                if let Some(tables) = tables {
+                    return ddl::handle_drop_tables(self, &tables);
+                }
+                // Execute each non-table drop in sequence. DDL side effects happen during
                 // physical planning (as for the other Drop nodes here), so this
                 // recursion performs every drop; the operators are discarded.
                 for drop in drops {

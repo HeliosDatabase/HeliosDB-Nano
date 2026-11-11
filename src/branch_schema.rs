@@ -97,7 +97,7 @@ enum BranchDdl<'p> {
         with_data: bool,
     },
     /// `DROP TABLE` (one, or the comma list): (name, IF EXISTS).
-    DropTables(Vec<(&'p str, bool)>),
+    DropTables(Vec<(&'p str, bool, bool)>),
     /// `ALTER TABLE t ADD COLUMN …` (every op of the statement): the table and
     /// (column, IF NOT EXISTS) in statement order.
     AddColumns {
@@ -133,7 +133,7 @@ pub fn schema_statement_name(plan: &LogicalPlan) -> Option<&'static str> {
     Some(match plan {
         LogicalPlan::CreateTable { .. } => "CREATE TABLE",
         LogicalPlan::CreateTableAs { .. } => "CREATE TABLE … AS",
-        LogicalPlan::DropTable { .. } => "DROP TABLE",
+        LogicalPlan::DropTable { .. } | LogicalPlan::DropTableCascade { .. } => "DROP TABLE",
         LogicalPlan::DropMulti { drops } => return drops.iter().find_map(schema_statement_name).or(Some("DROP")),
         LogicalPlan::AlterTableAddColumn { .. } => "ALTER TABLE … ADD COLUMN",
         LogicalPlan::AlterTableMulti { operations } => {
@@ -219,7 +219,7 @@ fn schema_plan_tables(storage: &StorageEngine, plan: &LogicalPlan) -> Vec<String
         // own (B3 third fix pass): they are refused or held here, up front, never
         // half way through the drop. And the tables on the other end of its foreign
         // keys: a parent's DELETE reads what references it.
-        LogicalPlan::DropTable { name, .. } => {
+        LogicalPlan::DropTable { name, .. } | LogicalPlan::DropTableCascade { name, .. } => {
             let mut tables = storage.catalog().with_partition_descendants(vec![name.clone()]);
             let neighbours: Vec<String> = tables.iter().flat_map(|table| fk_neighbours(storage, table)).collect();
             tables.extend(neighbours);
@@ -317,6 +317,19 @@ fn fk_neighbours(storage: &StorageEngine, table: &str) -> Vec<String> {
     tables
 }
 
+fn table_drop_requests(plan: &LogicalPlan) -> Option<Vec<(&str, bool, bool)>> {
+    match plan {
+        LogicalPlan::DropTable { name, if_exists } => Some(vec![(name, *if_exists, false)]),
+        LogicalPlan::DropTableCascade { name, if_exists } => Some(vec![(name, *if_exists, true)]),
+        LogicalPlan::DropMulti { drops } => drops
+            .iter()
+            .map(table_drop_requests)
+            .collect::<Option<Vec<_>>>()
+            .map(|sets| sets.into_iter().flatten().collect()),
+        _ => None,
+    }
+}
+
 /// Classify `plan` for a statement on a branch.
 fn classify(plan: &LogicalPlan) -> BranchDdl<'_> {
     match plan {
@@ -334,12 +347,16 @@ fn classify(plan: &LogicalPlan) -> BranchDdl<'_> {
             query,
             with_data: *with_data,
         },
-        LogicalPlan::DropTable { name, if_exists } => BranchDdl::DropTables(vec![(name.as_str(), *if_exists)]),
+        LogicalPlan::DropTable { name, if_exists } => BranchDdl::DropTables(vec![(name.as_str(), *if_exists, false)]),
+        LogicalPlan::DropTableCascade { name, if_exists } => {
+            BranchDdl::DropTables(vec![(name.as_str(), *if_exists, true)])
+        }
         LogicalPlan::DropMulti { drops } => {
             let mut tables = Vec::with_capacity(drops.len());
             for drop in drops {
                 match drop {
-                    LogicalPlan::DropTable { name, if_exists } => tables.push((name.as_str(), *if_exists)),
+                    LogicalPlan::DropTable { name, if_exists } => tables.push((name.as_str(), *if_exists, false)),
+                    LogicalPlan::DropTableCascade { name, if_exists } => tables.push((name.as_str(), *if_exists, true)),
                     other => return BranchDdl::Refuse(schema_statement_name(other).unwrap_or("DROP")),
                 }
             }
@@ -484,7 +501,34 @@ impl EmbeddedDatabase {
         let Some(statement) = schema_statement_name(plan) else {
             return Ok(None);
         };
-        let tables = schema_plan_tables(&self.storage, plan);
+        let schema_members = if let LogicalPlan::DropSchema {
+            names, cascade: true, ..
+        } = plan
+        {
+            let mut members = Vec::new();
+            for name in names {
+                members.extend(self.storage.catalog().schema_members(name)?);
+            }
+            Some(members)
+        } else {
+            None
+        };
+        let requested = schema_members
+            .as_ref()
+            .map(|members| members.iter().map(|name| (name.as_str(), true, true)).collect())
+            .or_else(|| table_drop_requests(plan));
+        let tables = if let Some(requested) = requested {
+            let catalog = self.storage.catalog();
+            let targets = catalog.collect_main_drop_targets(&requested)?;
+            catalog.main_drop_table_owners(&targets)?
+        } else {
+            let tables = schema_plan_tables(&self.storage, plan);
+            if statement.starts_with("ALTER TABLE") || statement == "CREATE TABLE" {
+                self.storage.catalog().main_constraint_result_owners(tables)?
+            } else {
+                tables
+            }
+        };
         let tables: Vec<&str> = tables.iter().map(String::as_str).collect();
         self.storage.enter_main_statement(&tables, statement).map(Some)
     }
@@ -979,7 +1023,7 @@ impl EmbeddedDatabase {
     fn branch_drop_tables(
         &self,
         view: &BranchView<'_>,
-        targets: &[(&str, bool)],
+        targets: &[(&str, bool, bool)],
         txn: Option<&Transaction>,
     ) -> Result<u64> {
         let catalog = self.storage.catalog();
@@ -987,7 +1031,7 @@ impl EmbeddedDatabase {
         // drops nothing takes no section.
         let existing = |catalog: &crate::storage::Catalog<'_>| -> Result<Vec<String>> {
             let mut dropping: Vec<String> = Vec::with_capacity(targets.len());
-            for (name, if_exists) in targets {
+            for (name, if_exists, _) in targets {
                 if !catalog.table_exists(name)? {
                     if *if_exists {
                         continue;
@@ -1021,6 +1065,24 @@ impl EmbeddedDatabase {
                 if catalog.table_exists(&child)? && !dropping.contains(&child) {
                     dropping.push(child);
                 }
+            }
+        }
+        // The branch's surviving child definitions live in its overlay. Do
+        // not mutate main's constraint records or leave an orphan definition.
+        // Cascading those overlay definitions is not supported yet; refuse
+        // before descendant materialization or the first tombstone write.
+        for name in &dropping {
+            for fk in catalog.get_referencing_fks(name)? {
+                if dropping.contains(&fk.table_name) {
+                    continue;
+                }
+                if targets.iter().any(|(_, _, cascade)| *cascade) {
+                    return Err(Error::branch_schema_unsupported(
+                        "DROP TABLE CASCADE with incoming foreign keys",
+                        view.name(),
+                    ));
+                }
+                return Err(Error::table_drop_has_dependents(name, &fk.name, &fk.table_name));
             }
         }
         // Sorted: the locks of a statement that takes several (spec R5.1).

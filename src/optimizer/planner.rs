@@ -343,6 +343,7 @@ impl Planner {
             | LogicalPlan::CreateTable { .. }
             | LogicalPlan::CreateTableAs { .. }
             | LogicalPlan::DropTable { .. }
+            | LogicalPlan::DropTableCascade { .. }
             | LogicalPlan::DropMulti { .. }
             | LogicalPlan::CreateIndex { .. }
             | LogicalPlan::DropIndex { .. }

@@ -21707,9 +21707,7 @@ impl StorageEngine {
         self.generic_mutation_generation.fetch_add(1, Ordering::Release);
         // Cache/plan/data fences precede any backend/ART retirement wait.
         self.vector_indexes.retire_table_indexes(table, reason);
-        if let Err(error) = self.art_index_manager.drop_table_indexes(table) {
-            tracing::error!("Failed to retire unusable indexes of {table}: {error}");
-        }
+        self.art_index_manager.retire_table_indexes_ram_only(table);
         Error::storage(format!(
             "indexes of table '{table}' are unavailable after reconciliation failed: {reason}; reopen to rebuild"
         ))

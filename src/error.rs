@@ -842,6 +842,15 @@ impl Error {
         ))
     }
 
+    /// A DROP TABLE RESTRICT dependency, classified as PostgreSQL 2BP01 by
+    /// the existing dependent-objects diagnostic shared with DROP ROLE.
+    pub(crate) fn table_drop_has_dependents(table: &str, constraint: &str, child: &str) -> Self {
+        Self::query_execution(format!(
+            "table \"{table}\" cannot be dropped because some objects depend on it: \
+             constraint \"{constraint}\" on table \"{child}\"; use DROP TABLE ... CASCADE"
+        ))
+    }
+
     /// Spec R5.4 (P12): this statement waited `waited` for the write lock of row
     /// `row_id` of `table`, held by another transaction that is changing it, and gave
     /// up. Nothing it would have changed has changed. SQLSTATE 55P03.
