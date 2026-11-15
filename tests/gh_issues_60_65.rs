@@ -248,3 +248,22 @@ fn gh59_sqlite_ddl_types_and_rowid_alias() {
         );
     }
 }
+
+#[test]
+fn gh63_qualified_reference_to_derived_table_column() {
+    let db = db();
+    db.execute("CREATE TABLE ob_k (id BIGINT PRIMARY KEY, amt DOUBLE PRECISION)")
+        .expect("create");
+    db.execute("INSERT INTO ob_k VALUES (1, 1.5), (2, 2.5)")
+        .expect("insert");
+    for sql in [
+        "SELECT pg_typeof(s.x) FROM (SELECT sum(amt) AS x FROM ob_k) AS s",
+        "SELECT pg_typeof(x) FROM (SELECT sum(amt) AS x FROM ob_k) AS s",
+        "SELECT s.x FROM (SELECT sum(amt) AS x FROM ob_k) AS s",
+        "SELECT s.x + 1 FROM (SELECT sum(amt) AS x FROM ob_k) AS s",
+        "SELECT abs(s.id) FROM (SELECT id FROM ob_k) AS s ORDER BY s.id",
+    ] {
+        let rows = db.query(sql, &[]).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        assert!(!rows.is_empty(), "{sql}");
+    }
+}
