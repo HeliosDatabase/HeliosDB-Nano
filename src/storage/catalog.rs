@@ -6124,7 +6124,15 @@ impl<'a> Catalog<'a> {
             }
             let mut other_constraints = self.load_table_constraints(&other)?;
             if Self::rename_referenced_column(table, old, new, &mut other_constraints) {
-                self.stage_table_constraints(&other, &other_constraints, ddl)?;
+                // The reference names the column as this rename leaves it, whether or
+                // not the caller has published the renamed schema yet.
+                let mut renamed = self.main_table_schema(table)?;
+                for column in &mut renamed.columns {
+                    if column.name.eq_ignore_ascii_case(old) {
+                        column.name = new.to_string();
+                    }
+                }
+                self.stage_table_constraints_beside(&other, &other_constraints, Some((table, &renamed)), ddl)?;
             }
         }
 
@@ -8161,6 +8169,25 @@ impl<'a> Catalog<'a> {
     where
         'a: 'd,
     {
+        self.stage_table_constraints_beside(table_name, constraints, None, ddl)
+    }
+
+    /// [`Self::stage_table_constraints`] for a record rewritten by a statement that
+    /// changes a table the record's foreign keys reference: `staged_parent` is that
+    /// table and the schema the same `ddl` batch stages for it. The published schema
+    /// still has the old column names until the batch is written, so a reference to
+    /// the staged parent is checked against what the statement is about to publish
+    /// (`ALTER TABLE parent RENAME COLUMN` over an inbound foreign key).
+    pub(crate) fn stage_table_constraints_beside<'d>(
+        &self,
+        table_name: &str,
+        constraints: &crate::sql::TableConstraints,
+        staged_parent: Option<(&str, &Schema)>,
+        ddl: &mut super::DdlBatch<'d>,
+    ) -> Result<()>
+    where
+        'a: 'd,
+    {
         // sprinter 6bc4a4040eb7 (B3 second fix pass): a table an unfinished merge
         // holds is refused (55006), whatever route got here. Held until the write.
         let scope = self.storage.table_locks().statement_scope();
@@ -8186,7 +8213,14 @@ impl<'a> Catalog<'a> {
         // A CREATE's self-reference names its own not-yet-published schema.
         for fk in &constraints.foreign_keys {
             if fk.references_table != table_name {
-                let parent = self.main_table_schema(&fk.references_table)?;
+                let published;
+                let parent = match staged_parent {
+                    Some((staged, schema)) if staged == fk.references_table => schema,
+                    _ => {
+                        published = self.main_table_schema(&fk.references_table)?;
+                        &published
+                    }
+                };
                 for column in &fk.references_columns {
                     if parent.get_column_index(column).is_none() {
                         return Err(Error::query_execution(format!(

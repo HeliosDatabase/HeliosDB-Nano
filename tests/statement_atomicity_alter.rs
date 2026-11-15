@@ -503,6 +503,41 @@ fn rename_to_with_other_clauses_is_refused_and_writes_nothing() {
     assert!(db.query("SELECT * FROM rn2", &[]).is_err());
 }
 
+/// Renaming a column another table's foreign key references rewrites that
+/// reference in the same statement, and the key still holds afterwards. The
+/// child's record is validated against the schema the statement is publishing:
+/// checked against the published one, the new name does not exist yet and the
+/// rename was refused ("Column 'renamed' not found in referenced table").
+#[test]
+fn renaming_a_referenced_column_keeps_the_inbound_foreign_key() {
+    for family in FAMILIES {
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE rp (id INT PRIMARY KEY, u INT UNIQUE)")
+            .unwrap();
+        db.execute("INSERT INTO rp VALUES (1, 10)").unwrap();
+        db.execute("CREATE TABLE rc (id INT PRIMARY KEY, p INT, CONSTRAINT rc_fk FOREIGN KEY (p) REFERENCES rp(u))")
+            .unwrap();
+        db.execute("INSERT INTO rc VALUES (1, 10)").unwrap();
+
+        run(&db, family, "ALTER TABLE rp RENAME COLUMN u TO renamed");
+
+        assert_eq!(column_names(&db, "rp"), vec!["id", "renamed"]);
+        let constraints = db.storage.catalog().load_table_constraints("rc").unwrap();
+        assert_eq!(constraints.foreign_keys.len(), 1, "{family:?}");
+        assert_eq!(
+            constraints.foreign_keys[0].references_columns,
+            vec!["renamed"],
+            "{family:?}"
+        );
+        // Still enforced, against the renamed column's values.
+        run(&db, family, "INSERT INTO rp VALUES (2, 20)");
+        run(&db, family, "INSERT INTO rc VALUES (2, 20)");
+        let orphan = attempt(&db, family, "INSERT INTO rc VALUES (3, 30)");
+        assert!(orphan.is_err(), "{family:?}: an orphan was accepted after the rename");
+        assert_eq!(rows(&db, "SELECT id FROM rc ORDER BY id").len(), 2, "{family:?}");
+    }
+}
+
 /// A parent rename/drop replaces a child's FK record. The child can finish an
 /// earlier transaction, including an unrelated CHECK, while the parent waits.
 /// Its new CHECK must survive: loading the child's record before taking its lock

@@ -1472,8 +1472,15 @@ impl EmbeddedDatabase {
                 catalog.stage_table_constraints(&table, constraints, &mut ddl)?;
             }
         }
+        // Another table's rewritten foreign key names this table's columns as this
+        // statement leaves them, which the published schema does not show yet.
         for (other, constraints) in &other_constraints {
-            catalog.stage_table_constraints(other, constraints, &mut ddl)?;
+            catalog.stage_table_constraints_beside(
+                other,
+                constraints,
+                Some((table.as_str(), &change.schema)),
+                &mut ddl,
+            )?;
         }
         if identity_changed {
             if let Some(identity) = &identity {
