@@ -43363,9 +43363,8 @@ mod tests {
 
     #[test]
     fn test_fk_drop_parent_table() {
-        // Dropping a parent table that is referenced by FK constraints
-        // Documents actual behavior: HeliosDB currently allows dropping referenced tables
-        // (PostgreSQL would disallow without CASCADE)
+        // DROP TABLE of a parent that an FK still references is refused, as in
+        // PostgreSQL (RESTRICT is the default; SQLSTATE 2BP01), and changes nothing.
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         db.execute("CREATE TABLE fk_drop_parent (id INT PRIMARY KEY, name TEXT)")
             .unwrap();
@@ -43381,33 +43380,21 @@ mod tests {
         db.execute("INSERT INTO fk_drop_parent VALUES (1, 'Alice')").unwrap();
         db.execute("INSERT INTO fk_drop_child VALUES (100, 1)").unwrap();
 
-        // Try to drop the parent table
-        match db.execute("DROP TABLE fk_drop_parent") {
-            Ok(_) => {
-                // HeliosDB allows dropping referenced tables (no FK dependency check on DROP)
-                // Document this behavior: child table still exists but FK is now dangling
-                let child_rows = db.query("SELECT * FROM fk_drop_child", &[]).unwrap();
-                assert_eq!(
-                    child_rows.len(),
-                    1,
-                    "Child table data should still exist after parent drop"
-                );
-            }
-            Err(e) => {
-                // If HeliosDB blocks the drop, verify the error message
-                let err_msg = e.to_string();
-                assert!(
-                    err_msg.to_lowercase().contains("foreign key")
-                        || err_msg.to_lowercase().contains("referenced")
-                        || err_msg.to_lowercase().contains("depends"),
-                    "Error should mention FK dependency, got: {}",
-                    err_msg
-                );
-                // Both tables should still exist
-                let parent_rows = db.query("SELECT * FROM fk_drop_parent", &[]).unwrap();
-                assert_eq!(parent_rows.len(), 1, "Parent should still exist after failed drop");
-            }
-        }
+        let err_msg = db
+            .execute("DROP TABLE fk_drop_parent")
+            .expect_err("a referenced parent must not be dropped without CASCADE")
+            .to_string();
+        assert!(
+            err_msg.contains("cannot be dropped because some objects depend on it")
+                && err_msg.contains("on table \"fk_drop_child\""),
+            "Error should name the dependent FK and its table, got: {}",
+            err_msg
+        );
+        // Both tables are intact.
+        let parent_rows = db.query("SELECT * FROM fk_drop_parent", &[]).unwrap();
+        assert_eq!(parent_rows.len(), 1, "Parent should still exist after failed drop");
+        let child_rows = db.query("SELECT * FROM fk_drop_child", &[]).unwrap();
+        assert_eq!(child_rows.len(), 1, "Child should still exist after failed drop");
     }
 
     #[test]
