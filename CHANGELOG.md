@@ -10,6 +10,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Release-candidate notes for 4.42.0. Final correctness, physical-standby and performance
 acceptance remains pending; these entries describe the current implementation.
 
+### Fixed — an index emptied of long-prefix keys accepts new keys again
+
+- Deleting every key that shared a long common prefix (UUID primary keys, keys with a common
+  leading part) left a childless inner node in the ART index. A later insert under that prefix
+  could fail with the internal error `Cannot recover hidden ART prefix byte`, and an emptied index
+  kept a root node. A childless node is now dropped, or kept as a full-key leaf when the prefix
+  itself is a stored key, and the node and leaf counters match the tree through every node size.
+
 ### Fixed — distinguish a refused write from an applied write whose publication failed
 
 - A refusal before the native data write rolls back the statement's staged rows and eager index
