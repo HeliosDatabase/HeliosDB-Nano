@@ -72,3 +72,6 @@ perf/baseline_runs/bins/
 /stacks.txt
 /stacks_b.txt
 /dist/
+
+# Local planning notes (not tracked)
+BACKLOG.local.md
