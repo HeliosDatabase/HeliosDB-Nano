@@ -36,7 +36,16 @@
 //!   A handoff costs microseconds (the worker's core moves to another thread),
 //!   which a point read cannot afford and a long statement does not notice.
 //!   So an executed statement pays at most ONE handoff; what runs inside an
-//!   offloaded call nests for free. Gated by a process-wide switch that is
+//!   offloaded call nests for free. A BOUNDED WRITE is the third exemption
+//!   (4.42.0 R1): the cached primary-key `UPDATE`/`DELETE` of a wire session
+//!   — one row, no user code — runs on the worker inside a [`WorkerWrite`]
+//!   scope, and everything it declines runs off it as before. Its waits leave
+//!   the worker on their own: the lock waits and the replication wait always
+//!   did ([`off_worker`]); inside the scope the durable-commit fsync and the
+//!   snapshot GC a registration can trigger do too, and a RocksDB write is
+//!   first tried with `no_slowdown` and, when RocksDB answers that it would
+//!   have to stall, made again off the worker (`storage::write_gate`). Gated
+//!   by a process-wide switch that is
 //!   OFF by default, so an embedder's runtime sees no change, and that the
 //!   server turns ON before its listeners start ([`enable_for_server`]) unless
 //!   `HELIOSDB_NANO_STATEMENT_OFFLOAD` says off. An embedder that wants it
@@ -113,6 +122,49 @@ impl Drop for CountedHandoff {
             IN_HANDOFF.with(|inside| inside.set(false));
         }
     }
+}
+
+thread_local! {
+    /// This thread runs a bounded write on the async worker ([`WorkerWrite`]).
+    static WORKER_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The scope of one bounded write that stays on the async worker serving its
+/// client (module documentation): while it is open on this thread, and outside
+/// any [`off_worker`] call made inside it, [`in_worker_write`] is true and the
+/// blocking points of the write path leave the worker themselves.
+#[must_use = "the scope ends when the guard is dropped"]
+pub(crate) struct WorkerWrite {
+    previous: bool,
+}
+
+impl WorkerWrite {
+    /// Open the scope on this thread; the previous state returns on drop.
+    pub(crate) fn enter() -> Self {
+        Self {
+            previous: WORKER_WRITE.with(|scope| scope.replace(true)),
+        }
+    }
+
+    /// Leave the scope for the duration of the returned guard: the work that
+    /// follows has left the worker.
+    fn suspend() -> Self {
+        Self {
+            previous: WORKER_WRITE.with(|scope| scope.replace(false)),
+        }
+    }
+}
+
+impl Drop for WorkerWrite {
+    fn drop(&mut self) {
+        WORKER_WRITE.with(|scope| scope.set(self.previous));
+    }
+}
+
+/// Is this thread inside a [`WorkerWrite`] scope, still on the worker?
+#[inline]
+pub(crate) fn in_worker_write() -> bool {
+    WORKER_WRITE.with(std::cell::Cell::get)
 }
 
 /// The process-wide per-statement switch (module documentation): OFF until
@@ -201,6 +253,8 @@ pub fn off_worker<T>(f: impl FnOnce() -> T) -> T {
         tokio::task::block_in_place(|| {
             #[cfg(feature = "internal-tests")]
             let _counted = CountedHandoff::enter();
+            // The worker's core is handed over: what runs here is off the worker.
+            let _left = WorkerWrite::suspend();
             pending.take().map(|f| f())
         })
     }));
@@ -379,6 +433,41 @@ mod tests {
         assert!(!is_block_in_place_refusal(other.as_ref()));
         let opaque: Box<dyn std::any::Any + Send> = Box::new(7_u8);
         assert!(!is_block_in_place_refusal(opaque.as_ref()));
+    }
+
+    /// The scope nests, restores what it found, and is left for exactly the
+    /// duration of a handoff: on a worker `off_worker` runs its closure off
+    /// the worker, so the write path there must not treat it as on one.
+    #[test]
+    fn a_worker_write_scope_is_left_inside_a_handoff_and_restored_after_it() {
+        assert!(!in_worker_write());
+        {
+            let _outer = WorkerWrite::enter();
+            assert!(in_worker_write());
+            {
+                let _inner = WorkerWrite::enter();
+                assert!(in_worker_write());
+            }
+            assert!(in_worker_write());
+        }
+        assert!(!in_worker_write());
+
+        let runtime = multi_thread_one_worker();
+        let (before, inside, after) = runtime.block_on(async {
+            tokio::spawn(async {
+                let _scope = WorkerWrite::enter();
+                let before = in_worker_write();
+                let inside = off_worker(in_worker_write);
+                (before, inside, in_worker_write())
+            })
+            .await
+            .unwrap()
+        });
+        assert_eq!((before, inside, after), (true, false, true));
+        // Where there is no worker to leave, `off_worker` runs inline and the
+        // scope stays as it is: the write path's own guards still apply.
+        let _scope = WorkerWrite::enter();
+        assert!(off_worker(in_worker_write));
     }
 
     #[test]

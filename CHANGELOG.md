@@ -532,6 +532,28 @@ range scans lose 6 % of throughput at 1 client and up to 28 % at 32 clients, poi
 nothing. `HELIOSDB_NANO_STATEMENT_OFFLOAD=off` restores the previous behaviour. The
 embedded library is unchanged unless it opts in.
 
+A prepared primary-key `UPDATE` or `DELETE` (extended protocol, autocommit, the statement's
+cached fast path) also stays on the worker: it is a bounded write, as a point read is a bounded
+read. Whatever in it can wait leaves the worker by itself — a table or row lock, the wait for a
+synchronous standby, the fsync of a durable commit, a write RocksDB would stall (it is tried
+without waiting first, and made again off the worker when RocksDB says it would wait), and the
+snapshot GC pass a registration can trigger. A statement the fast path declines, one inside a
+transaction, and any statement while another session has a transaction open take the handoff as
+before. Not covered: statements sent as text (simple protocol), memory-only servers, tables with
+dictionary or columnar column storage or a vector index, and a store with a live child branch.
+
+Measured over the wire with `benches/public/wire_pk_ab.sh` (32-core host, local clients, 64,000
+rows, each client on its own rows, median of 4 alternating rounds of 15 s), prepared
+`UPDATE … WHERE id = $2`:
+
+| clients | before, ops/s | after, ops/s | change | p99 before | p99 after |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 8,031 | 9,278 | +16% | 0.15 ms | 0.13 ms |
+| 16 | 54,812 | 65,187 | +19% | 0.82 ms | 0.81 ms |
+| 64 | 54,924 | 70,846 | +29% | 13.6 ms | 2.4 ms |
+
+That is what the same server delivers with the handoff switched off (9,117 / 66,745 / 73,669).
+
 ### Changed — BREAKING: a branch is a fork, selected per session (sprinter 6bc4a4040eb7, specs B1–B4)
 
 - **The active branch is session state.** `USE BRANCH b` used to move every connection of the

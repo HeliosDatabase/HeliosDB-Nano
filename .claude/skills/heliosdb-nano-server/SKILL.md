@@ -126,8 +126,12 @@ scan, an aggregate) no longer stops the server from accepting connections, servi
 sessions, answering `/health` or feeding its physical standbys. The server runs each
 executed statement with `tokio::task::block_in_place`, which hands its async worker to
 another thread for the statement's duration. Primary-key point reads (simple and
-prepared) and result-cache hits stay on the worker; every other executed statement pays
-one handoff, roughly 10 µs.
+prepared), result-cache hits and prepared primary-key `UPDATE` / `DELETE` statements
+(extended protocol, autocommit) stay on the worker; every other executed statement pays
+one handoff, roughly 10 µs. A prepared primary-key write that has to wait — for a lock, a
+synchronous standby, an fsync or a RocksDB stall — leaves the worker for the wait. The
+same write sent as text takes the handoff: prefer prepared statements for
+write-heavy clients.
 
 `HELIOSDB_NANO_STATEMENT_OFFLOAD=off` (also `0`, `false`, `no`, `disabled`) turns the
 handoff off for throughput A/B runs on hosts whose workload has only short statements;

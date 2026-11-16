@@ -3312,7 +3312,15 @@ impl SnapshotManager {
     fn gc_if_needed(&self) -> Result<()> {
         let snapshot_count = self.snapshots.read().len();
         if snapshot_count > self.gc_trigger() {
-            self.gc_old_snapshots()?;
+            // 4.42.0 R1: the registration that crosses the trigger pays for a pass
+            // over the whole map, a sweep of stored records and a write. When that
+            // registration is a bounded write on the async worker, the pass leaves
+            // the worker (`runtime_offload::WorkerWrite`).
+            if crate::runtime_offload::in_worker_write() {
+                crate::runtime_offload::off_worker(|| self.gc_old_snapshots())?;
+            } else {
+                self.gc_old_snapshots()?;
+            }
         }
         Ok(())
     }

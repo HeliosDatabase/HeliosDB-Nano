@@ -6512,11 +6512,39 @@ impl StorageEngine {
     /// transactional commit in the same generation.
     pub fn durable_autocommit_barrier(&self) -> Result<()> {
         if self.statement_durability_required() {
-            self.group_committer
-                .wait_durable(|| self.db.flush_wal(true).map_err(|e| e.to_string()))
-                .map_err(|e| Error::storage(format!("WAL fsync failed: {}", e)))?;
+            let wait = || {
+                self.group_committer
+                    .wait_durable(|| self.db.flush_wal(true).map_err(|e| e.to_string()))
+            };
+            // 4.42.0 R1: the fsync of a write that stayed on the async worker
+            // leaves the worker (`runtime_offload::WorkerWrite`).
+            let waited = if crate::runtime_offload::in_worker_write() {
+                crate::runtime_offload::off_worker(wait)
+            } else {
+                wait()
+            };
+            waited.map_err(|e| Error::storage(format!("WAL fsync failed: {}", e)))?;
         }
         Ok(())
+    }
+
+    /// 4.42.0 R1: is a fast change of one row of `table` a BOUNDED write — one
+    /// whose only waits are the ones that leave the async worker by themselves
+    /// (`runtime_offload::WorkerWrite`)? Not when
+    ///
+    /// * the store's writes name their own options (memory-only): only a write
+    ///   with the default options is retried off the worker when RocksDB stalls
+    ///   (`write_gate::worker_write`);
+    /// * a child branch is live: the write first copies what the branch froze;
+    /// * the table keeps dictionary or columnar side storage, or a vector index:
+    ///   their maintenance is not bounded by the one row.
+    ///
+    /// A statement on such a table runs off the worker, as every other statement.
+    pub(crate) fn fast_row_write_is_bounded(&self, table: &str, schema: &crate::Schema) -> bool {
+        self.memory_write_options.is_none()
+            && self.gate.active_freeze().is_none()
+            && !schema_uses_column_storage(schema)
+            && !self.vector_indexes().table_has_indexes(table)
     }
 
     /// Model a reported flush failure after this thread's actual state group

@@ -15692,16 +15692,7 @@ impl EmbeddedDatabase {
         let trimmed = sql.trim_start();
         let prefix = trimmed.as_bytes().get(..6)?;
         if prefix.eq_ignore_ascii_case(b"UPDATE") {
-            let spec = if let Some(spec) = self
-                .hot_fast_param_update_spec
-                .read()
-                .as_ref()
-                .and_then(|(cached_sql, spec)| (cached_sql == sql).then(|| std::sync::Arc::clone(spec)))
-            {
-                spec
-            } else {
-                self.fast_param_update_cache.get(sql)?
-            };
+            let spec = self.cached_fast_param_update_spec(sql)?;
             let _locks = lock_main_table_at_generation_or_return!(self, &spec.table_name, generation);
             if self.tenant_manager.should_apply_rls(&spec.table_name, "UPDATE")
                 || self.trigger_registry.has_triggers_for_table(&spec.table_name)
@@ -15712,19 +15703,7 @@ impl EmbeddedDatabase {
         }
 
         if prefix.eq_ignore_ascii_case(b"DELETE") {
-            let fk_mode = *self.fk_validation_mode.read();
-            let fk_source = *self.fk_validation_source.read();
-            let cache_key = format!("\0fast_param_delete\0{fk_mode:?}\0{fk_source:?}\0{sql}");
-            let spec = if let Some(spec) = self
-                .hot_fast_param_delete_spec
-                .read()
-                .as_ref()
-                .and_then(|(cached_key, spec)| (cached_key == &cache_key).then(|| std::sync::Arc::clone(spec)))
-            {
-                spec
-            } else {
-                self.fast_param_delete_cache.get(&cache_key)?
-            };
+            let spec = self.cached_fast_param_delete_spec(sql)?;
             let _locks = lock_main_table_at_generation_or_return!(self, &spec.table_name, generation);
             if self.tenant_manager.should_apply_rls(&spec.table_name, "DELETE")
                 || self.trigger_registry.has_triggers_for_table(&spec.table_name)
@@ -15735,6 +15714,75 @@ impl EmbeddedDatabase {
         }
 
         None
+    }
+
+    /// The cached spec of a fast parameterized primary-key `UPDATE`, if `sql`
+    /// has one.
+    fn cached_fast_param_update_spec(&self, sql: &str) -> Option<std::sync::Arc<FastParamUpdateSpec>> {
+        if let Some(spec) = self
+            .hot_fast_param_update_spec
+            .read()
+            .as_ref()
+            .and_then(|(cached_sql, spec)| (cached_sql == sql).then(|| std::sync::Arc::clone(spec)))
+        {
+            return Some(spec);
+        }
+        self.fast_param_update_cache.get(sql)
+    }
+
+    /// The cached spec of a fast parameterized primary-key `DELETE`, if `sql`
+    /// has one under the foreign-key validation mode in force.
+    fn cached_fast_param_delete_spec(&self, sql: &str) -> Option<std::sync::Arc<FastParamDeleteSpec>> {
+        let fk_mode = *self.fk_validation_mode.read();
+        let fk_source = *self.fk_validation_source.read();
+        let cache_key = format!("\0fast_param_delete\0{fk_mode:?}\0{fk_source:?}\0{sql}");
+        if let Some(spec) = self
+            .hot_fast_param_delete_spec
+            .read()
+            .as_ref()
+            .and_then(|(cached_key, spec)| (cached_key == &cache_key).then(|| std::sync::Arc::clone(spec)))
+        {
+            return Some(spec);
+        }
+        self.fast_param_delete_cache.get(&cache_key)
+    }
+
+    /// 4.42.0 R1: is `sql` a statement to run on the async worker serving its
+    /// client, as a BOUNDED write (`runtime_offload::WorkerWrite`)?
+    ///
+    /// Yes for a parameterized `UPDATE` or `DELETE` of one row by primary key
+    /// that already has its cached spec — the statement
+    /// [`Self::try_autocommit_fast_update_delete_params_cached`] answers with
+    /// one index probe, one row lock and one write group, and no user code —
+    /// on a table whose fast row change is bounded
+    /// (`StorageEngine::fast_row_write_is_bounded`), while that path would not
+    /// decline at once. Only where statements are offloaded at all (the server;
+    /// an embedder's runtime sees no change).
+    ///
+    /// This only chooses the thread the statement STARTS on. The fast path makes
+    /// every decision again, and whatever it declines is general work that runs
+    /// off the worker ([`Self::execute_params_inner_unguarded`]): a wrong "yes"
+    /// costs the statement nothing but the handoff it would have paid first.
+    fn worker_write_candidate(&self, sql: &str) -> bool {
+        if !crate::runtime_offload::statement_offload()
+            || self.in_transaction()
+            || self.any_session_txns()
+            || self.storage.is_branch_active()
+        {
+            return false;
+        }
+        let Some(prefix) = sql.trim_start().as_bytes().get(..6) else {
+            return false;
+        };
+        if prefix.eq_ignore_ascii_case(b"UPDATE") {
+            self.cached_fast_param_update_spec(sql)
+                .is_some_and(|spec| self.storage.fast_row_write_is_bounded(&spec.table_name, &spec.schema))
+        } else if prefix.eq_ignore_ascii_case(b"DELETE") {
+            self.cached_fast_param_delete_spec(sql)
+                .is_some_and(|spec| self.storage.fast_row_write_is_bounded(&spec.table_name, &spec.schema))
+        } else {
+            false
+        }
     }
 
     fn try_fast_update_params(
@@ -20998,8 +21046,7 @@ impl EmbeddedDatabase {
     /// `parameterized_plan_cached` output, so DML keeps the exact planning
     /// behavior (no extra optimizer passes — see the W3 caveat).
     fn execute_params_inner(&self, sql: &str, params: &[Value], plan_override: Option<&PinnedPlan>) -> Result<u64> {
-        // sprinter ccebc95977f1: off the async worker serving the client (`runtime_offload`).
-        offload_statement(|| -> Result<u64> {
+        let statement = || -> Result<u64> {
             // Spec P1.4: reads only on a physical standby (`admit_on_physical_standby`).
             let _standby = self.admit_on_physical_standby(sql)?;
             // sprinter d03de7fc3b22: charge this CLIENT statement against the active
@@ -21017,7 +21064,15 @@ impl EmbeddedDatabase {
             self.run_layout_statement(self.in_transaction(), || {
                 self.run_global_statement(sql, || self.execute_params_inner_unguarded(sql, params, plan_override))
             })
-        })
+        };
+        // 4.42.0 R1: a wire session's bounded write stays on the worker up to the
+        // cached fast path, which answers it there; what that path declines is
+        // offloaded below it (`execute_params_inner_unguarded`).
+        if crate::runtime_offload::in_worker_write() {
+            return statement();
+        }
+        // sprinter ccebc95977f1: off the async worker serving the client (`runtime_offload`).
+        offload_statement(statement)
     }
 
     /// The body of [`execute_params_inner`](Self::execute_params_inner),
@@ -21088,35 +21143,41 @@ impl EmbeddedDatabase {
             }
         }
 
-        let plan = match plan_override {
-            // Spec R5.6: a pin built under another layout of a table it reads is not
-            // used; the statement plans again.
-            Some(p) => match p.current() {
-                Some(plan) => plan,
+        // 4.42.0 R1: everything from here is general work — planning, the other
+        // fast paths, the executor. A statement that started on the async worker
+        // as a bounded write (`worker_write_candidate`) and was not answered above
+        // leaves the worker here; for every other caller this nests for free.
+        offload_statement(|| -> Result<u64> {
+            let plan = match plan_override {
+                // Spec R5.6: a pin built under another layout of a table it reads is not
+                // used; the statement plans again.
+                Some(p) => match p.current() {
+                    Some(plan) => plan,
+                    None => self.parameterized_plan_cached(sql)?,
+                },
                 None => self.parameterized_plan_cached(sql)?,
-            },
-            None => self.parameterized_plan_cached(sql)?,
-        };
+            };
 
-        if !schema_active {
-            if let Some(result) = self.try_transaction_fast_insert_params(sql, &plan, params) {
-                let count = result?;
-                return Ok(count);
+            if !schema_active {
+                if let Some(result) = self.try_transaction_fast_insert_params(sql, &plan, params) {
+                    let count = result?;
+                    return Ok(count);
+                }
+                if let Some(result) = self.try_autocommit_fast_insert_params(sql, &plan, params) {
+                    let count = result?;
+                    self.invalidate_result_cache();
+                    return Ok(count);
+                }
+                if let Some(result) = self.try_autocommit_fast_update_delete_params(sql, &plan, params) {
+                    let count = result?;
+                    self.invalidate_result_cache();
+                    return Ok(count);
+                }
             }
-            if let Some(result) = self.try_autocommit_fast_insert_params(sql, &plan, params) {
-                let count = result?;
-                self.invalidate_result_cache();
-                return Ok(count);
-            }
-            if let Some(result) = self.try_autocommit_fast_update_delete_params(sql, &plan, params) {
-                let count = result?;
-                self.invalidate_result_cache();
-                return Ok(count);
-            }
-        }
 
-        let (count, _tuples) = self.execute_plan_with_params_with_sql(&plan, params, None, Some(sql))?;
-        Ok(count)
+            let (count, _tuples) = self.execute_plan_with_params_with_sql(&plan, params, None, Some(sql))?;
+            Ok(count)
+        })
     }
 
     /// Execute one parameterized statement for many parameter rows.
@@ -27631,12 +27692,23 @@ impl EmbeddedDatabase {
         params: &[Value],
         plan_override: Option<&PinnedPlan>,
     ) -> Result<u64> {
-        // sprinter ccebc95977f1: off the async worker serving the client (`runtime_offload`).
-        offload_statement(|| {
+        let statement = || {
             self.run_layout_statement(self.session_has_open_transaction(session_id), || {
                 self.execute_params_for_session_inner_body(session_id, sql, params, plan_override)
             })
-        })
+        };
+        // 4.42.0 R1: a cached primary-key UPDATE/DELETE is a bounded write and
+        // stays on the async worker serving the client, as a primary-key point
+        // read does: it is one index probe, one row lock and one write group, and
+        // every wait in it leaves the worker by itself (`runtime_offload`,
+        // "bounded write"). The handoff it no longer pays was the largest single
+        // part of the 16-client UPDATE regression against v4.41.1.
+        if self.worker_write_candidate(sql) {
+            let _on_worker = crate::runtime_offload::WorkerWrite::enter();
+            return statement();
+        }
+        // sprinter ccebc95977f1: off the async worker serving the client (`runtime_offload`).
+        offload_statement(statement)
     }
 
     /// The body of [`Self::execute_params_for_session_inner`], which runs it through
@@ -27719,31 +27791,36 @@ impl EmbeddedDatabase {
             return self.execute_params_inner(sql, params, plan_override);
         }
 
-        let slot = self
-            .session_txn_slot(session_id)
-            .ok_or_else(|| Error::transaction("Session transaction disappeared during execute"))?;
-        // HDB-008: refuse before `touch_session_for_statement` (see
-        // `execute_for_session`).
-        self.refuse_session_statement_if_failed(&slot, sql)?;
-        self.touch_session_for_statement(session_id)?;
-        let txn = parking_lot::RwLockReadGuard::try_map(slot.read(), |t| t.as_ref())
-            .map_err(|_| Error::transaction("Session transaction disappeared during execute"))?;
-        // HDB-008: plan + fast path + execute inside the failed-transaction
-        // boundary.
-        self.run_statement_in_transaction(&txn, sql, || {
-            let plan = match plan_override {
-                // Spec R5.6: as in `execute_params_inner_unguarded`.
-                Some(p) => match p.current() {
-                    Some(plan) => plan,
+        // 4.42.0 R1: a statement in a session transaction is general work. No
+        // bounded write reaches here (`worker_write_candidate` takes none while
+        // any session transaction is open); were one to, it leaves the worker.
+        offload_statement(|| {
+            let slot = self
+                .session_txn_slot(session_id)
+                .ok_or_else(|| Error::transaction("Session transaction disappeared during execute"))?;
+            // HDB-008: refuse before `touch_session_for_statement` (see
+            // `execute_for_session`).
+            self.refuse_session_statement_if_failed(&slot, sql)?;
+            self.touch_session_for_statement(session_id)?;
+            let txn = parking_lot::RwLockReadGuard::try_map(slot.read(), |t| t.as_ref())
+                .map_err(|_| Error::transaction("Session transaction disappeared during execute"))?;
+            // HDB-008: plan + fast path + execute inside the failed-transaction
+            // boundary.
+            self.run_statement_in_transaction(&txn, sql, || {
+                let plan = match plan_override {
+                    // Spec R5.6: as in `execute_params_inner_unguarded`.
+                    Some(p) => match p.current() {
+                        Some(plan) => plan,
+                        None => self.parameterized_plan_cached(sql)?,
+                    },
                     None => self.parameterized_plan_cached(sql)?,
-                },
-                None => self.parameterized_plan_cached(sql)?,
-            };
-            if let Some(result) = self.try_session_txn_fast_insert_params(sql, &plan, params, &txn) {
-                return result;
-            }
-            let (count, _tuples) = self.execute_plan_with_params_with_sql(&plan, params, Some(&txn), Some(sql))?;
-            Ok(count)
+                };
+                if let Some(result) = self.try_session_txn_fast_insert_params(sql, &plan, params, &txn) {
+                    return result;
+                }
+                let (count, _tuples) = self.execute_plan_with_params_with_sql(&plan, params, Some(&txn), Some(sql))?;
+                Ok(count)
+            })
         })
     }
 

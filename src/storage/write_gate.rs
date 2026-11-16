@@ -77,6 +77,93 @@ use super::write_outcome::WriteAttempt;
 thread_local! {
     static FAIL_NEXT_NATIVE_WRITE_AFTER_APPLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FAIL_NEXT_NATIVE_WRITE_BEFORE_APPLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static STALL_NEXT_WORKER_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// 4.42.0 R1: how a native write is made inside a bounded write that stays on
+/// the async worker (`runtime_offload::WorkerWrite`).
+///
+/// RocksDB makes a writer wait when it stalls writes (too many unflushed
+/// memtables or level-0 files, compaction behind): milliseconds, at worst
+/// seconds. On the worker that would stall the server, which is what
+/// `runtime_offload` exists to prevent. So inside the scope a write with the
+/// default options is first made with `no_slowdown`: RocksDB then answers
+/// `Incomplete` instead of waiting, before the write group reaches its log or
+/// a memtable (`DBImpl::DelayWrite`, `WriteThread::BeginWriteStall`), so
+/// nothing of it is applied. Only then is the same write made again, with the
+/// default options and off the worker. To the caller it is one write: the
+/// refused attempt is never reported, and the outcome is the second call's.
+///
+/// A write that names its own options (memory-only, or synchronous) is made as
+/// before: the statements that stay on the worker are not chosen on a store
+/// that needs them (`EmbeddedDatabase::worker_write_candidate`).
+mod worker_write {
+    use super::{AtomicU64, OnceLock, Ordering, WriteBatch, WriteOptions, DB};
+
+    /// The default write options with `no_slowdown`.
+    static NO_WAIT: OnceLock<WriteOptions> = OnceLock::new();
+    /// Writes RocksDB refused to make without waiting, and that were made again
+    /// off the worker. A diagnostic and a test surface.
+    static STALLED: AtomicU64 = AtomicU64::new(0);
+
+    fn no_wait() -> &'static WriteOptions {
+        NO_WAIT.get_or_init(|| {
+            let mut options = WriteOptions::default();
+            options.set_no_slowdown(true);
+            options
+        })
+    }
+
+    /// Is this native write one to try without waiting first?
+    #[inline]
+    pub(super) fn applies(opts: Option<&WriteOptions>) -> bool {
+        opts.is_none() && crate::runtime_offload::in_worker_write()
+    }
+
+    pub(super) fn stalled_writes() -> u64 {
+        STALLED.load(Ordering::Relaxed)
+    }
+
+    /// Run `first` (the write with [`no_wait`]) and, when RocksDB would have
+    /// had to wait, `again` (the same write with the default options) off the
+    /// worker.
+    fn first_then_off_worker(
+        first: impl FnOnce(&WriteOptions) -> Result<(), rocksdb::Error>,
+        again: impl FnOnce() -> Result<(), rocksdb::Error>,
+    ) -> Result<(), rocksdb::Error> {
+        #[cfg(any(test, feature = "internal-tests"))]
+        let injected = super::STALL_NEXT_WORKER_WRITE.with(|stall| stall.replace(false));
+        #[cfg(not(any(test, feature = "internal-tests")))]
+        let injected = false;
+        if !injected {
+            match first(no_wait()) {
+                Err(error) if error.kind() == rocksdb::ErrorKind::Incomplete => {}
+                outcome => return outcome,
+            }
+        }
+        STALLED.fetch_add(1, Ordering::Relaxed);
+        crate::runtime_offload::off_worker(again)
+    }
+
+    /// `DB::write` of a statement's group, in a worker-write scope.
+    pub(super) fn write(db: &DB, batch: WriteBatch) -> Result<(), rocksdb::Error> {
+        // `DB::write_opt` consumes the batch; its bytes are what a second call needs.
+        let bytes = batch.data().to_vec();
+        first_then_off_worker(
+            |no_wait| db.write_opt(batch, no_wait),
+            || db.write(WriteBatch::from_data(&bytes)),
+        )
+    }
+
+    /// `DB::put`, in a worker-write scope.
+    pub(super) fn put(db: &DB, key: &[u8], value: &[u8]) -> Result<(), rocksdb::Error> {
+        first_then_off_worker(|no_wait| db.put_opt(key, value, no_wait), || db.put(key, value))
+    }
+
+    /// `DB::delete`, in a worker-write scope.
+    pub(super) fn delete(db: &DB, key: &[u8]) -> Result<(), rocksdb::Error> {
+        first_then_off_worker(|no_wait| db.delete_opt(key, no_wait), || db.delete(key))
+    }
 }
 use super::layout_epochs::{LayoutChange, LayoutEpochs, LayoutHook, LayoutKey};
 use crate::{Error, Result};
@@ -823,6 +910,8 @@ impl WriteGate {
         }
         let applied = match opts {
             Some(opts) => db.write_opt(batch, opts),
+            // 4.42.0 R1: on the async worker, never a stalled wait (`worker_write`).
+            None if worker_write::applies(opts) => worker_write::write(db, batch),
             None => db.write(batch),
         }
         .map_err(Error::from);
@@ -848,6 +937,21 @@ impl WriteGate {
     #[doc(hidden)]
     pub fn debug_fail_next_native_write_after_apply(&self) {
         FAIL_NEXT_NATIVE_WRITE_AFTER_APPLY.with(|fail| fail.set(true));
+    }
+
+    /// Make this thread's next write in a worker-write scope behave as if RocksDB
+    /// had refused to make it without waiting: it is made off the worker.
+    #[cfg(any(test, feature = "internal-tests"))]
+    #[doc(hidden)]
+    pub fn debug_stall_next_worker_write(&self) {
+        STALL_NEXT_WORKER_WRITE.with(|stall| stall.set(true));
+    }
+
+    /// How many writes of a worker-write scope RocksDB refused to make without
+    /// waiting, in this process: each was made again off the async worker.
+    #[doc(hidden)]
+    pub fn debug_stalled_worker_writes() -> u64 {
+        worker_write::stalled_writes()
     }
 
     /// Simulate a native error that did not apply the owning group. An observer
@@ -1111,6 +1215,7 @@ impl WriteGate {
                 }
                 let applied = match opts {
                     Some(opts) => db.put_opt(key, value, opts),
+                    None if worker_write::applies(opts) => worker_write::put(db, key, value),
                     None => db.put(key, value),
                 }
                 .map_err(Error::from);
@@ -1160,6 +1265,7 @@ impl WriteGate {
             let applied = self.refuse_point_group(key.len(), None).and_then(|()| {
                 match opts {
                     Some(opts) => db.delete_opt(key, opts),
+                    None if worker_write::applies(opts) => worker_write::delete(db, key),
                     None => db.delete(key),
                 }
                 .map_err(Error::from)
@@ -1232,6 +1338,64 @@ mod tests {
         opts.create_if_missing(true);
         let db = DB::open(&opts, dir.path()).expect("open");
         (dir, db)
+    }
+
+    /// 4.42.0 R1: inside a worker-write scope a write with the default options
+    /// is tried without waiting, and one RocksDB would have stalled is made
+    /// again (off the worker) and applied exactly once: to the caller it is one
+    /// write. A write that names its own options, and any write outside the
+    /// scope, is made as before.
+    #[test]
+    fn a_worker_write_that_would_stall_is_made_again_and_applied_once() {
+        let (_dir, db) = scratch_db();
+        let gate = WriteGate::open();
+        let get = |key: &[u8]| db.get(key).unwrap();
+        let stalled = WriteGate::debug_stalled_worker_writes;
+        let start = stalled();
+
+        // Outside the scope the injected stall is not even looked at.
+        gate.debug_stall_next_worker_write();
+        gate.put(&db, b"outside", b"1", None).unwrap();
+        assert_eq!(get(b"outside").as_deref(), Some(&b"1"[..]));
+        assert_eq!(stalled(), start);
+        assert!(STALL_NEXT_WORKER_WRITE.with(|stall| stall.replace(false)));
+
+        let scope = crate::runtime_offload::WorkerWrite::enter();
+        // No stall: the no-wait call is the write.
+        let mut batch = WriteBatch::default();
+        batch.put(b"k1", b"v1");
+        gate.write(&db, batch, None).unwrap();
+        assert_eq!(get(b"k1").as_deref(), Some(&b"v1"[..]));
+        assert_eq!(stalled(), start);
+
+        // A stalled group: every operation of it lands, once.
+        gate.debug_stall_next_worker_write();
+        let mut batch = WriteBatch::default();
+        batch.put(b"k2", b"v2");
+        batch.delete(b"k1");
+        gate.write(&db, batch, None).unwrap();
+        assert_eq!(get(b"k2").as_deref(), Some(&b"v2"[..]));
+        assert_eq!(get(b"k1"), None);
+        assert_eq!(stalled(), start + 1);
+
+        // The point writes take the same route.
+        gate.debug_stall_next_worker_write();
+        gate.put(&db, b"k3", b"v3", None).unwrap();
+        assert_eq!(get(b"k3").as_deref(), Some(&b"v3"[..]));
+        gate.debug_stall_next_worker_write();
+        gate.delete(&db, b"k3", None).unwrap();
+        assert_eq!(get(b"k3"), None);
+        assert_eq!(stalled(), start + 3);
+
+        // A write that names its own options is not tried without waiting.
+        let own = WriteOptions::default();
+        gate.debug_stall_next_worker_write();
+        gate.put(&db, b"k4", b"v4", Some(&own)).unwrap();
+        assert_eq!(get(b"k4").as_deref(), Some(&b"v4"[..]));
+        assert_eq!(stalled(), start + 3);
+        assert!(STALL_NEXT_WORKER_WRITE.with(|stall| stall.replace(false)));
+        drop(scope);
+        assert_eq!(gate.refusals(), 0);
     }
 
     #[test]

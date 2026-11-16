@@ -658,6 +658,126 @@ async fn point_reads_stay_on_the_worker_and_general_statements_leave_it() {
     assert_eq!(after - before, 2, "a prepared range read leaves the worker once");
 }
 
+/// 4.42.0 R1: a primary-key `UPDATE` or `DELETE` prepared over the extended
+/// protocol is a bounded write once its spec is cached — one probe, one row
+/// lock, one write group — and stays on the async worker, like a point read
+/// (the handoff was the largest single part of the 16-client UPDATE regression
+/// against v4.41.1). Its first execution plans, so it leaves the worker; so
+/// does every execution the fast path declines — here because another session
+/// has a transaction open — and so does the same statement in a transaction.
+/// Counted as in the test above: 1 is the counter read alone, 2 one handoff.
+#[cfg(feature = "internal-tests")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cached_primary_key_write_stays_on_the_worker_and_what_it_declines_leaves_it() {
+    let server = Server::start(&[], &[]);
+    let client = server.connect().await;
+    client
+        .batch_execute("CREATE TABLE bench (id INT PRIMARY KEY, v TEXT)")
+        .await
+        .unwrap();
+    for id in 1..=20 {
+        client
+            .batch_execute(&format!("INSERT INTO bench VALUES ({id}, 'v{id}')"))
+            .await
+            .unwrap();
+    }
+    let update = client.prepare("UPDATE bench SET v = $1 WHERE id = $2").await.unwrap();
+    let delete = client.prepare("DELETE FROM bench WHERE id = $1").await.unwrap();
+    let mut reads = 0;
+    let value_of = |id: i32| {
+        let client = &client;
+        async move {
+            let messages = client
+                .simple_query(&format!("SELECT v FROM bench WHERE id = {id}"))
+                .await
+                .unwrap();
+            first_value(&messages)
+        }
+    };
+
+    // The first execution builds the spec on the general path.
+    let before = handoffs(&client, &mut reads).await;
+    assert_eq!(client.execute(&update, &[&"w1", &1i32]).await.unwrap(), 1);
+    let after = handoffs(&client, &mut reads).await;
+    assert_eq!(after - before, 2, "the first execution plans, off the worker");
+    // From then on it is answered on the worker, and it is the same write.
+    for id in 2..=6 {
+        let before = handoffs(&client, &mut reads).await;
+        assert_eq!(client.execute(&update, &[&format!("w{id}"), &id]).await.unwrap(), 1);
+        let after = handoffs(&client, &mut reads).await;
+        assert_eq!(
+            after - before,
+            1,
+            "a cached primary-key UPDATE must not leave the worker (id {id})"
+        );
+        assert_eq!(value_of(id).await, Some(format!("w{id}")));
+    }
+    let before = handoffs(&client, &mut reads).await;
+    assert_eq!(client.execute(&update, &[&"none", &999i32]).await.unwrap(), 0);
+    let after = handoffs(&client, &mut reads).await;
+    assert_eq!(after - before, 1, "a cached UPDATE of no row stays on the worker too");
+
+    assert_eq!(client.execute(&delete, &[&20i32]).await.unwrap(), 1);
+    for id in 17..=19 {
+        let before = handoffs(&client, &mut reads).await;
+        assert_eq!(client.execute(&delete, &[&id]).await.unwrap(), 1);
+        let after = handoffs(&client, &mut reads).await;
+        assert_eq!(
+            after - before,
+            1,
+            "a cached primary-key DELETE must not leave the worker (id {id})"
+        );
+        assert_eq!(value_of(id).await, None);
+    }
+
+    // Another session's open transaction: the fast path declines, and the
+    // statement — started on the worker — leaves it for the general path.
+    let other = server.connect().await;
+    other
+        .batch_execute("BEGIN; UPDATE bench SET v = 'other' WHERE id = 16")
+        .await
+        .unwrap();
+    let before = handoffs(&client, &mut reads).await;
+    assert_eq!(client.execute(&update, &[&"w7", &7i32]).await.unwrap(), 1);
+    let after = handoffs(&client, &mut reads).await;
+    assert_eq!(after - before, 2, "a declined write leaves the worker once");
+    assert_eq!(value_of(7).await, Some("w7".to_string()));
+    other.batch_execute("ROLLBACK").await.unwrap();
+    assert_eq!(value_of(16).await, Some("v16".to_string()));
+
+    // In this session's own transaction it is general work as well.
+    client.batch_execute("BEGIN").await.unwrap();
+    let before = handoffs(&client, &mut reads).await;
+    assert_eq!(client.execute(&update, &[&"w8", &8i32]).await.unwrap(), 1);
+    let after = handoffs(&client, &mut reads).await;
+    assert!(after - before >= 2, "a write in a transaction leaves the worker");
+    client.batch_execute("COMMIT").await.unwrap();
+    assert_eq!(value_of(8).await, Some("w8".to_string()));
+
+    // And with no transaction open anywhere it is bounded again.
+    let before = handoffs(&client, &mut reads).await;
+    assert_eq!(client.execute(&update, &[&"w9", &9i32]).await.unwrap(), 1);
+    let after = handoffs(&client, &mut reads).await;
+    assert_eq!(after - before, 1, "bounded again once no transaction is open");
+    assert_eq!(value_of(9).await, Some("w9".to_string()));
+
+    // Every write registers a snapshot, and the registration that crosses the
+    // GC trigger (2000 by default) runs a pass over all of them: that pass
+    // leaves the worker, the writes around it do not.
+    let before = handoffs(&client, &mut reads).await;
+    for turn in 0..3000_i32 {
+        let id = 2 + turn % 5;
+        assert_eq!(client.execute(&update, &[&format!("t{turn}"), &id]).await.unwrap(), 1);
+    }
+    let after = handoffs(&client, &mut reads).await;
+    let left = after - before - 1;
+    assert!(
+        (1..=30).contains(&left),
+        "3000 cached writes left the worker {left} times: only a snapshot GC pass should"
+    );
+    assert_eq!(value_of(6).await, Some("t2999".to_string()));
+}
+
 // ---------------------------------------------------------------------------
 // A long statement, no hook (default tier)
 // ---------------------------------------------------------------------------
