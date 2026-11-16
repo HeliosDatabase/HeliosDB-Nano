@@ -80,3 +80,10 @@ statement with nextval; the pinned-plan path. Un-ignore the main and paced tests
   statements that took a sequence value, an advisory lock or ran `CALL`, and statements past their
   first durable write. A sequence's high-water write is `outside_statement`.
 - Kept separate from `storage::row_locks`' R5.4 row-change epochs (1024 striped slots).
+- The 100 ms of decision 2(g) start at a statement's first refusal (release gate, 2026-11-16).
+  Counted from the statement's start, a writer that planned, then waited for its table lock
+  behind an `ALTER TABLE` for longer than 100 ms, was refused 40001 with no retry at all:
+  `tests/table_write_lock.rs` saw 15 of 20 writer kinds refused beside one `ADD COLUMN` that
+  held the table for about 170 ms. Such a writer is now planned again and succeeds
+  (`a_writer_that_waited_past_the_retry_budget_behind_an_add_column_is_planned_again`). A
+  statement inside an explicit transaction is still refused at once, as above.

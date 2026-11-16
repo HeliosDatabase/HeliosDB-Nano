@@ -92,7 +92,8 @@ const UNAVAILABLE: u64 = 1 << 63;
 const ONE_CHANGE: u64 = IN_FLIGHT_MASK + 1;
 
 /// How long a statement keeps retrying a layout change in total before it is
-/// refused (decision 2(g)).
+/// refused (decision 2(g)), from its first refusal: what its first attempt waited
+/// for (a table lock, say) is not retrying.
 pub const RETRY_BUDGET: Duration = Duration::from_millis(100);
 
 /// The first pause between two attempts; it doubles, inside [`RETRY_BUDGET`].

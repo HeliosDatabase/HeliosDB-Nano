@@ -30,6 +30,7 @@ use std::time::{Duration, Instant};
 use heliosdb_nano::protocol::postgres::server::{PgServer, PgServerConfig};
 use heliosdb_nano::session::IsolationLevel;
 use heliosdb_nano::storage::branch_catalog::MergeFailSite;
+use heliosdb_nano::storage::layout_epochs::{self, is_layout_changed};
 use heliosdb_nano::{EmbeddedDatabase, Tuple, Value, TABLE_LOCK_TIMEOUT_MARKER};
 use tokio_postgres::NoTls;
 
@@ -576,15 +577,32 @@ fn assert_every_row_has_the_default(db: &EmbeddedDatabase, what: &str) {
     );
 }
 
+/// The two [`WRITERS`] that run an explicit transaction.
+const TRANSACTION_WRITERS: [&str; 2] = ["a session transaction", "a transaction handle"];
+
 /// Every writer loops on `d` until `statement` is done, having each finished at least one
 /// statement before it starts. Every statement must succeed, or be a clean 55P03.
-fn every_writer_beside(db: &EmbeddedDatabase, statement: &str) {
+///
+/// With one exception when `statement` changes the layout of `d` (spec R5.6): a statement
+/// that planned against the table as it was and then waited for its lock behind
+/// `statement` must not run that plan. An autocommit statement is planned again, so it
+/// still succeeds. A statement inside an explicit transaction is never retried: it is
+/// refused 40001 (`could not serialize access due to a concurrent schema change`) and its
+/// transaction rolls back, which the two transaction writers may therefore answer. What
+/// they left behind is checked with everything else afterwards.
+fn every_writer_beside(db: &EmbeddedDatabase, statement: &str, changes_layout: bool) {
     let late_before = db.storage.debug_table_lock_late_acquisitions();
     let names: Vec<String> = WRITERS.iter().map(|(kind, _)| (*kind).to_string()).collect();
     let result = beside_writers(
         statement,
         &names,
-        |index, round| (WRITERS[index].1)(db, KEY_SPACING * (index as i64 + 1), round),
+        |index, round| {
+            let (kind, write) = WRITERS[index];
+            match write(db, KEY_SPACING * (index as i64 + 1), round) {
+                Err(e) if changes_layout && TRANSACTION_WRITERS.contains(&kind) && is_layout_changed(&e) => Ok(()),
+                answer => answer,
+            }
+        },
         || db.execute(statement),
     );
     result.unwrap_or_else(|e| panic!("`{statement}` beside every writer: {e}"));
@@ -606,7 +624,7 @@ fn every_writer_kind_beside_a_merge_leaves_everything_agreeing() {
         let db = EmbeddedDatabase::new(dir.path()).unwrap();
         seed(&db, SEED_ROWS);
         branch_changing_every_row(&db);
-        every_writer_beside(&db, "MERGE BRANCH r INTO main");
+        every_writer_beside(&db, "MERGE BRANCH r INTO main", false);
         let found = assert_everything_agrees(&db, "after the merge");
         // Nothing came back: every seeded row has the merged key and the merged value.
         let seeded: Vec<(i64, String)> = found.iter().filter(|(id, _)| *id <= SEED_ROWS).cloned().collect();
@@ -643,7 +661,7 @@ fn every_writer_kind_beside_an_add_column_leaves_everything_agreeing() {
     let found = {
         let db = EmbeddedDatabase::new(dir.path()).unwrap();
         seed(&db, SEED_ROWS);
-        every_writer_beside(&db, "ALTER TABLE d ADD COLUMN x INT DEFAULT 5");
+        every_writer_beside(&db, "ALTER TABLE d ADD COLUMN x INT DEFAULT 5", true);
         let found = assert_everything_agrees(&db, "after the ADD COLUMN");
         // No row was left narrower than the schema, or lost its default.
         assert_every_row_has_the_default(&db, "after the ADD COLUMN");
@@ -900,6 +918,55 @@ fn a_transaction_open_before_an_add_column_goes_first_and_a_later_writer_after_i
     assert_eq!(count(&db, "SELECT g FROM d WHERE id = 2"), 8);
     assert_eq!(count(&db, "SELECT COUNT(*) FROM d WHERE x = 5"), 100);
     assert_eq!(count(&db, "SELECT x FROM d WHERE id = 2"), 5);
+}
+
+/// The same, with the first transaction open for longer than the layout retry budget
+/// (spec R5.6, decision 2(g)). The later writers planned against the table as it was,
+/// waited behind the rewrite, and are refused that plan once they have the table: each
+/// is planned again and succeeds. The budget is for retrying, so the wait before the
+/// first refusal is not counted against it; counted, it left these writers a 40001 and
+/// no retry at all.
+#[test]
+fn a_writer_that_waited_past_the_retry_budget_behind_an_add_column_is_planned_again() {
+    let _watchdog = watchdog(
+        "a_writer_that_waited_past_the_retry_budget_behind_an_add_column_is_planned_again",
+        TEST_AT_MOST,
+    );
+    let db = EmbeddedDatabase::new_in_memory().unwrap();
+    seed(&db, 100);
+    let retries = layout_epochs::retries();
+    let session = db.create_session("first", IsolationLevel::ReadCommitted).unwrap();
+    db.begin_transaction_for_session(session).unwrap();
+    db.execute_for_session(session, "UPDATE d SET g = 7 WHERE id = 1")
+        .unwrap();
+    std::thread::scope(|scope| {
+        let altering = scope.spawn(|| db.execute("ALTER TABLE d ADD COLUMN x INT DEFAULT 5"));
+        wait_for("the ALTER to wait", || db.storage.debug_table_lock_waiters("d").0 == 1);
+        let text = scope.spawn(|| db.execute("UPDATE d SET g = 8 WHERE id = 2"));
+        let bound = scope.spawn(|| db.execute_params(INSERT_ONE_BOUND, &new_row_values(KEY_SPACING)));
+        wait_for("both later writers to wait", || {
+            db.storage.debug_table_lock_waiters("d").1 == 2
+        });
+        std::thread::sleep(layout_epochs::RETRY_BUDGET * 3);
+        assert!(!altering.is_finished() && !text.is_finished() && !bound.is_finished());
+        db.commit_transaction_for_session(session).unwrap();
+        altering.join().unwrap().unwrap();
+        text.join()
+            .unwrap()
+            .expect("the text writer is planned again, not refused");
+        bound
+            .join()
+            .unwrap()
+            .expect("the params writer is planned again, not refused");
+    });
+    assert!(
+        layout_epochs::retries() > retries,
+        "a writer was refused its old plan and retried"
+    );
+    assert_eq!(count(&db, "SELECT g FROM d WHERE id = 1"), 7);
+    assert_eq!(count(&db, "SELECT g FROM d WHERE id = 2"), 8);
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM d WHERE x = 5"), 101);
+    assert_eq!(count(&db, &format!("SELECT x FROM d WHERE id = {KEY_SPACING}")), 5);
 }
 
 /// A held transaction makes ALTER and MERGE fail after `lock_timeout_ms`, naming what

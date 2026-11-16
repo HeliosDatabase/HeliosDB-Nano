@@ -4928,20 +4928,22 @@ impl EmbeddedDatabase {
     /// durable effect (the write funnel refuses a write of a statement whose layout moved)
     /// and, for a statement with none, here, before its rows go to the caller. A
     /// statement whose layout moved under it is run again from the start, planned again,
-    /// with a backoff that doubles from 1 ms, for at most 100 ms in all; then, or at once
-    /// when it may not run again (inside an explicit transaction, past a durable write,
-    /// after a sequence value, an advisory lock or a procedure body), it fails 40001
-    /// "could not serialize access due to a concurrent schema change". The pauses are
-    /// taken off the async workers (`runtime_offload::off_worker`), so a waiting
-    /// statement never stalls the server. A nested execution joins the read set of the
-    /// statement it runs in, and only the outermost runs again. Same on a primary and
-    /// on a physical standby.
+    /// with a backoff that doubles from 1 ms, for at most 100 ms of retrying in all; then,
+    /// or at once when it may not run again (inside an explicit transaction, past a
+    /// durable write, after a sequence value, an advisory lock or a procedure body), it
+    /// fails 40001 "could not serialize access due to a concurrent schema change". The
+    /// 100 ms start at the first refusal: an attempt that waited for its table lock
+    /// behind the schema statement that then changed the layout has waited, not retried,
+    /// and is still planned again. The pauses are taken off the async workers
+    /// (`runtime_offload::off_worker`), so a waiting statement never stalls the server.
+    /// A nested execution joins the read set of the statement it runs in, and only the
+    /// outermost runs again. Same on a primary and on a physical standby.
     fn run_layout_statement<T>(&self, in_transaction: bool, mut body: impl FnMut() -> Result<T>) -> Result<T> {
         let scope = storage::StatementScope::enter();
         if !scope.is_outermost() {
             return body();
         }
-        let started = std::time::Instant::now();
+        let mut retrying_since: Option<std::time::Instant> = None;
         let mut pause = storage::layout_epochs::FIRST_PAUSE;
         loop {
             scope.reset();
@@ -4985,7 +4987,8 @@ impl EmbeddedDatabase {
                 storage::layout_epochs::count_refusal();
                 return Err(failure);
             }
-            let Some(wait) = storage::layout_epochs::next_pause(started.elapsed(), pause) else {
+            let retrying = retrying_since.get_or_insert_with(std::time::Instant::now).elapsed();
+            let Some(wait) = storage::layout_epochs::next_pause(retrying, pause) else {
                 storage::layout_epochs::count_refusal();
                 return Err(failure);
             };
