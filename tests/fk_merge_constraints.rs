@@ -397,9 +397,16 @@ fn merge_crash_resume_uses_durable_policy_instead_of_new_handles_strict_default(
     }
 }
 
+/// The merged schema must be a valid one whatever the rows say: a child whose
+/// parent the target no longer has (or has in another shape) is refused before the
+/// merge's intent, with empty and NULL-only children and with every row-check
+/// policy.
+///
+/// The parent changes on the TARGET after the fork. A branch cannot drop a parent
+/// its own child still references (`DROP TABLE` is RESTRICT, SQLSTATE 2BP01, on a
+/// branch as on main), which is how this used to be set up.
 #[test]
 fn final_fk_schema_is_validated_for_empty_and_null_children_even_when_row_checks_are_bypassed() {
-    use heliosdb_nano::sql::ConstraintEnforcement;
     for family in FAMILIES {
         for null_child in [false, true] {
             for replacement in [
@@ -408,28 +415,46 @@ fn final_fk_schema_is_validated_for_empty_and_null_children_even_when_row_checks
                 Some("CREATE TABLE p (id INT,other INT PRIMARY KEY)"),
             ] {
                 for mode in ["enforced", "off", "audit", "proxy", "not_enforced"] {
+                    let case = format!("{family:?} null_child={null_child} replacement={replacement:?} mode={mode}");
                     let db = EmbeddedDatabase::new_in_memory().unwrap();
                     db.execute("CREATE TABLE p (id INT PRIMARY KEY)").unwrap();
-                    db.execute(
-                        "CREATE TABLE c (id INT PRIMARY KEY,pid INT,CONSTRAINT c_fk FOREIGN KEY(pid) REFERENCES p(id))",
+                    db.execute("CREATE DATABASE BRANCH work").unwrap();
+                    db.execute("USE BRANCH work").unwrap();
+                    // A stored NOT ENFORCED key skips the row checks, never the schema one.
+                    let enforcement = if mode == "not_enforced" { " NOT ENFORCED" } else { "" };
+                    run(
+                        &db,
+                        family,
+                        &format!(
+                            "CREATE TABLE c (id INT PRIMARY KEY,pid INT,\
+                             CONSTRAINT c_fk FOREIGN KEY(pid) REFERENCES p(id){enforcement})"
+                        ),
                     )
                     .unwrap();
                     if null_child {
-                        db.execute("INSERT INTO c VALUES (1,NULL)").unwrap();
+                        run(&db, family, "INSERT INTO c VALUES (1,NULL)").unwrap();
                     }
-                    if mode == "not_enforced" {
-                        let catalog = db.storage.catalog();
-                        let mut constraints = catalog.load_table_constraints("c").unwrap();
-                        constraints.foreign_keys[0].enforcement = ConstraintEnforcement::NotEnforced;
-                        catalog.save_table_constraints("c", &constraints).unwrap();
-                    }
-                    db.execute("CREATE DATABASE BRANCH work").unwrap();
-                    db.execute("USE BRANCH work").unwrap();
+                    // The dependency refusal that keeps a branch from doing this itself.
+                    let refused = run(&db, family, "DROP TABLE p").unwrap_err().to_string();
+                    assert!(
+                        refused.contains("cannot be dropped because some objects depend on it"),
+                        "{case}: {refused}"
+                    );
+                    db.execute("USE BRANCH main").unwrap();
                     run(&db, family, "DROP TABLE p").unwrap();
                     if let Some(sql) = replacement {
                         run(&db, family, sql).unwrap();
                     }
-                    db.execute("USE BRANCH main").unwrap();
+                    let target_parent = db.storage.catalog().table_exists("p").unwrap().then(|| {
+                        db.storage
+                            .catalog()
+                            .get_table_schema("p")
+                            .unwrap()
+                            .columns
+                            .iter()
+                            .map(|column| column.name.clone())
+                            .collect::<Vec<_>>()
+                    });
                     if mode == "proxy" {
                         db.execute("SET helios.fk_validation_source = 'proxy'").unwrap();
                     } else if mode != "not_enforced" {
@@ -437,44 +462,45 @@ fn final_fk_schema_is_validated_for_empty_and_null_children_even_when_row_checks
                     }
                     let sequence = db.storage.db().latest_sequence_number();
                     let error = run(&db, family, "MERGE BRANCH work INTO main").unwrap_err();
-                    assert!(matches!(error, Error::ConstraintViolation(_)), "{error}");
-                    assert!(error.to_string().contains("invalid final MERGE schema"), "{error}");
+                    assert!(matches!(error, Error::ConstraintViolation(_)), "{case}: {error}");
+                    assert!(
+                        error.to_string().contains("invalid final MERGE schema"),
+                        "{case}: {error}"
+                    );
                     assert_eq!(
                         db.storage.db().latest_sequence_number(),
                         sequence,
-                        "schema refusal precedes intent and any data/log mutation"
+                        "{case}: schema refusal precedes intent and any data/log mutation"
                     );
-                    let schema = db.storage.catalog().get_table_schema("p").unwrap();
+                    assert!(!db.storage.catalog().table_exists("c").unwrap(), "{case}");
                     assert_eq!(
-                        schema
-                            .columns
-                            .iter()
-                            .map(|column| column.name.as_str())
-                            .collect::<Vec<_>>(),
-                        vec!["id"]
+                        db.storage.catalog().table_exists("p").unwrap().then(|| {
+                            db.storage
+                                .catalog()
+                                .get_table_schema("p")
+                                .unwrap()
+                                .columns
+                                .iter()
+                                .map(|column| column.name.clone())
+                                .collect::<Vec<_>>()
+                        }),
+                        target_parent,
+                        "{case}: the target's parent is as the target left it"
                     );
-                    assert_eq!(
-                        rows(&db, "c"),
-                        if null_child {
-                            vec![vec![Value::Int4(1), Value::Null]]
-                        } else {
-                            Vec::new()
-                        }
+                    assert!(
+                        matches!(
+                            db.storage.get_branch("work").unwrap().state,
+                            heliosdb_nano::storage::BranchState::Active
+                        ),
+                        "{case}"
                     );
-                    assert!(matches!(
-                        db.storage.get_branch("work").unwrap().state,
-                        heliosdb_nano::storage::BranchState::Active
-                    ));
-                    // A final image dropping the dependent child too is valid;
-                    // this is dependency checking, not refusing DROP/recreate.
+                    // A final image without the dependent child is valid: this is
+                    // dependency checking, not a refusal of DROP/recreate.
                     db.execute("USE BRANCH work").unwrap();
                     run(&db, family, "DROP TABLE c").unwrap();
                     db.execute("USE BRANCH main").unwrap();
                     run(&db, family, "MERGE BRANCH work INTO main").unwrap();
-                    assert!(!db.storage.catalog().table_exists("c").unwrap());
-                    if replacement.is_none() {
-                        assert!(!db.storage.catalog().table_exists("p").unwrap());
-                    }
+                    assert!(!db.storage.catalog().table_exists("c").unwrap(), "{case}");
                 }
             }
         }
