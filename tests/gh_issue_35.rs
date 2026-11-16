@@ -41,9 +41,24 @@
 //!
 //! * `positive_control_a_checkpointed_store_reopens_unchanged`
 //! * `positive_control_default_config_logs_ddl_but_not_autocommit_dml`
-//! * `genuine_redo_past_the_checkpoint_still_works` — genuine redo for a
-//!   NON-destructive entry above the checkpoint must still happen; a "fix" that
-//!   simply stops replaying fails here.
+//!
+//! # Since 4.42.0 (spec R5.7): startup adopts, it does not redo
+//!
+//! A logical entry now rides in the same write group as the data it describes,
+//! so an open treats RocksDB's committed groups as the truth: it advances the
+//! checkpoint and never re-executes retained entries, whatever
+//! `wal_replay_destructive_ddl` says. The text above describes the 4.41.x
+//! recovery these tests were written against; their data assertions hold
+//! unchanged under adoption. Two tests that required startup redo now pin the
+//! new contract instead:
+//!
+//! * `startup_adopts_committed_data_and_does_not_redo_past_the_checkpoint`
+//!   (was `genuine_redo_past_the_checkpoint_still_works`);
+//! * `destructive_replay_policy_apply_cannot_enable_startup_redo`
+//!   (was `destructive_replay_policy_apply_still_applies`).
+//!
+//! Explicit replay of retained history (`StorageEngine::replay_wal_after`) is
+//! covered by tests/explicit_wal_truncate.rs.
 //!
 //! Every assertion is on DATA (a table's existence and its rows) or on the
 //! on-disk checkpoint, never on a log line.
@@ -259,17 +274,23 @@ fn positive_control_a_checkpointed_store_reopens_unchanged() {
     }
 }
 
-/// The anti-regression control: genuine logical redo must STILL happen for a
-/// non-destructive entry above the checkpoint. Any fix for GH#35 that simply
-/// stops replaying fails here.
+/// Spec R5.7: startup ADOPTS the committed store; it does not redo the logical
+/// WAL. This test used to be the opposite control (`genuine_redo_past_the_
+/// checkpoint_still_works`): it required an entry above the checkpoint to be
+/// re-executed at open. Since 4.42.0 a logical entry rides in the same write
+/// group as the data it describes, so RocksDB's committed groups are the truth
+/// and the retained log is history, not a redo window: redo over committed rows
+/// was observed to undo newer values.
 ///
 /// The store is driven with `logical_wal_per_statement = true` and the close
-/// checkpoint disabled, so DML lands in the logical WAL and stays there; the
-/// row's data key is then deleted behind the engine's back and the checkpoint
-/// planted just below that entry's LSN — the exact "entry landed, data write
-/// did not" window redo exists for.
+/// checkpoint disabled, so DML lands in the logical WAL and stays there; one
+/// row's data key is then removed behind the engine's back and the checkpoint
+/// planted just below its entry. The next open must leave the store as it finds
+/// it (the row stays absent), move the checkpoint past the entry, and be stable
+/// across a further reopen. Explicit replay of retained history remains the
+/// caller's choice (`StorageEngine::replay_wal_after`, tests/explicit_wal_truncate.rs).
 #[test]
-fn genuine_redo_past_the_checkpoint_still_works() {
+fn startup_adopts_committed_data_and_does_not_redo_past_the_checkpoint() {
     let temp = TempDir::new().unwrap();
     let dir = temp.path();
 
@@ -280,7 +301,7 @@ fn genuine_redo_past_the_checkpoint_still_works() {
         db.execute("INSERT INTO r VALUES (1, 'alpha')").expect("insert 1");
         db.execute("INSERT INTO r VALUES (2, 'beta')").expect("insert 2");
     }
-    {
+    let planted_lsn = {
         let raw = open_raw(dir);
         let wal = WriteAheadLog::open(
             Arc::clone(&raw),
@@ -306,59 +327,27 @@ fn genuine_redo_past_the_checkpoint_still_works() {
             raw.get(&data_key).expect("get").is_some(),
             "vacuity: the data key must exist before it is removed"
         );
-        raw.delete(&data_key).expect("simulate the lost data write");
+        raw.delete(&data_key).expect("remove the row behind the engine");
         raw.put(CHECKPOINT_KEY, (lsn - 1).to_le_bytes())
             .expect("plant checkpoint");
-    }
-    {
-        let db = open_db_logging_dml(dir);
-        assert_eq!(
-            text_column_opt(&db, "SELECT id, v FROM r ORDER BY id", 1),
-            Some(vec!["alpha".to_string(), "beta".to_string()]),
-            "an entry past the checkpoint was NOT replayed — crash recovery has become a no-op"
+        lsn
+    };
+    for round in 1..=2 {
+        {
+            let db = open_db_logging_dml(dir);
+            assert_eq!(
+                text_column_opt(&db, "SELECT id, v FROM r ORDER BY id", 1),
+                Some(vec!["alpha".to_string()]),
+                "open #{round}: startup re-executed a logical entry over the committed store (spec R5.7)"
+            );
+        }
+        let raw = open_raw(dir);
+        let checkpoint = checkpoint_of(&raw).expect("an open stamps the checkpoint");
+        assert!(
+            checkpoint >= planted_lsn,
+            "open #{round}: the checkpoint ({checkpoint}) must move past the adopted entry ({planted_lsn})"
         );
     }
-}
-
-/// Under the DEFAULT configuration, DDL is written to the logical WAL and
-/// autocommit DML is not. Pinned here so the asymmetry is a stated, tested
-/// fact — and so nobody "fixes" GH#35 by flipping
-/// `storage.logical_wal_per_statement` to `true`, which would put a synchronous
-/// WAL append on every autocommit write while leaving the actual defect intact.
-///
-/// The close-time checkpoint is disabled so the log survives to be inspected;
-/// the shape of the retained log is the subject, not the data.
-#[test]
-fn positive_control_default_config_logs_ddl_but_not_autocommit_dml() {
-    let temp = TempDir::new().unwrap();
-    let dir = temp.path();
-
-    {
-        let db = open_db_no_close_checkpoint(dir);
-        db.execute("CREATE TABLE asym (id INT PRIMARY KEY, v TEXT)")
-            .expect("create");
-        db.execute("INSERT INTO asym VALUES (1, 'row')").expect("insert");
-        db.execute("DROP TABLE asym").expect("drop");
-    }
-
-    let raw = open_raw(dir);
-    let ops = retained_ops(&raw);
-    assert!(
-        ops.iter()
-            .any(|(_, op)| matches!(op, WalOperation::CreateTable { table, .. } if table == "asym")),
-        "CREATE TABLE must be logged regardless of `logical_wal_per_statement`, got {ops:?}"
-    );
-    assert!(
-        ops.iter()
-            .any(|(_, op)| matches!(op, WalOperation::DropTable { table } if table == "asym")),
-        "DROP TABLE must be logged regardless of `logical_wal_per_statement`, got {ops:?}"
-    );
-    assert!(
-        !ops.iter()
-            .any(|(_, op)| matches!(op, WalOperation::Insert { table, .. } if table == "asym")),
-        "*** with `logical_wal_per_statement = false` (the default) an autocommit INSERT must \
-         NOT be logged — if it is, this file's premise has changed. Got {ops:?} ***"
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -669,11 +658,14 @@ fn a_replayed_rename_must_not_consume_a_recreated_source_table() {
     );
 }
 
-/// The escape hatch: `wal_replay_destructive_ddl = "apply"` restores the
-/// operator-driven redo — and therefore DOES destroy the live rows, which is
-/// exactly why `refuse` is the default. Pins that the knob is wired.
+/// Spec R5.7: `wal_replay_destructive_ddl = "apply"` cannot turn startup into a
+/// redo. This test used to pin the opposite (`destructive_replay_policy_apply_
+/// still_applies`: the replayed `DropTable` removed the live rows at open). The
+/// setting stays parseable for explicit replay
+/// (`StorageEngine::replay_wal_after`, tests/explicit_wal_truncate.rs), but an
+/// open adopts the committed store whatever it says.
 #[test]
-fn destructive_replay_policy_apply_still_applies() {
+fn destructive_replay_policy_apply_cannot_enable_startup_redo() {
     let temp = TempDir::new().unwrap();
     let dir = temp.path();
     seed_checkpointed_store(dir);
@@ -685,13 +677,18 @@ fn destructive_replay_policy_apply_still_applies() {
             .expect("recreate");
         db.execute("INSERT INTO t VALUES (1, 'new row')").expect("insert");
     }
-    assert_hazard_retained_above_checkpoint(dir);
+    let ops = assert_hazard_retained_above_checkpoint(dir);
+    assert!(
+        ops.iter()
+            .any(|(_, op)| matches!(op, WalOperation::DropTable { table } if table == "t")),
+        "vacuity: the retained log must hold `DropTable t`, got {ops:?}"
+    );
 
     let db = open_db_with_replay_policy(dir, DestructiveDdlReplay::Apply);
     assert_eq!(
         text_column_opt(&db, "SELECT id, v FROM t", 1),
-        Some(vec![]),
-        "*** with wal_replay_destructive_ddl = \"apply\" the replayed DropTable must remove \
-         the live table's rows and leave the empty recreated shell ***"
+        Some(vec!["new row".to_string()]),
+        "*** spec R5.7: with wal_replay_destructive_ddl = \"apply\" an open still adopts the committed \
+         store; it must not re-execute the retained DropTable ***"
     );
 }
