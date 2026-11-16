@@ -43,7 +43,18 @@ fn quirk_j_mv_aggregates_against_real_data() {
         eprintln!("SKIP: {DATA} not present");
         return;
     }
-    let db = EmbeddedDatabase::new(DATA).expect("open data dir");
+    // The fixture is an optional local dataset at a shared path. One this user
+    // cannot write (another account's copy on a shared host) cannot be opened at
+    // all, RocksDB rotates its LOG on open, and proves nothing about the engine:
+    // skipped like an absent or hollowed one. Any other open failure still fails.
+    let db = match EmbeddedDatabase::new(DATA) {
+        Ok(db) => db,
+        Err(e) if e.to_string().contains("Permission denied") => {
+            eprintln!("SKIP: {DATA} exists but this user cannot open it: {e}");
+            return;
+        }
+        Err(e) => panic!("open data dir: {e}"),
+    };
 
     // Content guard, not just a path guard: /tmp cleaners have hollowed this
     // fixture out before (dir survives, SSTs gone), and RocksDB re-initializes
