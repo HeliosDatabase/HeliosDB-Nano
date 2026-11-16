@@ -35,8 +35,22 @@ fn project_and_search_finds_symbol() -> Result<()> {
         "def helper():\n    return 42\n\ndef caller():\n    return helper()\n",
     )?;
     db.code_index(CodeIndexOptions::for_table("src"))?;
+    // `code_index` mirrors the symbols it indexed into `_hdb_graph_nodes` itself, so
+    // both functions are nodes already. An explicit pass is idempotent: it finds
+    // nothing new to project and adds no second node for a symbol.
+    let symbol_nodes = || -> Result<usize> {
+        Ok(db
+            .query(
+                "SELECT node_id FROM _hdb_graph_nodes WHERE source_ref LIKE 'code_symbol:%'",
+                &[],
+            )?
+            .len())
+    };
+    let projected = symbol_nodes()?;
+    assert!(projected >= 2, "code_index projected {projected} symbol nodes");
     let stats = db.graph_rag_project_symbols()?;
-    assert!(stats.code_symbols_projected >= 2);
+    assert_eq!(stats.code_symbols_projected, 0, "nothing new to project");
+    assert_eq!(symbol_nodes()?, projected, "the explicit pass duplicated a node");
 
     let hits = db.graph_rag_search(&GraphRagOptions {
         seed_text: "helper".into(),
