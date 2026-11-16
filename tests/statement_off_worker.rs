@@ -778,6 +778,142 @@ async fn a_cached_primary_key_write_stays_on_the_worker_and_what_it_declines_lea
     assert_eq!(value_of(6).await, Some("t2999".to_string()));
 }
 
+/// 4.42.0 R1: the same write sent as text (the simple protocol, what `psql` and
+/// drivers that interpolate client-side send) is bounded too once the literal
+/// fast path has cached its spec. A statement of that shape which the fast path
+/// declines — an expression it does not evaluate, another session's open
+/// transaction — starts on the worker and leaves it once.
+#[cfg(feature = "internal-tests")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_primary_key_write_sent_as_text_stays_on_the_worker_once_its_spec_is_cached() {
+    let server = Server::start(&[], &[]);
+    let client = server.connect().await;
+    client
+        .batch_execute("CREATE TABLE bench (id INT PRIMARY KEY, v TEXT)")
+        .await
+        .unwrap();
+    for id in 1..=20 {
+        client
+            .batch_execute(&format!("INSERT INTO bench VALUES ({id}, 'v{id}')"))
+            .await
+            .unwrap();
+    }
+    let mut reads = 0;
+    let value_of = |id: i32| {
+        let client = &client;
+        async move {
+            let messages = client
+                .simple_query(&format!("SELECT v FROM bench WHERE id = {id}"))
+                .await
+                .unwrap();
+            first_value(&messages)
+        }
+    };
+
+    // The first statement of the shape builds the spec, off the worker.
+    let before = handoffs(&client, &mut reads).await;
+    client
+        .batch_execute("UPDATE bench SET v = 'w1' WHERE id = 1")
+        .await
+        .unwrap();
+    let after = handoffs(&client, &mut reads).await;
+    assert_eq!(
+        after - before,
+        2,
+        "the first UPDATE of a shape builds its spec off the worker"
+    );
+    assert_eq!(value_of(1).await, Some("w1".to_string()));
+    for id in 2..=6 {
+        let before = handoffs(&client, &mut reads).await;
+        client
+            .batch_execute(&format!("UPDATE bench SET v = 'w{id}' WHERE id = {id}"))
+            .await
+            .unwrap();
+        let after = handoffs(&client, &mut reads).await;
+        assert_eq!(
+            after - before,
+            1,
+            "a primary-key UPDATE sent as text must not leave the worker (id {id})"
+        );
+        assert_eq!(value_of(id).await, Some(format!("w{id}")));
+    }
+    let before = handoffs(&client, &mut reads).await;
+    client
+        .batch_execute("UPDATE bench SET v = 'none' WHERE id = 999")
+        .await
+        .unwrap();
+    let after = handoffs(&client, &mut reads).await;
+    assert_eq!(after - before, 1, "an UPDATE of no row stays on the worker too");
+
+    // The same shape with a value the fast path does not evaluate: it starts on
+    // the worker, is declined, and leaves it for the planner.
+    let before = handoffs(&client, &mut reads).await;
+    client
+        .batch_execute("UPDATE bench SET v = upper(v) WHERE id = 2")
+        .await
+        .unwrap();
+    let after = handoffs(&client, &mut reads).await;
+    assert_eq!(after - before, 2, "a declined UPDATE leaves the worker once");
+    assert_eq!(value_of(2).await, Some("W2".to_string()));
+
+    client.batch_execute("DELETE FROM bench WHERE id = 20").await.unwrap();
+    for id in 17..=19 {
+        let before = handoffs(&client, &mut reads).await;
+        client
+            .batch_execute(&format!("DELETE FROM bench WHERE id = {id}"))
+            .await
+            .unwrap();
+        let after = handoffs(&client, &mut reads).await;
+        assert_eq!(
+            after - before,
+            1,
+            "a primary-key DELETE sent as text must not leave the worker (id {id})"
+        );
+        assert_eq!(value_of(id).await, None);
+    }
+
+    // Another session's open transaction: declined, and off the worker.
+    let other = server.connect().await;
+    other
+        .batch_execute("BEGIN; UPDATE bench SET v = 'other' WHERE id = 16")
+        .await
+        .unwrap();
+    let before = handoffs(&client, &mut reads).await;
+    client
+        .batch_execute("UPDATE bench SET v = 'w7' WHERE id = 7")
+        .await
+        .unwrap();
+    let after = handoffs(&client, &mut reads).await;
+    assert!(
+        after - before >= 2,
+        "a write beside an open transaction leaves the worker"
+    );
+    assert_eq!(value_of(7).await, Some("w7".to_string()));
+    other.batch_execute("ROLLBACK").await.unwrap();
+    assert_eq!(value_of(16).await, Some("v16".to_string()));
+
+    // Several statements in one query are an implicit transaction: general work.
+    let before = handoffs(&client, &mut reads).await;
+    client
+        .batch_execute("UPDATE bench SET v = 'a8' WHERE id = 8; UPDATE bench SET v = 'a9' WHERE id = 9")
+        .await
+        .unwrap();
+    let after = handoffs(&client, &mut reads).await;
+    assert!(after - before >= 2, "an implicit transaction block leaves the worker");
+    assert_eq!(value_of(8).await, Some("a8".to_string()));
+    assert_eq!(value_of(9).await, Some("a9".to_string()));
+
+    // And alone again, it is bounded again.
+    let before = handoffs(&client, &mut reads).await;
+    client
+        .batch_execute("UPDATE bench SET v = 'w10' WHERE id = 10")
+        .await
+        .unwrap();
+    let after = handoffs(&client, &mut reads).await;
+    assert_eq!(after - before, 1, "bounded again once no transaction is open");
+    assert_eq!(value_of(10).await, Some("w10".to_string()));
+}
+
 // ---------------------------------------------------------------------------
 // A long statement, no hook (default tier)
 // ---------------------------------------------------------------------------

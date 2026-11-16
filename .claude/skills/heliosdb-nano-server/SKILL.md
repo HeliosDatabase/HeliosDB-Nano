@@ -125,13 +125,12 @@ Since 4.42.0 a statement that runs for a long time (a big `INSERT … SELECT`, a
 scan, an aggregate) no longer stops the server from accepting connections, serving other
 sessions, answering `/health` or feeding its physical standbys. The server runs each
 executed statement with `tokio::task::block_in_place`, which hands its async worker to
-another thread for the statement's duration. Primary-key point reads (simple and
-prepared), result-cache hits and prepared primary-key `UPDATE` / `DELETE` statements
-(extended protocol, autocommit) stay on the worker; every other executed statement pays
-one handoff, roughly 10 µs. A prepared primary-key write that has to wait — for a lock, a
-synchronous standby, an fsync or a RocksDB stall — leaves the worker for the wait. The
-same write sent as text takes the handoff: prefer prepared statements for
-write-heavy clients.
+another thread for the statement's duration. Primary-key point reads, result-cache hits
+and autocommit primary-key `UPDATE` / `DELETE` statements of one row (simple and
+prepared) stay on the worker; every other executed statement pays one handoff, roughly
+10 µs. A primary-key write that has to wait — for a lock, a synchronous standby, an fsync
+or a RocksDB stall — leaves the worker for the wait, and one inside a transaction, or
+beside another session's open transaction, takes the handoff.
 
 `HELIOSDB_NANO_STATEMENT_OFFLOAD=off` (also `0`, `false`, `no`, `disabled`) turns the
 handoff off for throughput A/B runs on hosts whose workload has only short statements;

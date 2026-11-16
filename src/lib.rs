@@ -2419,6 +2419,16 @@ struct FastLiteralUpdateSpec {
     assignment_affects_indexes: bool,
 }
 
+/// What [`EmbeddedDatabase::fast_literal_update_shape`] read from the text of
+/// a one-assignment primary-key `UPDATE`.
+struct FastLiteralUpdateShape<'a> {
+    table_name: &'a str,
+    set_col: &'a str,
+    set_val_str: &'a str,
+    pk_col: &'a str,
+    pk_val_str: &'a str,
+}
+
 struct FastLiteralDeleteSpec {
     table_name: String,
     schema: std::sync::Arc<Schema>,
@@ -13858,10 +13868,21 @@ impl EmbeddedDatabase {
     #[cfg(feature = "code-graph")]
     fn maybe_auto_reparse(&self, touched_table: Option<&str>) {
         let Some(tbl) = touched_table else { return };
-        for idx in code_graph::storage::ast_indexes_for_table(self.storage.instance_id(), tbl) {
-            if !idx.auto_reparse {
-                continue;
-            }
+        let indexes: Vec<_> = code_graph::storage::ast_indexes_for_table(self.storage.instance_id(), tbl)
+            .into_iter()
+            .filter(|idx| idx.auto_reparse)
+            .collect();
+        if indexes.is_empty() {
+            return;
+        }
+        // 4.42.0 R1: indexing is general work, also after a bounded write that
+        // was answered on the async worker.
+        offload_statement(|| self.auto_reparse(indexes));
+    }
+
+    #[cfg(feature = "code-graph")]
+    fn auto_reparse(&self, indexes: Vec<code_graph::storage::AstIndexMeta>) {
+        for idx in indexes {
             let opts = code_graph::CodeIndexOptions {
                 source_table: idx.table.clone(),
                 embed_bodies: idx.embed_bodies,
@@ -14046,8 +14067,15 @@ impl EmbeddedDatabase {
     }
 
     pub fn execute(&self, sql: &str) -> Result<u64> {
+        let statement = || self.run_layout_statement(self.in_transaction(), || self.execute_body(sql));
+        // 4.42.0 R1: a wire session's bounded write stays on the worker up to its
+        // fast path, which answers it there; what that path declines is offloaded
+        // below it (`execute_body`).
+        if crate::runtime_offload::in_worker_write() {
+            return statement();
+        }
         // sprinter ccebc95977f1: off the async worker serving the client (`runtime_offload`).
-        offload_statement(|| self.run_layout_statement(self.in_transaction(), || self.execute_body(sql)))
+        offload_statement(statement)
     }
 
     /// The body of [`Self::execute`], which runs it through
@@ -14164,21 +14192,29 @@ impl EmbeddedDatabase {
                 // inside `execute_in_transaction_no_fast_path`, so wrapping it
                 // here makes a parse error abort the transaction just as a
                 // constraint violation does.
+                // 4.42.0 R1: general work, off the worker for a statement that
+                // started on it as a bounded write (it nests for free otherwise).
                 (
-                    self.run_statement_in_transaction(txn_ref, sql, || {
-                        self.execute_in_transaction_no_fast_path(sql, txn_ref)
+                    offload_statement(|| {
+                        self.run_statement_in_transaction(txn_ref, sql, || {
+                            self.execute_in_transaction_no_fast_path(sql, txn_ref)
+                        })
                     }),
                     true,
                 )
             } else {
                 drop(txn_lock);
+                // 4.42.0 R1: a bounded write (`text_worker_write_candidate`) is an
+                // UPDATE or DELETE, which the INSERT fast path turns away at its
+                // first word and the UPDATE/DELETE one answers on the worker.
+                // Whatever that one declines is general work and leaves it.
                 if let Some(result) = self.try_autocommit_fast_insert(sql) {
                     (result, false)
                 } else if let Some(result) = self.try_autocommit_fast_update_delete(sql) {
                     (result, false)
                 } else {
                     // No active transaction - create implicit transaction
-                    (self.execute_with_implicit_transaction(sql), false)
+                    (offload_statement(|| self.execute_with_implicit_transaction(sql)), false)
                 }
             }
         };
@@ -16579,6 +16615,54 @@ impl EmbeddedDatabase {
         }
     }
 
+    /// 4.42.0 R1: [`Self::worker_write_candidate`] for a statement sent as text
+    /// (the simple protocol): a one-assignment `UPDATE` or a `DELETE` of one row
+    /// by primary-key literal whose spec [`Self::try_fast_update`] /
+    /// [`Self::prepare_fast_delete`] has cached, on a table whose fast row change
+    /// is bounded. Reading the statement's shape is a scan of its text, with no
+    /// catalog access.
+    ///
+    /// As there, this only chooses the thread the statement starts on: the fast
+    /// path decides again under the session's own schema and branch, and what it
+    /// declines runs off the worker ([`Self::execute_body`]).
+    fn text_worker_write_candidate(&self, sql: &str) -> bool {
+        if !crate::runtime_offload::statement_offload()
+            || self.in_transaction()
+            || self.any_session_txns()
+            || self.has_effective_tenant_context()
+            || self.current_schema_is_set()
+            || self.storage.is_branch_active()
+        {
+            return false;
+        }
+        let Some(prefix) = sql.trim_start().as_bytes().get(..6) else {
+            return false;
+        };
+        if prefix.eq_ignore_ascii_case(b"UPDATE") {
+            Self::fast_literal_update_shape(sql)
+                .and_then(|shape| {
+                    self.fast_literal_update_cache.get(&Self::fast_literal_update_cache_key(
+                        shape.table_name,
+                        shape.set_col,
+                        shape.pk_col,
+                    ))
+                })
+                .is_some_and(|spec| self.storage.fast_row_write_is_bounded(&spec.table_name, &spec.schema))
+        } else if prefix.eq_ignore_ascii_case(b"DELETE") {
+            let fk_mode = *self.fk_validation_mode.read();
+            let fk_source = *self.fk_validation_source.read();
+            Self::fast_literal_delete_shape(sql)
+                .and_then(|(table_name, pk_col, _)| {
+                    self.fast_literal_delete_cache.get(&Self::fast_literal_delete_cache_key(
+                        table_name, pk_col, fk_mode, fk_source,
+                    ))
+                })
+                .is_some_and(|spec| self.storage.fast_row_write_is_bounded(&spec.table_name, &spec.schema))
+        } else {
+            false
+        }
+    }
+
     /// Execute eligible autocommit UPDATE/DELETE fast paths without creating an
     /// otherwise-empty transaction wrapper.
     fn try_autocommit_fast_update_delete(&self, sql: &str) -> Option<Result<u64>> {
@@ -18222,9 +18306,12 @@ impl EmbeddedDatabase {
             && self.storage.art_indexes().has_only_single_column_pk_index(table_name)
     }
 
-    /// Fast path for simple UPDATE: `UPDATE table SET col = literal WHERE pk_col = literal`
-    /// Returns None to fall through to normal path for complex UPDATE statements.
-    fn try_fast_update(&self, sql: &str) -> Option<Result<u64>> {
+    /// The pieces of `UPDATE <table> SET <col> = <value> WHERE <pk> = <value>`,
+    /// read without the parser, or `None` for any other statement. Nothing here
+    /// touches the catalog: [`Self::try_fast_update`] decides the rest, and
+    /// [`Self::text_worker_write_candidate`] asks only whether the statement's
+    /// spec is cached.
+    fn fast_literal_update_shape(sql: &str) -> Option<FastLiteralUpdateShape<'_>> {
         let trimmed = sql.trim();
 
         // Quick prefix check
@@ -18306,6 +18393,26 @@ impl EmbeddedDatabase {
         if pk_col.is_empty() || pk_val_str.is_empty() {
             return None;
         }
+
+        Some(FastLiteralUpdateShape {
+            table_name,
+            set_col,
+            set_val_str,
+            pk_col,
+            pk_val_str,
+        })
+    }
+
+    /// Fast path for simple UPDATE: `UPDATE table SET col = literal WHERE pk_col = literal`
+    /// Returns None to fall through to normal path for complex UPDATE statements.
+    fn try_fast_update(&self, sql: &str) -> Option<Result<u64>> {
+        let FastLiteralUpdateShape {
+            table_name,
+            set_col,
+            set_val_str,
+            pk_col,
+            pk_val_str,
+        } = Self::fast_literal_update_shape(sql)?;
 
         // Check branch — skip fast path on branches
         if self.storage.is_branch_active() {
@@ -18469,7 +18576,10 @@ impl EmbeddedDatabase {
         Some(result)
     }
 
-    fn prepare_fast_delete(&self, sql: &str, require_tuple: bool) -> Option<Result<Option<FastDeleteTarget>>> {
+    /// The table, key column and key literal of `DELETE FROM <table> WHERE <pk> =
+    /// <value>`, read without the parser, or `None` for any other statement
+    /// (as [`Self::fast_literal_update_shape`]).
+    fn fast_literal_delete_shape(sql: &str) -> Option<(&str, &str, &str)> {
         let trimmed = sql.trim();
 
         if trimmed.len() < 24 || !trimmed.as_bytes().get(..6)?.eq_ignore_ascii_case(b"DELETE") {
@@ -18527,6 +18637,12 @@ impl EmbeddedDatabase {
         if pk_col.is_empty() || pk_val_str.is_empty() {
             return None;
         }
+
+        Some((table_name, pk_col, pk_val_str))
+    }
+
+    fn prepare_fast_delete(&self, sql: &str, require_tuple: bool) -> Option<Result<Option<FastDeleteTarget>>> {
+        let (table_name, pk_col, pk_val_str) = Self::fast_literal_delete_shape(sql)?;
 
         if self.tenant_manager.should_apply_rls(table_name, "DELETE") || self.has_effective_tenant_context() {
             return None;
@@ -27126,12 +27242,20 @@ impl EmbeddedDatabase {
 
     /// Execute a statement on behalf of a wire-protocol session.
     pub fn execute_for_session(&self, session_id: crate::session::SessionId, sql: &str) -> Result<u64> {
-        // sprinter ccebc95977f1: off the async worker serving the client (`runtime_offload`).
-        offload_statement(|| {
+        let statement = || {
             self.run_layout_statement(self.session_has_open_transaction(session_id), || {
                 self.execute_for_session_body(session_id, sql)
             })
-        })
+        };
+        // 4.42.0 R1: a primary-key UPDATE/DELETE with a cached spec is a bounded
+        // write and stays on the async worker, as its prepared form does
+        // (`execute_params_for_session_inner`).
+        if self.text_worker_write_candidate(sql) {
+            let _on_worker = crate::runtime_offload::WorkerWrite::enter();
+            return statement();
+        }
+        // sprinter ccebc95977f1: off the async worker serving the client (`runtime_offload`).
+        offload_statement(statement)
     }
 
     /// The body of [`Self::execute_for_session`], which runs it through
