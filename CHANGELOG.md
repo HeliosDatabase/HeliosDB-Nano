@@ -94,6 +94,12 @@ acceptance remains pending; these entries describe the current implementation.
   A pure read can replan within the bounded retry policy; writes and statements with sequence,
   procedure or advisory-lock effects are not replayed after those effects. An unrecoverable layout
   race returns `40001`; an already-described result-shape change returns `0A000` before execution.
+- A statement that waited for its table behind a schema statement, and then finds the plan it made
+  before the wait stale, is planned again before it writes anything. The 100 ms retry allowance
+  counts from that first refusal, not from the statement's start, so a long `ALTER TABLE` does not
+  turn a queued writer's wait into `40001`. A statement inside an explicit transaction is never
+  retried: it fails `40001` (`could not serialize access due to a concurrent schema change`), and
+  the application retries the transaction.
 - SQL `PREPARE`, `EXECUTE` and `DEALLOCATE` share session-scoped routing in both executor families;
   inner `$N` placeholders remain the prepared statement's parameters. A prepared body which is
   itself a prepared utility or transaction-control statement is refused before registration. The custom `SET STORAGE`, `MERGE BRANCH` and
