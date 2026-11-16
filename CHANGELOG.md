@@ -532,6 +532,82 @@ range scans lose 6 % of throughput at 1 client and up to 28 % at 32 clients, poi
 nothing. `HELIOSDB_NANO_STATEMENT_OFFLOAD=off` restores the previous behaviour. The
 embedded library is unchanged unless it opts in.
 
+### Changed — BREAKING: a branch is a fork, selected per session (sprinter 6bc4a4040eb7, specs B1–B4)
+
+- **The active branch is session state.** `USE BRANCH b` used to move every connection of the
+  database; it now moves its own session only. A session also selects a branch with
+  `SET heliosdb.branch = 'b'`, with `dbname=<db>@<branch>` or `options=-c heliosdb.branch=b` at
+  PostgreSQL startup, and through the REST `/v1/branches/:name/…` routes. A session bound to a
+  branch that was dropped or merged is refused `3D000` until it selects another; switching branches
+  inside a transaction is refused `25001`.
+- **Writes and constraints stay on the branch.** Every write path changes the branch only, explicit
+  transactions work on a branch, and `PRIMARY KEY`, `UNIQUE` and `FOREIGN KEY` hold over what the
+  branch sees. What cannot stay on a branch is refused `0A000` instead of writing main (lock-free
+  ingestion, direct bulk load, `CREATE` / `REFRESH MATERIALIZED VIEW`).
+- **A branch has its own catalog** for `CREATE TABLE`, `CREATE TABLE AS`, `DROP TABLE` and
+  `ALTER TABLE … ADD COLUMN`; other schema statements on a branch are refused `0A000` before they
+  change anything. Views, materialized views, functions, procedures and sequences are shared by all
+  branches, and a branch session cannot change them.
+- **A branch sees its parent as it was at its fork point.** The parent's later writes, deletes,
+  schema changes, truncates and version GC no longer show through: the parent copies a row's
+  earlier image to each live child the first time it writes that row. A schema statement on the
+  parent is wholly before or wholly after a fork (it waits up to 30 s, then `55006`).
+- **`MERGE BRANCH` carries schema changes, lands through the target's ordinary commit and finishes
+  after a crash.** A merge that failed part-way stays pending: running it again, or the next
+  writable open, finishes it, and `MERGE BRANCH x ABORT` abandons it and lists what may be partial.
+  It is still last-writer-wins with no conflict detection for rows both sides changed. It refuses,
+  leaving the source active, with `55000` (the target changed a table's definition the branch
+  depends on), `23505` (a merged row's key is held by another row), `55006` (an open transaction has
+  staged writes on its tables) or `54000` (a table's changed rows do not fit one write).
+- **Upgrade note:** a branch created by an earlier release has no recorded fork point. It reads what
+  its parent held when 4.42.0 first opened the store, and `MERGE BRANCH` refuses it (`55000`) for
+  any table whose rows it changed. Recreate such a branch to merge it.
+- **Removed from the Rust API** (unused since `MERGE` moved into the engine):
+  `BranchManager::merge_branch`, `run_gc`, `with_gc_config`, `gc_eligible_branches`,
+  `pending_gc_count`, `gc_config`, `BranchGcConfig`, `BranchGcMode`.
+- MCP gained `heliosdb_branch_drop`; the branch tools are scoped to their call.
+
+The full rules, with every refusal, are in the `heliosdb-nano-branches` skill and in
+`docs/plans/specs/B1_session_branch.md` to `B4`.
+
+### Added — writers wait for schema statements and merges (sprinter 925803b35113, spec R5.1)
+
+Every writer holds its table's lock, shared, from its statement's first read to its commit; a
+schema statement that reads or rewrites the table, and `MERGE BRANCH` on its tables, hold it
+exclusive. A writer beside a schema change or a merge therefore waits instead of failing or
+writing rows of the old definition. A wait is bounded by `[session] lock_timeout_ms` (default
+30 s, then `55P03`) and by the session's `SET lock_timeout`, and ends at `statement_timeout` or a
+PostgreSQL `CancelRequest` (`57014`, nothing run). MySQL's `lock_wait_timeout` maps to the same
+timeout.
+
+### Changed — `ADD COLUMN` with a stable default rewrites no row (spec R5.2)
+
+`ALTER TABLE … ADD COLUMN … DEFAULT <stable expression>` evaluates the default once and stores it
+with the schema (as PostgreSQL's `attmissingval`), in one write group at any table size. A
+volatile default still rewrites every row, in one write group up to
+`[storage] max_atomic_rewrite_bytes` (default 256 MiB, refused `54000` above it). `NOT NULL` with
+no usable default on a table that has rows is refused `23502` before any write.
+
+A prepared statement that was described, and whose result columns changed since, is refused at
+Execute with `0A000` "cached plan must not change result type" and nothing run, so drivers that
+handle that error (asyncpg, pgjdbc) prepare it again.
+
+### Fixed — query results and the extended protocol
+
+- An aggregate's `FILTER (WHERE …)` was dropped on every route: `sum(v) FILTER (WHERE id <= 1)`
+  returned the unfiltered sum.
+- Two window calls with the same output name (`count(*) OVER (ORDER BY id)`, `count(*) OVER ()`)
+  both returned the first one's values.
+- `random()` returned values around 1e8; it returns a value in `[0, 1)`, new for every row.
+- `INSERT … SELECT` and `CREATE TABLE … AS` with bound parameters failed on every
+  extended-protocol driver ("Parameter $1 not provided").
+- `ON CONFLICT DO UPDATE` on the text route started from the row's last version instead of the
+  row: it lost a value after `ADD COLUMN`, shifted columns after `DROP COLUMN`, and undid a
+  preceding fast `UPDATE`.
+- A PostgreSQL `CancelRequest` was not routed to the statement it named; it is now, including a
+  TLS-first one that arrives while the server is at its connection limit.
+- `COPY` reported every failure as `XX000`.
+
 ### Changed — BREAKING: one replication connection, physical standbys only
 
 A standby is a read-only **physical replica** of its primary
@@ -950,9 +1026,9 @@ Oracle's `SWITCHOVER` / `FAILOVER TO` and PostgreSQL's timelines
   with the reason and keeps retrying, so a corrected `--primary-host` takes
   effect). A fresh snapshot receiver is never compared. A source no longer
   answers with a `Fence`.
-- `SWITCHOVER TO` / `SWITCHOVER CHECK` stay refused on the primary; their
-  messages name both promotions of the TARGET: `SELECT pg_promote(true, N)`
-  on the running standby, or `heliosdb-nano promote` on a stopped one.
+- `SWITCHOVER TO` / `SWITCHOVER CHECK` were still refused on the primary when
+  promotion landed; both are implemented in this release (see "rewind a former
+  primary in place; `SWITCHOVER TO`" above).
 - **A standby no longer drops its session during a bulk statement on the
   primary**: it waited for a poll's `PollStart` one frame timeout (30 s) while
   the primary may take its operation deadline (120 s) to collect the poll —
