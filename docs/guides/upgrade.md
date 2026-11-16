@@ -13,8 +13,8 @@ wire-protocol or schema boundary.
 | Older incompatible layout | Dump-and-restore via `heliosdb-nano dump` | Required |
 
 There is **no required step-wise migration** across supported releases.
-Stop the server, replace the binary, and start it again — recovery is
-automatic via WAL replay.
+Stop the server, replace the binary, and start it again. Upgrading to
+4.42.0 from 4.41.x has its own section below: read it first.
 
 ```bash
 # Stop the running server (graceful)
@@ -31,8 +31,67 @@ cargo install heliosdb-nano --locked --force
 
 # Start with the same data-dir
 heliosdb-nano start --data-dir ./mydata
-# → WAL replay runs once, no manual reindex
+# → no manual reindex
 ```
+
+## Upgrading to 4.42.0 from 4.41.x — read before upgrading
+
+4.42.0 is a drop-in upgrade for a standalone server or a primary that was shut down
+cleanly. It is **not** a drop-in upgrade for standbys, and a few statements that used to
+succeed are now refused. `CHANGELOG.md` has the full list; this is what to plan for.
+
+**Before you start.** Take a `heliosdb-nano dump` of the data directory. A directory that
+4.42.0 has written cannot be opened by 4.41.x again.
+
+**Standalone server or primary.**
+
+1. Stop the server cleanly and swap the binary, as above.
+2. Start it. Startup no longer replays the logical WAL over committed data: the committed
+   rows are authoritative.
+3. If the start is refused because the directory has log entries above its checkpoint (a
+   4.41.x process that did not shut down cleanly can leave that), stop everything that uses
+   the directory, keep your backup, and run the command the message names:
+
+   ```bash
+   heliosdb-nano recover-wal --data-dir ./mydata --adopt-local-state
+   ```
+
+   It adopts the rows the directory holds. It does not recover writes an older process
+   acknowledged and did not store.
+
+**Standbys.** There is no replication between 4.41.x and 4.42.0 in either direction.
+
+1. Upgrade the primary and its standbys in the same maintenance window.
+2. Start each standby on a **new, empty data directory**; it copies itself from the
+   primary. Its 4.41.x directory is refused, so keep it aside until the new standby is
+   verified (`heliosdb-nano standby verify --data-dir …` on the stopped standby).
+3. A standby's `--primary-host` names the primary's replication port (default 5433), the
+   only replication port now. Remove `--physical-replication-listen`, `--observer-hosts`,
+   `observer_hosts` and `HELIOSDB_PRIMARY_PG_PORT` from your configuration: they are gone,
+   and an unknown key is an error.
+4. Standbys refuse writes (`25006`) instead of forwarding them. Point writers at the
+   primary.
+5. A node with a replication role archives its WAL by default, to `<data dir>.archive`
+   with a 7-day window. Plan the disk space, or set `[replication.archive]`.
+
+See `docs/guides/physical-standby.md` for the standby's operation, promotion and
+switchover.
+
+**What applications may notice.**
+
+| Change | What you see |
+|---|---|
+| Writers wait for a schema statement or `MERGE BRANCH` on their table | A wait of up to `[session] lock_timeout_ms` (default 30 s), then `55P03`; a deadlock is `40P01` |
+| A concurrent schema change under a running statement | `40001` for a statement inside a transaction: retry the transaction |
+| One statement or transaction writes at most about 1.33 GiB of row data | `54000`: split the load into batches |
+| `DROP COLUMN` and `SET STORAGE` rewrite in one write, up to `[storage] max_atomic_rewrite_bytes` (256 MiB) | `54000` above it: raise the limit or rebuild the table |
+| A prepared statement whose result columns changed | `0A000` "cached plan must not change result type": prepare again (asyncpg and pgjdbc do) |
+| `USE BRANCH` moves only its own session | Connections that relied on another connection's `USE BRANCH` must select the branch themselves |
+| A branch created before 4.42.0 | `MERGE BRANCH` refuses it (`55000`) for tables whose rows it changed: recreate it |
+| The server hands each statement to a blocking thread | Short range scans cost a little more per statement; `HELIOSDB_NANO_STATEMENT_OFFLOAD=off` restores 4.41 behaviour, long statements stalling the server included |
+
+**Building from source.** The minimum Rust version is 1.88 (1.92 with `--features
+code-embed`, which also needs glibc 2.38 or later).
 
 ## What's new in 3.58.1
 
