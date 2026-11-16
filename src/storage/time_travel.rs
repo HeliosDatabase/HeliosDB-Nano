@@ -34,7 +34,7 @@ use parking_lot::{Mutex, RwLock};
 use rocksdb::{ReadOptions, WriteBatch, WriteOptions, DB};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -531,6 +531,61 @@ pub enum ImageSource {
 /// A cached snapshot read: the generation it was read at, and what it found.
 type CachedSnapshotRead = (u64, Option<(ImageSource, Vec<u8>)>);
 
+/// How many snapshots one step of a snapshot GC pass visits while it holds the
+/// registry's lock. A pass over a full registry used to hold it for about half
+/// a millisecond, once per thousand commits, with every writer queued behind
+/// it at the publication of its snapshot.
+const GC_STEP: usize = 64;
+
+/// What the snapshot manager holds in memory of the snapshots: the newest of
+/// them, by timestamp.
+///
+/// 4.42.0: this was three maps behind three locks — the snapshots, and the
+/// timestamp each transaction id and each SCN names — so every committed row
+/// write took three global write locks to publish its snapshot and a fourth
+/// acquisition to count the map for GC, and a GC pass had to bring the two id
+/// maps back in line with what it took out. The id maps had two readers, `AS
+/// OF TRANSACTION` and `AS OF SCN`. Those now walk the registry, newest first,
+/// as `AS OF TIMESTAMP` always has: it holds a bounded number of snapshots
+/// (`GcConfig::max_snapshots` and its slack), and every commit is spared two
+/// map updates under a global lock. A publication is one insert
+/// ([`Self::publish`], which returns the count).
+#[derive(Default)]
+struct SnapshotRegistry {
+    /// The snapshots, by timestamp, oldest first: GC takes the oldest from the
+    /// front without a walk of the rest.
+    snapshots: BTreeMap<u64, SnapshotMetadata>,
+}
+
+impl SnapshotRegistry {
+    /// Add one snapshot and return how many the registry now holds.
+    fn publish(&mut self, metadata: SnapshotMetadata) -> usize {
+        self.snapshots.insert(metadata.timestamp, metadata);
+        self.snapshots.len()
+    }
+
+    /// The newest snapshot held that carries transaction id `id`. An id can
+    /// name several snapshots (`register_snapshot_with_lsn` takes the WAL LSN,
+    /// and commits with nothing logged between them share one), and it names
+    /// its newest: what a recovery of the same records answers (spec P1.1b).
+    fn newest_of_transaction(&self, id: TransactionId) -> Option<u64> {
+        self.snapshots
+            .values()
+            .rev()
+            .find(|metadata| metadata.transaction_id == id)
+            .map(|metadata| metadata.timestamp)
+    }
+
+    /// The snapshot held that carries `scn` (an SCN names one snapshot).
+    fn of_scn(&self, scn: Scn) -> Option<u64> {
+        self.snapshots
+            .values()
+            .rev()
+            .find(|metadata| metadata.scn == scn)
+            .map(|metadata| metadata.timestamp)
+    }
+}
+
 /// Snapshot Manager
 ///
 /// Manages historical snapshots for time-travel queries.
@@ -539,12 +594,11 @@ pub struct SnapshotManager {
     db: Arc<DB>,
     /// The write gate of the engine that owns `db`.
     gate: Arc<WriteGate>,
-    /// In-memory snapshot registry for fast lookups
-    snapshots: Arc<RwLock<HashMap<u64, SnapshotMetadata>>>,
-    /// Transaction ID to timestamp mapping
-    txn_to_timestamp: Arc<RwLock<HashMap<TransactionId, u64>>>,
-    /// SCN to timestamp mapping
-    scn_to_timestamp: Arc<RwLock<HashMap<Scn, u64>>>,
+    /// The in-memory snapshot registry: the newest snapshots, by timestamp.
+    registry: RwLock<SnapshotRegistry>,
+    /// Held by the one snapshot GC pass that runs at a time
+    /// ([`Self::gc_old_snapshots`]).
+    gc_pass: Mutex<()>,
     /// Current SCN counter.
     /// W2.2(d): a lock-free `AtomicU64` — every DML allocated an SCN under a
     /// `RwLock<u64>` write lock, one of ~6 SnapshotManager lock acquisitions
@@ -684,9 +738,8 @@ impl SnapshotManager {
         Self {
             db,
             gate,
-            snapshots: Arc::new(RwLock::new(HashMap::new())),
-            txn_to_timestamp: Arc::new(RwLock::new(HashMap::new())),
-            scn_to_timestamp: Arc::new(RwLock::new(HashMap::new())),
+            registry: RwLock::new(SnapshotRegistry::default()),
+            gc_pass: Mutex::new(()),
             current_scn: Arc::new(AtomicU64::new(1)),
             newest_snapshot_ts: AtomicU64::new(0),
             current_txn_id: Arc::new(AtomicU64::new(1)),
@@ -725,9 +778,8 @@ impl SnapshotManager {
         Self {
             db,
             gate,
-            snapshots: Arc::new(RwLock::new(HashMap::new())),
-            txn_to_timestamp: Arc::new(RwLock::new(HashMap::new())),
-            scn_to_timestamp: Arc::new(RwLock::new(HashMap::new())),
+            registry: RwLock::new(SnapshotRegistry::default()),
+            gc_pass: Mutex::new(()),
             current_scn: Arc::new(AtomicU64::new(1)),
             newest_snapshot_ts: AtomicU64::new(0),
             current_txn_id: Arc::new(AtomicU64::new(1)),
@@ -757,9 +809,8 @@ impl SnapshotManager {
         Self {
             db,
             gate,
-            snapshots: Arc::new(RwLock::new(HashMap::new())),
-            txn_to_timestamp: Arc::new(RwLock::new(HashMap::new())),
-            scn_to_timestamp: Arc::new(RwLock::new(HashMap::new())),
+            registry: RwLock::new(SnapshotRegistry::default()),
+            gc_pass: Mutex::new(()),
             current_scn: Arc::new(AtomicU64::new(1)),
             newest_snapshot_ts: AtomicU64::new(0),
             current_txn_id: Arc::new(AtomicU64::new(1)),
@@ -1044,9 +1095,7 @@ impl SnapshotManager {
         self.newest_snapshot_ts.fetch_max(timestamp, Ordering::AcqRel);
 
         // Store in-memory
-        self.snapshots.write().insert(timestamp, metadata.clone());
-        self.map_transaction_timestamp(txn_id, timestamp);
-        self.scn_to_timestamp.write().insert(scn, timestamp);
+        let held = self.registry.write().publish(metadata.clone());
 
         if self.persist_metadata {
             self.persist_snapshot_metadata(&metadata)?;
@@ -1054,7 +1103,7 @@ impl SnapshotManager {
 
         // Run GC if enabled
         if self.gc_config.auto_gc_enabled {
-            if let Err(e) = self.gc_if_needed() {
+            if let Err(e) = self.gc_if_needed(held) {
                 eprintln!("Warning: Snapshot GC failed: {}", e);
             }
         }
@@ -1152,8 +1201,8 @@ impl SnapshotManager {
         let mut best: Option<(i64, u64)> = None;
         let mut span = SnapshotSpan::default();
         let memory_answers = {
-            let snapshots = self.snapshots.read();
-            for metadata in snapshots.values() {
+            let registry = self.registry.read();
+            for metadata in registry.snapshots.values() {
                 span.add(metadata.wall_clock_unix_secs());
                 Self::closer_at_or_before(&mut best, metadata, target_secs);
             }
@@ -1252,12 +1301,12 @@ impl SnapshotManager {
                 let target_secs = i64::try_from(target_time).unwrap_or(i64::MAX);
                 let mut best_match: Option<u64> = None;
                 let (memory_empty, memory_answers) = {
-                    let snapshots = self.snapshots.read();
-                    for metadata in snapshots.values() {
+                    let registry = self.registry.read();
+                    for metadata in registry.snapshots.values() {
                         Self::range_candidate(&mut best_match, metadata, target_secs, is_start);
                     }
                     (
-                        snapshots.is_empty(),
+                        registry.snapshots.is_empty(),
                         self.memory_answers_range(best_match, target_secs, is_start),
                     )
                 };
@@ -1291,7 +1340,7 @@ impl SnapshotManager {
     /// carries it, from the store's records when the in-memory map has let go
     /// of one that may be newer than the one it maps the id to.
     fn resolve_transaction(&self, txn_id: TransactionId) -> Result<u64> {
-        let mut found = self.txn_to_timestamp.read().get(&txn_id).copied();
+        let mut found = self.registry.read().newest_of_transaction(txn_id);
         if !self.memory_holds_every_snapshot_after(found) {
             let mut newer = |timestamp: u64| {
                 if found.is_none_or(|ts| timestamp > ts) {
@@ -1318,7 +1367,7 @@ impl SnapshotManager {
     /// Resolve SCN to snapshot timestamp (an SCN names one snapshot; from the
     /// store's records when the in-memory map has let go of it).
     pub fn resolve_scn(&self, scn: Scn) -> Result<u64> {
-        let mut found = self.scn_to_timestamp.read().get(&scn).copied();
+        let mut found = self.registry.read().of_scn(scn);
         if found.is_none() && self.evicted.any.load(Ordering::Acquire) {
             if self.id_index_trusted() {
                 found = self.newest_indexed_id(SnapshotId::Scn(scn))?;
@@ -1582,7 +1631,7 @@ impl SnapshotManager {
     /// Get current timestamp
     fn get_current_timestamp(&self) -> u64 {
         // Get the latest snapshot timestamp
-        self.snapshots.read().values().map(|m| m.timestamp).max().unwrap_or(1)
+        self.registry.read().snapshots.keys().next_back().copied().unwrap_or(1)
     }
 
     /// R4.3: set the version-GC low watermark (highest horizon ever applied).
@@ -1623,7 +1672,7 @@ impl SnapshotManager {
     /// Used to seed the engine's logical timestamp counter at startup so
     /// timestamps stay monotonic across reopens.
     pub fn max_snapshot_timestamp(&self) -> Option<u64> {
-        self.snapshots.read().keys().max().copied()
+        self.registry.read().snapshots.keys().next_back().copied()
     }
 
     /// R4.3: largest snapshot timestamp whose wall-clock registration time
@@ -1631,9 +1680,9 @@ impl SnapshotManager {
     /// half of the retention horizon's wall-clock → logical-ts mapping (the
     /// version GC's persisted time anchors are the other half).
     pub fn max_snapshot_ts_at_or_before_wallclock(&self, cutoff_unix_secs: i64) -> Option<u64> {
-        let snapshots = self.snapshots.read();
+        let registry = self.registry.read();
         let mut best: Option<u64> = None;
-        for metadata in snapshots.values() {
+        for metadata in registry.snapshots.values() {
             // W2.2(b): epoch-micros metadata, seconds granularity as before.
             if metadata.wall_clock_unix_secs() <= cutoff_unix_secs {
                 best = Some(best.map_or(metadata.timestamp, |b: u64| b.max(metadata.timestamp)));
@@ -2853,9 +2902,9 @@ impl SnapshotManager {
     /// Spec R5.4 (F1.5): the batch carrying a staged `snapshot:` record was written:
     /// `AS OF` resolves to it from now on, as after [`Self::register_snapshot`].
     pub(crate) fn publish_staged_snapshot(&self, metadata: SnapshotMetadata) {
-        self.publish_snapshot_metadata(metadata);
+        let held = self.publish_snapshot_metadata(metadata);
         if self.gc_config.auto_gc_enabled {
-            if let Err(e) = self.gc_if_needed() {
+            if let Err(e) = self.gc_if_needed(held) {
                 tracing::warn!("snapshot GC failed: {}", e);
             }
         }
@@ -2992,13 +3041,16 @@ impl SnapshotManager {
         scn: Scn,
         metadata: SnapshotMetadata,
     ) -> Result<SnapshotMetadata> {
-        self.snapshots.write().insert(timestamp, metadata.clone());
-        self.map_transaction_timestamp(txn_id, timestamp);
-        self.scn_to_timestamp.write().insert(scn, timestamp);
+        debug_assert_eq!(
+            (metadata.timestamp, metadata.transaction_id, metadata.scn),
+            (timestamp, txn_id, scn),
+            "a version's snapshot is published under the ids it was allocated"
+        );
+        let held = self.registry.write().publish(metadata.clone());
         self.invalidate_cache_for_row(table_name, row_id);
 
         if self.gc_config.auto_gc_enabled {
-            if let Err(e) = self.gc_if_needed() {
+            if let Err(e) = self.gc_if_needed(held) {
                 eprintln!("Warning: Snapshot GC failed: {}", e);
             }
         }
@@ -3093,7 +3145,25 @@ impl SnapshotManager {
     ///   watermark on a quiet store too.
     ///
     /// Returns how many left the in-memory map.
+    ///
+    /// 4.42.0: one pass runs at a time, and it takes the registry's lock for
+    /// [`GC_STEP`] entries at a time and for none of its store work. The pass
+    /// used to hold that lock from its first entry to the write of its deletes
+    /// — about half a millisecond for a full registry, measured — so every
+    /// writer publishing a snapshot waited behind the one whose registration
+    /// had crossed the trigger, once per `gc_trigger` slack of commits. A
+    /// lookup between two steps sees what one after the pass sees: the
+    /// eviction watermarks move before each entry leaves. An entry leaves
+    /// memory before its record is deleted, as before: a pass that fails or a
+    /// crash between the two leaves a record the sweep finds later, never an
+    /// entry without one.
     pub fn gc_old_snapshots(&self) -> Result<usize> {
+        let _pass = self.gc_pass.lock();
+        self.gc_pass_holding()
+    }
+
+    /// One GC pass; the caller holds `gc_pass`.
+    fn gc_pass_holding(&self) -> Result<usize> {
         let now_secs = Utc::now().timestamp();
         let min_retention = i64::try_from(self.gc_config.min_retention_seconds).unwrap_or(i64::MAX);
         let watermark = self.gc_low_watermark();
@@ -3104,53 +3174,55 @@ impl SnapshotManager {
                 && now_secs.saturating_sub(metadata.wall_clock_unix_secs()) > min_retention
         };
 
-        let mut snapshots = self.snapshots.write();
-        let to_remove: Vec<u64> = snapshots
-            .values()
-            .filter(|&metadata| expired(metadata))
-            .map(|metadata| metadata.timestamp)
-            .collect();
-
-        // If we're still over the limit, the oldest eligible leave memory only.
-        let to_evict = self.oldest_beyond_limit(&snapshots, &to_remove);
-
-        // Remove snapshots
-        let count = to_remove.len() + to_evict.len();
-        let mut delete_batch = WriteBatch::default();
-        let mut removed = Vec::with_capacity(to_remove.len());
-        for ts in &to_remove {
-            if let Some(metadata) = snapshots.remove(ts) {
-                if self.persist_metadata {
-                    let snap_key = format!("snapshot:{}", ts);
-                    // The legacy id-map records of databases written by older
-                    // versions: nothing reads them (recovery rebuilds the maps
-                    // from `snapshot:` alone), so they go with the snapshot.
-                    let txn_key = format!("txn_map:{}", metadata.transaction_id);
-                    let scn_key = format!("scn_map:{}", metadata.scn);
-
-                    delete_batch.delete(snap_key.as_bytes());
-                    delete_batch.delete(txn_key.as_bytes());
-                    delete_batch.delete(scn_key.as_bytes());
-                    delete_snapshot_indexes(&mut delete_batch, &metadata);
+        // In memory, in steps: each takes the registry's lock for a few entries
+        // and gives it back, so the writers publishing their snapshots meanwhile
+        // wait for one step at most. Expired snapshots are below the watermark.
+        let mut removed = Vec::new();
+        if watermark > 0 {
+            let mut from = 0;
+            loop {
+                let mut registry = self.registry.write();
+                let mut leaving = Vec::new();
+                let mut next = None;
+                for (visited, (ts, metadata)) in registry.snapshots.range(from..watermark).enumerate() {
+                    if visited == GC_STEP {
+                        next = Some(*ts);
+                        break;
+                    }
+                    if expired(metadata) {
+                        leaving.push(*ts);
+                    }
                 }
+                let gone: Vec<SnapshotMetadata> =
+                    leaving.iter().filter_map(|ts| registry.snapshots.remove(ts)).collect();
+                drop(registry);
+                removed.extend(gone);
+                match next {
+                    Some(ts) => from = ts,
+                    None => break,
+                }
+            }
+        }
+        // If we're still over the limit, the oldest eligible leave memory only.
+        let count = removed.len() + self.evict_beyond_limit()?;
 
+        // In the store, with the registry free for the writers publishing
+        // their snapshots meanwhile.
+        let mut delete_batch = WriteBatch::default();
+        if self.persist_metadata {
+            for metadata in &removed {
+                delete_batch.delete(format!("snapshot:{}", metadata.timestamp).as_bytes());
+                // The legacy id-map records of databases written by older
+                // versions: nothing reads them (recovery rebuilds the maps
+                // from `snapshot:` alone), so they go with the snapshot.
+                delete_batch.delete(format!("txn_map:{}", metadata.transaction_id).as_bytes());
+                delete_batch.delete(format!("scn_map:{}", metadata.scn).as_bytes());
+                delete_snapshot_indexes(&mut delete_batch, metadata);
                 // Note: We don't delete the versioned data (v:*) here
                 // That would require a separate GC pass to avoid breaking
                 // any in-flight queries
-                removed.push(metadata);
             }
         }
-        // Remove from the id mappings only what names a removed snapshot
-        // (spec P1.1b). This removed every removed snapshot's transaction-id
-        // mapping unconditionally, but an id can name several snapshots
-        // (`register_snapshot_with_lsn` takes the WAL LSN, and commits with
-        // nothing logged between them share one): GC dropped the id of a
-        // surviving snapshot, `AS OF TRANSACTION` stopped resolving it, and a
-        // restart — which maps every id a surviving record carries — disagreed
-        // with the running process.
-        self.unmap_forgotten_snapshots(&snapshots, &removed);
-
-        self.evict_from_memory(&mut snapshots, &to_evict)?;
 
         // A manager that writes its own records (not a physical image's, which
         // change only through replication) deletes those of evicted snapshots
@@ -3160,7 +3232,7 @@ impl SnapshotManager {
             && self.evicted.any.load(Ordering::Acquire)
         {
             let budget = self.gc_config.max_snapshots.clamp(1, 1000).saturating_mul(2);
-            self.sweep_expired_records(&snapshots, &mut delete_batch, expired, budget)?
+            self.sweep_expired_records(&mut delete_batch, expired, budget)?
         } else {
             false
         };
@@ -3184,25 +3256,37 @@ impl SnapshotManager {
         Ok(count)
     }
 
-    /// The oldest gc-eligible snapshots past `max_snapshots`, not counting the
-    /// ones in `leaving` (on their way out already).
-    fn oldest_beyond_limit(&self, snapshots: &HashMap<u64, SnapshotMetadata>, leaving: &[u64]) -> Vec<u64> {
-        let excess = snapshots
-            .len()
-            .saturating_sub(leaving.len())
-            .saturating_sub(self.gc_config.max_snapshots);
-        if excess == 0 {
-            return Vec::new();
+    /// Let the oldest gc-eligible snapshots past `max_snapshots` go from memory
+    /// ([`Self::evict_from_memory`]), as many as the registry is over its limit
+    /// when this starts, a step at a time. Returns how many went. The caller
+    /// holds `gc_pass`: two of these at once would each take the excess.
+    fn evict_beyond_limit(&self) -> Result<usize> {
+        let mut excess = None;
+        let mut from = 0;
+        let mut evicted = 0;
+        loop {
+            let mut registry = self.registry.write();
+            let excess =
+                *excess.get_or_insert_with(|| registry.snapshots.len().saturating_sub(self.gc_config.max_snapshots));
+            let mut step = Vec::new();
+            let mut next = None;
+            for (visited, (ts, metadata)) in registry.snapshots.range(from..).enumerate() {
+                if visited == GC_STEP || evicted + step.len() == excess {
+                    next = Some(*ts);
+                    break;
+                }
+                if metadata.gc_eligible {
+                    step.push(*ts);
+                }
+            }
+            self.evict_from_memory(&mut registry, &step)?;
+            drop(registry);
+            evicted += step.len();
+            match next {
+                Some(ts) if evicted < excess => from = ts,
+                _ => return Ok(evicted),
+            }
         }
-        let leaving: HashSet<u64> = leaving.iter().copied().collect();
-        let mut eligible: Vec<u64> = snapshots
-            .values()
-            .filter(|metadata| metadata.gc_eligible && !leaving.contains(&metadata.timestamp))
-            .map(|metadata| metadata.timestamp)
-            .collect();
-        eligible.sort_unstable();
-        eligible.truncate(excess);
-        eligible
     }
 
     /// Let the snapshots at `evict` go from the in-memory maps while their
@@ -3211,26 +3295,27 @@ impl SnapshotManager {
     /// writes no record as it registers a snapshot, so it writes these now.
     /// The watermarks move before any entry goes: a lookup that misses an
     /// entry must see them.
-    fn evict_from_memory(&self, snapshots: &mut HashMap<u64, SnapshotMetadata>, evict: &[u64]) -> Result<()> {
+    fn evict_from_memory(&self, registry: &mut SnapshotRegistry, evict: &[u64]) -> Result<()> {
         if evict.is_empty() {
             return Ok(());
         }
         if self.non_durable_writes && !self.persist_metadata {
             let mut batch = WriteBatch::default();
-            for metadata in evict.iter().filter_map(|ts| snapshots.get(ts)) {
+            for metadata in evict.iter().filter_map(|ts| registry.snapshots.get(ts)) {
                 Self::put_snapshot_record(&mut batch, metadata)?;
             }
             self.write_batch(batch, "Failed to keep the records of evicted snapshots")?;
         }
-        for metadata in evict.iter().filter_map(|ts| snapshots.get(ts)) {
+        for metadata in evict.iter().filter_map(|ts| registry.snapshots.get(ts)) {
             self.note_evicted(metadata);
         }
-        let evicted: Vec<SnapshotMetadata> = evict.iter().filter_map(|ts| snapshots.remove(ts)).collect();
-        // The id maps follow the rule removal follows: an id that named an
-        // evicted snapshot moves to its newest one still in memory. A lookup
-        // checks that against the watermarks and walks the records when an
-        // evicted snapshot may be newer (`resolve_transaction`).
-        self.unmap_forgotten_snapshots(snapshots, &evicted);
+        // An id that named an evicted snapshot now names its newest one still
+        // in memory (`SnapshotRegistry::newest_of_transaction`). A lookup checks
+        // that against the watermarks and walks the records when an evicted
+        // snapshot may be newer (`resolve_transaction`).
+        for ts in evict {
+            registry.snapshots.remove(ts);
+        }
         Ok(())
     }
 
@@ -3260,9 +3345,12 @@ impl SnapshotManager {
     /// starting over past the end of the family, so the cost follows the
     /// registrations that trigger GC and every record is revisited within
     /// about `records / budget` calls. Returns whether it staged a delete.
+    ///
+    /// It runs without the registry's lock and asks the registry about each
+    /// expired record it finds — a handful per call, since the pass over the
+    /// registry has just removed the expired entries it held.
     fn sweep_expired_records(
         &self,
-        in_memory: &HashMap<u64, SnapshotMetadata>,
         batch: &mut WriteBatch,
         expired: impl Fn(&SnapshotMetadata) -> bool,
         budget: usize,
@@ -3287,7 +3375,7 @@ impl SnapshotManager {
             let Some(metadata) = deserialize_snapshot_metadata(&value) else {
                 continue;
             };
-            if in_memory.contains_key(&metadata.timestamp) || !expired(&metadata) {
+            if !expired(&metadata) || self.registry.read().snapshots.contains_key(&metadata.timestamp) {
                 continue;
             }
             batch.delete(&key);
@@ -3308,19 +3396,25 @@ impl SnapshotManager {
         self.gc_config.max_snapshots.saturating_add(slack)
     }
 
-    /// Run GC if needed
-    fn gc_if_needed(&self) -> Result<()> {
-        let snapshot_count = self.snapshots.read().len();
-        if snapshot_count > self.gc_trigger() {
-            // 4.42.0 R1: the registration that crosses the trigger pays for a pass
-            // over the whole map, a sweep of stored records and a write. When that
-            // registration is a bounded write on the async worker, the pass leaves
-            // the worker (`runtime_offload::WorkerWrite`).
-            if crate::runtime_offload::in_worker_write() {
-                crate::runtime_offload::off_worker(|| self.gc_old_snapshots())?;
-            } else {
-                self.gc_old_snapshots()?;
-            }
+    /// Run GC if the registry, which holds `held` snapshots after the
+    /// registration that calls this, has outgrown the trigger and no pass is
+    /// running. A registration that finds one running leaves the registry to
+    /// it: the next one past the trigger starts another.
+    fn gc_if_needed(&self, held: usize) -> Result<()> {
+        if held <= self.gc_trigger() {
+            return Ok(());
+        }
+        let Some(_pass) = self.gc_pass.try_lock() else {
+            return Ok(());
+        };
+        // 4.42.0 R1: the registration that starts a pass pays for a walk of the
+        // registry, a sweep of stored records and a write. When that
+        // registration is a bounded write on the async worker, the pass leaves
+        // the worker (`runtime_offload::WorkerWrite`).
+        if crate::runtime_offload::in_worker_write() {
+            crate::runtime_offload::off_worker(|| self.gc_pass_holding())?;
+        } else {
+            self.gc_pass_holding()?;
         }
         Ok(())
     }
@@ -3329,18 +3423,18 @@ impl SnapshotManager {
     /// the GC trigger, by count alone, and deleting nothing: as a physical
     /// standby ingests the primary's records, which change only through
     /// replication (the primary's GC deletes them).
-    fn trim_memory_if_needed(&self) -> Result<()> {
-        if !self.gc_config.auto_gc_enabled || self.snapshots.read().len() <= self.gc_trigger() {
+    fn trim_memory_if_needed(&self, held: usize) -> Result<()> {
+        if !self.gc_config.auto_gc_enabled || held <= self.gc_trigger() {
             return Ok(());
         }
-        let mut snapshots = self.snapshots.write();
-        let evict = self.oldest_beyond_limit(&snapshots, &[]);
-        self.evict_from_memory(&mut snapshots, &evict)
+        let _pass = self.gc_pass.lock();
+        self.evict_beyond_limit()?;
+        Ok(())
     }
 
     /// Get snapshot metadata
     pub fn get_snapshot_metadata(&self, timestamp: u64) -> Option<SnapshotMetadata> {
-        self.snapshots.read().get(&timestamp).cloned()
+        self.registry.read().snapshots.get(&timestamp).cloned()
     }
 
     /// Has a snapshot newer than `timestamp` been registered?
@@ -3361,7 +3455,7 @@ impl SnapshotManager {
     /// How many snapshots the in-memory map holds: all of them until it lets
     /// some go by count (`has_snapshots_beyond_memory`), the newest after.
     pub fn snapshot_count(&self) -> usize {
-        self.snapshots.read().len()
+        self.registry.read().snapshots.len()
     }
 
     /// List the snapshots the in-memory map holds, oldest first: every one
@@ -3371,8 +3465,8 @@ impl SnapshotManager {
     /// ([`Self::has_snapshots_beyond_memory`]). `AS OF` reaches the older
     /// ones through their records.
     pub fn list_snapshots(&self) -> Result<Vec<SnapshotMetadata>> {
-        let snapshots = self.snapshots.read();
-        let mut result: Vec<_> = snapshots.values().cloned().collect();
+        let registry = self.registry.read();
+        let mut result: Vec<_> = registry.snapshots.values().cloned().collect();
         result.sort_by_key(|s| s.timestamp);
         Ok(result)
     }
@@ -3568,22 +3662,11 @@ impl SnapshotManager {
     /// Publish one recovered or replicated snapshot into the in-memory maps
     /// and advance the SCN / transaction-id counters past it. The publish half
     /// of [`Self::recover_snapshots_with_policy`].
-    fn publish_snapshot_metadata(&self, metadata: SnapshotMetadata) {
-        // Restore in-memory state
-        self.snapshots.write().insert(metadata.timestamp, metadata.clone());
-        self.map_transaction_timestamp(metadata.transaction_id, metadata.timestamp);
-        self.scn_to_timestamp.write().insert(metadata.scn, metadata.timestamp);
+    /// Returns how many snapshots the registry now holds.
+    fn publish_snapshot_metadata(&self, metadata: SnapshotMetadata) -> usize {
+        let held = self.registry.write().publish(metadata.clone());
         self.advance_counters(&metadata);
-    }
-
-    /// Completion order need not equal timestamp order. Reused IDs always name
-    /// their newest snapshot, including before anything has left the memory maps.
-    fn map_transaction_timestamp(&self, id: TransactionId, timestamp: u64) {
-        self.txn_to_timestamp
-            .write()
-            .entry(id)
-            .and_modify(|mapped| *mapped = (*mapped).max(timestamp))
-            .or_insert(timestamp);
+        held
     }
 
     /// Advance the SCN / transaction-id counters and the newest timestamp past
@@ -3609,75 +3692,26 @@ impl SnapshotManager {
         let metadata = Self::decode_snapshot_record(key, value, true)?
             .ok_or_else(|| Error::storage("malformed snapshot metadata"))?;
         let timestamp = metadata.timestamp;
-        self.publish_snapshot_metadata(metadata);
+        let held = self.publish_snapshot_metadata(metadata);
         // The primary keeps every record inside retention; the map keeps the
         // newest, as the primary's does.
-        self.trim_memory_if_needed()?;
+        self.trim_memory_if_needed(held)?;
         Ok(timestamp)
     }
 
     /// Forget the snapshots at `timestamps` after their `snapshot:` records
     /// were deleted on the primary (snapshot GC): the in-memory half of
-    /// [`Self::gc_old_snapshots`], without the write, leaving the maps as a
-    /// fresh recovery of the surviving records builds them. Returns how many
-    /// were known. The id maps follow [`Self::unmap_forgotten_snapshots`], the
-    /// rule GC applies too.
+    /// [`Self::gc_old_snapshots`], without the write, leaving the registry as a
+    /// fresh recovery of the surviving records builds it. Returns how many
+    /// were known. An id a forgotten snapshot carried names the newest survivor
+    /// that carries it, as after GC ([`SnapshotRegistry::newest_of_transaction`]).
     #[cfg_attr(not(feature = "ha-tier1"), allow(dead_code))]
     pub(crate) fn forget_snapshots(&self, timestamps: &[u64]) -> usize {
-        let mut snapshots = self.snapshots.write();
-        let forgotten: Vec<SnapshotMetadata> = timestamps
+        let mut registry = self.registry.write();
+        timestamps
             .iter()
-            .filter_map(|timestamp| snapshots.remove(timestamp))
-            .collect();
-        self.unmap_forgotten_snapshots(&snapshots, &forgotten);
-        forgotten.len()
-    }
-
-    /// The id-map half of forgetting snapshots, shared by GC
-    /// ([`Self::gc_old_snapshots`]) and a physical standby's
-    /// [`Self::forget_snapshots`] (factored out of the latter, spec P1.1b).
-    /// `survivors` is the snapshot map with `forgotten` already removed.
-    ///
-    /// A transaction id can name several snapshots (`register_snapshot_with_lsn`
-    /// takes the WAL LSN, and commits with nothing logged between them share
-    /// one), and recovery maps every id a surviving record still carries. So
-    /// a mapping is removed only when it names a forgotten snapshot, and an id
-    /// left unmapped that way moves to its newest surviving snapshot, the one
-    /// the latest registration under it would have mapped. SCNs are never
-    /// shared, but are held to the same rule.
-    /// The counters stay where they are: they only move forward, and GC runs
-    /// as a snapshot is registered and keeps that one, whose ids are the
-    /// highest and are what recovery derives the counters from. The lock order
-    /// is GC's: the snapshot map (held by the caller), then one id map at a
-    /// time.
-    fn unmap_forgotten_snapshots(&self, survivors: &HashMap<u64, SnapshotMetadata>, forgotten: &[SnapshotMetadata]) {
-        let mut unmapped = HashSet::new();
-        {
-            let mut by_txn = self.txn_to_timestamp.write();
-            for metadata in forgotten {
-                if by_txn.get(&metadata.transaction_id) == Some(&metadata.timestamp) {
-                    by_txn.remove(&metadata.transaction_id);
-                    unmapped.insert(metadata.transaction_id);
-                }
-            }
-        }
-        {
-            let mut by_scn = self.scn_to_timestamp.write();
-            for metadata in forgotten {
-                if by_scn.get(&metadata.scn) == Some(&metadata.timestamp) {
-                    by_scn.remove(&metadata.scn);
-                }
-            }
-        }
-        if !unmapped.is_empty() {
-            let mut by_txn = self.txn_to_timestamp.write();
-            for metadata in survivors.values() {
-                if unmapped.contains(&metadata.transaction_id) {
-                    let mapped = by_txn.entry(metadata.transaction_id).or_insert(metadata.timestamp);
-                    *mapped = (*mapped).max(metadata.timestamp);
-                }
-            }
-        }
+            .filter(|timestamp| registry.snapshots.remove(timestamp).is_some())
+            .count()
     }
 
     /// Load one replicated `vmeta:` COPY marker into the in-memory interval
@@ -4104,8 +4138,14 @@ mod tests {
         let manager = SnapshotManager::with_gc_config(Arc::clone(&db), WriteGate::open(), gc_config());
         manager.register_snapshot_with_lsn(100, 7).unwrap();
         manager.register_snapshot_with_lsn(200, 7).unwrap();
-        manager.snapshots.write().get_mut(&100).unwrap().gc_eligible = false;
-        manager.snapshots.write().get_mut(&200).unwrap().wall_clock_micros = 0;
+        manager.registry.write().snapshots.get_mut(&100).unwrap().gc_eligible = false;
+        manager
+            .registry
+            .write()
+            .snapshots
+            .get_mut(&200)
+            .unwrap()
+            .wall_clock_micros = 0;
         manager.set_gc_low_watermark(201);
         let shared_scn = manager.get_snapshot_metadata(200).unwrap().scn;
         assert_eq!(manager.gc_old_snapshots().unwrap(), 1);
@@ -4206,6 +4246,86 @@ mod tests {
         assert_eq!(recovered.recover_snapshots().unwrap(), 10);
         assert_eq!(recovered.snapshot_count(), 2);
         check(&recovered, "recovered");
+    }
+
+    /// 4.42.0: one GC pass runs at a time, and a registration that crosses the
+    /// trigger while one runs returns without waiting for it. The pass used to
+    /// be taken by every such registration in turn, each behind the registry's
+    /// write lock.
+    #[test]
+    fn a_registration_does_not_wait_for_a_running_gc_pass() {
+        let (db, _temp) = create_test_db();
+        let manager = SnapshotManager::with_gc_config(
+            Arc::clone(&db),
+            WriteGate::open(),
+            GcConfig {
+                min_retention_seconds: 3600,
+                max_snapshots: 2,
+                auto_gc_enabled: true,
+            },
+        );
+        // The trigger is four: `max_snapshots` and as many again.
+        let running = manager.gc_pass.lock();
+        for i in 1..=8u64 {
+            manager.register_snapshot(i * 100).unwrap();
+        }
+        assert_eq!(manager.snapshot_count(), 8, "no second pass started, and none waited");
+        drop(running);
+
+        manager.register_snapshot(900).unwrap();
+        assert_eq!(
+            manager.snapshot_count(),
+            2,
+            "the next registration past the trigger runs one"
+        );
+        assert_eq!(
+            manager.resolve_scn(1).unwrap(),
+            100,
+            "what it evicted is found in the store"
+        );
+        assert_eq!(manager.resolve_scn(9).unwrap(), 900);
+    }
+
+    /// Registrations from several threads with GC passes running among them:
+    /// a pass holds the registry only while entries leave memory, so the others
+    /// publish during its store work. Every snapshot stays resolvable by its
+    /// SCN — from the registry or from its record — and the registry ends at
+    /// its bound.
+    #[test]
+    fn concurrent_registrations_and_gc_passes_lose_no_snapshot() {
+        const THREADS: u64 = 8;
+        const EACH: u64 = 500;
+        let (db, _temp) = create_test_db();
+        let manager = Arc::new(SnapshotManager::with_gc_config(
+            db,
+            WriteGate::open(),
+            GcConfig {
+                min_retention_seconds: 3600,
+                max_snapshots: 8,
+                auto_gc_enabled: true,
+            },
+        ));
+        let writers: Vec<_> = (0..THREADS)
+            .map(|thread| {
+                let manager = Arc::clone(&manager);
+                std::thread::spawn(move || {
+                    (0..EACH)
+                        .map(|i| {
+                            let timestamp = 1 + thread + i * THREADS;
+                            (manager.register_snapshot(timestamp).unwrap().scn, timestamp)
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let registered: Vec<(Scn, u64)> = writers.into_iter().flat_map(|writer| writer.join().unwrap()).collect();
+        assert_eq!(registered.len() as u64, THREADS * EACH);
+
+        manager.gc_old_snapshots().unwrap();
+        assert_eq!(manager.snapshot_count(), 8);
+        for (scn, timestamp) in registered {
+            assert_eq!(manager.resolve_scn(scn).unwrap(), timestamp, "SCN {scn}");
+        }
     }
 
     /// A record lives as long as the history it resolves to: while the
@@ -4509,7 +4629,7 @@ mod tests {
         }
         manager.gc_old_snapshots().unwrap();
         assert!(
-            !manager.txn_to_timestamp.read().contains_key(&42),
+            manager.registry.read().newest_of_transaction(42).is_none(),
             "every occurrence left memory"
         );
         manager.evicted.records_read.store(0, Ordering::Relaxed);
@@ -4600,8 +4720,8 @@ mod tests {
         seed_dated_snapshots(&manager, 10);
         manager.gc_old_snapshots().unwrap();
         assert!(manager.id_index_trusted());
-        assert!(!manager.scn_to_timestamp.read().contains_key(&3));
-        assert!(!manager.txn_to_timestamp.read().contains_key(&3));
+        assert!(manager.registry.read().of_scn(3).is_none());
+        assert!(manager.registry.read().newest_of_transaction(3).is_none());
         assert_eq!(manager.resolve_scn(3).unwrap(), 300);
         for id in [SnapshotId::Scn(3), SnapshotId::Transaction(3)] {
             // Both timestamps and the key shape are valid, but snapshot 400

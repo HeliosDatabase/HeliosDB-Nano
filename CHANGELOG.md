@@ -543,20 +543,71 @@ statements in one simple query included), and any statement while another sessio
 transaction open take the handoff as before. Not covered: memory-only servers, tables with
 dictionary or columnar column storage or a vector index, and a store with a live child branch.
 
-Measured over the wire with `benches/public/wire_pk_ab.sh` (32-core host, local clients, 64,000
-rows, each client on its own rows, median of 4 alternating rounds of 15 s), ops/s:
+Taken alone this is worth +16% / +19% / +29% on a prepared primary-key `UPDATE` at 1 / 16 / 64
+clients, and it brings the 64-client p99 from 13.6 ms to 2.4 ms; the measurements of the release
+as a whole are under "Performance — primary-key writes over the wire" below.
 
-| statement | clients | before | after | change | p99 before | p99 after |
-|---|---:|---:|---:|---:|---:|---:|
-| prepared `UPDATE … WHERE id = $2` | 1 | 8,031 | 9,278 | +16% | 0.15 ms | 0.13 ms |
-| | 16 | 54,812 | 65,187 | +19% | 0.82 ms | 0.81 ms |
-| | 64 | 54,924 | 70,846 | +29% | 13.6 ms | 2.4 ms |
-| text `UPDATE … WHERE id = 7` | 1 | 8,507 | 9,303 | +9% | 0.14 ms | 0.13 ms |
-| | 16 | 56,575 | 66,173 | +17% | 0.81 ms | 0.81 ms |
-| | 64 | 55,757 | 72,410 | +30% | 12.8 ms | 2.2 ms |
+### Changed — a commit publishes its snapshot with one insert; snapshot GC no longer stops writers
 
-For the prepared statement that is what the same server delivers with the handoff switched off
-(9,117 / 66,745 / 73,669).
+Every committed row write registers a time-travel snapshot in memory. That took three global write
+locks (the snapshots, and two maps from transaction id and SCN to snapshot) and a fourth
+acquisition to count them, and once per thousand commits the writer that crossed the limit ran a
+GC pass that held the first lock for about half a millisecond — measured — while every other
+writer queued at its own publication.
+
+- The registry is one ordered map behind one lock, and a publication is one insert.
+- The two id maps are gone. Their only readers were `AS OF TRANSACTION` and `AS OF SCN`, which now
+  walk the registry newest-first, as `AS OF TIMESTAMP` always has; it holds at most
+  `max_snapshots` and its slack (2,000 by default), and older snapshots are found through their
+  records as before. A GC pass no longer has id maps to bring back in line with what it removed.
+- One GC pass runs at a time, a writer that finds one running does not wait for it, and the pass
+  takes the registry's lock for 64 entries at a time and for none of its store work.
+
+No behaviour changes: a snapshot is published before its statement returns, the retention rules
+and what `pg_snapshots`, `pg_transaction_map` and `pg_scn_map` list are the same, and the
+eviction watermarks still move before an entry leaves memory.
+
+On the same build with and without this change (prepared `UPDATE`, median of 6 alternating
+rounds): 16 clients 65,367 → 69,542 ops/s (+6%), p99 0.79 → 0.50 ms; 32 clients +2%, p95 0.80 →
+0.64 ms; 64 clients +1%, p95 1.50 → 1.34 ms. **The far tail above the worker count got slower**:
+p99.9 at 32 clients 5.7 → 7.4 ms and p99 at 64 clients 2.0 → 3.2 ms on a 32-core host that also
+ran the clients (4.9–5.7 ms in the three-server runs below, against 12.9–16.0 ms before this
+release's performance work). The pause this removes was also spacing out writers when there are
+twice as many of them as worker threads; if that regime matters more to you than the median and
+p99 at moderate concurrency, this one commit can be reverted on its own.
+
+### Performance — primary-key writes over the wire, against 4.41.1
+
+4.42.0 is slower than 4.41.1 on single-row primary-key writes, and most of that is deliberate:
+since this release a fast-path `UPDATE` or `DELETE` records the row's history and its snapshot in
+the same write group (four keys where 4.41.1 wrote one), so `AS OF` is correct after it. 4.41.1
+skipped that history on its fast path.
+
+`benches/public/wire_pk_ab.sh` with `examples/wire_pk_bench.rs` (a `tokio-postgres` client; no
+`psql`, `pgbench` or Docker needed), 32-core EPYC 7371, clients on the same host, 64,000 rows,
+each client on its own rows, perf profile, median of 4 alternating rounds of 15 s. "Before" is
+this release without the two performance changes above. Ops/s:
+
+| statement | clients | 4.41.1 | before | 4.42.0 | 4.42.0 / 4.41.1 | p99 before | p99 4.42.0 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| prepared `UPDATE … WHERE id = $2` | 1 | 12,633 | 7,986 | 9,191 | 0.73 | 0.16 ms | 0.13 ms |
+| | 16 | 105,808 | 55,080 | 67,982 | 0.64 | 0.82 ms | 0.52 ms |
+| | 64 | 140,633 | 54,209 | 73,158 | 0.52 | 14.4 ms | 5.3 ms |
+| text `UPDATE … WHERE id = 7` | 1 | 12,438 | 8,052 | 9,154 | 0.74 | 0.15 ms | 0.14 ms |
+| | 16 | 107,181 | 56,621 | 68,243 | 0.64 | 0.81 ms | 0.54 ms |
+| | 64 | 143,561 | 56,022 | 73,759 | 0.51 | 12.3 ms | 4.3 ms |
+
+- **With `[storage] time_travel_enabled = false`** 4.42.0 writes what 4.41.1 wrote and measures
+  0.86 / 0.96 / 0.95 of it at 1 / 16 / 64 clients (11,075 / 99,636 / 130,829 ops/s, 2 rounds). A
+  store that does not use `AS OF`, branches from the past or `VERSIONS BETWEEN` can run that way.
+- **Not improved in this release:** a prepared primary-key `SELECT` at 16 clients measures 0.92 of
+  4.41.1 (111,985 against 121,336 ops/s), and a `DELETE` followed by the `INSERT` of the same row
+  0.42 (17,531 against 41,390 pairs/s): both statements of that pair record history now.
+- 4.41.1's p99 at 16 and 64 clients was 0.30 ms and 1.07 ms.
+
+To reproduce, build two servers and run
+`benches/public/wire_pk_ab.sh out old=/path/to/old/heliosdb-nano new=/path/to/new/heliosdb-nano`;
+the script's header lists its settings.
 
 ### Changed — BREAKING: a branch is a fork, selected per session (sprinter 6bc4a4040eb7, specs B1–B4)
 
