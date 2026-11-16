@@ -18,20 +18,19 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use heliosdb_nano::EmbeddedDatabase;
-use std::net::TcpStream;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
-/// How long to wait for the server to accept connections after spawn.
+/// How long to wait for the server to say it is ready after spawn.
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
+/// What the server prints once its listeners serve the opened database and its
+/// shutdown listener is installed (`start`, step 4 of 4).
+const READY_BANNER: &str = "Server ready!";
 /// How long to wait for the process to exit after being signalled.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
-/// Settle time after the port opens, so the probe connection's task finishes
-/// and releases its `Arc<EmbeddedDatabase>` clone before we signal.
-const SETTLE: Duration = Duration::from_secs(1);
 /// Rows seeded before the server starts.
 const SEEDED_ROWS: i32 = 10;
 
@@ -69,21 +68,30 @@ fn seed_without_snapshot(dir: &Path) {
     db.storage.set_row_counter_flush_on_close(false);
 }
 
-fn wait_until_listening(child: &mut Child, port: u16) {
+/// Wait until the server has printed [`READY_BANNER`] to `stdout_log`.
+///
+/// Not "until the port accepts": since 4.42.0 the PostgreSQL listener is bound
+/// before the database opens, so a connection succeeds while the process is
+/// still starting. A signal sent then is not a shutdown of a running server: it
+/// arrives before the shutdown listener exists and ends the process by the
+/// default action, with no `Drop` (and a probe connection accepted late would
+/// hold its own `Arc<EmbeddedDatabase>` across the signal). On a loaded host
+/// that made this test fail with no snapshot written. The banner comes after
+/// both, and no connection is opened at all.
+fn wait_until_ready(child: &mut Child, stdout_log: &Path) {
     let deadline = Instant::now() + STARTUP_TIMEOUT;
     while Instant::now() < deadline {
         if let Ok(Some(status)) = child.try_wait() {
             panic!("server exited during startup with {status}");
         }
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            thread::sleep(SETTLE);
+        if std::fs::read_to_string(stdout_log).is_ok_and(|log| log.contains(READY_BANNER)) {
             return;
         }
         thread::sleep(Duration::from_millis(100));
     }
     let _ = child.kill();
     let _ = child.wait();
-    panic!("server never listened on port {port}");
+    panic!("server never printed `{READY_BANNER}`");
 }
 
 /// Send `sig` (e.g. `TERM`) the same way the `stop` subcommand does, then wait
@@ -113,6 +121,8 @@ fn signal_and_wait(child: &mut Child, sig: &str) {
 /// Spawn the server on `dir`, wait for it to serve, signal it, wait for exit.
 fn run_server_then_signal(dir: &Path, sig: &str) {
     let port = free_port();
+    let logs = TempDir::new().unwrap();
+    let stdout_log = logs.path().join("stdout.log");
     let mut child = Command::new(env!("CARGO_BIN_EXE_heliosdb-nano"))
         .arg("start")
         .arg("--data-dir")
@@ -123,12 +133,12 @@ fn run_server_then_signal(dir: &Path, sig: &str) {
         // `Arc<EmbeddedDatabase>` clone, which would keep the database alive
         // past the shutdown path and defeat the very Drop under test.
         .args(["--http-port", "0"])
-        .stdout(Stdio::null())
+        .stdout(std::fs::File::create(&stdout_log).unwrap())
         .stderr(Stdio::null())
         .spawn()
         .expect("the heliosdb-nano binary must be runnable");
 
-    wait_until_listening(&mut child, port);
+    wait_until_ready(&mut child, &stdout_log);
     signal_and_wait(&mut child, sig);
 }
 
