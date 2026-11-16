@@ -160,6 +160,16 @@ CI still only compiles it (`feature-gated-compile`); executing it remains a loca
 cargo test --features internal-tests --tests --no-fail-fast -- --skip lock_management
 ```
 
+Four targets are gated on `vector-persist` as well (`persistent_mv_atomicity`,
+`vector_create_cleanup`, `vector_create_retry`, `vector_row_overlay_recovery`) and report
+`0 passed` under the command above. They run with both features, locally and in the
+`internal-tests-execute` CI job (first executed in a gate on 2026-11-16: 22 passed / 0 failed):
+
+```bash
+cargo test --features "internal-tests vector-persist" --no-fail-fast \
+  $(grep -lE '^#!\[cfg\(.*vector-persist' tests/*.rs | sed 's|^tests/|--test |; s|\.rs$||')
+```
+
 **History, kept because it is the point of §3b:** as of 2026-08-17 this suite had never run
 in any gate and did not even build — `cargo build --features internal-tests --tests` failed
 with `E0063` missing-field errors in struct literals whose structs gained fields in 2026-02

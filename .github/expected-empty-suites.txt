@@ -1,6 +1,6 @@
 # Integration-test targets that legitimately execute ZERO tests under the default
 # `cargo test --tests` command, because their contents are behind a non-default
-# cargo feature (`code-graph`, `mcp-endpoint`, `graph-rag`, `internal-tests`).
+# cargo feature (`code-graph`, `mcp-endpoint`, `graph-rag`, `internal-tests`, `vector-persist`).
 #
 # WHY THIS FILE EXISTS. `docs/GATES.md` §3b makes "a suite reporting
 # `ok. 0 passed; 0 failed; 0 ignored` ran nothing" a gate FAILURE. That rule is right for a
@@ -23,8 +23,10 @@ branch_merge_conflict_tests
 branch_sql_integration_tests
 code_graph_ast_index
 code_graph_body_vec
+code_graph_branch_bootstrap
 code_graph_extractor_registry
 code_graph_grammar_registry
+code_graph_grouped_in_diagnostic
 code_graph_list_languages
 code_graph_local_embedder
 code_graph_mvp
@@ -37,7 +39,12 @@ code_graph_rename_apply
 code_graph_semantic_hash_ddl
 code_graph_sql
 code_graph_temporal
+code_graph_transaction_ownership
+commit_outcome_boundaries
+ddl_uncertain_publication
 delta_tracking_integration_test
+direct_row_native_outcomes
+direct_write_atomicity
 encryption_tests
 graph_rag_docling
 graph_rag_ingest
@@ -58,12 +65,24 @@ mcp_progress
 mcp_progress_http
 mv_auto_refresh_integration_test
 mv_incremental_test
+mv_uncertain_publication
 network_protocol_test
+persistent_mv_atomicity
 phase3_comprehensive_integration
+physical_snapshot_resume
 protocol_integration_test
 repl_tenant_commands
+routine_native_outcomes
 semantic_merkle
+sequence_cold_loader
+sequence_ddl_outcomes
+sequence_inflight_owner
+sequence_refill_funnel
+sequence_setval_outcomes
 time_travel_integration_tests
 time_travel_optimization_tests
 time_travel_system_views_tests
+vector_create_cleanup
+vector_create_retry
+vector_row_overlay_recovery
 with_context

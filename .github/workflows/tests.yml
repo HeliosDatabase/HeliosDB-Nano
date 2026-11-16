@@ -299,9 +299,21 @@ jobs:
             echo "::error::expected at least 15 internal-tests targets, found $n"
             exit 1
           fi
-          args=$(echo "$targets" | awk '{printf "--test %s ", $0}')
+          # A target whose gate ALSO names `vector-persist` is empty under
+          # `internal-tests` alone, and the strict check below would (rightly) fail
+          # on it. Run those with both features, into the same log, so they execute
+          # here instead of nowhere.
+          both=$(grep -lE '^#!\[cfg\(.*vector-persist' tests/*.rs \
+                 | sed 's|^tests/||; s|\.rs$||' | sort || true)
+          only=$(comm -23 <(echo "$targets") <(echo "$both"))
+          args=$(echo "$only" | awk 'NF {printf "--test %s ", $0}')
           cargo test --locked --no-fail-fast --features internal-tests $args -- \
             --skip lock_management 2>&1 | tee internal.log
+          if [ -n "$both" ]; then
+            args=$(echo "$both" | awk 'NF {printf "--test %s ", $0}')
+            cargo test --locked --no-fail-fast --features "internal-tests vector-persist" $args -- \
+              --skip lock_management 2>&1 | tee -a internal.log
+          fi
       # The STRICT check from the smoke tier, not the shard tier's allowlist. Every
       # target above is gated on the feature this job turns ON, so each one is
       # supposed to run tests here; `.github/expected-empty-suites.txt` lists them
