@@ -391,11 +391,22 @@ impl Drop for LayoutChange {
         if !self.is_empty() {
             let _ = STATE.try_with(|state| {
                 let mut state = state.borrow_mut();
-                for slot in self.all_slots() {
+                for slot in &self.slots {
                     if let Some(at) = state.own.iter().position(|own| Arc::ptr_eq(own, slot)) {
                         state.own.swap_remove(at);
                     }
                     state.rerecord(slot);
+                }
+                for slot in self
+                    .branches
+                    .iter()
+                    .map(|(_, slot)| slot)
+                    .chain(self.branch_wide.iter())
+                {
+                    if let Some(at) = state.own.iter().position(|own| Arc::ptr_eq(own, slot)) {
+                        state.own.swap_remove(at);
+                    }
+                    state.rerecord_branch(slot);
                 }
             });
         }
@@ -703,6 +714,10 @@ impl Recorded {
         }
     }
 
+    fn knows(&self, slot: &Arc<EpochSlot>) -> bool {
+        self.entries.iter().any(|(known, _)| Arc::ptr_eq(known, slot))
+    }
+
     fn rerecord(&mut self, slot: &Arc<EpochSlot>) {
         let value = slot.load();
         match self.entries.iter_mut().find(|(known, _)| Arc::ptr_eq(known, slot)) {
@@ -738,11 +753,17 @@ struct State {
     collectors: Vec<Recorded>,
     /// Slots of the changes this thread has in flight (one entry per change).
     own: Vec<Arc<EpochSlot>>,
+    /// Slots the statement looked up while its own change of them was in flight:
+    /// not recorded then ([`Self::record`]), so the end of the change records them.
+    looked_up_in_flight: Vec<Arc<EpochSlot>>,
 }
 
 impl State {
     fn record(&mut self, slot: &Arc<EpochSlot>, value: u64) {
         if self.own.iter().any(|own| Arc::ptr_eq(own, slot)) {
+            if !self.looked_up_in_flight.iter().any(|known| Arc::ptr_eq(known, slot)) {
+                self.looked_up_in_flight.push(Arc::clone(slot));
+            }
             return;
         }
         if self.depth > 0 && !self.statement.record(slot, value) && self.moved.is_none() {
@@ -759,6 +780,7 @@ impl State {
             // records the result.
             return;
         }
+        self.forget_lookup_in_flight(slot);
         if self.depth > 0 {
             self.statement.rerecord(slot);
         }
@@ -767,8 +789,47 @@ impl State {
         }
     }
 
+    /// [`Self::rerecord`] for a branch level's slot (or the branch catalog's), whose
+    /// change may be bookkeeping this thread did for another branch: a main statement
+    /// that changes a table freezes the definition a branch forked from, and a merge
+    /// or drop of that branch may retire the frozen copy at any time. The result is
+    /// recorded only where the slot was already a dependency (recorded before the
+    /// change, or looked up while it was in flight), so a write alone never makes a
+    /// statement depend on a branch it did not read ([`note_branch_table`]).
+    fn rerecord_branch(&mut self, slot: &Arc<EpochSlot>) {
+        if self.own.iter().any(|own| Arc::ptr_eq(own, slot)) {
+            return;
+        }
+        let looked_up = self.forget_lookup_in_flight(slot);
+        if self.depth > 0 && (looked_up || self.statement.knows(slot)) {
+            self.statement.rerecord(slot);
+        }
+        for collector in &mut self.collectors {
+            if looked_up || collector.knows(slot) {
+                collector.rerecord(slot);
+            }
+        }
+    }
+
+    /// Whether `slot` was looked up while this thread's change of it was in flight;
+    /// forgotten with the answer.
+    fn forget_lookup_in_flight(&mut self, slot: &Arc<EpochSlot>) -> bool {
+        match self
+            .looked_up_in_flight
+            .iter()
+            .position(|known| Arc::ptr_eq(known, slot))
+        {
+            Some(at) => {
+                self.looked_up_in_flight.swap_remove(at);
+                true
+            }
+            None => false,
+        }
+    }
+
     fn reset_statement(&mut self) {
         self.statement.entries.clear();
+        self.looked_up_in_flight.clear();
         self.moved = None;
         self.no_retry = None;
         self.durable = false;
@@ -1342,6 +1403,51 @@ mod tests {
         drop(change);
         note_table(&epochs, "t");
         assert!(scope.finish().is_ok(), "decision 2(e)");
+    }
+
+    /// A main statement that only WRITES a branch level's record (the frozen copy of
+    /// the definition a branch forked from) does not come to depend on that branch:
+    /// a merge or drop retiring the copy afterwards is no layout change of the
+    /// statement's (tests/branch_schema_isolation.rs, B10).
+    #[test]
+    fn a_branch_record_a_statement_only_wrote_is_not_its_dependency() {
+        let epochs = Arc::new(LayoutEpochs::new());
+        let scope = StatementScope::enter();
+        note_table(&epochs, "t");
+        drop(epochs.begin_scoped_change(std::iter::empty(), [(7, "t")], true));
+        let retire = {
+            let epochs = Arc::clone(&epochs);
+            std::thread::spawn(move || drop(epochs.begin_scoped_change(std::iter::empty(), [(7, "t")], true)))
+        };
+        retire.join().unwrap();
+        assert!(at_durable_effect().is_ok(), "another thread retired the branch's copy");
+        assert!(scope.finish().is_ok());
+    }
+
+    /// The branch record is a dependency once the statement read it: before its own
+    /// change of it, or while that change was in flight.
+    #[test]
+    fn a_branch_record_a_statement_read_stays_its_dependency_across_its_own_change() {
+        for read_in_flight in [false, true] {
+            let epochs = Arc::new(LayoutEpochs::new());
+            let scope = StatementScope::enter();
+            if !read_in_flight {
+                note_branch_table(&epochs, 7, "t");
+            }
+            let change = epochs.begin_scoped_change(std::iter::empty(), [(7, "t")], false);
+            if read_in_flight {
+                note_branch_table(&epochs, 7, "t");
+            }
+            drop(change);
+            assert!(scope.finish().is_ok(), "its own change is not a move");
+            let other = {
+                let epochs = Arc::clone(&epochs);
+                std::thread::spawn(move || drop(epochs.begin_scoped_change(std::iter::empty(), [(7, "t")], false)))
+            };
+            other.join().unwrap();
+            let error = scope.finish().unwrap_err();
+            assert!(is_layout_changed(&error), "read_in_flight={read_in_flight}: {error}");
+        }
     }
 
     #[test]
