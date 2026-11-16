@@ -812,9 +812,13 @@ fn set_schema_from_schema_into_pg_catalog_is_bare() -> Result<()> {
 /// PK-index agree on the qualified key `fkpart9.pk`, but `SET CONSTRAINTS` was a
 /// complete no-op, so the check ran IMMEDIATELY against the still-empty parent
 /// and the valid "insert child, then parent, then COMMIT" sequence failed.
-/// Mirrors the foreign_key corpus 968-984 (fkpart9). The auto-generated FK name
-/// is `fk_fk_a__pk`, so the corpus's `SET CONSTRAINTS fk_a_fkey DEFERRED` is
-/// honored as ALL.
+/// Mirrors the foreign_key corpus 968-984 (fkpart9), with `SET CONSTRAINTS ALL`.
+///
+/// Since 4.42.0 a named `SET CONSTRAINTS` is supported under the default `public`
+/// search path only, and a name that identifies no foreign key is refused instead
+/// of being honored as ALL (the corpus's `fk_a_fkey` is not this table's
+/// auto-generated name). Under `search_path = fkpart9` the named form is
+/// therefore refused, and it must not defer anything.
 #[test]
 fn set_constraints_defers_fk_on_partitioned_qualified_parent() -> Result<()> {
     let db = EmbeddedDatabase::new_in_memory()?;
@@ -832,10 +836,23 @@ fn set_constraints_defers_fk_on_partitioned_qualified_parent() -> Result<()> {
         "immediate FK must reject a reference to the empty parent"
     );
 
+    // The named form is refused under a non-public search path, and the refusal
+    // fails the transaction: nothing was deferred behind the caller's back.
+    db.execute("BEGIN")?;
+    let refused = db
+        .execute("SET CONSTRAINTS fk_a_fkey DEFERRED")
+        .expect_err("a named SET CONSTRAINTS outside the public search path is refused");
+    assert!(
+        refused.to_string().contains("default public search_path only"),
+        "{refused}"
+    );
+    db.execute("ROLLBACK")?;
+    assert_eq!(one_i64(&db, "SELECT count(*) FROM fkpart9.fk"), 0);
+
     // Deferred, parent STILL empty at COMMIT: the deferred check fires at COMMIT
     // and rejects; the failed COMMIT rolls back cleanly (so BEGIN below works).
     db.execute("BEGIN")?;
-    db.execute("SET CONSTRAINTS fk_a_fkey DEFERRED")?;
+    db.execute("SET CONSTRAINTS ALL DEFERRED")?;
     db.execute("INSERT INTO fk VALUES (1)")?; // deferred — accepted for now
     assert!(
         db.execute("COMMIT").is_err(),
@@ -846,7 +863,7 @@ fn set_constraints_defers_fk_on_partitioned_qualified_parent() -> Result<()> {
 
     // Deferred, parent gains the row LATER in the same txn (the classic case).
     db.execute("BEGIN")?;
-    db.execute("SET CONSTRAINTS fk_a_fkey DEFERRED")?;
+    db.execute("SET CONSTRAINTS ALL DEFERRED")?;
     db.execute("INSERT INTO fk VALUES (1)")?; // child first
     db.execute("INSERT INTO fkpart9.pk VALUES (1)")?; // parent gains a=1 (lands in the parent)
     db.execute("COMMIT")?; // deferred check finds fkpart9.pk(a)=1
