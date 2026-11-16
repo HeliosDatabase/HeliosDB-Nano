@@ -1152,61 +1152,31 @@ fn positive_control_unclashed_unique_spellings_survive_a_reopen() {
 // 6. Crash recovery — a durable user index wins over a WAL-replayed mint
 // ===========================================================================
 
-/// The pass-1 guarantee of `Catalog::rebuild_all_indexes` — every durable
-/// `meta:index:` name is registered BEFORE any constraint key is minted — only
-/// covers the mints the rebuild itself makes. On the crash-recovery open,
-/// `StorageEngine::open` runs `recover_wal_at_open` FIRST: a post-checkpoint
-/// `CreateTable` entry whose `meta:table:` record never landed
-/// (`log_create_table` appends the entry separately from the schema put, so a
-/// crash between the two leaves exactly that) is replayed through
-/// `Catalog::create_table`, which mints the table's column-flag key into the
-/// still-empty registry. `CREATE UNIQUE INDEX acct_role_name_key ON z (x)`
-/// (durable, checkpointed) then finds its own name taken when pass 1 reaches
-/// it, `IndexAlreadyExists` is only warned, and the user's index enforces
-/// NOTHING for the life of the process.
+/// A table created by replaying logical history must not take a durable user
+/// index's name away from it.
 ///
-/// The window is modelled the way tests/wal_replay_upgrade_tests.rs models
-/// crash recovery: the store is closed, the `CreateTable` entry is appended
-/// through the ordinary `WriteAheadLog` API against the raw RocksDB handle,
-/// `meta:table:acct_role` is deliberately NOT written, and the checkpoint is
-/// planted just below the entry so it is unambiguously post-checkpoint.
+/// `CreateTable acct_role (name UNIQUE)` derives the constraint index name
+/// `acct_role_name_key`, which a user index on another table (`z.x`) already
+/// owns. When the entry was re-executed, the mint used to claim the name and the
+/// user's index enforced NOTHING for the life of the process.
 ///
-/// Asserted on DATA, on the crash-recovery open AND on one more clean reopen
-/// (the fix must converge, not merely survive one open):
+/// Until 4.42.0 this was reached at open: startup re-executed a `CreateTable`
+/// entry retained above the checkpoint, and this test planted one on a closed
+/// store. Startup now adopts the committed store and never redoes the logical
+/// WAL (spec R5.7; tests/gh_issue_35.rs pins that), so the replay is the explicit
+/// one a caller asks for (`StorageEngine::replay_wal_after`): the entry is
+/// recorded as history on the open store (`log_create_table` writes no catalog
+/// record), then replayed.
+///
+/// Asserted on DATA, after the replay AND on one more clean reopen (the outcome
+/// must be durable, not a property of the replaying process):
 ///   - `acct_role` exists (the replay ran — control),
 ///   - a duplicate `x` on `z` is REJECTED (the defect),
-///   - a duplicate `name` on `acct_role` is REJECTED (the constraint is still
-///     enforced by exactly one tree after the mint is evicted and re-minted).
+///   - a duplicate `name` on `acct_role` is REJECTED (the constraint is enforced
+///     by exactly one tree).
 #[test]
-fn durable_user_index_wins_over_a_wal_replayed_mint_on_crash_recovery() {
-    use heliosdb_nano::storage::{WalOperation, WalSyncMode, WriteAheadLog};
+fn durable_user_index_wins_over_an_explicitly_replayed_mint() {
     use heliosdb_nano::{Column, DataType, Schema};
-    use std::sync::Arc;
-
-    /// `WriteAheadLog::CHECKPOINT_KEY`, restated so the test fails loudly if
-    /// the on-disk name ever changes without this test being revisited.
-    const CHECKPOINT_KEY: &[u8] = b"wal:checkpoint";
-
-    /// Raw RocksDB handle on a CLOSED store — the same 5-byte fixed prefix
-    /// extractor `StorageEngine::open` configures, retried because the
-    /// previous handle's background threads release the directory lock
-    /// asynchronously.
-    fn open_raw(dir: &std::path::Path) -> Arc<rocksdb::DB> {
-        let mut opts = rocksdb::Options::default();
-        opts.create_if_missing(false);
-        opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(5));
-        let mut last_err = None;
-        for _ in 0..100 {
-            match rocksdb::DB::open(&opts, dir) {
-                Ok(db) => return Arc::new(db),
-                Err(e) => {
-                    last_err = Some(e);
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                }
-            }
-        }
-        panic!("raw RocksDB open failed: {:?}", last_err);
-    }
 
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().to_str().expect("utf-8 path").to_string();
@@ -1219,81 +1189,49 @@ fn durable_user_index_wins_over_a_wal_replayed_mint_on_crash_recovery() {
         db.execute("CREATE UNIQUE INDEX acct_role_name_key ON z (x)")
             .expect("the user index");
         db.execute("INSERT INTO z (id, x) VALUES (1, 1)").expect("seed row");
-        // Control: the index enforces BEFORE the crash, so a pass after the
-        // reopen can only be the rebuild's doing.
+        // Control: the index enforces BEFORE the replay, so a pass after it can
+        // only be the name resolution's doing.
         expect_duplicate(
             &db,
             "INSERT INTO z (id, x) VALUES (2, 1)",
             false,
-            "z.x before the crash",
+            "z.x before the replay",
         );
         assert_eq!(rows_in(&db, "z"), 1);
     }
 
-    // (2) The crash window: the `CreateTable acct_role` entry is durable, its
-    //     `meta:table:` record is not, and the checkpoint sits just below it.
-    let planted_lsn = {
-        let raw = open_raw(dir.path());
-        let wal = WriteAheadLog::open(
-            Arc::clone(&raw),
-            heliosdb_nano::storage::WriteGate::open(),
-            WalSyncMode::Sync,
-        )
-        .expect("open wal");
-        let schema = Schema::new(vec![
-            Column::new("id", DataType::Int4).primary_key(),
-            Column::new("name", DataType::Int4).unique(),
-        ]);
-        let lsn = wal
-            .append(WalOperation::CreateTable {
-                table: "acct_role".to_string(),
-                schema: bincode::serialize(&schema).expect("bincode schema"),
-            })
-            .expect("append CreateTable");
-
-        // VACUITY GUARDS: the store must be in exactly the state this window
-        // is about, else the reopen below proves nothing.
-        assert!(
-            raw.get(b"meta:table:acct_role").expect("read").is_none(),
-            "vacuity: `meta:table:acct_role` must be ABSENT, or the replay skips the entry"
-        );
-        assert!(
-            raw.get(b"meta:table:z").expect("read").is_some(),
-            "vacuity: `z` must be durable before the reopen"
-        );
-        assert!(
-            raw.get(b"meta:index:acct_role_name_key").expect("read").is_some(),
-            "vacuity: the user index must have a durable `meta:index:` record"
-        );
-        let highest = wal
-            .replay()
-            .expect("read the retained log")
-            .iter()
-            .map(|e| e.lsn)
-            .max()
-            .expect("non-empty log");
-        assert_eq!(
-            highest, lsn,
-            "vacuity: the planted entry must be the highest retained LSN"
-        );
-
-        // Everything strictly before the entry is checkpointed; the entry is not.
-        raw.put(CHECKPOINT_KEY, (lsn - 1).to_le_bytes())
-            .expect("plant checkpoint");
-        lsn
-    };
-    assert!(planted_lsn > 0);
-
-    // (3) The open under test, then ONE MORE clean reopen — the same three
-    //     facts must hold on both.
     for round in 1..=2u32 {
-        let db = EmbeddedDatabase::new(&path).unwrap_or_else(|e| panic!("reopen #{round}: {e}"));
+        let db = EmbeddedDatabase::new(&path).unwrap_or_else(|e| panic!("open #{round}: {e}"));
         let ctx = |what: &str| format!("open #{round}: {what}");
 
-        // Control: the replay ran and created the table.
+        if round == 1 {
+            // (2) The entry as history only, then its explicit replay.
+            let schema = Schema::new(vec![
+                Column::new("id", DataType::Int4).primary_key(),
+                Column::new("name", DataType::Int4).unique(),
+            ]);
+            let after = db.storage.wal_lsn().expect("the store has a logical WAL");
+            db.storage
+                .log_create_table("acct_role", &schema)
+                .expect("record CreateTable as history");
+            assert_eq!(
+                db.storage.wal_lsn(),
+                Some(after + 1),
+                "vacuity: exactly the planted entry is retained after `after`"
+            );
+            assert!(
+                db.query("SELECT * FROM acct_role", &[]).is_err(),
+                "vacuity: recording history must not create the table"
+            );
+            db.storage
+                .replay_wal_after(after)
+                .expect("explicit replay of the planted CreateTable");
+        }
+
+        // Control: the replay ran and created the table (durably, on round 2).
         db.query("SELECT * FROM acct_role", &[]).unwrap_or_else(|e| {
             panic!(
-                "{}: the WAL-replayed CreateTable did not create the table: {e}",
+                "{}: the replayed CreateTable did not create the table: {e}",
                 ctx("control")
             )
         });
@@ -1319,8 +1257,8 @@ fn durable_user_index_wins_over_a_wal_replayed_mint_on_crash_recovery() {
             &ctx("a distinct x on z"),
         );
 
-        // Control: the replayed table's own UNIQUE is enforced too — by the
-        // re-minted tree, not by nothing and not twice.
+        // Control: the replayed table's own UNIQUE is enforced too — by one
+        // tree, not by nothing and not twice.
         let seed = i64::from(round) * 10;
         expect_accepted(
             &db,
