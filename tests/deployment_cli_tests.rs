@@ -14,8 +14,16 @@ use std::{
 
 const START_TIMEOUT: Duration = Duration::from_secs(15);
 
+#[path = "support/ports.rs"]
+mod ports;
+
+/// A listener occupying a private port. The port number itself stays reserved
+/// for the life of the test process (`support/ports.rs`), so once the listener
+/// is dropped only the daemon the test starts next can bind it: a port bound
+/// and released at once could be handed to any other `bind(…:0)` on the host
+/// before the daemon reached its own bind ("Address already in use").
 fn reserve(ip: &str) -> TcpListener {
-    TcpListener::bind(format!("{ip}:0")).expect("reserve private port")
+    TcpListener::bind((ip, ports::free_port())).expect("occupy the reserved private port")
 }
 
 struct Server {
