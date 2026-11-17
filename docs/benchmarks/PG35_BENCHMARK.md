@@ -18,7 +18,16 @@ the per-category history lives in
 > not a measurement artifact. With that fixed it is a decisive Nano win (~157×).
 > See *The category that found a real bug* below.
 
-## Latest run — v3.60.3 (2026-06-26)
+## Current release — v4.42.0 (2026-11-17)
+
+The run of the current release, beside 4.41.1 and with every binary identified, is in
+[`RELEASE_4_42_0.md`](RELEASE_4_42_0.md). With the strict harness (every result checked, exactly
+300 timed iterations) **Nano is faster than PostgreSQL 18.4 in 34 of the 35 categories and slower
+in one, the 4-table join** (0.5x; 0.8x for 4.41.1 in the same run). Several write and schema
+categories are slower than in 4.41.1; that page lists them with their causes. The v3.60.3 table
+below is kept as history and is not the current release's result.
+
+## Earlier run — v3.60.3 (2026-06-26)
 
 **300 iterations/category**, against PostgreSQL 18.4. **Scoreboard: Nano 35 ·
 PG 0 · ties 0.** (300 iterations to damp the shared-host noise on the near-parity

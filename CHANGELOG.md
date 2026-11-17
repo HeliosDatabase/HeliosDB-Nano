@@ -319,6 +319,14 @@ Known limits:
   multi-row statement partly applied around its commit: some of its rows changed, others not
   yet. It never sees uncommitted rows, and a full scan sees the statement whole. With one writer
   changing 400 rows per `UPDATE` in a loop, about a third of such reads saw a partial statement.
+- A correlated subquery on the table of its own outer query returns the whole-table result for
+  every row when the inner table has an alias and the outer row is named by the table's name:
+  `SELECT id, (SELECT COUNT(*) FROM acct AS a WHERE a.grp = acct.grp) FROM acct` counts all of
+  `acct` on each row. It is the same in 4.41.1 and applies to `UPDATE … SET col = (…)` too. Give
+  the outer table the alias instead (`FROM acct AS o … WHERE a.grp = o.grp`) in a `SELECT`; for an
+  `UPDATE`, check the result. No error is raised.
+- An in-memory database pauses a writer for about 5 ms once per 1,000 commits, when it writes the
+  records of the snapshots it evicts from memory.
 - Statement atomicity does not make DDL transactional across `BEGIN` / `ROLLBACK`: a completed
   schema statement can survive rollback of the block's DML. Take a backup or branch before a
   destructive migration. The lower-level raw KV/index APIs retain their caller-owned index and
@@ -624,8 +632,9 @@ p99 at moderate concurrency, this one commit can be reverted on its own.
 
 ### Performance — three regressions against 4.41.1 found by the pgbench and pg35 gates
 
-Each was measured as an A/B against 4.41.1 on the release candidate, then fixed; the numbers of the
-final build are in `docs/benchmarks/RELEASE_4_42_0.md`.
+Each was measured as an A/B against 4.41.1 on the release candidate, then fixed. The release build
+was measured again after the fixes; all its numbers, and what is still slower than 4.41.1, are in
+`docs/benchmarks/RELEASE_4_42_0.md`.
 
 - **A point read through a secondary index stays on the async worker.** This release moves every
   statement off the worker that serves its connection, so that a long statement cannot stall the
@@ -636,14 +645,19 @@ final build are in `docs/benchmarks/RELEASE_4_42_0.md`.
   index entry it fetches names at most eight rows; a value with more rows under it leaves the
   worker as before. Same servers before and after (pgbench, perf profile, 6 s per cell): simple
   protocol 8,714 → 11,848 / 85,585 → 122,016 / 90,270 → 156,756 tps at 1 / 16 / 64 clients;
-  prepared 8,513 → 13,113 / 81,768 → 123,223 / 89,499 → 161,989.
+  prepared 8,513 → 13,113 / 81,768 → 123,223 / 89,499 → 161,989. Release build against 4.41.1 in
+  the pgbench gate: 0.91–0.98 as text, 0.90–0.92 extended and 0.85–0.88 prepared, where it was
+  0.49–0.71, 0.66–0.77 and 0.43–0.67. The rest of the gap is not traced.
 - **`UPDATE … SET col = (SELECT …)` reads through an index again.** The subquery now runs in the
   statement's own transaction, so that it sees the rows the statement has already written. That
   transaction was treated like an explicit one, whose reads come from its snapshot, and every such
   subquery became a full scan: pg35's `UPDATE+subquery` took 4.72 ms against 139 µs in 4.41.1
   (34x). An autocommit statement's transaction took its snapshot when the statement began, so a
   table the statement has not written is read through its indexes; a table it has written still
-  comes from the write set. Embedded probe of the pg35 statement: 5,087 → 197 µs (4.41.1: 150 µs).
+  comes from the write set. Embedded probe of the pg35 statement: 5,087 → 197 µs (4.41.1: 150 µs);
+  release build in pg35: 191 µs against 138 µs (1.38x, from 34x). The same rule serves the `SELECT`
+  of an `INSERT … SELECT`: pg35's statement reads ten rows of another table by primary-key range
+  and takes 196 µs, against 1.16 ms before this fix and 1.41 ms in 4.41.1.
   Also fixed here: an aggregate over a correlated filter in `SET`
   (`SET total = (SELECT COUNT(*) FROM items WHERE items.order_id = orders.order_id)`) was refused
   with "column not found", in 4.41 as well, because the outer reference was not bound below the
@@ -654,15 +668,23 @@ final build are in `docs/benchmarks/RELEASE_4_42_0.md`.
   with the number of earlier drops (pg35 `DROP TABLE` 894 µs against 149 µs, `CREATE TABLE`, which
   drops what it creates, 478 against 166 µs). The walks now end where their prefix ends, like the
   history walks already did. Embedded probe: `DROP TABLE` 977 → 361 µs, `CREATE TABLE` + `DROP`
-  560 → 385 µs. What remains is the dependency discovery this release added to `DROP TABLE`,
-  which reads every table's constraint record three times.
+  560 → 385 µs; release build in pg35: `DROP TABLE` 359 µs against 150 µs (2.4x, from 6.0x) and
+  `CREATE TABLE` 344 against 158 µs (2.2x). What remains is the dependency discovery this release
+  added to `DROP TABLE`, which reads every table's constraint record three times.
 
 ### Performance — primary-key writes over the wire, against 4.41.1
 
 4.42.0 is slower than 4.41.1 on single-row primary-key writes, and most of that is deliberate:
 since this release a fast-path `UPDATE` or `DELETE` records the row's history and its snapshot in
-the same write group (four keys where 4.41.1 wrote one), so `AS OF` is correct after it. 4.41.1
-skipped that history on its fast path.
+the same write group (four keys where 4.41.1 wrote one), so `AS OF` is correct after it. Checked
+on both releases: after a fast-path `DELETE`, a query `AS OF` a moment before it does not find the
+row in 4.41.1 and finds it in 4.42.0; after an `UPDATE` both return the old value.
+
+The release build measures the same over 1 to 64 clients
+(`docs/benchmarks/RELEASE_4_42_0.md`, 4 alternating rounds of 20 s): prepared 0.71 / 0.59 / 0.65 /
+0.67 / 0.62 / 0.49 / 0.46 of 4.41.1 at 1 / 2 / 4 / 8 / 16 / 32 / 64 clients, as text 0.62 / 0.53 /
+0.59 / 0.64 / 0.59 / 0.50 / 0.46. The table below is the earlier measurement that shows what the
+two performance changes above bought.
 
 `benches/public/wire_pk_ab.sh` with `examples/wire_pk_bench.rs` (a `tokio-postgres` client; no
 `psql`, `pgbench` or Docker needed), 32-core EPYC 7371, clients on the same host, 64,000 rows,

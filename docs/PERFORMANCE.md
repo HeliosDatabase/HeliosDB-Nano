@@ -90,6 +90,9 @@ benches/public/pg35_run.py out candidate=.
 benches/public/release_bench.sh v4.41.1
 ```
 
+The 4.42.0 run of that command, with the pgbench comparison and what is slower than 4.41.1, is
+[`docs/benchmarks/RELEASE_4_42_0.md`](benchmarks/RELEASE_4_42_0.md).
+
 Found a case where Nano is slower than you expected? **Open an issue with the
 repro** — the categories above are exactly the ones we want sharpened, and a
 concrete workload is the best way to get there.
