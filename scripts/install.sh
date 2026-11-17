@@ -16,6 +16,8 @@
 #
 # Supported targets (must match .github/workflows/release.yml build matrix):
 #   x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu, aarch64-apple-darwin
+# The Linux binaries need glibc >= 2.39; the script refuses to install one that
+# cannot start on this host.
 # Windows users: download the .zip release asset manually, or use
 #   cargo binstall heliosdb-nano
 
@@ -99,6 +101,15 @@ fi
 
 # ── extract + install ───────────────────────────────────────────────────
 tar -xzf "$TMP/$ASSET" -C "$TMP" heliosdb-nano
+
+# Smoke-test before installing: Linux release binaries are built on Ubuntu 24.04
+# and need glibc >= 2.39, so older distros (RHEL/Rocky/Alma 9, Ubuntu 22.04,
+# Debian 12) download fine but cannot start. Say so instead of installing a
+# binary that fails on first use.
+if ! SMOKE="$("$TMP/heliosdb-nano" --version 2>&1)"; then
+  echo "$SMOKE" >&2
+  fatal "the downloaded binary cannot run on this system (usually a glibc older than 2.39). Nothing was installed. Use the Docker image (ghcr.io/heliosdatabase/heliosdb-nano) or 'cargo install heliosdb-nano --locked'."
+fi
 
 if [ -n "${HELIOSDB_INSTALL_DIR:-}" ]; then
   INSTALL_DIR="$HELIOSDB_INSTALL_DIR"
