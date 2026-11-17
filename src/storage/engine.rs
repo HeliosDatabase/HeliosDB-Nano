@@ -4571,6 +4571,12 @@ impl StorageEngine {
         block_opts.set_bloom_filter(14.0, false);
         block_opts.set_whole_key_filtering(true);
         block_opts.set_cache_index_and_filter_blocks(true);
+        // Pin the L0 files' index and filter blocks, as disk-backed mode does. Every
+        // iterator opens each L0 file through its index block; unpinned, the small
+        // default cache let them go, and a store past its first flush read and
+        // decompressed them again for each iterator — once per UPDATE and DELETE,
+        // whose row-history check is an iterator.
+        block_opts.set_pin_l0_filter_and_index_blocks_in_cache(true);
         opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(5));
         opts.set_block_based_table_factory(&block_opts);
 
