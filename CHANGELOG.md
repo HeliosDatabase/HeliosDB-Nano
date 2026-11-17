@@ -5,10 +5,22 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [4.42.0] - 2026-11-17
 
-Release-candidate notes for 4.42.0. Final correctness, physical-standby and performance
-acceptance remains pending; these entries describe the current implementation.
+Upgrading from 4.41.x: read `docs/guides/upgrade.md` first. Standbys are rebuilt, a data
+directory an older build last wrote is adopted once, and some application-visible behaviour
+changes.
+
+### Changed — the installer refuses a binary that cannot start
+
+- `scripts/install.sh` runs the downloaded binary with `--version` before installing it. The
+  Linux release binaries need glibc 2.39 or newer; on an older distribution (RHEL/Rocky/Alma 9,
+  Ubuntu 22.04, Debian 12) the script used to install a binary that failed on first use. It now
+  prints the loader's message, installs nothing and points at the Docker image and
+  `cargo install`.
+- The README leads with a quickstart, what Nano is for and a comparison table, and Install
+  leads with the prebuilt binaries and Docker. The stated binary size is the measured one:
+  about 53 MB on Linux x86_64 (a 20 MB download), not ~32 MB.
 
 ### Fixed — an index emptied of long-prefix keys accepts new keys again
 
