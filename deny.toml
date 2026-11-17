@@ -59,6 +59,12 @@ ignore = [
     # both entries when a compatible published graph removes paste. Review scope,
     # ownership and removal conditions: docs/SECURITY_MAINTENANCE_EXCEPTIONS.md.
     { id = "RUSTSEC-2024-0436", reason = "optional Tokenizers compile-time macro; maintenance-only exception tracked12d7fb448cd0; see security maintenance record" },
+    # Maintenance exception confirmed by the owner 2026-11-17. RUSTSEC-2026-0543
+    # declares chrono unmaintained, with no patched version; it reports no
+    # vulnerability. chrono 0.4.39 is a direct dependency whose types are in the
+    # public Value enum and the serialized row format, and oauth2 5.0 depends on
+    # it, so there is nothing to upgrade to. The same ID is in .cargo/audit.toml.
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained, no patched version; owner-confirmed 2026-11-17; replacement is a format/API project; see security maintenance record" },
 ]
 
 [licenses]

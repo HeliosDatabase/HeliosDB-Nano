@@ -420,6 +420,12 @@ Four crates in `Cargo.lock` move to their patched releases, with no other entry 
 
 None of these four needed an entry in `.cargo/audit.toml` or `deny.toml`.
 
+One new maintenance exception: RUSTSEC-2026-0543, published 2026-11-17, declares `chrono` unmaintained.
+It reports no vulnerability and lists no patched version. chrono is a direct dependency whose types are
+in the public `Value` enum and the stored row encoding, so replacing it is an API and format change for
+a minor release. The ID is in `.cargo/audit.toml` and `deny.toml`; scope and removal work are in
+`docs/SECURITY_MAINTENANCE_EXCEPTIONS.md`.
+
 ### Security — `code-embed` no longer pulls webpki-roots 0.26 (sprinter b93af8c4a65f)
 
 - **fastembed 4.9 → 7.5** for the optional `code-embed` feature. fastembed 4 reached the

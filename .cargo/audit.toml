@@ -13,6 +13,11 @@ ignore = [
     # NEW maintenance exception adopted2026-11-08 for optional Tokenizers -> paste;
     # tracked12d7fb448cd0. Paired with deny.toml, not a vulnerability exemption.
     "RUSTSEC-2024-0436",
+    # Maintenance exception confirmed by the owner 2026-11-17: chrono declared
+    # unmaintained (no vulnerability, no patched version). chrono is a direct
+    # dependency and its types are in the public Value enum and the serialized
+    # row format. Paired with deny.toml; see docs/SECURITY_MAINTENANCE_EXCEPTIONS.md.
+    "RUSTSEC-2026-0543",
     # rkyv 0.7.46 (out-of-bounds read validating Rc/Arc archives) is in
     # Cargo.lock only as rust_decimal 1.40's optional `rkyv` dependency. No
     # feature of this workspace enables it, so it is never compiled:
