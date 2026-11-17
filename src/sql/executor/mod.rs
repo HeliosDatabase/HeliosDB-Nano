@@ -5566,7 +5566,7 @@ impl<'a> Executor<'a> {
     /// R2.3: is the attached transaction's snapshot guaranteed to be as fresh
     /// as current storage at statement start?
     ///
-    /// True only for **ReadCommitted session transactions**: every session
+    /// True for **ReadCommitted session transactions**: every session
     /// statement path (`touch_session_for_statement`, the inline refresh in
     /// `query_in_session` / `execute_in_session`) calls
     /// `Transaction::refresh_snapshot` before executing, and the v3.39
@@ -5582,8 +5582,20 @@ impl<'a> Executor<'a> {
     /// - Embedded global-slot transactions (`session_id() == None`) are
     ///   nominally ReadCommitted but never refresh per statement, so their
     ///   de-facto snapshot reads must not be widened to current storage.
+    ///
+    /// The other fresh case is **one autocommit statement's own transaction**
+    /// (`StorageEngine::begin_autocommit_transaction`, `is_statement_scoped`):
+    /// it took its snapshot when the statement began and ends with it, so it is
+    /// ReadCommitted with nothing older to preserve. Since 4.42.0 such a
+    /// transaction reaches the executors of a statement's nested reads (a
+    /// `SET col = (SELECT …)` subquery, so that it sees the rows the statement
+    /// has already staged); without this case every one of those reads was a
+    /// full scan with a write-set merge, where 4.41 probed an index (pg35
+    /// `UPDATE+subquery`: 34x slower). The per-table half of the gate below
+    /// still sends a table the statement HAS written to the merging scan.
     fn txn_snapshot_is_statement_fresh(txn: &crate::storage::Transaction) -> bool {
-        txn.isolation_level() == crate::session::IsolationLevel::ReadCommitted && txn.session_id().is_some()
+        txn.isolation_level() == crate::session::IsolationLevel::ReadCommitted
+            && (txn.session_id().is_some() || txn.is_statement_scoped())
     }
 
     /// R2.3 coarse fast-path gate, for sites that haven't resolved the target
@@ -6127,6 +6139,43 @@ fn walk_expr_subplans(expr: &crate::sql::LogicalExpr, visit: &mut dyn FnMut(&cra
 
 #[cfg(all(test, feature = "vector-search"))]
 pub(crate) mod ann_publication_tests;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod statement_fresh_read_gate_tests {
+    use super::Executor;
+    use crate::EmbeddedDatabase;
+
+    /// One autocommit statement's own transaction is statement-fresh: a nested
+    /// read may probe an index, except on a table the statement has written,
+    /// whose rows come from the write set. The embedded handle's explicit
+    /// transaction keeps its snapshot and stays on the merging scan.
+    #[test]
+    fn an_autocommit_statement_probes_the_tables_it_has_not_written() {
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE written(id INT PRIMARY KEY, v INT)").unwrap();
+        db.execute("CREATE TABLE other(id INT PRIMARY KEY, v INT)").unwrap();
+
+        let statement = db.storage.begin_autocommit_transaction().unwrap();
+        {
+            let executor = Executor::with_storage(&db.storage).with_transaction(&statement);
+            assert!(!executor.txn_forces_slow_reads());
+            assert!(!executor.txn_forces_slow_reads_for_table("written"));
+            statement.put(b"data:written:1".to_vec(), vec![1]).unwrap();
+            assert!(executor.txn_forces_slow_reads_for_table("written"));
+            assert!(!executor.txn_forces_slow_reads_for_table("other"));
+        }
+        statement.rollback().unwrap();
+
+        let explicit = db.storage.begin_transaction().unwrap();
+        {
+            let executor = Executor::with_storage(&db.storage).with_transaction(&explicit);
+            assert!(executor.txn_forces_slow_reads());
+            assert!(executor.txn_forces_slow_reads_for_table("other"));
+        }
+        explicit.rollback().unwrap();
+    }
+}
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]

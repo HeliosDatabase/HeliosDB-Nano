@@ -32935,6 +32935,42 @@ impl EmbeddedDatabase {
                     .collect(),
                 asc: asc.clone(),
             },
+            // An aggregate over a correlated filter (`SELECT COUNT(*) FROM items
+            // WHERE items.order_id = orders.order_id`): what lies below it is bound
+            // like the rest. Left unbound, a subquery on another table failed with
+            // "column not found", and one on the updated table under an alias
+            // compared the inner column with itself and aggregated every row.
+            LogicalPlan::Aggregate {
+                input,
+                group_by,
+                aggr_exprs,
+                having,
+            } => {
+                let bind =
+                    |e: &sql::LogicalExpr| Self::bind_outer_refs_in_expr(e, outer_row, outer_schema, outer_table);
+                LogicalPlan::Aggregate {
+                    input: Box::new(Self::bind_outer_refs_in_plan(
+                        input,
+                        outer_row,
+                        outer_schema,
+                        outer_table,
+                    )),
+                    group_by: group_by.iter().map(bind).collect(),
+                    aggr_exprs: aggr_exprs.iter().map(bind).collect(),
+                    having: having.as_ref().map(bind),
+                }
+            }
+            LogicalPlan::FilteredScan { predicate: Some(_), .. } => {
+                let mut bound = plan.clone();
+                if let LogicalPlan::FilteredScan {
+                    predicate: Some(predicate),
+                    ..
+                } = &mut bound
+                {
+                    *predicate = Self::bind_outer_refs_in_expr(predicate, outer_row, outer_schema, outer_table);
+                }
+                bound
+            }
             other => other.clone(),
         }
     }
