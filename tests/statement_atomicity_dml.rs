@@ -1214,6 +1214,99 @@ fn an_uncommitted_delete_holds_its_key_until_it_ends() {
     }
 }
 
+/// Review F3, the UPDATE half: an UPDATE that moves a row's PRIMARY KEY / UNIQUE value
+/// to one an open transaction took out (its DELETE, or its own key-moving UPDATE) found
+/// the key free and went ahead at once; after that transaction's ROLLBACK two rows
+/// shared the key and the index found only one of them. The key stays the remover's
+/// until it ends: the UPDATE waits, takes the key after a commit and fails 23505 after
+/// a rollback. Both statement families, PRIMARY KEY and UNIQUE.
+#[test]
+fn a_key_moving_update_waits_for_a_key_an_open_transaction_took_out() {
+    let _watchdog = watchdog(
+        "a_key_moving_update_waits_for_a_key_an_open_transaction_took_out",
+        TEST_AT_MOST,
+    );
+    let db = Arc::new(in_memory());
+    db.execute("CREATE TABLE kp (id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE ku (id INT UNIQUE, v INT)").unwrap();
+    type Mover = fn(&EmbeddedDatabase, &str) -> heliosdb_nano::Result<u64>;
+    let movers: [(&str, Mover); 2] = [
+        ("text", |db, table| {
+            db.execute(&format!("UPDATE {table} SET id = 1 WHERE id = 2"))
+        }),
+        ("params", |db, table| {
+            db.execute_params(
+                &format!("UPDATE {table} SET id = $1 WHERE id = $2"),
+                &[Value::Int4(1), Value::Int4(2)],
+            )
+        }),
+    ];
+    // What takes key 1 out, and where its row is once that commits.
+    let removers = [
+        ("DELETE", "DELETE FROM {t} WHERE id = 1", None),
+        ("UPDATE", "UPDATE {t} SET id = 5 WHERE id = 1", Some(5)),
+    ];
+    for table in ["kp", "ku"] {
+        for (family, mover) in movers {
+            for (remover, remover_sql, moved_to) in removers {
+                for commit in [false, true] {
+                    let what = format!(
+                        "{table}, {family} UPDATE, the {remover} {}",
+                        if commit { "commits" } else { "rolls back" }
+                    );
+                    db.execute(&format!("DELETE FROM {table}")).unwrap();
+                    db.execute(&format!("INSERT INTO {table} VALUES (1, 10), (2, 20)"))
+                        .unwrap();
+                    let first = db.create_session("remover", IsolationLevel::ReadCommitted).unwrap();
+                    db.begin_transaction_for_session(first).unwrap();
+                    db.execute_for_session(first, &remover_sql.replace("{t}", table))
+                        .unwrap();
+                    let moving = {
+                        let db = Arc::clone(&db);
+                        std::thread::spawn(move || mover(&db, table))
+                    };
+                    wait_for("the key-moving UPDATE to wait for the remover", || {
+                        db.storage.row_locks().waiting() > 0
+                    });
+                    if commit {
+                        db.commit_transaction_for_session(first).unwrap();
+                    } else {
+                        db.rollback_transaction_for_session(first).unwrap();
+                    }
+                    db.destroy_session(first).unwrap();
+                    let outcome = moving.join().unwrap();
+                    // `v` has no index: this reads every stored row.
+                    let stored: Vec<(i64, i64)> =
+                        rows(&db, &format!("SELECT id, v FROM {table} WHERE v > 0 ORDER BY v"))
+                            .iter()
+                            .map(|row| (int(row.values.first()), int(row.values.get(1))))
+                            .collect();
+                    if commit {
+                        assert_eq!(outcome.unwrap(), 1, "{what}: the key is free, the UPDATE takes it");
+                        let expected: Vec<(i64, i64)> =
+                            moved_to.map(|id| (id, 10)).into_iter().chain([(1, 20)]).collect();
+                        assert_eq!(stored, expected, "{what}");
+                    } else {
+                        let err = outcome.expect_err("the key is the restored row's");
+                        assert!(
+                            err.to_string().to_ascii_lowercase().contains("duplicate"),
+                            "{what}: {err}"
+                        );
+                        assert_eq!(stored, vec![(1, 10), (2, 20)], "{what}: nothing moved");
+                    }
+                    let holders: Vec<i64> = stored.iter().filter(|(id, _)| *id == 1).map(|(_, v)| *v).collect();
+                    assert_eq!(holders.len(), 1, "{what}: one row has key 1");
+                    let found: Vec<i64> = rows(&db, &format!("SELECT v FROM {table} WHERE id = 1"))
+                        .iter()
+                        .map(|row| int(row.values.first()))
+                        .collect();
+                    assert_eq!(found, holders, "{what}: the key finds the row that has it");
+                }
+            }
+        }
+    }
+}
+
 /// Review F4 (pre-existing): ON DELETE CASCADE took no lock on the children, so a child
 /// updated by an open transaction was deleted under it and written back by that
 /// transaction's COMMIT: an orphan. The cascade's exclusive inbound-table request

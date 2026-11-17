@@ -22,6 +22,18 @@ changes.
   leads with the prebuilt binaries and Docker. The stated binary size is the measured one:
   about 53 MB on Linux x86_64 (a 20 MB download), not ~32 MB.
 
+### Fixed — a key-moving UPDATE waits for a key an open transaction took out
+
+- An `UPDATE` that moves a row's PRIMARY KEY or UNIQUE value to one another open transaction
+  took out of the index (its `DELETE`, or its own key-moving `UPDATE`) found the key free and
+  went ahead at once. When that transaction rolled back, two rows had the same key: a scan
+  returned both, a lookup by the key found one, and on a PRIMARY KEY `COUNT(*)` counted one.
+  The `UPDATE` now waits for that transaction, as an `INSERT` and an upsert of the key already
+  did: it takes the key after a commit and fails 23505 after a rollback. Both statement
+  families, on main; a branch arbitrates its keys through its own view.
+  (`tests/statement_atomicity_dml.rs`,
+  `a_key_moving_update_waits_for_a_key_an_open_transaction_took_out`.)
+
 ### Fixed — an index emptied of long-prefix keys accepts new keys again
 
 - Deleting every key that shared a long common prefix (UUID primary keys, keys with a common
@@ -303,6 +315,10 @@ Known limits:
   v4.41.1 wrote such a statement row by row, not atomically.
 - A cycle through a table-lock upgrade and a row lock can still end at `lock_timeout` rather
   than deadlock detection; an upsert racing a plain INSERT of the same new key can get 23505.
+- A read through a secondary index, a PRIMARY KEY range or an IN-list can see a concurrent
+  multi-row statement partly applied around its commit: some of its rows changed, others not
+  yet. It never sees uncommitted rows, and a full scan sees the statement whole. With one writer
+  changing 400 rows per `UPDATE` in a loop, about a third of such reads saw a partial statement.
 - Statement atomicity does not make DDL transactional across `BEGIN` / `ROLLBACK`: a completed
   schema statement can survive rollback of the block's DML. Take a backup or branch before a
   destructive migration. The lower-level raw KV/index APIs retain their caller-owned index and

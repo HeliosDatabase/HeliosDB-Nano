@@ -304,7 +304,9 @@ the other's commit. R5.1's table lock does not order them, since every writer ho
   key is **held** for it. Another writer of that key waits for the transaction, as in PostgreSQL: an INSERT then
   succeeds after a commit and fails 23505 after a rollback (it used to go ahead, and the rollback left two rows with one
   primary key), and a PK UPDATE / DELETE finds the row and waits for its lock (it used to find nothing and lose its
-  change). Readers see the key gone, as before.
+  change). An UPDATE that moves its row's key **to** the held value waits as well: it takes the key after a commit
+  and fails 23505 after a rollback (it used to find the key free and go ahead, and the rollback left two rows with one
+  key, one of them unreachable through the index). Readers see the key gone, as before.
 - **`INSERT … ON CONFLICT` is PostgreSQL's speculative insertion.** It holds the value it arbitrates on until its
   transaction ends, so a second upsert of the same new key waits for the first and then takes its DO UPDATE (or inserts
   after the first rolled back) instead of failing 23505 or 40001; a conflicting row deleted meanwhile makes it insert.
@@ -337,6 +339,11 @@ the other's commit. R5.1's table lock does not order them, since every writer ho
   its version with time travel on, its logical-WAL operation), so the effective limit is about 1.33 GiB of row data
   (keys and serialized rows) per statement or transaction with the defaults, 2 GiB with time travel off. An autocommit
   `INSERT … SELECT` past it fails in seconds and frees what it staged; v4.41.1 wrote such a statement row by row.
+- **Not covered: a read through an index can see a multi-row statement partly applied.** A read that goes through a
+  secondary index, a PRIMARY KEY range or an IN-list while a multi-row statement commits can find some of the
+  statement's rows changed and others not yet. It never sees uncommitted rows (nothing of an open transaction's
+  UPDATE, before or after its ROLLBACK), and a full scan always sees the statement whole. Measured on 4.42.0 with one
+  writer changing 400 rows per UPDATE in a loop: about a third of such reads saw a partial statement, no scan did.
 - **Foreign-key actions** share `src/fk_update.rs` across ordinary UPDATE/upsert and recursive
   DELETE. NO ACTION/RESTRICT/CASCADE/SET NULL/SET DEFAULT check the proposed/final relationship,
   including composites and self-references. Only deferrable NO ACTION waits until SET IMMEDIATE

@@ -31664,6 +31664,9 @@ impl EmbeddedDatabase {
         // branch-only key through and refused one onto a key the branch had
         // freed.
         let branch_view = self.storage.branch_view()?;
+        if branch_view.is_none() {
+            self.wait_out_holds_on_moved_keys(table_name, schema, old_tuple, new_tuple, index_unique_sets, active_txn)?;
+        }
         // The row being updated, so no pass can report it as its own duplicate.
         // `new_tuple` carries the id on the UPDATE arms (it is a clone of the
         // scanned row); `old_tuple` carries it on the ON CONFLICT DO UPDATE leg.
@@ -31855,6 +31858,55 @@ impl EmbeddedDatabase {
             seen_table_keys.push((columns.clone(), new_values, updated_row_id));
         }
 
+        Ok(())
+    }
+
+    /// Spec R5.4 (review F3), the UPDATE half: a PRIMARY KEY / UNIQUE value this row
+    /// moves to may be one another open transaction took out of its index (its DELETE,
+    /// or its own key-moving UPDATE). The key is that transaction's until it ends, so
+    /// wait for it (`StorageEngine::wait_out_key_hold`) before the probes of
+    /// [`Self::enforce_unique_on_update`]: after its commit the key is free and the
+    /// UPDATE takes it; after its rollback the key is back and the UPDATE fails 23505.
+    /// Was: the probe found the key free, the UPDATE went ahead at once, and the other
+    /// transaction's ROLLBACK left two rows with one primary key, one of them
+    /// unreachable through the index.
+    ///
+    /// Runs once per updated row, so it asks the index registry nothing unless the row
+    /// moves a key (`index_unique_sets` is the statement's copy of the enforced column
+    /// sets). On main only: a branch's keys are arbitrated by its view.
+    fn wait_out_holds_on_moved_keys(
+        &self,
+        table_name: &str,
+        schema: &Schema,
+        old_tuple: &Tuple,
+        new_tuple: &Tuple,
+        index_unique_sets: &[Vec<String>],
+        active_txn: Option<&storage::Transaction>,
+    ) -> Result<()> {
+        let moves_a_key = index_unique_sets.iter().flatten().any(|column| {
+            schema
+                .get_column_index(column)
+                .is_some_and(|idx| old_tuple.values.get(idx) != new_tuple.values.get(idx))
+        });
+        if !moves_a_key {
+            return Ok(());
+        }
+        let mut new_values = std::collections::HashMap::with_capacity(schema.columns.len());
+        for (idx, column) in schema.columns.iter().enumerate() {
+            if let Some(value) = new_tuple.values.get(idx) {
+                new_values.insert(column.name.clone(), value.clone());
+            }
+        }
+        // A hold is never this statement's own to wait for: its transaction's holds
+        // are excluded, and without a transaction no hold carries this id.
+        let own = active_txn.map_or(u64::MAX, storage::Transaction::transaction_id);
+        while let Some(hold) = self
+            .storage
+            .art_indexes()
+            .held_key_for(table_name, &new_values, None, own)
+        {
+            self.storage.wait_out_key_hold(table_name, &hold, active_txn)?;
+        }
         Ok(())
     }
 
