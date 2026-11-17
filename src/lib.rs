@@ -3560,6 +3560,18 @@ impl EmbeddedDatabase {
                 Ok(sql::Parser::parse_merge_branch_abort(trimmed).map(BranchStatement::AbortMerge))
             }
             Some(b'S' | b's' | b'R' | b'r') => {
+                // Only a SET / SHOW / RESET that names `heliosdb.branch` is one of
+                // these (the prefixes `parse_db_setting_statement` accepts). Its name
+                // normalizes by trimming spaces and quotes around each part and
+                // lowercasing ASCII, so its text holds `branch` in some ASCII case.
+                // Any other statement skips the parse, which a setting statement's
+                // own handler makes again.
+                let setting = starts_with_icase(trimmed, "SET ")
+                    || starts_with_icase(trimmed, "SHOW ")
+                    || starts_with_icase(trimmed, "RESET ");
+                if !setting || !Self::contains_ascii_case_insensitive(trimmed, b"branch") {
+                    return Ok(None);
+                }
                 let statement = match Self::parse_db_setting_statement(trimmed) {
                     Some(statement) => statement,
                     None => return Ok(None),
