@@ -394,6 +394,22 @@ and refuses on a physical standby (its key is its primary's) and on a primary wh
 replication port serves (naming the standbys attached), naming the procedure: re-key a
 primary that serves no standby, then rebuild each standby from it with the new key;
 otherwise it refuses because no re-encryption exists.
+
+### Security — `cargo audit --deny warnings` is clean again
+
+Three crates in `Cargo.lock` move to their patched releases, with no other entry changed:
+
+- `rustix` 1.1.3 → 1.1.6 (RUSTSEC-2026-0486, unsound: the xattr functions marked unwritten bytes as
+  initialized for a zero-length buffer), with `linux-raw-sys` 0.11.0 → 0.12.1, which it requires. This one
+  is compiled: `tempfile`, `terminal_size` and the REPL's line editor depend on it.
+- `quinn-proto` 0.11.18 → 0.11.19 (RUSTSEC-2026-0523, RUSTSEC-2026-0524) and `quinn-udp` 0.5.14 → 0.5.16
+  (RUSTSEC-2026-0538). Neither is compiled into any build: they are optional dependencies of `reqwest`'s
+  HTTP/3 support, which no feature of this crate enables (`cargo tree --all-features --target all -i
+  quinn-proto` prints nothing). They are updated rather than ignored, so the audit needs no new exception.
+
+No advisory was added to `.cargo/audit.toml` or `deny.toml`. `cargo deny check` and
+`cargo deny --all-features check` pass before and after.
+
 ### Security — `code-embed` no longer pulls webpki-roots 0.26 (sprinter b93af8c4a65f)
 
 - **fastembed 4.9 → 7.5** for the optional `code-embed` feature. fastembed 4 reached the
