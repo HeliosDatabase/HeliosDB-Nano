@@ -658,6 +658,131 @@ async fn point_reads_stay_on_the_worker_and_general_statements_leave_it() {
     assert_eq!(after - before, 2, "a prepared range read leaves the worker once");
 }
 
+/// A point read through a SECONDARY index is a bounded read too, while the
+/// index entry it fetches names few rows: pgbench's indexed point read (a
+/// table with no primary key) ran at 0.43-0.72 of v4.41.1 while every such
+/// read left the worker. A value with many rows under it, and an equality on
+/// a column with no index, still leave the worker. Counted as in the test
+/// above: 1 is the counter read alone, 2 one handoff.
+#[cfg(feature = "internal-tests")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_point_read_through_a_secondary_index_stays_on_the_worker_while_its_rows_are_few() {
+    let server = Server::start(&[], &[]);
+    let client = server.connect().await;
+    client
+        .batch_execute(
+            "CREATE TABLE acct (aid INT, grp INT, abalance INT);
+             CREATE INDEX acct_aid ON acct(aid);
+             CREATE INDEX acct_grp ON acct(grp)",
+        )
+        .await
+        .unwrap();
+    // aid is unique in fact; grp 0 holds twenty rows, grp 1 three, every other grp one.
+    for aid in 1..=40 {
+        let grp = match aid {
+            1..=20 => 0,
+            21..=23 => 1,
+            other => other,
+        };
+        client
+            .batch_execute(&format!("INSERT INTO acct VALUES ({aid}, {grp}, {})", aid * 10))
+            .await
+            .unwrap();
+    }
+    // Warm the normalized plans (admitted to the plan cache on a repeat).
+    for aid in 30..=34 {
+        let by_aid = format!("SELECT abalance FROM acct WHERE aid = {aid}");
+        assert_eq!(
+            first_value(&client.simple_query(&by_aid).await.unwrap()),
+            Some((aid * 10).to_string())
+        );
+        let by_grp = format!("SELECT aid FROM acct WHERE grp = {aid}");
+        assert_eq!(
+            first_value(&client.simple_query(&by_grp).await.unwrap()),
+            Some(aid.to_string())
+        );
+        let by_balance = format!("SELECT aid FROM acct WHERE abalance = {}", aid * 10);
+        assert_eq!(
+            first_value(&client.simple_query(&by_balance).await.unwrap()),
+            Some(aid.to_string())
+        );
+    }
+    let by_aid = client
+        .prepare("SELECT abalance FROM acct WHERE aid = $1")
+        .await
+        .unwrap();
+    let by_grp = client.prepare("SELECT aid FROM acct WHERE grp = $1").await.unwrap();
+    let mut reads = 0;
+
+    // Text: one row, three rows, and a miss stay on the worker.
+    for (sql, rows) in [
+        ("SELECT abalance FROM acct WHERE aid = 7", 1),
+        ("SELECT aid FROM acct WHERE grp = 1", 3),
+        ("SELECT abalance FROM acct WHERE aid = 999", 0),
+    ] {
+        let before = handoffs(&client, &mut reads).await;
+        let messages = client.simple_query(sql).await.unwrap();
+        let after = handoffs(&client, &mut reads).await;
+        let returned = messages
+            .iter()
+            .filter(|message| matches!(message, SimpleQueryMessage::Row(_)))
+            .count();
+        assert_eq!(returned, rows, "{sql}");
+        assert_eq!(
+            after - before,
+            1,
+            "a few-row index read must not leave the worker: {sql}"
+        );
+    }
+    // Prepared: the same.
+    let before = handoffs(&client, &mut reads).await;
+    let rows = client.query(&by_aid, &[&12i32]).await.unwrap();
+    let after = handoffs(&client, &mut reads).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, i32>(0), 120);
+    assert_eq!(
+        after - before,
+        1,
+        "a prepared index point read must not leave the worker"
+    );
+    let before = handoffs(&client, &mut reads).await;
+    let rows = client.query(&by_grp, &[&1i32]).await.unwrap();
+    let after = handoffs(&client, &mut reads).await;
+    let mut aids: Vec<i32> = rows.iter().map(|row| row.get(0)).collect();
+    aids.sort_unstable();
+    assert_eq!(aids, vec![21, 22, 23]);
+    assert_eq!(
+        after - before,
+        1,
+        "a prepared three-row index read must not leave the worker"
+    );
+
+    // Twenty rows under one value, and an equality with no index, leave it.
+    for (sql, rows) in [
+        ("SELECT aid FROM acct WHERE grp = 0", 20),
+        ("SELECT aid FROM acct WHERE abalance = 70", 1),
+    ] {
+        let before = handoffs(&client, &mut reads).await;
+        let messages = client.simple_query(sql).await.unwrap();
+        let after = handoffs(&client, &mut reads).await;
+        let returned = messages
+            .iter()
+            .filter(|message| matches!(message, SimpleQueryMessage::Row(_)))
+            .count();
+        assert_eq!(returned, rows, "{sql}");
+        assert_eq!(after - before, 2, "this read leaves the worker: {sql}");
+    }
+    let before = handoffs(&client, &mut reads).await;
+    let rows = client.query(&by_grp, &[&0i32]).await.unwrap();
+    let after = handoffs(&client, &mut reads).await;
+    assert_eq!(rows.len(), 20);
+    assert_eq!(
+        after - before,
+        2,
+        "a prepared twenty-row index read leaves the worker once"
+    );
+}
+
 /// 4.42.0 R1: a primary-key `UPDATE` or `DELETE` prepared over the extended
 /// protocol is a bounded write once its spec is cached — one probe, one row
 /// lock, one write group — and stays on the async worker, like a point read

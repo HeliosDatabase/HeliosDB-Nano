@@ -31,8 +31,9 @@
 //!   engine without SQL. Never the cheap steps around them (the result-cache
 //!   probe, Parse/Describe planning, `BEGIN`, a per-statement savepoint), and
 //!   never a BOUNDED read: the hot read funnels (`query_with_schema`,
-//!   `query_params_inner_unguarded`) answer a primary-key point read — one
-//!   probe, no user code — on the worker and offload only their general path.
+//!   `query_params_inner_unguarded`) answer a point read — one probe of the
+//!   primary key, or of another single-column index whose entry names at most
+//!   eight rows; no user code — on the worker and offload only their general path.
 //!   A handoff costs microseconds (the worker's core moves to another thread),
 //!   which a point read cannot afford and a long statement does not notice.
 //!   So an executed statement pays at most ONE handoff; what runs inside an

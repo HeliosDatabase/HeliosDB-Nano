@@ -20915,7 +20915,7 @@ impl EmbeddedDatabase {
     /// general path, answered on the async worker: SQL `EXECUTE name(args)` of
     /// a prepared primary-key point SELECT (`try_fast_prepared_select_with_schema`),
     /// and the A2 normalized read (`try_normalized_query_with_schema`) whose
-    /// plan is already cached and is one primary-key probe
+    /// plan is already cached and is one index probe that fetches few rows
     /// (`plan_is_bounded_point_read`). Each is exactly what the general path
     /// would run for that statement, under the same gates — no interceptor
     /// ahead of it there answers a `SELECT` or an `EXECUTE` (`SET`/`SHOW`/
@@ -20952,10 +20952,12 @@ impl EmbeddedDatabase {
 
     /// sprinter ccebc95977f1: is executing `plan` with `params` BOUNDED work,
     /// so that it may run on the async worker instead of off it
-    /// (`runtime_offload`)? Only ONE primary-key probe qualifies: `[Project of
-    /// plain columns over] FilteredScan | Filter(Scan)` of a base table whose
-    /// predicate is exactly `pk = <literal | parameter>` on the table's
-    /// single-column PRIMARY KEY — at most one row, re-checked by a plain
+    /// (`runtime_offload`)? Only ONE index probe that fetches few rows
+    /// qualifies: `[Project of plain columns over] FilteredScan | Filter(Scan)`
+    /// of a base table whose predicate is exactly `column = <literal |
+    /// parameter>` on the table's single-column PRIMARY KEY (at most one row),
+    /// or on another single-column index whose entry for that value names at
+    /// most [`Self::BOUNDED_INDEX_READ_ROWS`] rows — re-checked by a plain
     /// comparison, and no expression that can call a function.
     ///
     /// It mirrors the executor's own route for that shape
@@ -21015,8 +21017,10 @@ impl EmbeddedDatabase {
         if !Self::is_bound_value(value) {
             return false;
         }
-        // The table's single-column PRIMARY KEY, with no RLS on the table.
-        if !matches!(self.fast_select_spec(table_name, column), Some(Ok(_))) {
+        // The table's single-column PRIMARY KEY, or another single-column index
+        // (checked below); no RLS on the table either way.
+        let primary_key = matches!(self.fast_select_spec(table_name, column), Some(Ok(_)));
+        if !primary_key && self.tenant_manager.should_apply_rls(table_name, "SELECT") {
             return false;
         }
         let kind = self.storage.cached_table_kind(table_name);
@@ -21024,12 +21028,29 @@ impl EmbeddedDatabase {
             return false;
         }
         let lookup = sql::executor::scan::indexed_equality_lookup(&self.storage, table_name, schema, predicate, params);
-        let Some((_index, value)) = lookup else {
+        let Some((index, value)) = lookup else {
             return false;
         };
         let numeric_or_null = matches!(value, Value::Numeric(_) | Value::Null);
-        !numeric_or_null && !self.storage.has_uncommitted_index_removals_for_table(table_name)
+        if numeric_or_null || self.storage.has_uncommitted_index_removals_for_table(table_name) {
+            return false;
+        }
+        // A secondary index has no "at most one row": the read is bounded only
+        // while the entry it is about to fetch names few rows. One extra probe.
+        primary_key || {
+            let key = storage::ArtIndexManager::encode_key_from_values(std::iter::once(&value));
+            self.storage.art_indexes().index_get_all(&index, &key).len() <= Self::BOUNDED_INDEX_READ_ROWS
+        }
     }
+
+    /// The most rows a point read through a secondary index may fetch on the
+    /// async worker (`plan_is_bounded_point_read`). A handoff costs a wire
+    /// statement tens of microseconds and, repeated on every statement, caps a
+    /// server's read throughput (pgbench's indexed point read ran at 0.43-0.72
+    /// of v4.41.1 while every such read left the worker); a row fetch costs a
+    /// few microseconds, so past this many the handoff is the smaller cost and
+    /// the read is the general kind that must not pin a worker.
+    const BOUNDED_INDEX_READ_ROWS: usize = 8;
 
     /// A projected expression that evaluates no function (sprinter
     /// ccebc95977f1, `plan_is_bounded_point_read`).
@@ -24862,8 +24883,8 @@ impl EmbeddedDatabase {
             if let Some(result) = self.try_fast_select_with_schema(sql) {
                 return result;
             }
-            // sprinter ccebc95977f1: a BOUNDED read — one primary-key probe, no user
-            // code — is answered here, on the async worker; everything else below
+            // sprinter ccebc95977f1: a BOUNDED read — one index probe that fetches
+            // few rows, no user code — is answered here, on the async worker; everything else below
             // (the interceptors, planning, the executor) runs off it, in one handoff
             // (`runtime_offload`). The guards above stay installed: the offloaded
             // closure runs on this same thread.
@@ -28458,7 +28479,7 @@ impl EmbeddedDatabase {
         // once, inside the shared read choke point, on the RLS branch only.
         //
         // sprinter ccebc95977f1: a plan already in hand — pinned by the extended
-        // protocol, or in the plan cache — that is ONE primary-key probe
+        // protocol, or in the plan cache — that is ONE index probe fetching few rows
         // (`plan_is_bounded_point_read`) runs here, on the async worker; planning
         // and every other plan run off it (`runtime_offload`), in one handoff.
         // Spec R5.6: a pin is ready only while its layout is current.
