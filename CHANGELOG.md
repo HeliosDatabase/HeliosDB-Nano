@@ -1471,6 +1471,14 @@ send (`docs/guides/physical-standby.md`, "Online").
   running-node refusal in `tests/archive_cli_tests.rs`.
   `tests/physical_standby_refusals.rs`'s `WalPruned` case now turns the
   primary's archive off (with it on, the gap is filled) and checks both floors.
+- `tests/layout_epochs.rs`: `a_statement_that_took_a_sequence_value_is_refused_at_once` proves
+  "at once" by the sequence (the refused statement took exactly one value, so it ran once)
+  instead of by a 90 ms wall-clock bound. The bound failed once in the final gate rounds at
+  90.9 ms with no retry behind it: under load one attempt alone was measured at up to 69 ms,
+  0.8 ms idle, zero retries in 1,800 refusals. Its neighbour
+  `a_change_that_ends_inside_the_budget_is_waited_out` depends on the 100 ms retry budget in
+  wall-clock time and can still fail on an overloaded host (6 of 64 runs with eight copies of
+  the test binary running at once, none in 25 runs alone).
 
 ### Replication
 - **A primary restart no longer breaks its standby** (field finding J). A clean

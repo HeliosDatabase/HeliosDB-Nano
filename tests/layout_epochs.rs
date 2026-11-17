@@ -122,12 +122,19 @@ fn a_statement_that_took_a_sequence_value_is_refused_at_once() {
     holder.join().unwrap();
 
     assert!(is_layout_changed(&error), "{error}");
-    assert!(
-        waited < Duration::from_millis(90),
-        "no retry for a statement that advanced a sequence: {waited:?}"
-    );
+    // "At once" is proved by the sequence, not by the clock: every attempt evaluates
+    // `nextval`, and a retry pause is always followed by another attempt, so a
+    // statement that was retried after taking a value would have taken a second one.
+    // The earlier bound (`waited < 90 ms`) failed in a gate run at 90.9 ms without a
+    // retry: on a busy host one attempt alone was measured at up to 69 ms (0.8 ms
+    // idle), with zero retries in 1,800 refusals.
     let rows = db.query("SELECT nextval('layout_seq')", &[]).unwrap();
-    assert_eq!(ints(&rows), vec![2], "the refused statement took exactly one value");
+    assert_eq!(
+        ints(&rows),
+        vec![2],
+        "the refused statement took exactly one value: it ran once and was not retried"
+    );
+    assert!(waited < Duration::from_secs(5), "refused, not left waiting: {waited:?}");
 }
 
 /// A durable setval is not the SELECT's durable row effect. This exercises its
