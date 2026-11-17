@@ -66,9 +66,11 @@ succeed are now refused. `CHANGELOG.md` has the full list; this is what to plan 
    primary. Its 4.41.x directory is refused, so keep it aside until the new standby is
    verified (`heliosdb-nano standby verify --data-dir …` on the stopped standby).
 3. A standby's `--primary-host` names the primary's replication port (default 5433), the
-   only replication port now. Remove `--physical-replication-listen`, `--observer-hosts`,
-   `observer_hosts` and `HELIOSDB_PRIMARY_PG_PORT` from your configuration: they are gone,
-   and an unknown key is an error.
+   only replication port now. The flag and key for a separate physical endpoint, the
+   observer settings (`--observer-hosts`, `observer_hosts`) and the environment variable
+   that pointed a standby at the primary's PostgreSQL port are gone, and an unknown key is
+   an error. The CHANGELOG lists each removed name under "one replication connection,
+   physical standbys only"; take them out of your configuration before the first start.
 4. Standbys refuse writes (`25006`) instead of forwarding them. Point writers at the
    primary.
 5. A node with a replication role archives its WAL by default, to `<data dir>.archive`
