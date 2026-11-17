@@ -3584,14 +3584,15 @@ impl<'a> Catalog<'a> {
     /// Stage into `batch` a delete of every key under `prefix`; returns how
     /// many. A total-order iterator seeked to the prefix (the scan
     /// [`Self::delete_keys_with_prefix`] uses), so the walk is exact whatever
-    /// the prefix's length and whatever range tombstones lie on the way.
+    /// the prefix's length and whatever range tombstones lie on the way, and
+    /// bounded at the prefix's end: a table usually has no key under most of
+    /// the families a DROP clears, and an unbounded walk then stepped over the
+    /// deleted keys of every table dropped before it (pg35 `DROP TABLE`: 6x).
     fn stage_prefix_delete(&self, prefix: &str, batch: &mut rocksdb::WriteBatch) -> Result<usize> {
         let prefix_bytes = prefix.as_bytes();
-        let mut read_opts = rocksdb::ReadOptions::default();
-        read_opts.set_total_order_seek(true);
         let iter = self.storage.db.iterator_opt(
             rocksdb::IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward),
-            read_opts,
+            super::time_travel::bounded_read_options(prefix_bytes),
         );
         let mut count = 0;
         for item in iter {
@@ -3661,11 +3662,9 @@ impl<'a> Catalog<'a> {
     pub fn list_registered_schemas(&self) -> Result<Vec<String>> {
         let prefix = b"meta:schema:";
         let mut out = Vec::new();
-        let mut read_opts = rocksdb::ReadOptions::default();
-        read_opts.set_total_order_seek(true);
         let iter = self.storage.db.iterator_opt(
             rocksdb::IteratorMode::From(prefix, rocksdb::Direction::Forward),
-            read_opts,
+            super::time_travel::bounded_read_options(prefix),
         );
         for item in iter {
             let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
@@ -3803,11 +3802,9 @@ impl<'a> Catalog<'a> {
         let mut tables = Vec::new();
 
         // Use prefix seek to jump directly to "meta:table:" range
-        let mut read_opts = rocksdb::ReadOptions::default();
-        read_opts.set_total_order_seek(true);
         let iter = self.storage.db.iterator_opt(
             rocksdb::IteratorMode::From(prefix, rocksdb::Direction::Forward),
-            read_opts,
+            super::time_travel::bounded_read_options(prefix),
         );
         for item in iter {
             let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
@@ -5173,11 +5170,9 @@ impl<'a> Catalog<'a> {
 
         // Seek to the table's data prefix instead of scanning from the start
         // of the keyspace; stage each move (raw bytes, verbatim) in the batch.
-        let mut read_opts = rocksdb::ReadOptions::default();
-        read_opts.set_total_order_seek(true);
         let iter = self.storage.db.iterator_opt(
             rocksdb::IteratorMode::From(old_prefix_bytes, rocksdb::Direction::Forward),
-            read_opts,
+            super::time_travel::bounded_read_options(old_prefix_bytes),
         );
         for item in iter {
             let (key, value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
@@ -7965,11 +7960,9 @@ impl<'a> Catalog<'a> {
         let mut keys_to_delete = Vec::new();
 
         // Seek to the prefix instead of scanning from the keyspace start.
-        let mut read_opts = rocksdb::ReadOptions::default();
-        read_opts.set_total_order_seek(true);
         let iter = self.storage.db.iterator_opt(
             rocksdb::IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward),
-            read_opts,
+            super::time_travel::bounded_read_options(prefix_bytes),
         );
         for item in iter {
             let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;

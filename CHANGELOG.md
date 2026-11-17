@@ -620,6 +620,41 @@ release's performance work). The pause this removes was also spacing out writers
 twice as many of them as worker threads; if that regime matters more to you than the median and
 p99 at moderate concurrency, this one commit can be reverted on its own.
 
+### Performance — three regressions against 4.41.1 found by the pgbench and pg35 gates
+
+Each was measured as an A/B against 4.41.1 on the release candidate, then fixed; the numbers of the
+final build are in `docs/benchmarks/RELEASE_4_42_0.md`.
+
+- **A point read through a secondary index stays on the async worker.** This release moves every
+  statement off the worker that serves its connection, so that a long statement cannot stall the
+  server, and exempted only a primary-key point read. A read through any other index paid the
+  handoff on every execution: pgbench's indexed point read (a table with an index and no primary
+  key) ran at 0.43–0.72 of 4.41.1 and stopped scaling at about 90,000 tps. A point read
+  `WHERE column = value` through a single-column index now stays on the worker too, while the
+  index entry it fetches names at most eight rows; a value with more rows under it leaves the
+  worker as before. Same servers before and after (pgbench, perf profile, 6 s per cell): simple
+  protocol 8,714 → 11,848 / 85,585 → 122,016 / 90,270 → 156,756 tps at 1 / 16 / 64 clients;
+  prepared 8,513 → 13,113 / 81,768 → 123,223 / 89,499 → 161,989.
+- **`UPDATE … SET col = (SELECT …)` reads through an index again.** The subquery now runs in the
+  statement's own transaction, so that it sees the rows the statement has already written. That
+  transaction was treated like an explicit one, whose reads come from its snapshot, and every such
+  subquery became a full scan: pg35's `UPDATE+subquery` took 4.72 ms against 139 µs in 4.41.1
+  (34x). An autocommit statement's transaction took its snapshot when the statement began, so a
+  table the statement has not written is read through its indexes; a table it has written still
+  comes from the write set. Embedded probe of the pg35 statement: 5,087 → 197 µs (4.41.1: 150 µs).
+  Also fixed here: an aggregate over a correlated filter in `SET`
+  (`SET total = (SELECT COUNT(*) FROM items WHERE items.order_id = orders.order_id)`) was refused
+  with "column not found", in 4.41 as well, because the outer reference was not bound below the
+  aggregate.
+- **`DROP TABLE` no longer steps over the deleted keys of earlier drops.** Its walks of the record
+  families it clears had no upper bound, and a table usually has no key in most of them, so each
+  walk ran on through the tombstones of every table dropped before it: the cost of a DROP grew
+  with the number of earlier drops (pg35 `DROP TABLE` 894 µs against 149 µs, `CREATE TABLE`, which
+  drops what it creates, 478 against 166 µs). The walks now end where their prefix ends, like the
+  history walks already did. Embedded probe: `DROP TABLE` 977 → 361 µs, `CREATE TABLE` + `DROP`
+  560 → 385 µs. What remains is the dependency discovery this release added to `DROP TABLE`,
+  which reads every table's constraint record three times.
+
 ### Performance — primary-key writes over the wire, against 4.41.1
 
 4.42.0 is slower than 4.41.1 on single-row primary-key writes, and most of that is deliberate:

@@ -12494,11 +12494,10 @@ impl StorageEngine {
     /// Key suffixes (after `prefix`) of every key under `prefix`.
     fn keys_with_prefix_suffixes(&self, prefix: &str) -> Vec<String> {
         let prefix_bytes = prefix.as_bytes();
-        let mut read_opts = ReadOptions::default();
-        read_opts.set_total_order_seek(true);
-        let iter = self
-            .db
-            .iterator_opt(IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward), read_opts);
+        let iter = self.db.iterator_opt(
+            IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward),
+            super::time_travel::bounded_read_options(prefix_bytes),
+        );
         let mut out = Vec::new();
         for item in iter {
             let Ok((key, _)) = item else { break };
@@ -12561,11 +12560,9 @@ impl StorageEngine {
     /// Complete decrypted metadata scan for immutable snapshot validation.
     /// Iterator failures, malformed names and disappearing keys are errors.
     pub fn meta_blobs_with_prefix_strict(&self, prefix: &str) -> Result<Vec<(String, Vec<u8>)>> {
-        let mut options = ReadOptions::default();
-        options.set_total_order_seek(true);
         let iterator = self.db.iterator_opt(
             IteratorMode::From(prefix.as_bytes(), rocksdb::Direction::Forward),
-            options,
+            super::time_travel::bounded_read_options(prefix.as_bytes()),
         );
         let mut output = Vec::new();
         for entry in iterator {
