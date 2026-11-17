@@ -3264,47 +3264,70 @@ impl SnapshotManager {
         let mut excess = None;
         let mut from = 0;
         let mut evicted = 0;
+        let write_records = self.non_durable_writes && !self.persist_metadata;
         loop {
-            let mut registry = self.registry.write();
-            let excess =
-                *excess.get_or_insert_with(|| registry.snapshots.len().saturating_sub(self.gc_config.max_snapshots));
-            let mut step = Vec::new();
-            let mut next = None;
-            for (visited, (ts, metadata)) in registry.snapshots.range(from..).enumerate() {
-                if visited == GC_STEP || evicted + step.len() == excess {
-                    next = Some(*ts);
-                    break;
+            // A step's entries, and the copies of them whose records a memory-only
+            // database writes now, under the read lock: the writers publishing
+            // their snapshots meanwhile are not held up by the store work.
+            let (step, records, next) = {
+                let registry = self.registry.read();
+                let excess = *excess
+                    .get_or_insert_with(|| registry.snapshots.len().saturating_sub(self.gc_config.max_snapshots));
+                let mut step = Vec::new();
+                let mut next = None;
+                for (visited, (ts, metadata)) in registry.snapshots.range(from..).enumerate() {
+                    if visited == GC_STEP || evicted + step.len() == excess {
+                        next = Some(*ts);
+                        break;
+                    }
+                    if metadata.gc_eligible {
+                        step.push(*ts);
+                    }
                 }
-                if metadata.gc_eligible {
-                    step.push(*ts);
-                }
-            }
-            self.evict_from_memory(&mut registry, &step)?;
-            drop(registry);
+                let records: Vec<SnapshotMetadata> = if write_records {
+                    step.iter()
+                        .filter_map(|ts| registry.snapshots.get(ts).cloned())
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                (step, records, next)
+            };
+            // Only a pass removes entries, and one runs at a time (the caller holds
+            // `gc_pass`): the entries are still in the map when the step ends.
+            self.keep_records_of_evicted(&records)?;
+            self.evict_from_memory(&mut self.registry.write(), &step);
             evicted += step.len();
-            match next {
-                Some(ts) if evicted < excess => from = ts,
+            match (next, excess) {
+                (Some(ts), Some(excess)) if evicted < excess => from = ts,
                 _ => return Ok(evicted),
             }
         }
     }
 
-    /// Let the snapshots at `evict` go from the in-memory maps while their
-    /// `snapshot:` records stay in the store, where the lookups the maps can no
-    /// longer answer find them ([`EvictedSnapshots`]). A memory-only database
-    /// writes no record as it registers a snapshot, so it writes these now.
-    /// The watermarks move before any entry goes: a lookup that misses an
-    /// entry must see them.
-    fn evict_from_memory(&self, registry: &mut SnapshotRegistry, evict: &[u64]) -> Result<()> {
-        if evict.is_empty() {
+    /// A memory-only database writes no record as it registers a snapshot: it
+    /// writes those of the snapshots its map lets go of, before they go
+    /// ([`Self::evict_from_memory`]), without holding the registry's lock.
+    fn keep_records_of_evicted(&self, records: &[SnapshotMetadata]) -> Result<()> {
+        if records.is_empty() {
             return Ok(());
         }
-        if self.non_durable_writes && !self.persist_metadata {
-            let mut batch = WriteBatch::default();
-            for metadata in evict.iter().filter_map(|ts| registry.snapshots.get(ts)) {
-                Self::put_snapshot_record(&mut batch, metadata)?;
-            }
-            self.write_batch(batch, "Failed to keep the records of evicted snapshots")?;
+        let mut batch = WriteBatch::default();
+        for metadata in records {
+            Self::put_snapshot_record(&mut batch, metadata)?;
+        }
+        self.write_batch(batch, "Failed to keep the records of evicted snapshots")
+    }
+
+    /// Let the snapshots at `evict` go from the in-memory maps while their
+    /// `snapshot:` records stay in the store, where the lookups the maps can no
+    /// longer answer find them ([`EvictedSnapshots`]); a memory-only database
+    /// has just written them ([`Self::keep_records_of_evicted`]).
+    /// The watermarks move before any entry goes: a lookup that misses an
+    /// entry must see them.
+    fn evict_from_memory(&self, registry: &mut SnapshotRegistry, evict: &[u64]) {
+        if evict.is_empty() {
+            return;
         }
         for metadata in evict.iter().filter_map(|ts| registry.snapshots.get(ts)) {
             self.note_evicted(metadata);
@@ -3316,7 +3339,6 @@ impl SnapshotManager {
         for ts in evict {
             registry.snapshots.remove(ts);
         }
-        Ok(())
     }
 
     /// Move the eviction watermarks past `metadata`, a snapshot whose record
@@ -4284,6 +4306,40 @@ mod tests {
             "what it evicted is found in the store"
         );
         assert_eq!(manager.resolve_scn(9).unwrap(), 900);
+    }
+
+    /// A memory-only manager writes no record as it registers a snapshot: the
+    /// pass that lets snapshots go from its map writes theirs first (outside
+    /// the registry's lock), and lookups find them there.
+    #[test]
+    fn a_memory_only_pass_keeps_the_records_of_what_it_lets_go_of() {
+        let (db, _temp) = create_test_db();
+        let mut manager = SnapshotManager::new_non_durable(Arc::clone(&db), WriteGate::open());
+        manager.gc_config = GcConfig {
+            min_retention_seconds: 3600,
+            max_snapshots: 2,
+            auto_gc_enabled: true,
+        };
+        // The trigger is four: the fifth registration runs the pass.
+        for i in 1..=4u64 {
+            manager.register_snapshot(i * 100).unwrap();
+        }
+        assert_eq!(manager.snapshot_count(), 4);
+        assert!(
+            db.get(b"snapshot:100").unwrap().is_none(),
+            "a memory-only manager writes no record as it registers"
+        );
+        manager.register_snapshot(500).unwrap();
+        assert_eq!(manager.snapshot_count(), 2);
+        for ts in [100u64, 200, 300] {
+            assert!(
+                db.get(format!("snapshot:{ts}").as_bytes()).unwrap().is_some(),
+                "the record of evicted snapshot {ts} is kept"
+            );
+        }
+        assert_eq!(manager.resolve_scn(1).unwrap(), 100, "and found through it");
+        assert_eq!(manager.resolve_transaction(2).unwrap(), 200);
+        assert_eq!(manager.resolve_scn(5).unwrap(), 500);
     }
 
     /// Registrations from several threads with GC passes running among them:
