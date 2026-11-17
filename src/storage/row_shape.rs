@@ -58,7 +58,7 @@ use super::{Catalog, StorageEngine};
 use crate::sql::default_volatility::{default_is_stable, evaluate_column_default};
 use crate::sql::LogicalExpr;
 use crate::{DataType, Error, Result, Schema, Tuple, Value};
-use rocksdb::{Direction, IteratorMode, ReadOptions};
+use rocksdb::{Direction, IteratorMode};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -266,8 +266,11 @@ impl StorageEngine {
     pub(crate) fn stored_missing_values(&self, table: &str) -> Result<HashMap<String, Value>> {
         let prefix = Catalog::attmissing_prefix(table);
         let mut by_name = HashMap::new();
-        let mut read_opts = ReadOptions::default();
-        read_opts.set_total_order_seek(true);
+        // Bounded at the end of the prefix: a table with no missing values (most
+        // tables) has no key under it, and an unbounded seek would step over every
+        // deleted key after it to the next live one — all the catalog keys DDL has
+        // deleted since the store last compacted, once per scan of the table.
+        let read_opts = super::time_travel::bounded_read_options(prefix.as_bytes());
         let iter = self
             .db
             .iterator_opt(IteratorMode::From(prefix.as_bytes(), Direction::Forward), read_opts);
@@ -345,8 +348,9 @@ impl StorageEngine {
     /// Does main hold any row of `table`? One seek.
     pub(crate) fn table_has_rows(&self, table: &str) -> Result<bool> {
         let prefix = format!("data:{table}:");
-        let mut read_opts = ReadOptions::default();
-        read_opts.set_total_order_seek(true);
+        // Bounded: the walks below stop at the end of the table's rows (see
+        // `stored_missing_values`).
+        let read_opts = super::time_travel::bounded_read_options(prefix.as_bytes());
         let mut iter = self
             .db
             .iterator_opt(IteratorMode::From(prefix.as_bytes(), Direction::Forward), read_opts);
@@ -366,8 +370,7 @@ impl StorageEngine {
         row_ids: &std::collections::HashSet<u64>,
     ) -> Result<bool> {
         let prefix = format!("data:{table}:");
-        let mut read_opts = ReadOptions::default();
-        read_opts.set_total_order_seek(true);
+        let read_opts = super::time_travel::bounded_read_options(prefix.as_bytes());
         let iter = self
             .db
             .iterator_opt(IteratorMode::From(prefix.as_bytes(), Direction::Forward), read_opts);
@@ -429,8 +432,7 @@ impl StorageEngine {
         // write would, and the copies never take the write past the cap.
         let copying = self.branches_copying_main_rows(table)?;
         let mut copy_bytes = 0u64;
-        let mut read_opts = ReadOptions::default();
-        read_opts.set_total_order_seek(true);
+        let read_opts = super::time_travel::bounded_read_options(prefix.as_bytes());
         let iter = self
             .db
             .iterator_opt(IteratorMode::From(prefix.as_bytes(), Direction::Forward), read_opts);
