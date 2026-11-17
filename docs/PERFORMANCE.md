@@ -4,7 +4,7 @@ We'd rather you trust our numbers than be dazzled by them. HeliosDB-Nano is fast
 and production-useful for general OLTP/HTAP today — and there are areas we're
 openly still improving. This page is the honest version of both.
 
-The PostgreSQL comparison is reproducible from `tests/pg35_benchmark.rs`.
+The PostgreSQL comparison is reproducible from `tests/pg35_benchmark.rs` through `benches/public/pg35_run.py`.
 **Numbers vary with hardware, dataset, and config** — run them on your box; don't
 take a single figure as gospel.
 
@@ -83,8 +83,11 @@ Our internal goal is to turn "wins most categories" into "wins them all."
 ## How to reproduce
 
 ```bash
-# vs PostgreSQL (point a local PG at PG35_CONNSTR)
-cargo test --release --test pg35_benchmark -- --ignored --nocapture
+# vs PostgreSQL 18.4 (a postgres:18.4 container on 127.0.0.1:25433; the script names it)
+benches/public/pg35_run.py out candidate=.
+
+# a release against an earlier one: pg35 plus UPDATE over the wire at 1 to 64 clients
+benches/public/release_bench.sh v4.41.1
 ```
 
 Found a case where Nano is slower than you expected? **Open an issue with the

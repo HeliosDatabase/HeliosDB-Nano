@@ -217,8 +217,12 @@ for decisions), load-gated, PG 18.4 container:
 ```bash
 docker run -d --name pg_bench_nano -e POSTGRES_USER=bench -e POSTGRES_PASSWORD=benchpass \
   -e POSTGRES_DB=benchdb -p 25433:5432 postgres:18.4-bookworm
-PG35_ITERS=300 cargo test --release --test pg35_benchmark -- --nocapture --ignored
+benches/public/release_bench.sh <previous-release-rev>   # pg35 A/B + wire UPDATE A/B
+benches/public/pg35_run.py out old=<tree> new=<tree>     # pg35 alone
 ```
+The harness is strict since 4.42.0 (exactly 300 iterations, result checks, a build
+receipt and a reference preflight), so the bare `cargo test --test pg35_benchmark`
+no longer starts; `pg35_run.py` produces what it requires.
 Compare category-by-category against the last recorded table
 (`docs/benchmarks/PG35_BENCHMARK.md` + the status file's A/B history). Any category
 regression ⇒ the offending commit is fixed or reverted before the next lands.

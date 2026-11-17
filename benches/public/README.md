@@ -31,6 +31,9 @@ scripts' output — never hand-edited. Honesty rules baked in:
 | `run_concurrency.sh` | Multi-threaded embedded benches: hot-row lookups at 1/4/16 threads (`run_cache_concurrency_bench`), per-session transaction cycles (`run_session_txn_bench`, R0.1), and write-write conflict detection with zero-lost-update assertion (`run_conflict_bench`, R0.2). |
 | `ci_perf_smoke.sh` | The CI perf gate (used by `.github/workflows/perf-gate.yml`): TPS suite at N=1000/M=200 + the in-txn FK bulk-insert shape, best-of-3, checked against `ci_baseline.json`. |
 | `regen_ci_baseline.sh` | Regenerates `ci_baseline.json` from a fresh run on the current machine (rates pre-scaled down, default 0.5x). |
+| `release_bench.sh` | A release against an earlier one, in one command: `release_bench.sh v4.41.1` clones that revision, builds both sides with the release profile and runs `pg35_run.py` and `wire_pk_ab.sh` as A/Bs in alternating order. Writes `RESULTS.md` with the checksum of every binary measured. |
+| `pg35_run.py` | The strict `pg35` suite (`tests/pg35_benchmark.rs`): 35 SQL categories, embedded Nano against a real PostgreSQL 18.4, 300 timed iterations each with result checks. Builds the harness, writes the build receipt, profile and reference preflight it requires, runs it and tabulates the receipts. One or more source trees; needs the PostgreSQL reference on `127.0.0.1:25433` (the script's header has the `docker run` line) but no `psql`. |
+| `wire_pk_ab.sh` | Primary-key UPDATE / DELETE+INSERT / SELECT over the PostgreSQL wire against running servers, several binaries in alternating order, prepared and text protocol, any client counts (`examples/wire_pk_bench.rs`; no `psql` or `pgbench`). |
 | `bench_tools.py` | Shared stdlib-only tooling: `parse` (bench text → JSON), `assemble` (stamped results.json), `check` (gate), `baseline` (generate), `compare` (markdown tables). |
 
 Env knobs are documented in each script's header. Useful extras:

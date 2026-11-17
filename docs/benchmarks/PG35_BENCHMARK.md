@@ -146,15 +146,23 @@ deterministically fast.
   wire-to-wire comparison — Nano also as a TCP server, `pgbench` against both —
   see [`heliosdb-nano-vs-postgresql-2026-08-28.md`](heliosdb-nano-vs-postgresql-2026-08-28.md),
   where the margins are a far more modest 1.3×–2.8×.
-- **How to reproduce.** Start PostgreSQL 18.4 (e.g. a `postgres:18` container on
-  `:25433`, user `bench`/`benchpass`, db `benchdb`) and run:
+- **How to reproduce.** Start PostgreSQL 18.4 (a `postgres:18.4-bookworm`
+  container on `127.0.0.1:25433`, user `bench`/`benchpass`, db `benchdb`) and run:
 
   ```
-  PG35_ITERS=300 cargo test --release --test pg35_benchmark -- --ignored --nocapture
+  benches/public/pg35_run.py out candidate=.
   ```
 
-  Override the DSN with `PG35_CONNSTR` and the label with `PG35_PG_LABEL`. Higher
-  `PG35_ITERS` damps noise on the near-parity categories.
+  Since 4.42.0 the harness is strict: it runs exactly 300 timed iterations per
+  category, checks every result against an independent model on both engines,
+  and refuses to start without a build receipt for its own binary and an
+  identification of the PostgreSQL it measures. `pg35_run.py` builds the
+  harness, writes those from what it actually built and probed, runs it and
+  tabulates the receipts; the bare `cargo test` command of earlier releases no
+  longer starts. Give it two source trees (`old=<tree> new=<tree>`) for an A/B
+  in alternating order, or use `benches/public/release_bench.sh <rev>`, which
+  prepares the older tree itself. The password can be changed through
+  `PG35_CONNSTR`; host, port, user and database are fixed by the harness.
 - **Why iteration count matters.** The five near-parity join/top-k categories sit
   close enough to 1.0× that a low-iteration run on this shared development host
   can flip one or two of them (a 200-iter pass here landed 33–1–1 with INNER JOIN
