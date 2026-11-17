@@ -397,7 +397,7 @@ otherwise it refuses because no re-encryption exists.
 
 ### Security — `cargo audit --deny warnings` is clean again
 
-Three crates in `Cargo.lock` move to their patched releases, with no other entry changed:
+Four crates in `Cargo.lock` move to their patched releases, with no other entry changed:
 
 - `rustix` 1.1.3 → 1.1.6 (RUSTSEC-2026-0486, unsound: the xattr functions marked unwritten bytes as
   initialized for a zero-length buffer), with `linux-raw-sys` 0.11.0 → 0.12.1, which it requires. This one
@@ -406,9 +406,11 @@ Three crates in `Cargo.lock` move to their patched releases, with no other entry
   (RUSTSEC-2026-0538). Neither is compiled into any build: they are optional dependencies of `reqwest`'s
   HTTP/3 support, which no feature of this crate enables (`cargo tree --all-features --target all -i
   quinn-proto` prints nothing). They are updated rather than ignored, so the audit needs no new exception.
+- `libz-sys` 1.1.31 → 1.1.33 (RUSTSEC-2026-0544, published 2026-11-17: a heap overflow in zlib's `gzwrite`
+  path). Not compiled either: it is `librocksdb-sys`'s optional `zlib` dependency, which this crate does
+  not enable (`cargo tree --all-features --target all -i libz-sys` prints nothing).
 
-No advisory was added to `.cargo/audit.toml` or `deny.toml`. `cargo deny check` and
-`cargo deny --all-features check` pass before and after.
+None of these four needed an entry in `.cargo/audit.toml` or `deny.toml`.
 
 ### Security — `code-embed` no longer pulls webpki-roots 0.26 (sprinter b93af8c4a65f)
 
