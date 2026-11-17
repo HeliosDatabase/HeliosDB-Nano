@@ -15,7 +15,7 @@ use super::{Key, Snapshot, SnapshotId, WalOperation, WriteAheadLog};
 use crate::crypto::KeyManager;
 use crate::session::{IsolationLevel, SessionId};
 use crate::{Error, Result, Tuple};
-use dashmap::{DashMap, DashSet};
+use dashmap::DashMap;
 use parking_lot::{Mutex, RwLock};
 use rocksdb::{WriteOptions, DB};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
@@ -162,7 +162,7 @@ pub struct Transaction {
     /// Deliberately monotonic: ROLLBACK TO SAVEPOINT does not shrink it. An
     /// over-approximation only keeps a table on the slow (write-set-merging)
     /// read path, which is always correct.
-    written_tables: DashSet<String>,
+    written_tables: TxnSet,
     /// R2.3: set when a staged write's key is not a parseable `data:` key
     /// (e.g. raw `counter:`/meta keys via `put`). From then on
     /// `has_writes_for_table` answers `true` for every table — conservative,
@@ -764,6 +764,46 @@ impl Drop for UncommittedWriteHold {
     }
 }
 
+/// Shards of a transaction's own concurrent maps and sets. dashmap's default is
+/// four per CPU (128 on a 32-CPU host), and counting, walking or clearing a map
+/// visits every shard: a commit did that several times over maps holding a few
+/// keys, staged by the transaction's own statements, and every transaction —
+/// each autocommit statement's own included — allocated every shard of each map
+/// as it began. A few shards serve them.
+const TXN_MAP_SHARDS: usize = 4;
+
+/// A transaction's own set of table names: a [`DashMap`] of [`TXN_MAP_SHARDS`]
+/// shards behind the part of `DashSet`'s interface the transaction uses.
+#[derive(Debug)]
+struct TxnSet(DashMap<String, ()>);
+
+impl TxnSet {
+    fn new() -> Self {
+        Self(DashMap::with_shard_amount(TXN_MAP_SHARDS))
+    }
+
+    fn contains(&self, name: &str) -> bool {
+        self.0.contains_key(name)
+    }
+
+    /// `true` when `name` was not in the set yet, as `DashSet::insert`.
+    fn insert(&self, name: String) -> bool {
+        self.0.insert(name, ()).is_none()
+    }
+
+    fn iter(&self) -> dashmap::iter::Iter<'_, String, ()> {
+        self.0.iter()
+    }
+
+    fn clear(&self) {
+        self.0.clear();
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
 /// One transaction's membership in an [`UncommittedWriteCensus`].
 ///
 /// Owned by the `Transaction` itself, so membership ends on EVERY exit path —
@@ -788,9 +828,9 @@ struct WriteCensusGate {
     /// Holds the `unattributed` slot (a staged key with no attributable table).
     unattributed: AtomicBool,
     /// Tables whose `writes` slot this transaction holds.
-    tables_written: DashSet<String>,
+    tables_written: TxnSet,
     /// Tables whose `removals` slot this transaction holds.
-    tables_removed: DashSet<String>,
+    tables_removed: TxnSet,
     /// Ordinary staged values do not arm autocommit membership. Eager index
     /// additions explicitly arm cardinality; removals also arm missing-key
     /// probes. See [`Transaction::set_removal_census`].
@@ -804,8 +844,8 @@ impl WriteCensusGate {
             enrollment: Mutex::new(()),
             counted: AtomicBool::new(false),
             unattributed: AtomicBool::new(false),
-            tables_written: DashSet::new(),
-            tables_removed: DashSet::new(),
+            tables_written: TxnSet::new(),
+            tables_removed: TxnSet::new(),
             removals_only: false,
         }
     }
@@ -1021,10 +1061,10 @@ impl Transaction {
             snapshot_generation: AtomicU64::new(0),
             transaction_id,
             snapshot_manager,
-            write_set: Arc::new(DashMap::new()),
+            write_set: Arc::new(DashMap::with_shard_amount(TXN_MAP_SHARDS)),
             insert_log: Arc::new(RwLock::new(Vec::new())),
             row_counter_stages: Arc::new(RwLock::new(std::collections::HashMap::new())),
-            written_tables: DashSet::new(),
+            written_tables: TxnSet::new(),
             has_unattributed_writes: AtomicBool::new(false),
             state: AtomicU8::new(TransactionState::Active.to_u8()),
             session_id: None,
@@ -1828,10 +1868,10 @@ impl Transaction {
             snapshot_generation: AtomicU64::new(0),
             transaction_id,
             snapshot_manager,
-            write_set: Arc::new(DashMap::new()),
+            write_set: Arc::new(DashMap::with_shard_amount(TXN_MAP_SHARDS)),
             insert_log: Arc::new(RwLock::new(Vec::new())),
             row_counter_stages: Arc::new(RwLock::new(std::collections::HashMap::new())),
-            written_tables: DashSet::new(),
+            written_tables: TxnSet::new(),
             has_unattributed_writes: AtomicBool::new(false),
             state: AtomicU8::new(TransactionState::Active.to_u8()),
             session_id: Some(session_id),
