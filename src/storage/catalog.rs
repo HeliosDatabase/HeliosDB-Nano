@@ -2873,9 +2873,7 @@ impl<'a> Catalog<'a> {
         // BEFORE. Dependency discovery must prove the actual stored graph.
         let mut records = Vec::new();
         let mut tables: Vec<String> = targets.iter().map(|(name, _)| name.clone()).collect();
-        for (owner, bytes) in self.storage.meta_blobs_with_prefix("table_constraints:")? {
-            let constraints: crate::sql::TableConstraints = bincode::deserialize(&bytes)
-                .map_err(|error| Error::storage(format!("DROP TABLE constraint graph '{}': {}", owner, error)))?;
+        for (owner, constraints) in self.drop_dependency_records(targets)? {
             if constraints.foreign_keys.iter().any(|fk| fk.table_name != owner) {
                 return Err(Error::storage(format!(
                     "DROP TABLE constraint graph '{}' has a different FK owner",
@@ -2901,6 +2899,56 @@ impl<'a> Catalog<'a> {
         Ok((tables, records))
     }
 
+    /// The stored constraint records a DROP of `targets` depends on: every record
+    /// that names a foreign key (a child of a target, or a target's own edges to
+    /// its parents) and the targets' own. Read from the store, never from a cache
+    /// of records. Which tables name a foreign key is known without a walk while no
+    /// constraint record has been written since the last walk listed them (the
+    /// write gate counts every such write, `StorageEngine::foreign_key_owners`):
+    /// those records, and the targets', are then read by name. Otherwise every
+    /// record is walked, and the list kept for the next statement. The walk steps
+    /// over the deleted keys of every table dropped since the store last compacted.
+    fn drop_dependency_records(
+        &self,
+        targets: &[(String, bool)],
+    ) -> Result<Vec<(String, crate::sql::TableConstraints)>> {
+        let decode = |owner: &str, bytes: &[u8]| -> Result<crate::sql::TableConstraints> {
+            bincode::deserialize(bytes)
+                .map_err(|error| Error::storage(format!("DROP TABLE constraint graph '{}': {}", owner, error)))
+        };
+        if let Some(owners) = self.storage.foreign_key_owners() {
+            let mut names: Vec<&str> = owners
+                .iter()
+                .map(String::as_str)
+                .chain(targets.iter().map(|(name, _)| name.as_str()))
+                .collect();
+            names.sort_unstable();
+            names.dedup();
+            let mut records = Vec::new();
+            for name in names {
+                if let Some(bytes) = self.storage.get(&Self::table_constraints_key(name))? {
+                    records.push((name.to_string(), decode(name, &bytes)?));
+                }
+            }
+            return Ok(records);
+        }
+        let stamp = self.storage.write_gate().constraint_write_stamp();
+        let mut records = Vec::new();
+        for (owner, bytes) in self.storage.meta_blobs_with_prefix("table_constraints:")? {
+            let constraints = decode(&owner, &bytes)?;
+            records.push((owner, constraints));
+        }
+        if let Some(stamp) = stamp {
+            let owners = records
+                .iter()
+                .filter(|(_, constraints)| !constraints.foreign_keys.is_empty())
+                .map(|(owner, _)| owner.clone())
+                .collect();
+            self.storage.remember_foreign_key_owners(stamp, owners);
+        }
+        Ok(records)
+    }
+
     /// RESTRICT checks and CASCADE's surviving-child FK removals belong to
     /// the same native group as every target. Discover, lock in sorted order,
     /// then re-read under ownership before replacing any child definition.
@@ -2913,13 +2961,14 @@ impl<'a> Catalog<'a> {
         'a: 'd,
     {
         self.storage.refuse_main_catalog_write_on_branch("DROP TABLE")?;
-        let (locked, _) = self.drop_table_dependency_locks(targets)?;
+        let (locked, discovered) = self.drop_table_dependency_locks(targets)?;
         let scope = self.storage.table_locks().statement_scope();
         // Embedded SQL acquired this full set at its first guard. If discovery
         // expanded meanwhile, do not add a smaller owner behind that subset.
         // Direct catalog callers with no held owner acquire the full set once.
         let locks = self.storage.table_locks();
-        if locks.current_statement_holds_any()
+        let held = locks.current_statement_holds_any();
+        if held
             && locked
                 .iter()
                 .any(|name| !locks.current_statement_holds_exclusively(super::table_locks::MAIN_LEVEL, name))
@@ -2931,11 +2980,21 @@ impl<'a> Catalog<'a> {
         let names: Vec<&str> = locked.iter().map(String::as_str).collect();
         let guard = self.storage.main_catalog_write(&names, "DROP TABLE")?;
         ddl.hold_until_published(guard);
-        let (current, records) = self.drop_table_dependency_locks(targets)?;
-        if current.iter().any(|name| locked.binary_search(name).is_err()) {
-            let table = targets.first().map_or("DROP TABLE", |(name, _)| name.as_str());
-            return Err(super::layout_epochs::layout_changed(table));
-        }
+        // Under ownership. When the statement already held every table the
+        // discovery above named, that discovery was made under ownership: no
+        // foreign key to or from those tables can change while they are held (a
+        // constraint change locks its table and every parent it names), so it
+        // is the re-read. A caller that held nothing re-reads now that it does.
+        let records = if held {
+            discovered
+        } else {
+            let (current, records) = self.drop_table_dependency_locks(targets)?;
+            if current.iter().any(|name| locked.binary_search(name).is_err()) {
+                let table = targets.first().map_or("DROP TABLE", |(name, _)| name.as_str());
+                return Err(super::layout_epochs::layout_changed(table));
+            }
+            records
+        };
         let mut updates = Vec::new();
         for (child, mut constraints) in records {
             if targets.iter().any(|(name, _)| name == &child) {
