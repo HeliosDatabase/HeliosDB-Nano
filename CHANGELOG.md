@@ -675,8 +675,72 @@ was measured again after the fixes; all its numbers, and what is still slower th
   drops what it creates, 478 against 166 µs). The walks now end where their prefix ends, like the
   history walks already did. Embedded probe: `DROP TABLE` 977 → 361 µs, `CREATE TABLE` + `DROP`
   560 → 385 µs; release build in pg35: `DROP TABLE` 359 µs against 150 µs (2.4x, from 6.0x) and
-  `CREATE TABLE` 344 against 158 µs (2.2x). What remains is the dependency discovery this release
-  added to `DROP TABLE`, which reads every table's constraint record three times.
+  `CREATE TABLE` 344 against 158 µs (2.2x). What remained was the dependency discovery this
+  release added to `DROP TABLE`; see the next section.
+
+### Performance — a second pass over what 4.42.0 added to a statement
+
+The pg35 categories still slower than 4.41.1 after the three fixes above were profiled on both
+releases with an in-process sampler (about 1,000 samples a second, 8 s per statement shape, the
+pg35 schema and data, in memory), then each change below was measured the same way, against
+4.42.0 in the same run. Those numbers are per statement in a long run, where every cost that grows
+with history shows.
+
+In pg35 itself (release builds, 300 statements per category, 2 rounds, one run of all three:
+4.41.1 / 4.42.0 before this pass / 4.42.0 now) 13 categories got 13% or more faster and none
+slower, among them `Transaction ctl` 50.1 / 64.4 / 36.3 µs, `UPSERT` 62.4 / 100.2 / 61.2,
+`DROP TABLE` 153.9 / 352.0 / 234.9, `CREATE TABLE` 168.2 / 355.5 / 255.6, `CREATE INDEX`
+316.4 / 480.6 / 325.3 and `SET/SHOW/RESET` 2.4 / 2.9 / 2.4. The full table is in
+`docs/benchmarks/RELEASE_4_42_0.md`.
+
+- **A transaction's own maps have four shards, not four per CPU** (075b8a51). dashmap gives a map
+  four shards per CPU unless told otherwise, 128 on a 32-CPU host. A transaction's write set, the
+  set of tables it wrote and its write-census sets hold a few keys, yet a commit counted, walked
+  and cleared every shard of them several times, and every transaction (each autocommit
+  statement's included) allocated all of them as it began: about 21 µs per DDL or DML statement.
+  `BEGIN … SAVEPOINT … ROLLBACK TO … COMMIT` 85.8 → 55.5 µs (4.41.1: 55.8), `UPSERT` 129 → 86 µs
+  (79), multi-row `INSERT` 311 → 250 µs (203).
+- **The stored values of columns added later are found without walking past their prefix**
+  (54539f44). Before a table scan, 4.42.0 loads the values of columns added after the rows were
+  written (spec R5.2). The seek had no upper bound, and a table with no such values (most tables)
+  stepped over every deleted catalog key after its prefix, a cost that grew with every DDL:
+  `CREATE INDEX` + `DROP INDEX` 995 → 462 µs (4.41.1: 414).
+- **`DROP TABLE` reads the constraint records it depends on by name while none has changed**
+  (0499c05e). The write gate counts every write of a constraint record; while none has been
+  written since a walk listed the tables that name a foreign key, a DROP reads those records and its
+  targets' by name instead of walking every record (and the deleted keys of every table dropped
+  before it), and a statement that already holds every table the discovery named no longer makes
+  a third one. The records read are still the stored ones. `DROP TABLE` 1,101 → 685 µs (4.41.1:
+  644), `CREATE TABLE` + `DROP` 1,494 → 926 µs (804).
+- **The branch gate parses a setting statement only when it names a branch** (d1b77cdf): every
+  `SET`, `SHOW` and `RESET` was parsed twice. The three statements 3.53 → 2.89 µs (4.41.1: 2.17).
+- **The in-memory engine pins its L0 index and filter blocks** (28b77354), as the disk-backed engine
+  does. An `UPDATE` or `DELETE` of one row opens an iterator to check the row's newest version, and
+  once an in-memory store had flushed, each iterator read and decompressed the index blocks of
+  every L0 file again: one-row `INSERT` + `DELETE` 55.9 → 45.8 µs.
+- **A memory-only snapshot pass writes its records outside the registry lock** (c6597860), as
+  `gc_old_snapshots` was documented to, so writers publishing their snapshots meanwhile do not
+  wait for its store work. Running the pass on a thread of its own was measured and not kept: its
+  inserts contend with the committing thread's in the same memtable, and a single writer got
+  slower.
+
+What this pass did not change, and why:
+
+- **One-row writes record history.** A one-row `UPDATE` or `DELETE` writes the row, its version and
+  its version-index event, and checks the row's newest version first (an iterator); on disk it also
+  writes the snapshot record and its three index keys: seven keys where 4.41.1 wrote one. Embedded
+  on disk, a prepared one-row `UPDATE` takes 33 µs against 11 µs in 4.41.1 (the RocksDB write 14.5
+  against 6.3 µs, the newest-version check 5.2 µs, the snapshot record 2.1 µs); over the wire, a
+  server's connections wait for RocksDB's write group, and at 64 clients 4.42.0 makes about half
+  the commits per second 4.41.1 makes. That is the price of `AS OF` being right after a fast-path
+  write; a store that does not use `AS OF`, `VERSIONS BETWEEN` or branches from the past can set
+  `[storage] time_travel_enabled = false`.
+- **An in-memory store pays for the history it keeps beyond its newest snapshots.** Past 2,000
+  snapshots in memory, the commit that crosses the limit writes the records of the oldest 1,000
+  (four keys each) so `AS OF` still reaches them: about 5 ms once per 1,000 commits, 5 µs per
+  commit on average.
+- `TRUNCATE` and `REFRESH MATERIALIZED VIEW` cost more the more often they ran, because their
+  scans step over the rows deleted by the earlier runs; 4.41.1 does the same.
 
 ### Performance — primary-key writes over the wire, against 4.41.1
 
@@ -706,9 +770,11 @@ this release without the two performance changes above. Ops/s:
 | | 16 | 107,181 | 56,621 | 68,243 | 0.64 | 0.81 ms | 0.54 ms |
 | | 64 | 143,561 | 56,022 | 73,759 | 0.51 | 12.3 ms | 4.3 ms |
 
-- **With `[storage] time_travel_enabled = false`** 4.42.0 writes what 4.41.1 wrote and measures
-  0.86 / 0.96 / 0.95 of it at 1 / 16 / 64 clients (11,075 / 99,636 / 130,829 ops/s, 2 rounds). A
-  store that does not use `AS OF`, branches from the past or `VERSIONS BETWEEN` can run that way.
+- **With `[storage] time_travel_enabled = false`** 4.42.0 writes what 4.41.1 wrote. The release
+  build, started with a configuration file holding only that setting, measures 0.99 / 0.95 / 0.93 of
+  4.41.1 prepared and 0.94 / 0.95 / 0.95 as text at 1 / 16 / 64 clients (12,670 / 101,555 / 132,110
+  ops/s prepared, 2 rounds). A store that does not use `AS OF`, branches from the past or
+  `VERSIONS BETWEEN` can run that way.
 - **Not improved in this release:** a prepared primary-key `SELECT` at 16 clients measures 0.92 of
   4.41.1 (111,985 against 121,336 ops/s), and a `DELETE` followed by the `INSERT` of the same row
   0.42 (17,531 against 41,390 pairs/s): both statements of that pair record history now.
