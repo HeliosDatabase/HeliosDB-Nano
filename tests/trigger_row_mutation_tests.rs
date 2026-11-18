@@ -996,3 +996,128 @@ fn an_in_memory_database_opens_with_no_triggers() {
         "a fresh in-memory database has no triggers"
     );
 }
+
+// ===========================================================================
+// A recipe is the whole body or nothing
+// ===========================================================================
+//
+// The rewrite recipe was read off the body one `;`-separated piece at a time,
+// with no regard for the control flow around a piece: `IF … RETURN NULL; END IF;
+// RETURN NEW` skipped every row, and an assignment under an `IF` was applied to
+// every row. A body with control flow, a `RETURN` of anything but NEW or NULL, or
+// a `RETURN` that is not its last statement now registers no recipe: the trigger
+// is inert, which is what a body the engine cannot run has always been.
+
+/// Run `check` once per executor family, on a fresh database with the trigger
+/// function `body` on `trg_t`.
+fn with_trigger_body(body: &str, check: impl Fn(&EmbeddedDatabase, &dyn Fn(&str))) {
+    for params_family in [false, true] {
+        let db = mem_db();
+        create_tables(&db);
+        create_fn(&db, "body_fn", body);
+        create_trigger_text(&db, "trg", BEFORE_INSERT_ROW, "body_fn").expect("create trigger");
+        let insert = |sql: &str| {
+            let done = if params_family {
+                db.execute_params(sql, &[])
+            } else {
+                db.execute(sql)
+            };
+            done.unwrap_or_else(|e| panic!("`{sql}` failed: {e}"));
+        };
+        check(&db, &insert);
+    }
+}
+
+#[test]
+fn a_conditional_return_null_does_not_drop_rows() {
+    with_trigger_body(
+        "BEGIN IF NEW.id < 0 THEN RAISE NOTICE 'skipping'; RETURN NULL; END IF; RETURN NEW; END",
+        |db, insert| {
+            insert("INSERT INTO trg_t (id, tag) VALUES (1, 'kept')");
+            assert_eq!(rows_in(db, "trg_t"), 1);
+            assert_eq!(first_text(db, "SELECT tag FROM trg_t WHERE id = 1"), "kept");
+        },
+    );
+}
+
+#[test]
+fn a_conditional_assignment_is_not_applied_to_every_row() {
+    with_trigger_body(
+        "BEGIN IF NEW.tag IS NULL THEN NEW.tag = 'was-null'; END IF; RETURN NEW; END",
+        |db, insert| {
+            insert("INSERT INTO trg_t (id, tag) VALUES (1, 'original')");
+            assert_eq!(first_text(db, "SELECT tag FROM trg_t WHERE id = 1"), "original");
+        },
+    );
+}
+
+#[test]
+fn a_return_that_is_not_the_last_statement_registers_no_recipe() {
+    with_trigger_body("BEGIN RETURN NULL; NEW.tag = 'late'; END", |db, insert| {
+        insert("INSERT INTO trg_t (id, tag) VALUES (1, 'original')");
+        assert_eq!(first_text(db, "SELECT tag FROM trg_t WHERE id = 1"), "original");
+    });
+}
+
+#[test]
+fn return_nullif_is_not_return_null() {
+    with_trigger_body("BEGIN RETURN NULLIF(NEW, NEW); END", |db, insert| {
+        insert("INSERT INTO trg_t (id, tag) VALUES (1, 'original')");
+        assert_eq!(rows_in(db, "trg_t"), 1);
+    });
+}
+
+#[test]
+fn a_case_expression_on_the_right_hand_side_still_rewrites() {
+    with_trigger_body(
+        "BEGIN NEW.tag = CASE WHEN NEW.id > 5 THEN 'big' ELSE 'small' END; RETURN NEW; END",
+        |db, insert| {
+            insert("INSERT INTO trg_t (id, tag) VALUES (1, 'x'), (9, 'y')");
+            assert_eq!(first_text(db, "SELECT tag FROM trg_t WHERE id = 1"), "small");
+            assert_eq!(first_text(db, "SELECT tag FROM trg_t WHERE id = 9"), "big");
+        },
+    );
+}
+
+#[test]
+fn a_semicolon_inside_a_string_is_part_of_one_assignment() {
+    with_trigger_body("BEGIN NEW.tag = 'a; RETURN NULL; b'; RETURN NEW; END", |db, insert| {
+        insert("INSERT INTO trg_t (id, tag) VALUES (1, 'original')");
+        assert_eq!(
+            first_text(db, "SELECT tag FROM trg_t WHERE id = 1"),
+            "a; RETURN NULL; b"
+        );
+    });
+}
+
+#[test]
+fn an_assignment_that_cannot_be_converted_cancels_the_whole_recipe() {
+    // The second assignment is not an expression; the first must not be applied alone.
+    with_trigger_body(
+        "BEGIN NEW.tag = 'half'; NEW.id = (SELECT; RETURN NEW; END",
+        |db, insert| {
+            insert("INSERT INTO trg_t (id, tag) VALUES (1, 'original')");
+            assert_eq!(first_text(db, "SELECT tag FROM trg_t WHERE id = 1"), "original");
+        },
+    );
+}
+
+#[test]
+fn straight_line_bodies_keep_their_recipe() {
+    with_trigger_body(REWRITE_BODY, |db, insert| {
+        insert("INSERT INTO trg_t (id, tag) VALUES (1, 'original')");
+        assert_eq!(first_text(db, "SELECT tag FROM trg_t WHERE id = 1"), "set-by-trigger");
+    });
+    with_trigger_body(SKIP_BODY, |db, insert| {
+        insert("INSERT INTO trg_t (id, tag) VALUES (1, 'original')");
+        assert_eq!(rows_in(db, "trg_t"), 0);
+    });
+    // A statement without an effect on the row is ignored, as before.
+    with_trigger_body(
+        "BEGIN RAISE NOTICE 'seen'; NEW.tag := 'set'; RETURN NEW; END",
+        |db, insert| {
+            insert("INSERT INTO trg_t (id, tag) VALUES (1, 'original')");
+            assert_eq!(first_text(db, "SELECT tag FROM trg_t WHERE id = 1"), "set");
+        },
+    );
+}

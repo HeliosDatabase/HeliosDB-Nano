@@ -20760,30 +20760,44 @@ impl EmbeddedDatabase {
 
     /// Resolve a trigger function's body into a BEFORE-row NEW-mutation recipe
     /// for the `NEW.<col> = <expr>; … RETURN NEW|NULL` pattern. Returns `None`
-    /// when the function is unknown or its body has no recognised effect.
+    /// when the function is unknown, when its body has no recognised effect,
+    /// or when any part of the body is beyond the pattern: a recipe is the
+    /// whole body or nothing.
     fn build_trigger_row_mutation(
         &self,
         function_name: &str,
         events: &[sql::logical_plan::TriggerEvent],
     ) -> Option<sql::triggers::TriggerRowMutation> {
         let func = self.function_registry.get_function(function_name)?;
-        let (assigns, returns_null) = Self::parse_trigger_assignments(&func.body);
+        let Some((assigns, returns_null)) = Self::parse_trigger_assignments(&func.body) else {
+            tracing::warn!(
+                function = function_name,
+                "trigger function has control flow or a conditional RETURN; its trigger will not change or skip rows"
+            );
+            return None;
+        };
         if assigns.is_empty() && !returns_null {
             return None;
         }
         let mut assignments = Vec::new();
         for (col, rhs) in &assigns {
-            // Convert each RHS independently so one unsupported expression
-            // doesn't drop the others. Conversion goes straight through
-            // `expr_to_logical` (not full SELECT planning) so `NEW.col` /
-            // `OLD.col` references survive — they're resolved against the row
-            // context when the trigger fires.
-            if let Ok(expr) = self.rhs_to_logical_expr(rhs) {
-                assignments.push((col.clone(), expr));
+            // Conversion goes straight through `expr_to_logical` (not full
+            // SELECT planning) so `NEW.col` / `OLD.col` references survive —
+            // they're resolved against the row context when the trigger fires.
+            // An assignment that cannot be converted cancels the recipe:
+            // applying the others would store a row the function never made.
+            match self.rhs_to_logical_expr(rhs) {
+                Ok(expr) => assignments.push((col.clone(), expr)),
+                Err(error) => {
+                    tracing::warn!(
+                        function = function_name,
+                        column = col.as_str(),
+                        %error,
+                        "trigger function assignment is not supported; its trigger will not change or skip rows"
+                    );
+                    return None;
+                }
             }
-        }
-        if assignments.is_empty() && !returns_null {
-            return None;
         }
         Some(sql::triggers::TriggerRowMutation {
             events: events.to_vec(),
@@ -20793,50 +20807,86 @@ impl EmbeddedDatabase {
     }
 
     /// Parse a PL/pgSQL trigger body for `NEW.<col> = <expr>` assignments and a
-    /// `RETURN NULL` (skip-row) marker. Best effort: statements it doesn't
-    /// recognise are ignored.
-    fn parse_trigger_assignments(body: &str) -> (Vec<(String, String)>, bool) {
+    /// final `RETURN NEW` / `RETURN NULL`.
+    ///
+    /// `None` means the body is not the straight-line form: it has control
+    /// flow (`IF`, `CASE`, a loop, a nested block, an exception handler), a
+    /// `RETURN` of anything else, or a `RETURN` that is not its last statement.
+    /// Such a body used to be read as if its conditions were not there: an
+    /// `IF … RETURN NULL; END IF` skipped every row, and an assignment under an
+    /// `IF` was applied to every row. Statements without an effect on the row
+    /// (`RAISE`, `PERFORM`, an `INSERT` into another table) are still ignored.
+    fn parse_trigger_assignments(body: &str) -> Option<(Vec<(String, String)>, bool)> {
+        const CONTROL_FLOW: &[&str] = &[
+            "IF",
+            "ELSIF",
+            "ELSEIF",
+            "ELSE",
+            "END",
+            "CASE",
+            "LOOP",
+            "WHILE",
+            "FOR",
+            "FOREACH",
+            "EXIT",
+            "CONTINUE",
+            "EXCEPTION",
+            "WHEN",
+            "BEGIN",
+            "DECLARE",
+        ];
         // Narrow to the BEGIN … END block when present.
         let inner = {
             let upper = body.to_ascii_uppercase();
             let start = upper.find("BEGIN").map(|i| i + "BEGIN".len()).unwrap_or(0);
             let end = upper.rfind("END").unwrap_or(body.len());
-            if start <= end && end <= body.len() {
-                &body[start..end]
-            } else {
-                body
-            }
+            body.get(start..end).unwrap_or(body)
         };
+
+        let statements: Vec<String> = crate::protocol::postgres::handler::pg_split_sql_respecting_quotes(inner)
+            .into_iter()
+            .map(|statement| statement.trim().trim_end_matches(';').trim().to_string())
+            .filter(|statement| !statement.is_empty())
+            .collect();
+        let last = statements.len().checked_sub(1);
 
         let mut assignments = Vec::new();
         let mut returns_null = false;
-        for raw in inner.split(';') {
-            let stmt = raw.trim();
-            if stmt.is_empty() {
-                continue;
-            }
+        for (position, stmt) in statements.iter().enumerate() {
             let upper = stmt.to_ascii_uppercase();
-            if upper.starts_with("RETURN") {
-                if upper.contains("NULL") {
-                    returns_null = true;
+            let first_word: String = upper
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            if CONTROL_FLOW.contains(&first_word.as_str()) {
+                return None;
+            }
+            if first_word == "RETURN" {
+                if Some(position) != last {
+                    return None;
+                }
+                let returned: Vec<&str> = upper.split_whitespace().skip(1).collect();
+                match returned.as_slice() {
+                    ["NEW"] => {}
+                    ["NULL"] => returns_null = true,
+                    _ => return None,
                 }
                 continue;
             }
             // NEW.<col> [:]= <rhs>
-            if upper.starts_with("NEW.") {
-                let after = &stmt[4..]; // after "NEW."
-                if let Some(eq) = after.find('=') {
-                    let col = after[..eq].trim();
-                    // tolerate ':=' assignment
-                    let col = col.strip_suffix(':').unwrap_or(col).trim();
-                    let rhs = after[eq + 1..].trim();
-                    if !col.is_empty() && !rhs.is_empty() {
-                        assignments.push((col.to_string(), rhs.to_string()));
-                    }
+            if let Some(after) = stmt.get(4..).filter(|_| upper.starts_with("NEW.")) {
+                let eq = after.find('=')?;
+                let col = after.get(..eq)?.trim();
+                // tolerate ':=' assignment
+                let col = col.strip_suffix(':').unwrap_or(col).trim();
+                let rhs = after.get(eq + 1..)?.trim();
+                if col.is_empty() || rhs.is_empty() {
+                    return None;
                 }
+                assignments.push((col.to_string(), rhs.to_string()));
             }
         }
-        (assignments, returns_null)
+        Some((assignments, returns_null))
     }
 
     /// Convert a single scalar RHS expression (e.g. `NOW()`, `NEW.a + 1`) to a
