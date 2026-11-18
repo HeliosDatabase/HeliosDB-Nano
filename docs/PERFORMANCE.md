@@ -28,12 +28,18 @@ a wide margin, not a hair:
 A handful of categories are where Nano is *ahead but not by much* — these are our
 current focus, and we'd rather name them than hide them:
 
-- **Joins** (INNER / LEFT / 4-table) — Nano's indexed nested-loop join wins, but
-  only ~1.2–1.7×, and a 4-table join can dip to roughly tied on a noisy run.
-  Improving join ordering, build-side selection, and a streaming (non-materializing)
-  join operator is on the roadmap.
-- **`ORDER BY … LIMIT` (top-k)** — roughly tied with PostgreSQL; we're hardening the
-  ordered-index top-k fast path so it wins consistently.
+- **Joins** (INNER / LEFT / 4-table) — the margins here are the suite's smallest
+  after top-k. In the 4.42.0 release run they are 10.5×, 14.8× and 8.9×.
+  The 4-table join was slower than PostgreSQL up to 4.41.1 (about 0.8×): a `WHERE`
+  term pushed below the joins lost the index lookups of the joins above it, which
+  4.42.0 fixes. Join ordering, build-side selection, and a streaming
+  (non-materializing) join operator are on the roadmap.
+- **`ORDER BY … LIMIT` (top-k)** — 2.9× in the 4.42.0 release run, the smallest
+  margin of the 35 categories; we're hardening the ordered-index top-k fast path.
+- **One-row writes since 4.42.0** — still far ahead of a networked PostgreSQL, but
+  slower than 4.41.1 was, because every one-row `UPDATE` and `DELETE` now records the
+  row's history for `AS OF`. The release benchmark has the numbers and the setting
+  that turns it off (`docs/benchmarks/RELEASE_4_42_0.md`).
 - **Prepared / extended-protocol statements** — was the one shape where PostgreSQL led.
   v4.2.0 removed the session-mutex serialization on parameterized autocommit reads, and
   measured 2026-08-28 at v4.19.0 Nano is ahead on both (extended 1.33×–1.57×, prepared

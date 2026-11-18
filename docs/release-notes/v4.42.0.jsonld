@@ -66,7 +66,7 @@
      "name": "Is HeliosDB-Nano 4.42.0 faster than PostgreSQL?",
      "acceptedAnswer": {
       "@type": "Answer",
-      "text": "In the pg35 benchmark, embedded HeliosDB-Nano 4.42.0 is faster than PostgreSQL 18.4 in 34 of 35 SQL categories and slower in 1 (4-table JOIN). That compares an in-process, in-memory engine with a PostgreSQL server over TCP that syncs every commit; with both engines as servers the margins are much smaller (see the pgbench tables in the release benchmark)."
+      "text": "In the pg35 benchmark, embedded HeliosDB-Nano 4.42.0 is faster than PostgreSQL 18.4 in all 35 SQL categories. HeliosDB-Nano 4.41.1 was slower than PostgreSQL in one of them, the 4-table join. That compares an in-process, in-memory engine with a PostgreSQL server over TCP that syncs every commit; with both engines as servers the margins are much smaller (see the pgbench tables in the release benchmark)."
      }
     },
     {
@@ -74,7 +74,15 @@
      "name": "Is HeliosDB-Nano 4.42.0 faster or slower than 4.41.1?",
      "acceptedAnswer": {
       "@type": "Answer",
-      "text": "Both. In pg35, 20 of 35 categories are within 15% of 4.41.1, 4 are faster and 11 are slower. One-row INSERT, UPDATE and DELETE are slower because each commit now records row history; over the wire a one-row UPDATE runs at 0.47–0.72 of 4.41.1's throughput between 1 and 64 clients."
+      "text": "Both. In pg35, 15 of 35 categories are within 15% of 4.41.1, 6 are faster and 14 are slower. One-row INSERT, UPDATE and DELETE are slower because each commit now records row history; over the wire a one-row UPDATE runs at 0.45–0.74 of 4.41.1's throughput between 1 and 64 clients."
+     }
+    },
+    {
+     "@type": "Question",
+     "name": "What is the pg35 baseline, and which categories did 4.42.0 improve?",
+     "acceptedAnswer": {
+      "@type": "Answer",
+      "text": "The pg35 baseline is the best time per statement each of the 35 benchmark categories has reached in a release; a release that reaches a new best sets the baseline for that category. 4.42.0 sets a new baseline in 9 of 35 categories (ALTER TABLE, INSERT..SELECT, UPSERT, INNER JOIN, LEFT JOIN, 4-table JOIN, Window funcs, LIKE/BETWEEN/IN, Transaction ctl). In the other 26 the baseline stays with 4.41.1; 4.42.0 is within 15% of it in 13 and more than 15% slower in 13."
      }
     },
     {
@@ -90,7 +98,7 @@
      "name": "How do I get 4.41.1's write speed back?",
      "acceptedAnswer": {
       "@type": "Answer",
-      "text": "If the store does not use AS OF, VERSIONS BETWEEN or branches from the past, set time_travel_enabled = false in the [storage] section of the configuration file. Measured that way, the 4.42.0 server runs a one-row UPDATE at 0.93–0.99 of 4.41.1's throughput at 1, 16 and 64 clients."
+      "text": "If the store does not use AS OF, VERSIONS BETWEEN or branches from the past, set time_travel_enabled = false in the [storage] section of the configuration file. Measured that way, the 4.42.0 server runs a one-row UPDATE at 0.90–0.96 of 4.41.1's throughput at 1, 16 and 64 clients."
      }
     },
     {

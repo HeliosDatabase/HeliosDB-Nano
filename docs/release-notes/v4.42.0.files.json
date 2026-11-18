@@ -27,6 +27,10 @@
    "role": "every measurement as one JSON document (no file paths, hardware class only)"
   },
   {
+   "path": "benches/public/pg35_baseline.json",
+   "role": "the pg35 baseline: best time per category and the release that set it"
+  },
+  {
    "path": "docs/guides/upgrade.md",
    "role": "upgrade guide from 4.41.x"
   },

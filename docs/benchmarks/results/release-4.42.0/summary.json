@@ -1,14 +1,14 @@
 {
  "schema": "heliosdb-nano-release-benchmark/1",
  "produced_by": "benches/public/release_bench.sh",
- "note": "Commit ids and the label v4.42.0-2a5d741a are as the run recorded them. Commit messages were reworded afterwards without changing a file: c65978604c3a is now 6c554c1ef002 and 2a5d741a is now 255b19f9 (same trees, same binaries).",
+ "note": "Commit ids and the label v4.42.0-2a5d741a are as the run recorded them. Commit messages were reworded after that first benchmark without changing a file: 2a5d741a is 255b19f9 in the published history (same tree, same binary). The best time per category over eight rounds of each release is in benches/public/pg35_baseline.json.",
  "run": {
-  "date (UTC)": "2026-11-18T00:52:12Z",
+  "date (UTC)": "2026-11-18T06:15:19Z",
   "platform": "Linux x86_64, 32 logical CPUs, at least 64 GiB of memory",
   "toolchain": "rustc 1.100.0 (0ef1bc386 2026-11-09); cargo 1.100.0 (3acc79c0c 2026-11-05)",
-  "v4.42.0": "commit c65978604c3add569043e281077c8b77d90667fe, 2 uncommitted file(s)",
+  "v4.42.0": "commit 1e20624ba0883420b23fc065bb71a209d9d28cd3, 2 uncommitted file(s)",
   "v4.41.1": "commit 4af19e1c447b8b9f8a621a984e8cc0558195bf3b, pg35 harness files copied from v4.42.0",
-  "bin/v4.42.0/heliosdb-nano": "sha256 40ee9a9619f6979f6e44e1b57887ae87cd1e375a8c2d04760cad234bc9181a8d",
+  "bin/v4.42.0/heliosdb-nano": "sha256 86026c2a8f36fec4587a6164baa54327136db1b6629be5408c7ca331d34a156c",
   "bin/v4.41.1/heliosdb-nano": "sha256 956bc158fd90f677724a2f4133e1594a1cdaa75154ff44d38817ef5beddef947",
   "bin/wire_pk_bench": "sha256 e303016e9f70ede4e9acf35b842be259b73bf610cd5a14cd87dbc92c2eba970f"
  },
@@ -82,7 +82,7 @@
    },
    {
     "label": "v4.42.0",
-    "commit": "c65978604c3add569043e281077c8b77d90667fe",
+    "commit": "1e20624ba0883420b23fc065bb71a209d9d28cd3",
     "build_profile": "release",
     "features": [
      "default",
@@ -92,1095 +92,1095 @@
      "vector-search"
     ],
     "harness_source_sha256": "7cae77fcd3565862b662dc120f270c20c7aeee913d59a8db811f2d823ea401cb",
-    "harness_binary_sha256": "264a87807092d784c4098b3635dd77524cbf192e7bcea660964cbe3c71a17f1f",
+    "harness_binary_sha256": "3b29b3b3655f3946b46cb56b57cb1357b0331d6513c63f5817bffb3c3cc76757",
     "rustc": "rustc 1.100.0 (0ef1bc386 2026-11-09)"
    }
   ],
   "categories": [
    {
     "category": "CREATE TABLE",
-    "postgres_us": 35687.81,
+    "postgres_us": 30301.185,
     "nano": {
      "v4.41.1": {
-      "median_us": 168.152,
+      "median_us": 162.83,
       "runs_us": [
-       165.022,
-       171.282
+       170.687,
+       154.972
       ],
-      "x_postgres": 212.23
+      "x_postgres": 186.09
      },
      "v4.42.0-2a5d741a": {
-      "median_us": 355.48,
+      "median_us": 345.056,
       "runs_us": [
-       345.727,
-       365.234
+       348.045,
+       342.067
       ],
-      "x_postgres": 100.39
+      "x_postgres": 87.82
      },
      "v4.42.0": {
-      "median_us": 255.583,
+      "median_us": 239.963,
       "runs_us": [
-       258.324,
-       252.842
+       243.34,
+       236.586
       ],
-      "x_postgres": 139.63
+      "x_postgres": 126.27
      }
     },
-    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 2.114
+    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 2.119
    },
    {
     "category": "CREATE INDEX",
-    "postgres_us": 34008.349,
+    "postgres_us": 29032.456,
     "nano": {
      "v4.41.1": {
-      "median_us": 316.39,
+      "median_us": 292.587,
       "runs_us": [
-       328.067,
-       304.713
+       315.464,
+       269.711
       ],
-      "x_postgres": 107.49
+      "x_postgres": 99.23
      },
      "v4.42.0-2a5d741a": {
-      "median_us": 480.608,
+      "median_us": 480.413,
       "runs_us": [
-       482.193,
-       479.022
+       498.903,
+       461.923
       ],
-      "x_postgres": 70.76
+      "x_postgres": 60.43
      },
      "v4.42.0": {
-      "median_us": 325.301,
+      "median_us": 335.374,
       "runs_us": [
-       345.167,
-       305.436
+       319.144,
+       351.604
       ],
-      "x_postgres": 104.54
+      "x_postgres": 86.57
      }
     },
-    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 1.519
+    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 1.642
    },
    {
     "category": "ALTER TABLE",
-    "postgres_us": 29665.522,
+    "postgres_us": 27500.002,
     "nano": {
      "v4.41.1": {
-      "median_us": 951.886,
+      "median_us": 930.307,
       "runs_us": [
-       950.375,
-       953.397
+       991.843,
+       868.772
       ],
-      "x_postgres": 31.17
+      "x_postgres": 29.56
      },
      "v4.42.0-2a5d741a": {
-      "median_us": 700.568,
+      "median_us": 666.822,
       "runs_us": [
-       710.52,
-       690.616
+       655.816,
+       677.828
       ],
-      "x_postgres": 42.34
+      "x_postgres": 41.24
      },
      "v4.42.0": {
-      "median_us": 269.389,
+      "median_us": 267.526,
       "runs_us": [
-       280.376,
-       258.402
+       256.353,
+       278.7
       ],
-      "x_postgres": 110.12
+      "x_postgres": 102.79
      }
     },
-    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 0.736
+    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 0.717
    },
    {
     "category": "DROP TABLE",
-    "postgres_us": 14544.612,
+    "postgres_us": 13121.374,
     "nano": {
      "v4.41.1": {
-      "median_us": 153.93,
+      "median_us": 147.95,
       "runs_us": [
-       164.44,
-       143.421
+       155.041,
+       140.858
       ],
-      "x_postgres": 94.49
+      "x_postgres": 88.69
      },
      "v4.42.0-2a5d741a": {
-      "median_us": 352.03,
+      "median_us": 356.275,
       "runs_us": [
-       339.367,
-       364.694
+       334.8,
+       377.75
       ],
-      "x_postgres": 41.32
+      "x_postgres": 36.83
      },
      "v4.42.0": {
-      "median_us": 234.904,
+      "median_us": 220.928,
       "runs_us": [
-       237.917,
-       231.892
+       210.233,
+       231.622
       ],
-      "x_postgres": 61.92
+      "x_postgres": 59.39
      }
     },
-    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 2.287
+    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 2.408
    },
    {
     "category": "CREATE/DROP VIEW",
-    "postgres_us": 28200.452,
+    "postgres_us": 26602.492,
     "nano": {
      "v4.41.1": {
-      "median_us": 125.787,
+      "median_us": 120.472,
       "runs_us": [
-       129.696,
-       121.877
+       124.228,
+       116.717
       ],
-      "x_postgres": 224.19
+      "x_postgres": 220.82
      },
      "v4.42.0-2a5d741a": {
-      "median_us": 175.251,
+      "median_us": 172.691,
       "runs_us": [
-       181.056,
-       169.445
+       177.165,
+       168.217
       ],
-      "x_postgres": 160.91
+      "x_postgres": 154.05
      },
      "v4.42.0": {
-      "median_us": 132.515,
+      "median_us": 119.277,
       "runs_us": [
-       134.994,
-       130.036
+       117.348,
+       121.206
       ],
-      "x_postgres": 212.81
+      "x_postgres": 223.03
      }
     },
-    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 1.393
+    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 1.433
    },
    {
     "category": "REFRESH MATVIEW",
-    "postgres_us": 16601.664,
+    "postgres_us": 17460.042,
     "nano": {
      "v4.41.1": {
-      "median_us": 542.885,
+      "median_us": 589.796,
       "runs_us": [
-       555.064,
-       530.706
+       568.061,
+       611.531
       ],
-      "x_postgres": 30.58
+      "x_postgres": 29.6
      },
      "v4.42.0-2a5d741a": {
-      "median_us": 837.027,
+      "median_us": 791.704,
       "runs_us": [
-       829.063,
-       844.99
+       746.914,
+       836.494
       ],
-      "x_postgres": 19.83
+      "x_postgres": 22.05
      },
      "v4.42.0": {
-      "median_us": 826.439,
+      "median_us": 840.901,
       "runs_us": [
-       831.203,
-       821.674
+       852.446,
+       829.357
       ],
-      "x_postgres": 20.09
+      "x_postgres": 20.76
      }
     },
-    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 1.542
+    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 1.342
    },
    {
     "category": "TRUNCATE",
-    "postgres_us": 86387.199,
+    "postgres_us": 82079.12,
     "nano": {
      "v4.41.1": {
-      "median_us": 167.237,
+      "median_us": 154.357,
       "runs_us": [
-       176.953,
-       157.521
+       152.811,
+       155.903
       ],
-      "x_postgres": 516.56
+      "x_postgres": 531.75
      },
      "v4.42.0-2a5d741a": {
-      "median_us": 260.948,
+      "median_us": 280.71,
       "runs_us": [
-       259.639,
-       262.257
+       282.315,
+       279.104
       ],
-      "x_postgres": 331.05
+      "x_postgres": 292.4
      },
      "v4.42.0": {
-      "median_us": 225.801,
+      "median_us": 229.437,
       "runs_us": [
-       218.655,
-       232.947
+       213.385,
+       245.488
       ],
-      "x_postgres": 382.58
+      "x_postgres": 357.74
      }
     },
-    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 1.56
+    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 1.819
    },
    {
     "category": "INSERT single",
-    "postgres_us": 13744.122,
+    "postgres_us": 13356.028,
     "nano": {
      "v4.41.1": {
-      "median_us": 7.012,
+      "median_us": 6.65,
       "runs_us": [
-       7.186,
-       6.838
+       6.543,
+       6.756
       ],
-      "x_postgres": 1960.19
+      "x_postgres": 2008.5
      },
      "v4.42.0-2a5d741a": {
-      "median_us": 25.148,
+      "median_us": 25.634,
       "runs_us": [
-       24.041,
-       26.254
+       25.682,
+       25.586
       ],
-      "x_postgres": 546.54
+      "x_postgres": 521.03
      },
      "v4.42.0": {
-      "median_us": 26.904,
+      "median_us": 25.612,
       "runs_us": [
-       26.203,
-       27.605
+       26.308,
+       24.916
       ],
-      "x_postgres": 510.86
+      "x_postgres": 521.48
      }
     },
-    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 3.586
+    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 3.855
    },
    {
     "category": "INSERT multi-row",
-    "postgres_us": 14260.902,
+    "postgres_us": 12769.545,
     "nano": {
      "v4.41.1": {
-      "median_us": 161.398,
+      "median_us": 150.838,
       "runs_us": [
-       153.49,
-       169.306
+       151.722,
+       149.954
       ],
-      "x_postgres": 88.36
+      "x_postgres": 84.66
      },
      "v4.42.0-2a5d741a": {
-      "median_us": 227.119,
+      "median_us": 228.295,
       "runs_us": [
-       215.011,
-       239.226
+       219.234,
+       237.356
       ],
-      "x_postgres": 62.79
+      "x_postgres": 55.93
      },
      "v4.42.0": {
-      "median_us": 189.764,
+      "median_us": 189.904,
       "runs_us": [
-       184.031,
-       195.497
+       190.487,
+       189.321
       ],
-      "x_postgres": 75.15
+      "x_postgres": 67.24
      }
     },
-    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 1.407
+    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 1.514
    },
    {
     "category": "INSERT..SELECT",
-    "postgres_us": 14475.688,
+    "postgres_us": 13602.481,
     "nano": {
      "v4.41.1": {
-      "median_us": 1363.364,
+      "median_us": 1446.949,
       "runs_us": [
-       1273.109,
-       1453.619
+       1460.059,
+       1433.839
       ],
-      "x_postgres": 10.62
+      "x_postgres": 9.4
      },
      "v4.42.0-2a5d741a": {
-      "median_us": 211.033,
+      "median_us": 203.7,
       "runs_us": [
-       207.97,
-       214.097
+       211.374,
+       196.025
       ],
-      "x_postgres": 68.59
+      "x_postgres": 66.78
      },
      "v4.42.0": {
-      "median_us": 187.498,
+      "median_us": 176.391,
       "runs_us": [
-       190.865,
-       184.132
+       189.943,
+       162.839
       ],
-      "x_postgres": 77.2
+      "x_postgres": 77.12
      }
     },
-    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 0.155
+    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 0.141
    },
    {
     "category": "UPDATE point",
-    "postgres_us": 14131.532,
+    "postgres_us": 13124.931,
     "nano": {
      "v4.41.1": {
-      "median_us": 9.664,
+      "median_us": 10.6,
       "runs_us": [
-       9.469,
-       9.859
+       10.798,
+       10.402
       ],
-      "x_postgres": 1462.26
+      "x_postgres": 1238.2
      },
      "v4.42.0-2a5d741a": {
-      "median_us": 36.355,
+      "median_us": 38.449,
       "runs_us": [
-       37.782,
-       34.928
+       41.508,
+       35.391
       ],
-      "x_postgres": 388.71
+      "x_postgres": 341.36
      },
      "v4.42.0": {
-      "median_us": 33.81,
+      "median_us": 36.493,
       "runs_us": [
-       34.398,
-       33.223
+       35.274,
+       37.711
       ],
-      "x_postgres": 417.97
+      "x_postgres": 359.66
      }
     },
-    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 3.762
+    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 3.627
    },
    {
     "category": "DELETE point",
-    "postgres_us": 13897.861,
+    "postgres_us": 13726.992,
     "nano": {
      "v4.41.1": {
-      "median_us": 4.53,
+      "median_us": 4.015,
       "runs_us": [
-       4.145,
-       4.916
+       3.933,
+       4.097
       ],
-      "x_postgres": 3067.73
+      "x_postgres": 3419.31
      },
      "v4.42.0-2a5d741a": {
-      "median_us": 12.348,
+      "median_us": 11.936,
       "runs_us": [
-       11.554,
-       13.142
+       12.194,
+       11.677
       ],
-      "x_postgres": 1125.53
+      "x_postgres": 1150.06
      },
      "v4.42.0": {
-      "median_us": 11.8,
+      "median_us": 12.877,
       "runs_us": [
-       11.697,
-       11.902
+       12.551,
+       13.203
       ],
-      "x_postgres": 1177.82
+      "x_postgres": 1066.03
      }
     },
-    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 2.726
+    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 2.973
    },
    {
     "category": "UPSERT",
-    "postgres_us": 14273.146,
+    "postgres_us": 13720.392,
     "nano": {
      "v4.41.1": {
-      "median_us": 62.422,
+      "median_us": 61.499,
       "runs_us": [
-       61.014,
-       63.83
+       61.051,
+       61.948
       ],
-      "x_postgres": 228.66
+      "x_postgres": 223.1
      },
      "v4.42.0-2a5d741a": {
-      "median_us": 100.238,
+      "median_us": 97.39,
       "runs_us": [
-       94.825,
-       105.651
+       98.356,
+       96.423
       ],
-      "x_postgres": 142.39
+      "x_postgres": 140.88
      },
      "v4.42.0": {
-      "median_us": 61.224,
+      "median_us": 66.639,
       "runs_us": [
-       61.525,
-       60.923
+       65.975,
+       67.304
       ],
-      "x_postgres": 233.13
+      "x_postgres": 205.89
      }
     },
-    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 1.606
+    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 1.584
    },
    {
     "category": "UPDATE+subquery",
-    "postgres_us": 13966.234,
+    "postgres_us": 13504.488,
     "nano": {
      "v4.41.1": {
-      "median_us": 157.679,
+      "median_us": 124.07,
       "runs_us": [
-       136.596,
-       178.763
+       123.585,
+       124.555
       ],
-      "x_postgres": 88.57
+      "x_postgres": 108.85
      },
      "v4.42.0-2a5d741a": {
-      "median_us": 192.929,
+      "median_us": 200.22,
       "runs_us": [
-       188.491,
-       197.367
+       192.321,
+       208.119
       ],
-      "x_postgres": 72.39
+      "x_postgres": 67.45
      },
      "v4.42.0": {
-      "median_us": 159.786,
+      "median_us": 154.617,
       "runs_us": [
-       164.902,
-       154.67
+       157.926,
+       151.307
       ],
-      "x_postgres": 87.41
+      "x_postgres": 87.34
      }
     },
-    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 1.224
+    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 1.614
    },
    {
     "category": "Point lookup",
-    "postgres_us": 202.602,
+    "postgres_us": 199.027,
     "nano": {
      "v4.41.1": {
-      "median_us": 2.985,
+      "median_us": 2.782,
       "runs_us": [
-       2.756,
-       3.214
+       2.789,
+       2.776
       ],
-      "x_postgres": 67.88
+      "x_postgres": 71.53
      },
      "v4.42.0-2a5d741a": {
-      "median_us": 3.681,
+      "median_us": 3.262,
       "runs_us": [
-       3.639,
-       3.724
+       2.993,
+       3.532
       ],
-      "x_postgres": 55.04
+      "x_postgres": 61.01
      },
      "v4.42.0": {
-      "median_us": 3.205,
+      "median_us": 3.375,
       "runs_us": [
-       3.466,
-       2.945
+       3.47,
+       3.28
       ],
-      "x_postgres": 63.21
+      "x_postgres": 58.97
      }
     },
-    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 1.233
+    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 1.173
    },
    {
     "category": "Full scan+filter",
-    "postgres_us": 262.742,
+    "postgres_us": 265.687,
     "nano": {
      "v4.41.1": {
-      "median_us": 30.756,
+      "median_us": 27.829,
       "runs_us": [
-       28.61,
-       32.902
+       28.2,
+       27.459
       ],
-      "x_postgres": 8.54
+      "x_postgres": 9.55
      },
      "v4.42.0-2a5d741a": {
-      "median_us": 31.41,
+      "median_us": 28.18,
       "runs_us": [
-       33.354,
-       29.467
+       28.28,
+       28.079
       ],
-      "x_postgres": 8.36
+      "x_postgres": 9.43
      },
      "v4.42.0": {
-      "median_us": 28.564,
+      "median_us": 27.455,
       "runs_us": [
-       28.29,
-       28.839
+       27.429,
+       27.481
       ],
-      "x_postgres": 9.2
+      "x_postgres": 9.68
      }
     },
-    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 1.021
+    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 1.013
    },
    {
     "category": "Aggregation",
-    "postgres_us": 276.684,
+    "postgres_us": 270.677,
     "nano": {
      "v4.41.1": {
-      "median_us": 1.084,
+      "median_us": 1.174,
       "runs_us": [
-       1.179,
-       0.989
+       1.181,
+       1.168
       ],
-      "x_postgres": 255.28
+      "x_postgres": 230.48
      },
      "v4.42.0-2a5d741a": {
-      "median_us": 1.335,
+      "median_us": 1.327,
       "runs_us": [
-       1.351,
-       1.319
+       1.4,
+       1.255
       ],
-      "x_postgres": 207.23
+      "x_postgres": 203.92
      },
      "v4.42.0": {
-      "median_us": 1.155,
+      "median_us": 1.178,
       "runs_us": [
-       1.187,
-       1.122
+       1.115,
+       1.24
       ],
-      "x_postgres": 239.61
+      "x_postgres": 229.84
      }
     },
-    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 1.232
+    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 1.13
    },
    {
     "category": "INNER JOIN",
-    "postgres_us": 250.631,
+    "postgres_us": 246.947,
     "nano": {
      "v4.41.1": {
-      "median_us": 24.832,
+      "median_us": 28.859,
       "runs_us": [
-       26.225,
-       23.439
+       27.537,
+       30.181
       ],
-      "x_postgres": 10.09
+      "x_postgres": 8.56
      },
      "v4.42.0-2a5d741a": {
-      "median_us": 32.939,
+      "median_us": 29.616,
       "runs_us": [
-       30.596,
-       35.282
+       29.633,
+       29.599
       ],
-      "x_postgres": 7.61
+      "x_postgres": 8.34
      },
      "v4.42.0": {
-      "median_us": 26.649,
+      "median_us": 23.566,
       "runs_us": [
-       26.226,
-       27.073
+       25.122,
+       22.009
       ],
-      "x_postgres": 9.4
+      "x_postgres": 10.48
      }
     },
-    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 1.326
+    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 1.026
    },
    {
     "category": "LEFT JOIN",
-    "postgres_us": 256.867,
+    "postgres_us": 259.986,
     "nano": {
      "v4.41.1": {
-      "median_us": 18.988,
+      "median_us": 20.586,
       "runs_us": [
-       19.721,
-       18.254
+       19.521,
+       21.651
       ],
-      "x_postgres": 13.53
+      "x_postgres": 12.63
      },
      "v4.42.0-2a5d741a": {
-      "median_us": 23.282,
+      "median_us": 22.645,
       "runs_us": [
-       21.954,
-       24.61
+       22.545,
+       22.744
       ],
-      "x_postgres": 11.03
+      "x_postgres": 11.48
      },
      "v4.42.0": {
-      "median_us": 20.353,
+      "median_us": 17.553,
       "runs_us": [
-       21.012,
-       19.694
+       16.679,
+       18.427
       ],
-      "x_postgres": 12.62
+      "x_postgres": 14.81
      }
     },
-    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 1.226
+    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 1.1
    },
    {
     "category": "4-table JOIN",
-    "postgres_us": 505.305,
+    "postgres_us": 521.654,
     "nano": {
      "v4.41.1": {
-      "median_us": 646.089,
+      "median_us": 641.05,
       "runs_us": [
-       702.403,
-       589.776
+       602.996,
+       679.105
       ],
-      "x_postgres": 0.78
+      "x_postgres": 0.81
      },
      "v4.42.0-2a5d741a": {
-      "median_us": 940.893,
+      "median_us": 858.205,
       "runs_us": [
-       920.641,
-       961.146
+       904.742,
+       811.667
       ],
-      "x_postgres": 0.54
+      "x_postgres": 0.61
      },
      "v4.42.0": {
-      "median_us": 909.889,
+      "median_us": 58.659,
       "runs_us": [
-       899.996,
-       919.781
+       59.632,
+       57.686
       ],
-      "x_postgres": 0.56
+      "x_postgres": 8.89
      }
     },
-    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 1.456
+    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 1.339
    },
    {
     "category": "Scalar subquery",
-    "postgres_us": 363.509,
+    "postgres_us": 348.083,
     "nano": {
      "v4.41.1": {
-      "median_us": 2.757,
+      "median_us": 2.648,
       "runs_us": [
-       2.774,
-       2.74
+       2.434,
+       2.862
       ],
-      "x_postgres": 131.83
+      "x_postgres": 131.45
      },
      "v4.42.0-2a5d741a": {
-      "median_us": 3.056,
+      "median_us": 3.027,
       "runs_us": [
-       3.135,
-       2.977
+       2.98,
+       3.074
       ],
-      "x_postgres": 118.95
+      "x_postgres": 115.0
      },
      "v4.42.0": {
-      "median_us": 2.707,
+      "median_us": 2.723,
       "runs_us": [
-       2.463,
-       2.951
+       2.476,
+       2.969
       ],
-      "x_postgres": 134.28
+      "x_postgres": 127.85
      }
     },
-    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 1.108
+    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 1.143
    },
    {
     "category": "EXISTS subquery",
-    "postgres_us": 473.286,
+    "postgres_us": 463.074,
     "nano": {
      "v4.41.1": {
-      "median_us": 5.788,
+      "median_us": 5.98,
       "runs_us": [
-       5.79,
-       5.787
+       5.998,
+       5.961
       ],
-      "x_postgres": 81.76
+      "x_postgres": 77.44
      },
      "v4.42.0-2a5d741a": {
-      "median_us": 5.254,
+      "median_us": 4.812,
       "runs_us": [
-       5.672,
-       4.835
+       4.633,
+       4.99
       ],
-      "x_postgres": 90.09
+      "x_postgres": 96.24
      },
      "v4.42.0": {
-      "median_us": 4.799,
+      "median_us": 5.297,
       "runs_us": [
-       4.913,
-       4.684
+       4.856,
+       5.739
       ],
-      "x_postgres": 98.63
+      "x_postgres": 87.42
      }
     },
-    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 0.908
+    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 0.805
    },
    {
     "category": "IN subquery",
-    "postgres_us": 408.281,
+    "postgres_us": 398.0,
     "nano": {
      "v4.41.1": {
-      "median_us": 6.073,
+      "median_us": 5.228,
       "runs_us": [
-       5.942,
-       6.203
+       5.585,
+       4.871
       ],
-      "x_postgres": 67.23
+      "x_postgres": 76.13
      },
      "v4.42.0-2a5d741a": {
-      "median_us": 6.062,
+      "median_us": 4.991,
       "runs_us": [
-       5.852,
-       6.271
+       4.802,
+       5.181
       ],
-      "x_postgres": 67.36
+      "x_postgres": 79.74
      },
      "v4.42.0": {
-      "median_us": 6.012,
+      "median_us": 6.105,
       "runs_us": [
-       5.97,
-       6.053
+       6.197,
+       6.013
       ],
-      "x_postgres": 67.91
+      "x_postgres": 65.19
      }
     },
-    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 0.998
+    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 0.955
    },
    {
     "category": "CTE",
-    "postgres_us": 482.938,
+    "postgres_us": 465.777,
     "nano": {
      "v4.41.1": {
-      "median_us": 7.212,
+      "median_us": 7.131,
       "runs_us": [
-       7.075,
-       7.348
+       6.987,
+       7.275
       ],
-      "x_postgres": 66.96
+      "x_postgres": 65.32
      },
      "v4.42.0-2a5d741a": {
-      "median_us": 7.129,
+      "median_us": 6.363,
       "runs_us": [
-       7.417,
-       6.841
+       6.92,
+       5.807
       ],
-      "x_postgres": 67.74
+      "x_postgres": 73.2
      },
      "v4.42.0": {
-      "median_us": 6.322,
+      "median_us": 6.52,
       "runs_us": [
-       5.722,
-       6.923
+       5.661,
+       7.379
       ],
-      "x_postgres": 76.39
+      "x_postgres": 71.44
      }
     },
-    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 0.988
+    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 0.892
    },
    {
     "category": "Recursive CTE",
-    "postgres_us": 323.497,
+    "postgres_us": 311.844,
     "nano": {
      "v4.41.1": {
-      "median_us": 3.451,
+      "median_us": 3.125,
       "runs_us": [
-       3.336,
-       3.566
+       3.379,
+       2.871
       ],
-      "x_postgres": 93.74
+      "x_postgres": 99.78
      },
      "v4.42.0-2a5d741a": {
-      "median_us": 3.686,
+      "median_us": 3.61,
       "runs_us": [
-       3.768,
-       3.605
+       3.489,
+       3.73
       ],
-      "x_postgres": 87.76
+      "x_postgres": 86.39
      },
      "v4.42.0": {
-      "median_us": 3.351,
+      "median_us": 3.216,
       "runs_us": [
-       3.096,
-       3.606
+       3.059,
+       3.373
       ],
-      "x_postgres": 96.54
+      "x_postgres": 96.97
      }
     },
-    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 1.068
+    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 1.155
    },
    {
     "category": "Window funcs",
-    "postgres_us": 521.843,
+    "postgres_us": 504.597,
     "nano": {
      "v4.41.1": {
-      "median_us": 22.528,
+      "median_us": 20.701,
       "runs_us": [
-       22.921,
-       22.136
+       21.444,
+       19.958
       ],
-      "x_postgres": 23.16
+      "x_postgres": 24.38
      },
      "v4.42.0-2a5d741a": {
-      "median_us": 20.421,
+      "median_us": 20.015,
       "runs_us": [
-       20.626,
-       20.216
+       19.948,
+       20.082
       ],
-      "x_postgres": 25.55
+      "x_postgres": 25.21
      },
      "v4.42.0": {
-      "median_us": 19.69,
+      "median_us": 19.495,
       "runs_us": [
-       20.001,
-       19.379
+       18.969,
+       20.021
       ],
-      "x_postgres": 26.5
+      "x_postgres": 25.88
      }
     },
-    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 0.906
+    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 0.967
    },
    {
     "category": "UNION",
-    "postgres_us": 332.047,
+    "postgres_us": 311.614,
     "nano": {
      "v4.41.1": {
-      "median_us": 9.099,
+      "median_us": 8.318,
       "runs_us": [
-       8.806,
-       9.392
+       9.552,
+       7.085
       ],
-      "x_postgres": 36.49
+      "x_postgres": 37.46
      },
      "v4.42.0-2a5d741a": {
-      "median_us": 8.53,
+      "median_us": 8.713,
       "runs_us": [
-       8.769,
-       8.291
+       7.911,
+       9.515
       ],
-      "x_postgres": 38.92
+      "x_postgres": 35.77
      },
      "v4.42.0": {
-      "median_us": 8.801,
+      "median_us": 8.608,
       "runs_us": [
-       7.774,
-       9.828
+       7.863,
+       9.353
       ],
-      "x_postgres": 37.73
+      "x_postgres": 36.2
      }
     },
-    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 0.937
+    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 1.047
    },
    {
     "category": "DISTINCT",
-    "postgres_us": 238.36,
+    "postgres_us": 211.291,
     "nano": {
      "v4.41.1": {
-      "median_us": 0.804,
+      "median_us": 0.722,
       "runs_us": [
-       0.782,
-       0.826
+       0.783,
+       0.662
       ],
-      "x_postgres": 296.47
+      "x_postgres": 292.48
      },
      "v4.42.0-2a5d741a": {
-      "median_us": 0.925,
+      "median_us": 0.857,
       "runs_us": [
-       0.846,
-       1.004
+       0.84,
+       0.874
       ],
-      "x_postgres": 257.58
+      "x_postgres": 246.64
      },
      "v4.42.0": {
-      "median_us": 0.945,
+      "median_us": 0.858,
       "runs_us": [
-       0.899,
-       0.992
+       0.826,
+       0.89
       ],
-      "x_postgres": 252.11
+      "x_postgres": 246.31
      }
     },
-    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 1.15
+    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 1.187
    },
    {
     "category": "ORDER+LIMIT",
-    "postgres_us": 286.0,
+    "postgres_us": 275.958,
     "nano": {
      "v4.41.1": {
-      "median_us": 95.353,
+      "median_us": 98.18,
       "runs_us": [
-       92.919,
-       97.788
+       97.333,
+       99.027
       ],
-      "x_postgres": 3.0
+      "x_postgres": 2.81
      },
      "v4.42.0-2a5d741a": {
-      "median_us": 97.36,
+      "median_us": 95.728,
       "runs_us": [
-       89.465,
-       105.255
+       102.008,
+       89.448
       ],
-      "x_postgres": 2.94
+      "x_postgres": 2.88
      },
      "v4.42.0": {
-      "median_us": 90.723,
+      "median_us": 94.162,
       "runs_us": [
-       86.126,
-       95.319
+       88.071,
+       100.253
       ],
-      "x_postgres": 3.15
+      "x_postgres": 2.93
      }
     },
-    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 1.021
+    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 0.975
    },
    {
     "category": "CASE expr",
-    "postgres_us": 256.57,
+    "postgres_us": 248.447,
     "nano": {
      "v4.41.1": {
-      "median_us": 15.58,
+      "median_us": 18.063,
       "runs_us": [
-       16.378,
-       14.782
+       17.569,
+       18.558
       ],
-      "x_postgres": 16.47
+      "x_postgres": 13.75
      },
      "v4.42.0-2a5d741a": {
-      "median_us": 16.041,
+      "median_us": 16.223,
       "runs_us": [
-       16.172,
-       15.91
+       16.812,
+       15.634
       ],
-      "x_postgres": 15.99
+      "x_postgres": 15.31
      },
      "v4.42.0": {
-      "median_us": 15.982,
+      "median_us": 16.221,
       "runs_us": [
-       15.745,
-       16.219
+       16.022,
+       16.42
       ],
-      "x_postgres": 16.05
+      "x_postgres": 15.32
      }
     },
-    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 1.03
+    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 0.898
    },
    {
     "category": "LIKE/BETWEEN/IN",
-    "postgres_us": 274.44,
+    "postgres_us": 264.183,
     "nano": {
      "v4.41.1": {
-      "median_us": 12.389,
+      "median_us": 12.457,
       "runs_us": [
-       12.443,
-       12.335
-      ],
-      "x_postgres": 22.15
-     },
-     "v4.42.0-2a5d741a": {
-      "median_us": 11.436,
-      "runs_us": [
-       10.176,
-       12.695
-      ],
-      "x_postgres": 24.0
-     },
-     "v4.42.0": {
-      "median_us": 10.774,
-      "runs_us": [
-       10.329,
-       11.218
-      ],
-      "x_postgres": 25.47
-     }
-    },
-    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 0.923
-   },
-   {
-    "category": "String ops",
-    "postgres_us": 271.788,
-    "nano": {
-     "v4.41.1": {
-      "median_us": 14.082,
-      "runs_us": [
-       13.906,
-       14.257
-      ],
-      "x_postgres": 19.3
-     },
-     "v4.42.0-2a5d741a": {
-      "median_us": 12.813,
-      "runs_us": [
-       12.757,
-       12.87
+       12.327,
+       12.587
       ],
       "x_postgres": 21.21
      },
-     "v4.42.0": {
-      "median_us": 12.616,
+     "v4.42.0-2a5d741a": {
+      "median_us": 11.124,
       "runs_us": [
-       12.129,
-       13.104
+       11.851,
+       10.397
       ],
-      "x_postgres": 21.54
+      "x_postgres": 23.75
+     },
+     "v4.42.0": {
+      "median_us": 12.124,
+      "runs_us": [
+       12.289,
+       11.959
+      ],
+      "x_postgres": 21.79
      }
     },
-    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 0.91
+    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 0.893
+   },
+   {
+    "category": "String ops",
+    "postgres_us": 255.438,
+    "nano": {
+     "v4.41.1": {
+      "median_us": 14.4,
+      "runs_us": [
+       13.705,
+       15.095
+      ],
+      "x_postgres": 17.74
+     },
+     "v4.42.0-2a5d741a": {
+      "median_us": 12.873,
+      "runs_us": [
+       13.385,
+       12.361
+      ],
+      "x_postgres": 19.84
+     },
+     "v4.42.0": {
+      "median_us": 13.973,
+      "runs_us": [
+       13.23,
+       14.716
+      ],
+      "x_postgres": 18.28
+     }
+    },
+    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 0.894
    },
    {
     "category": "Transaction ctl",
-    "postgres_us": 14390.386,
+    "postgres_us": 13714.183,
     "nano": {
      "v4.41.1": {
-      "median_us": 50.061,
+      "median_us": 50.522,
       "runs_us": [
-       50.471,
-       49.65
+       48.653,
+       52.39
       ],
-      "x_postgres": 287.46
+      "x_postgres": 271.45
      },
      "v4.42.0-2a5d741a": {
-      "median_us": 64.398,
+      "median_us": 64.166,
       "runs_us": [
-       62.22,
-       66.576
+       65.353,
+       62.98
       ],
-      "x_postgres": 223.46
+      "x_postgres": 213.73
      },
      "v4.42.0": {
-      "median_us": 36.305,
+      "median_us": 37.396,
       "runs_us": [
-       34.097,
-       38.513
+       35.385,
+       39.408
       ],
-      "x_postgres": 396.37
+      "x_postgres": 366.72
      }
     },
-    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 1.286
+    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 1.27
    },
    {
     "category": "Prepared stmts",
-    "postgres_us": 452.7,
+    "postgres_us": 452.736,
     "nano": {
      "v4.41.1": {
-      "median_us": 3.422,
+      "median_us": 3.216,
       "runs_us": [
-       3.639,
-       3.205
+       3.215,
+       3.216
       ],
-      "x_postgres": 132.29
+      "x_postgres": 140.79
      },
      "v4.42.0-2a5d741a": {
-      "median_us": 4.427,
+      "median_us": 4.66,
       "runs_us": [
-       4.421,
-       4.432
+       4.973,
+       4.347
       ],
-      "x_postgres": 102.26
+      "x_postgres": 97.16
      },
      "v4.42.0": {
-      "median_us": 4.249,
+      "median_us": 4.735,
       "runs_us": [
-       4.242,
-       4.257
+       5.1,
+       4.371
       ],
-      "x_postgres": 106.53
+      "x_postgres": 95.61
      }
     },
-    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 1.294
+    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 1.449
    },
    {
     "category": "SET/SHOW/RESET",
-    "postgres_us": 381.215,
+    "postgres_us": 352.325,
     "nano": {
      "v4.41.1": {
-      "median_us": 2.449,
+      "median_us": 1.983,
       "runs_us": [
-       2.958,
-       1.94
+       1.821,
+       2.145
       ],
-      "x_postgres": 155.69
+      "x_postgres": 177.67
      },
      "v4.42.0-2a5d741a": {
-      "median_us": 2.925,
+      "median_us": 3.156,
       "runs_us": [
-       2.633,
-       3.218
+       3.098,
+       3.213
       ],
-      "x_postgres": 130.31
+      "x_postgres": 111.65
      },
      "v4.42.0": {
-      "median_us": 2.448,
+      "median_us": 2.67,
       "runs_us": [
-       2.497,
-       2.4
+       2.539,
+       2.802
       ],
-      "x_postgres": 155.69
+      "x_postgres": 131.94
      }
     },
-    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 1.194
+    "ratio_time_v4.42.0-2a5d741a_vs_v4.41.1": 1.592
    }
   ],
   "runs": [
@@ -1188,61 +1188,61 @@
     "job": "v4_41_1-r1",
     "label": "v4.41.1",
     "round": 1,
-    "started_at": "2026-11-17T23:33:47.350507+00:00",
-    "ended_at": "2026-11-17T23:36:11.445000+00:00",
-    "load1_before": 2.32,
-    "load1_after": 2.8,
-    "strict_receipt_sha256": "3a7706c122996bfb08ec1881bff287d3f1e022d0786db33204ffffe3a24c797d"
+    "started_at": "2026-11-18T05:01:30.496579+00:00",
+    "ended_at": "2026-11-18T05:04:14.062684+00:00",
+    "load1_before": 2.44,
+    "load1_after": 2.91,
+    "strict_receipt_sha256": "851dd4e970914afb325bdeea6d36539110bac74d79c08e605215c9a167c5d9ba"
    },
    {
     "job": "v4_42_0-2a5d741a-r1",
     "label": "v4.42.0-2a5d741a",
     "round": 1,
-    "started_at": "2026-11-17T23:36:11.445727+00:00",
-    "ended_at": "2026-11-17T23:38:21.737044+00:00",
-    "load1_before": 2.8,
-    "load1_after": 2.2,
-    "strict_receipt_sha256": "59697757b0860a390066bbff1cba42e1a90deb1cb6dee176372f0c34e074b942"
+    "started_at": "2026-11-18T05:04:14.063353+00:00",
+    "ended_at": "2026-11-18T05:06:33.086535+00:00",
+    "load1_before": 2.91,
+    "load1_after": 2.56,
+    "strict_receipt_sha256": "bc52d4145f5253ed552a1f6d324c5b87e6d23655317c395e24a9ae5b63080915"
    },
    {
     "job": "v4_42_0-r1",
     "label": "v4.42.0",
     "round": 1,
-    "started_at": "2026-11-17T23:38:21.737747+00:00",
-    "ended_at": "2026-11-17T23:40:54.260216+00:00",
-    "load1_before": 2.2,
-    "load1_after": 2.18,
-    "strict_receipt_sha256": "a8b34202e891957d67bde3241f0bdaadc53c005cdc586282e483f0ddf37fbda9"
+    "started_at": "2026-11-18T05:06:33.087305+00:00",
+    "ended_at": "2026-11-18T05:08:19.133790+00:00",
+    "load1_before": 2.56,
+    "load1_after": 2.43,
+    "strict_receipt_sha256": "e141b5bb15b4c7f6de79ab8062057ec8082a89319fe8c4f296609073ab7f7794"
    },
    {
     "job": "v4_42_0-r2",
     "label": "v4.42.0",
     "round": 2,
-    "started_at": "2026-11-17T23:40:54.260946+00:00",
-    "ended_at": "2026-11-17T23:42:58.312763+00:00",
-    "load1_before": 2.18,
-    "load1_after": 2.64,
-    "strict_receipt_sha256": "5fd0f4ae91914a60746bdda7f2261ab345787c1832e46625d1f94c6d6ba139bf"
+    "started_at": "2026-11-18T05:08:19.134561+00:00",
+    "ended_at": "2026-11-18T05:10:28.204914+00:00",
+    "load1_before": 2.43,
+    "load1_after": 2.41,
+    "strict_receipt_sha256": "a8e60acc4089256eacfad3e333da7be61d83de6c28110bb94bbeaf1fb4e8a2a2"
    },
    {
     "job": "v4_42_0-2a5d741a-r2",
     "label": "v4.42.0-2a5d741a",
     "round": 2,
-    "started_at": "2026-11-17T23:42:58.313670+00:00",
-    "ended_at": "2026-11-17T23:45:05.080531+00:00",
-    "load1_before": 2.64,
-    "load1_after": 2.33,
-    "strict_receipt_sha256": "62f7006881d629dd4b177b851c6d2e0ea551b54b4109d9501ed411bbe4f6ebcc"
+    "started_at": "2026-11-18T05:10:28.206288+00:00",
+    "ended_at": "2026-11-18T05:13:04.329179+00:00",
+    "load1_before": 2.41,
+    "load1_after": 2.75,
+    "strict_receipt_sha256": "b220cdecf849c87cf2e8d2a3ae5b3b9543af580720de629710da18718cfe2dd4"
    },
    {
     "job": "v4_41_1-r2",
     "label": "v4.41.1",
     "round": 2,
-    "started_at": "2026-11-17T23:45:05.081275+00:00",
-    "ended_at": "2026-11-17T23:47:44.357485+00:00",
-    "load1_before": 2.33,
-    "load1_after": 2.8,
-    "strict_receipt_sha256": "61fd43c3b598c4c6c5701f5757cb4a41abcbac98876a6d2decd701b27252b469"
+    "started_at": "2026-11-18T05:13:04.329899+00:00",
+    "ended_at": "2026-11-18T05:15:06.783001+00:00",
+    "load1_before": 2.75,
+    "load1_after": 2.1,
+    "strict_receipt_sha256": "6d31733ea6627f01b6ea115797ebeb9d4518e114657eafd5706bd4ee51dcd8f3"
    }
   ]
  },
@@ -1250,7 +1250,7 @@
   "description": "one-row UPDATE by primary key over the PostgreSQL wire against a running server; 'extended' is a prepared statement bound per execution, 'simple' the statement as text; each client has its own connection and its own rows; client and server on one host",
   "server_sha256": {
    "v4.41.1": "956bc158fd90f677724a2f4133e1594a1cdaa75154ff44d38817ef5beddef947",
-   "v4.42.0": "40ee9a9619f6979f6e44e1b57887ae87cd1e375a8c2d04760cad234bc9181a8d"
+   "v4.42.0": "86026c2a8f36fec4587a6164baa54327136db1b6629be5408c7ca331d34a156c"
   },
   "client_sha256": "e303016e9f70ede4e9acf35b842be259b73bf610cd5a14cd87dbc92c2eba970f",
   "seconds_per_run": 20,
@@ -1263,43 +1263,43 @@
     "clients": 1,
     "variants": {
      "v4.41.1": {
-      "ops_per_sec_median": 13614.1,
+      "ops_per_sec_median": 13133.6,
       "ops_per_sec_runs": [
-       13719.5,
-       13655.3,
-       13572.9,
-       12767.5
+       13252.7,
+       13014.5,
+       12666.2,
+       13867.0
       ],
-      "p50_us_median": 71.0,
-      "p99_us_median": 92.0,
+      "p50_us_median": 73.5,
+      "p99_us_median": 95.0,
       "errors": 0,
       "load1_before": [
-       4.88,
-       15.7,
-       16.32,
-       14.96
+       2.1,
+       14.23,
+       15.29,
+       16.49
       ]
      },
      "v4.42.0": {
-      "ops_per_sec_median": 9796.2,
+      "ops_per_sec_median": 9771.4,
       "ops_per_sec_runs": [
-       10048.1,
-       9564.8,
-       9573.5,
-       10019.0
+       9743.5,
+       9839.2,
+       9799.2,
+       9495.6
       ],
       "p50_us_median": 100.5,
-      "p99_us_median": 127.0,
+      "p99_us_median": 127.5,
       "errors": 0,
       "load1_before": [
-       13.03,
-       15.44,
-       15.18,
-       15.77
+       16.95,
+       9.19,
+       14.51,
+       15.28
       ]
      }
     },
-    "ratio_ops_v4.42.0_vs_v4.41.1": 0.72
+    "ratio_ops_v4.42.0_vs_v4.41.1": 0.744
    },
    {
     "mode": "update",
@@ -1307,43 +1307,43 @@
     "clients": 2,
     "variants": {
      "v4.41.1": {
-      "ops_per_sec_median": 20473.8,
+      "ops_per_sec_median": 20610.1,
       "ops_per_sec_runs": [
-       20661.8,
-       20571.3,
-       20322.7,
-       20376.3
+       20703.9,
+       20516.3,
+       20166.7,
+       21118.3
       ],
       "p50_us_median": 91.5,
-      "p99_us_median": 119.5,
+      "p99_us_median": 117.0,
       "errors": 0,
       "load1_before": [
-       4.12,
-       12.18,
-       11.35,
-       10.79
+       2.29,
+       10.95,
+       10.76,
+       12.26
       ]
      },
      "v4.42.0": {
-      "ops_per_sec_median": 12180.1,
+      "ops_per_sec_median": 12146.9,
       "ops_per_sec_runs": [
-       11965.2,
-       12253.0,
-       12107.2,
-       12309.7
+       12162.6,
+       12131.1,
+       11995.2,
+       12170.8
       ],
-      "p50_us_median": 160.0,
-      "p99_us_median": 222.5,
+      "p50_us_median": 161.5,
+      "p99_us_median": 218.5,
       "errors": 0,
       "load1_before": [
-       10.0,
-       10.76,
-       11.45,
-       11.05
+       12.05,
+       6.69,
+       11.03,
+       11.57
       ]
      }
     },
-    "ratio_ops_v4.42.0_vs_v4.41.1": 0.595
+    "ratio_ops_v4.42.0_vs_v4.41.1": 0.589
    },
    {
     "mode": "update",
@@ -1351,43 +1351,43 @@
     "clients": 4,
     "variants": {
      "v4.41.1": {
-      "ops_per_sec_median": 37312.1,
+      "ops_per_sec_median": 37446.6,
       "ops_per_sec_runs": [
-       37366.9,
-       37402.5,
-       37257.3,
-       36922.2
+       37654.2,
+       37245.3,
+       37279.9,
+       37613.2
       ],
-      "p50_us_median": 98.0,
-      "p99_us_median": 177.5,
+      "p50_us_median": 97.5,
+      "p99_us_median": 177.0,
       "errors": 0,
       "load1_before": [
-       3.83,
-       9.16,
-       9.15,
-       8.51
+       2.13,
+       7.9,
+       7.84,
+       8.87
       ]
      },
      "v4.42.0": {
-      "ops_per_sec_median": 24395.5,
+      "ops_per_sec_median": 24424.3,
       "ops_per_sec_runs": [
-       24360.1,
-       23932.8,
-       24447.1,
-       24431.0
+       24175.2,
+       24781.3,
+       24492.5,
+       24356.2
       ],
-      "p50_us_median": 153.0,
-      "p99_us_median": 277.0,
+      "p50_us_median": 152.0,
+      "p99_us_median": 271.0,
       "errors": 0,
       "load1_before": [
-       7.61,
-       8.49,
-       8.24,
-       8.69
+       9.36,
+       5.07,
+       7.9,
+       8.4
       ]
      }
     },
-    "ratio_ops_v4.42.0_vs_v4.41.1": 0.654
+    "ratio_ops_v4.42.0_vs_v4.41.1": 0.652
    },
    {
     "mode": "update",
@@ -1395,43 +1395,43 @@
     "clients": 8,
     "variants": {
      "v4.41.1": {
-      "ops_per_sec_median": 62102.1,
+      "ops_per_sec_median": 62379.7,
       "ops_per_sec_runs": [
-       62227.9,
-       61976.3,
-       62438.2,
-       60943.3
+       62532.9,
+       62226.4,
+       62079.7,
+       62607.1
       ],
       "p50_us_median": 120.0,
-      "p99_us_median": 205.5,
+      "p99_us_median": 204.5,
       "errors": 0,
       "load1_before": [
-       4.13,
-       7.5,
-       7.83,
-       7.4
+       2.72,
+       7.17,
+       7.01,
+       7.42
       ]
      },
      "v4.42.0": {
-      "ops_per_sec_median": 41549.7,
+      "ops_per_sec_median": 42143.5,
       "ops_per_sec_runs": [
-       41647.3,
-       41457.2,
-       41597.4,
-       41501.9
+       42348.7,
+       41708.5,
+       42714.7,
+       41938.3
       ],
-      "p50_us_median": 182.5,
-      "p99_us_median": 360.0,
+      "p50_us_median": 180.5,
+      "p99_us_median": 324.0,
       "errors": 0,
       "load1_before": [
-       6.7,
-       7.56,
-       7.27,
-       7.6
+       7.58,
+       4.98,
+       7.22,
+       7.08
       ]
      }
     },
-    "ratio_ops_v4.42.0_vs_v4.41.1": 0.669
+    "ratio_ops_v4.42.0_vs_v4.41.1": 0.676
    },
    {
     "mode": "update",
@@ -1439,43 +1439,43 @@
     "clients": 16,
     "variants": {
      "v4.41.1": {
-      "ops_per_sec_median": 106839.0,
+      "ops_per_sec_median": 107356.4,
       "ops_per_sec_runs": [
-       106629.9,
-       107650.8,
-       107048.1,
-       105311.3
+       108211.5,
+       105971.4,
+       107304.4,
+       107408.3
       ],
-      "p50_us_median": 139.0,
-      "p99_us_median": 305.5,
+      "p50_us_median": 138.5,
+      "p99_us_median": 305.0,
       "errors": 0,
       "load1_before": [
-       5.77,
-       7.77,
-       7.71,
-       9.55
+       5.13,
+       7.36,
+       7.28,
+       7.73
       ]
      },
      "v4.42.0": {
-      "ops_per_sec_median": 66776.7,
+      "ops_per_sec_median": 66243.0,
       "ops_per_sec_runs": [
-       67046.7,
-       66512.6,
-       67040.8,
-       66187.2
+       66673.8,
+       65812.2,
+       67672.5,
+       34611.0
       ],
-      "p50_us_median": 223.5,
-      "p99_us_median": 629.0,
+      "p50_us_median": 226.0,
+      "p99_us_median": 607.5,
       "errors": 0,
       "load1_before": [
-       7.38,
-       8.42,
-       7.49,
-       8.1
+       8.37,
+       6.7,
+       7.5,
+       7.92
       ]
      }
     },
-    "ratio_ops_v4.42.0_vs_v4.41.1": 0.625
+    "ratio_ops_v4.42.0_vs_v4.41.1": 0.617
    },
    {
     "mode": "update",
@@ -1483,43 +1483,43 @@
     "clients": 32,
     "variants": {
      "v4.41.1": {
-      "ops_per_sec_median": 139686.1,
+      "ops_per_sec_median": 143096.7,
       "ops_per_sec_runs": [
-       139003.0,
-       144071.4,
-       140278.9,
-       139093.3
+       145770.6,
+       139458.4,
+       143523.8,
+       142669.6
       ],
-      "p50_us_median": 201.0,
-      "p99_us_median": 658.5,
+      "p50_us_median": 198.0,
+      "p99_us_median": 616.0,
       "errors": 0,
       "load1_before": [
+       8.31,
+       9.95,
        9.52,
-       10.05,
-       10.53,
-       11.35
+       10.51
       ]
      },
      "v4.42.0": {
-      "ops_per_sec_median": 69582.6,
+      "ops_per_sec_median": 67906.9,
       "ops_per_sec_runs": [
-       69482.0,
-       69834.5,
-       69683.3,
-       69396.6
+       71167.3,
+       64646.6,
+       71693.1,
+       14770.0
       ],
-      "p50_us_median": 395.0,
-      "p99_us_median": 1097.0,
+      "p50_us_median": 398.0,
+      "p99_us_median": 1097.5,
       "errors": 0,
       "load1_before": [
-       10.74,
-       11.75,
-       10.48,
-       11.51
+       11.47,
+       9.93,
+       9.42,
+       11.4
       ]
      }
     },
-    "ratio_ops_v4.42.0_vs_v4.41.1": 0.498
+    "ratio_ops_v4.42.0_vs_v4.41.1": 0.475
    },
    {
     "mode": "update",
@@ -1527,43 +1527,43 @@
     "clients": 64,
     "variants": {
      "v4.41.1": {
-      "ops_per_sec_median": 143176.2,
+      "ops_per_sec_median": 145760.3,
       "ops_per_sec_runs": [
-       145190.0,
-       143817.8,
-       142534.6,
-       140610.4
+       147468.0,
+       142660.1,
+       144557.9,
+       146962.8
       ],
-      "p50_us_median": 403.5,
-      "p99_us_median": 1120.0,
+      "p50_us_median": 399.5,
+      "p99_us_median": 1090.5,
       "errors": 0,
       "load1_before": [
-       14.1,
-       13.7,
-       13.9,
-       14.72
+       11.66,
+       12.35,
+       13.63,
+       12.63
       ]
      },
      "v4.42.0": {
-      "ops_per_sec_median": 67860.2,
+      "ops_per_sec_median": 66113.2,
       "ops_per_sec_runs": [
-       67619.8,
-       69340.5,
-       67776.9,
-       67943.6
+       68310.4,
+       64752.4,
+       67474.0,
+       14635.9
       ],
-      "p50_us_median": 826.5,
-      "p99_us_median": 5898.0,
+      "p50_us_median": 825.5,
+      "p99_us_median": 6246.5,
       "errors": 0,
       "load1_before": [
-       14.19,
-       15.1,
-       13.0,
-       10.87
+       14.57,
+       13.97,
+       13.64,
+       13.32
       ]
      }
     },
-    "ratio_ops_v4.42.0_vs_v4.41.1": 0.474
+    "ratio_ops_v4.42.0_vs_v4.41.1": 0.454
    },
    {
     "mode": "update",
@@ -1571,43 +1571,43 @@
     "clients": 1,
     "variants": {
      "v4.41.1": {
-      "ops_per_sec_median": 12877.0,
+      "ops_per_sec_median": 12427.5,
       "ops_per_sec_runs": [
-       12784.0,
-       12970.0,
-       12291.6,
-       13018.9
+       12401.1,
+       12304.0,
+       13074.3,
+       12453.8
       ],
-      "p50_us_median": 75.0,
-      "p99_us_median": 95.0,
+      "p50_us_median": 77.0,
+      "p99_us_median": 97.0,
       "errors": 0,
       "load1_before": [
-       16.99,
-       16.01,
-       15.7,
-       16.44
+       11.12,
+       12.52,
+       16.14,
+       15.63
       ]
      },
      "v4.42.0": {
-      "ops_per_sec_median": 7732.7,
+      "ops_per_sec_median": 7657.1,
       "ops_per_sec_runs": [
-       7693.8,
-       7720.9,
-       7797.5,
-       7744.5
+       7834.3,
+       7616.5,
+       7697.7,
+       5308.9
       ],
-      "p50_us_median": 123.5,
+      "p50_us_median": 123.0,
       "p99_us_median": 197.0,
       "errors": 0,
       "load1_before": [
-       15.01,
-       17.15,
-       14.97,
-       10.19
+       16.53,
+       16.3,
+       16.76,
+       15.03
       ]
      }
     },
-    "ratio_ops_v4.42.0_vs_v4.41.1": 0.601
+    "ratio_ops_v4.42.0_vs_v4.41.1": 0.616
    },
    {
     "mode": "update",
@@ -1615,43 +1615,43 @@
     "clients": 2,
     "variants": {
      "v4.41.1": {
-      "ops_per_sec_median": 18971.5,
+      "ops_per_sec_median": 18941.6,
       "ops_per_sec_runs": [
-       18996.8,
-       19430.3,
-       18760.5,
-       18946.3
+       19902.3,
+       18357.8,
+       18756.2,
+       19127.0
       ],
-      "p50_us_median": 99.5,
-      "p99_us_median": 127.5,
+      "p50_us_median": 100.0,
+      "p99_us_median": 125.5,
       "errors": 0,
       "load1_before": [
-       11.86,
-       11.28,
-       10.81,
-       11.68
+       7.87,
+       9.51,
+       12.53,
+       10.97
       ]
      },
      "v4.42.0": {
-      "ops_per_sec_median": 10078.8,
+      "ops_per_sec_median": 10217.1,
       "ops_per_sec_runs": [
-       10033.2,
-       9978.7,
-       10185.8,
-       10124.3
+       10162.0,
+       10272.2,
+       9858.4,
+       11076.3
       ],
-      "p50_us_median": 194.5,
-      "p99_us_median": 272.5,
+      "p50_us_median": 191.5,
+      "p99_us_median": 260.0,
       "errors": 0,
       "load1_before": [
-       10.81,
-       12.26,
-       10.79,
-       7.49
+       11.61,
+       12.67,
+       12.68,
+       10.8
       ]
      }
     },
-    "ratio_ops_v4.42.0_vs_v4.41.1": 0.531
+    "ratio_ops_v4.42.0_vs_v4.41.1": 0.539
    },
    {
     "mode": "update",
@@ -1659,43 +1659,43 @@
     "clients": 4,
     "variants": {
      "v4.41.1": {
-      "ops_per_sec_median": 37511.2,
+      "ops_per_sec_median": 37750.1,
       "ops_per_sec_runs": [
-       37553.8,
-       37468.6,
-       37846.6,
-       37269.5
+       37837.7,
+       37662.4,
+       37925.5,
+       37490.1
       ],
-      "p50_us_median": 97.0,
-      "p99_us_median": 178.0,
+      "p50_us_median": 96.5,
+      "p99_us_median": 176.5,
       "errors": 0,
       "load1_before": [
-       9.27,
-       8.74,
-       8.67,
-       8.65
+       6.0,
+       7.29,
+       9.02,
+       8.48
       ]
      },
      "v4.42.0": {
-      "ops_per_sec_median": 21932.2,
+      "ops_per_sec_median": 21981.5,
       "ops_per_sec_runs": [
-       22111.6,
-       21787.9,
-       21881.2,
-       21983.3
+       21936.3,
+       21919.7,
+       22026.7,
+       23924.4
       ],
       "p50_us_median": 169.5,
-      "p99_us_median": 314.5,
+      "p99_us_median": 304.5,
       "errors": 0,
       "load1_before": [
-       8.24,
-       9.49,
-       8.37,
-       6.37
+       8.85,
+       9.01,
+       10.41,
+       8.43
       ]
      }
     },
-    "ratio_ops_v4.42.0_vs_v4.41.1": 0.585
+    "ratio_ops_v4.42.0_vs_v4.41.1": 0.582
    },
    {
     "mode": "update",
@@ -1703,43 +1703,43 @@
     "clients": 8,
     "variants": {
      "v4.41.1": {
-      "ops_per_sec_median": 63241.4,
+      "ops_per_sec_median": 63338.3,
       "ops_per_sec_runs": [
-       63201.3,
-       64052.6,
-       63281.4,
-       62355.7
+       63120.0,
+       63935.7,
+       63556.7,
+       62840.6
       ],
       "p50_us_median": 118.0,
-      "p99_us_median": 199.5,
+      "p99_us_median": 201.0,
       "errors": 0,
       "load1_before": [
-       7.96,
-       7.4,
-       7.26,
-       7.56
+       5.43,
+       6.27,
+       7.7,
+       7.3
       ]
      },
      "v4.42.0": {
-      "ops_per_sec_median": 40682.8,
+      "ops_per_sec_median": 41374.9,
       "ops_per_sec_runs": [
-       40578.6,
-       40786.9,
-       40171.3,
-       40871.1
+       40947.9,
+       39413.3,
+       42169.5,
+       41801.8
       ],
-      "p50_us_median": 185.5,
-      "p99_us_median": 419.5,
+      "p50_us_median": 184.0,
+      "p99_us_median": 340.0,
       "errors": 0,
       "load1_before": [
-       7.43,
-       8.51,
-       7.63,
-       6.38
+       8.1,
+       8.17,
+       8.94,
+       7.49
       ]
      }
     },
-    "ratio_ops_v4.42.0_vs_v4.41.1": 0.643
+    "ratio_ops_v4.42.0_vs_v4.41.1": 0.653
    },
    {
     "mode": "update",
@@ -1747,43 +1747,43 @@
     "clients": 16,
     "variants": {
      "v4.41.1": {
-      "ops_per_sec_median": 109760.8,
+      "ops_per_sec_median": 110308.4,
       "ops_per_sec_runs": [
-       111747.7,
-       109932.0,
-       109589.5,
-       107609.1
+       110873.9,
+       109935.4,
+       110248.8,
+       110367.9
       ],
-      "p50_us_median": 135.0,
-      "p99_us_median": 300.0,
+      "p50_us_median": 134.0,
+      "p99_us_median": 305.0,
       "errors": 0,
       "load1_before": [
-       8.84,
-       9.03,
-       7.45,
-       7.91
+       5.89,
+       7.13,
+       8.14,
+       7.78
       ]
      },
      "v4.42.0": {
-      "ops_per_sec_median": 64821.8,
+      "ops_per_sec_median": 65574.1,
       "ops_per_sec_runs": [
-       64991.2,
-       64652.4,
-       64648.1,
-       65667.1
+       65797.1,
+       65644.6,
+       65503.7,
+       63633.9
       ],
-      "p50_us_median": 227.5,
-      "p99_us_median": 657.0,
+      "p50_us_median": 228.0,
+      "p99_us_median": 611.5,
       "errors": 0,
       "load1_before": [
-       7.96,
-       9.27,
-       9.61,
-       7.82
+       9.2,
+       9.29,
+       9.13,
+       8.14
       ]
      }
     },
-    "ratio_ops_v4.42.0_vs_v4.41.1": 0.591
+    "ratio_ops_v4.42.0_vs_v4.41.1": 0.594
    },
    {
     "mode": "update",
@@ -1791,43 +1791,43 @@
     "clients": 32,
     "variants": {
      "v4.41.1": {
-      "ops_per_sec_median": 144717.2,
+      "ops_per_sec_median": 144036.3,
       "ops_per_sec_runs": [
-       145876.2,
-       143558.2,
-       146394.6,
-       134972.7
+       143953.4,
+       142209.1,
+       144119.3,
+       144319.0
       ],
-      "p50_us_median": 196.0,
-      "p99_us_median": 651.5,
+      "p50_us_median": 197.0,
+      "p99_us_median": 622.0,
       "errors": 0,
       "load1_before": [
-       10.85,
-       10.82,
-       9.15,
-       9.73
+       8.78,
+       10.23,
+       10.47,
+       10.1
       ]
      },
      "v4.42.0": {
-      "ops_per_sec_median": 72379.3,
+      "ops_per_sec_median": 72322.8,
       "ops_per_sec_runs": [
-       73353.0,
-       72358.6,
-       72400.0,
-       71705.5
+       72678.1,
+       72323.2,
+       72322.4,
+       70624.3
       ],
-      "p50_us_median": 388.0,
-      "p99_us_median": 1027.5,
+      "p50_us_median": 390.0,
+      "p99_us_median": 1049.5,
       "errors": 0,
       "load1_before": [
-       10.08,
-       10.89,
-       11.52,
-       10.12
+       11.4,
+       12.06,
+       11.33,
+       11.84
       ]
      }
     },
-    "ratio_ops_v4.42.0_vs_v4.41.1": 0.5
+    "ratio_ops_v4.42.0_vs_v4.41.1": 0.502
    },
    {
     "mode": "update",
@@ -1835,43 +1835,43 @@
     "clients": 64,
     "variants": {
      "v4.41.1": {
-      "ops_per_sec_median": 147068.5,
+      "ops_per_sec_median": 147960.1,
       "ops_per_sec_runs": [
-       148334.2,
-       147414.0,
-       146723.1,
-       141173.4
+       148342.0,
+       146256.5,
+       147578.3,
+       148712.7
       ],
-      "p50_us_median": 395.5,
-      "p99_us_median": 1085.0,
+      "p50_us_median": 394.0,
+      "p99_us_median": 1078.5,
       "errors": 0,
       "load1_before": [
-       13.18,
-       13.39,
-       12.94,
-       11.22
+       13.32,
+       12.12,
+       13.11,
+       13.04
       ]
      },
      "v4.42.0": {
-      "ops_per_sec_median": 68071.6,
+      "ops_per_sec_median": 67833.8,
       "ops_per_sec_runs": [
-       67298.4,
-       68357.5,
-       69109.9,
-       67785.7
+       68363.5,
+       67580.9,
+       68086.6,
+       63601.1
       ],
-      "p50_us_median": 835.5,
-      "p99_us_median": 4931.5,
+      "p50_us_median": 841.5,
+      "p99_us_median": 5675.5,
       "errors": 0,
       "load1_before": [
-       14.1,
-       14.47,
-       15.19,
-       14.05
+       9.78,
+       14.71,
+       13.85,
+       14.86
       ]
      }
     },
-    "ratio_ops_v4.42.0_vs_v4.41.1": 0.463
+    "ratio_ops_v4.42.0_vs_v4.41.1": 0.458
    }
   ]
  },
@@ -1887,159 +1887,159 @@
       "engine": "PostgreSQL",
       "test": "SELECT 1",
       "clients": 1,
-      "tps": 19639.293743,
-      "latency_ms": 0.051
+      "tps": 19007.304345,
+      "latency_ms": 0.053
      },
      {
       "engine": "PostgreSQL",
       "test": "SELECT 1",
       "clients": 8,
-      "tps": 137861.467049,
-      "latency_ms": 0.058
+      "tps": 141792.798965,
+      "latency_ms": 0.056
      },
      {
       "engine": "PostgreSQL",
       "test": "SELECT 1",
       "clients": 16,
-      "tps": 214913.894132,
-      "latency_ms": 0.074
+      "tps": 210894.082369,
+      "latency_ms": 0.076
      },
      {
       "engine": "PostgreSQL",
       "test": "SELECT 1",
       "clients": 32,
-      "tps": 292569.567903,
-      "latency_ms": 0.109
+      "tps": 301028.469613,
+      "latency_ms": 0.106
      },
      {
       "engine": "PostgreSQL",
       "test": "SELECT 1",
       "clients": 64,
-      "tps": 325018.815303,
+      "tps": 325598.245774,
       "latency_ms": 0.197
      },
      {
       "engine": "PostgreSQL",
       "test": "bulk-load COPY (rows -> ms)",
       "size": "10000",
-      "ms": 66
+      "ms": 76
      },
      {
       "engine": "PostgreSQL",
       "test": "bulk-load COPY (rows -> ms)",
       "size": "50000",
-      "ms": 84
+      "ms": 81
      },
      {
       "engine": "PostgreSQL",
       "test": "bulk-load COPY (rows -> ms)",
       "size": "100000",
-      "ms": 103
+      "ms": 91
      },
      {
       "engine": "PostgreSQL",
       "test": "indexed point-read (50k rows) [proto=simple]",
       "clients": 1,
-      "tps": 10616.774832,
-      "latency_ms": 0.094
+      "tps": 11175.219367,
+      "latency_ms": 0.089
      },
      {
       "engine": "PostgreSQL",
       "test": "indexed point-read (50k rows) [proto=simple]",
       "clients": 8,
-      "tps": 81151.822309,
-      "latency_ms": 0.099
+      "tps": 79255.247748,
+      "latency_ms": 0.101
      },
      {
       "engine": "PostgreSQL",
       "test": "indexed point-read (50k rows) [proto=simple]",
       "clients": 16,
-      "tps": 132996.69936,
-      "latency_ms": 0.12
+      "tps": 134317.054045,
+      "latency_ms": 0.119
      },
      {
       "engine": "PostgreSQL",
       "test": "indexed point-read (50k rows) [proto=simple]",
       "clients": 32,
-      "tps": 185381.23194,
-      "latency_ms": 0.173
+      "tps": 181966.844638,
+      "latency_ms": 0.176
      },
      {
       "engine": "PostgreSQL",
       "test": "indexed point-read (50k rows) [proto=simple]",
       "clients": 64,
-      "tps": 227508.218575,
-      "latency_ms": 0.281
+      "tps": 223938.352331,
+      "latency_ms": 0.286
      },
      {
       "engine": "PostgreSQL",
       "test": "indexed point-read (50k rows) [proto=extended]",
       "clients": 1,
-      "tps": 9882.682152,
-      "latency_ms": 0.101
+      "tps": 10032.228987,
+      "latency_ms": 0.1
      },
      {
       "engine": "PostgreSQL",
       "test": "indexed point-read (50k rows) [proto=extended]",
       "clients": 8,
-      "tps": 74903.260537,
+      "tps": 74772.044612,
       "latency_ms": 0.107
      },
      {
       "engine": "PostgreSQL",
       "test": "indexed point-read (50k rows) [proto=extended]",
       "clients": 16,
-      "tps": 122445.733053,
-      "latency_ms": 0.131
+      "tps": 127269.832612,
+      "latency_ms": 0.126
      },
      {
       "engine": "PostgreSQL",
       "test": "indexed point-read (50k rows) [proto=extended]",
       "clients": 32,
-      "tps": 176656.421685,
-      "latency_ms": 0.181
+      "tps": 168120.341874,
+      "latency_ms": 0.19
      },
      {
       "engine": "PostgreSQL",
       "test": "indexed point-read (50k rows) [proto=extended]",
       "clients": 64,
-      "tps": 198235.791611,
-      "latency_ms": 0.323
+      "tps": 209165.571724,
+      "latency_ms": 0.306
      },
      {
       "engine": "PostgreSQL",
       "test": "indexed point-read (50k rows) [proto=prepared]",
       "clients": 1,
-      "tps": 17395.220019,
+      "tps": 17632.605633,
       "latency_ms": 0.057
      },
      {
       "engine": "PostgreSQL",
       "test": "indexed point-read (50k rows) [proto=prepared]",
       "clients": 8,
-      "tps": 127463.959997,
-      "latency_ms": 0.063
+      "tps": 130156.609818,
+      "latency_ms": 0.061
      },
      {
       "engine": "PostgreSQL",
       "test": "indexed point-read (50k rows) [proto=prepared]",
       "clients": 16,
-      "tps": 199608.997317,
-      "latency_ms": 0.08
+      "tps": 189643.429201,
+      "latency_ms": 0.084
      },
      {
       "engine": "PostgreSQL",
       "test": "indexed point-read (50k rows) [proto=prepared]",
       "clients": 32,
-      "tps": 274740.812741,
-      "latency_ms": 0.116
+      "tps": 279575.441617,
+      "latency_ms": 0.114
      },
      {
       "engine": "PostgreSQL",
       "test": "indexed point-read (50k rows) [proto=prepared]",
       "clients": 64,
-      "tps": 306133.632974,
-      "latency_ms": 0.209
+      "tps": 310064.824925,
+      "latency_ms": 0.206
      },
      {
       "engine": "PostgreSQL",
@@ -2051,200 +2051,200 @@
       "engine": "HeliosDB-Nano 4.41.1",
       "test": "SELECT 1",
       "clients": 1,
-      "tps": 25102.736879,
-      "latency_ms": 0.04
+      "tps": 25769.19899,
+      "latency_ms": 0.039
      },
      {
       "engine": "HeliosDB-Nano 4.41.1",
       "test": "SELECT 1",
       "clients": 8,
-      "tps": 122731.717538,
-      "latency_ms": 0.065
+      "tps": 118990.654178,
+      "latency_ms": 0.067
      },
      {
       "engine": "HeliosDB-Nano 4.41.1",
       "test": "SELECT 1",
       "clients": 16,
-      "tps": 201915.792064,
-      "latency_ms": 0.079
+      "tps": 200046.083053,
+      "latency_ms": 0.08
      },
      {
       "engine": "HeliosDB-Nano 4.41.1",
       "test": "SELECT 1",
       "clients": 32,
-      "tps": 234995.11921,
-      "latency_ms": 0.136
+      "tps": 240756.765394,
+      "latency_ms": 0.133
      },
      {
       "engine": "HeliosDB-Nano 4.41.1",
       "test": "SELECT 1",
       "clients": 64,
-      "tps": 264725.314594,
-      "latency_ms": 0.242
+      "tps": 252033.962064,
+      "latency_ms": 0.254
      },
      {
       "engine": "HeliosDB-Nano 4.41.1",
       "test": "bulk-load COPY (rows -> ms)",
       "size": "10000",
-      "ms": 49
+      "ms": 48
      },
      {
       "engine": "HeliosDB-Nano 4.41.1",
       "test": "bulk-load COPY (rows -> ms)",
       "size": "50000",
-      "ms": 109
+      "ms": 99
      },
      {
       "engine": "HeliosDB-Nano 4.41.1",
       "test": "bulk-load COPY (rows -> ms)",
       "size": "100000",
-      "ms": 180
+      "ms": 157
      },
      {
       "engine": "HeliosDB-Nano 4.41.1",
       "test": "indexed point-read (50k rows) [proto=simple]",
       "clients": 1,
-      "tps": 14136.247844,
-      "latency_ms": 0.071
+      "tps": 13749.859215,
+      "latency_ms": 0.073
      },
      {
       "engine": "HeliosDB-Nano 4.41.1",
       "test": "indexed point-read (50k rows) [proto=simple]",
       "clients": 8,
-      "tps": 77988.453091,
+      "tps": 77501.260753,
       "latency_ms": 0.103
      },
      {
       "engine": "HeliosDB-Nano 4.41.1",
       "test": "indexed point-read (50k rows) [proto=simple]",
       "clients": 16,
-      "tps": 134975.151938,
-      "latency_ms": 0.119
+      "tps": 138431.19777,
+      "latency_ms": 0.116
      },
      {
       "engine": "HeliosDB-Nano 4.41.1",
       "test": "indexed point-read (50k rows) [proto=simple]",
       "clients": 32,
-      "tps": 180916.359639,
-      "latency_ms": 0.177
+      "tps": 174908.947178,
+      "latency_ms": 0.183
      },
      {
       "engine": "HeliosDB-Nano 4.41.1",
       "test": "indexed point-read (50k rows) [proto=simple]",
       "clients": 64,
-      "tps": 175386.642812,
-      "latency_ms": 0.365
+      "tps": 177400.472192,
+      "latency_ms": 0.361
      },
      {
       "engine": "HeliosDB-Nano 4.41.1",
       "test": "indexed point-read (50k rows) [proto=extended]",
       "clients": 1,
-      "tps": 9461.759016,
-      "latency_ms": 0.106
+      "tps": 9531.644269,
+      "latency_ms": 0.105
      },
      {
       "engine": "HeliosDB-Nano 4.41.1",
       "test": "indexed point-read (50k rows) [proto=extended]",
       "clients": 8,
-      "tps": 51554.369523,
-      "latency_ms": 0.155
+      "tps": 52043.832623,
+      "latency_ms": 0.154
      },
      {
       "engine": "HeliosDB-Nano 4.41.1",
       "test": "indexed point-read (50k rows) [proto=extended]",
       "clients": 16,
-      "tps": 94974.816824,
-      "latency_ms": 0.168
+      "tps": 91183.839036,
+      "latency_ms": 0.175
      },
      {
       "engine": "HeliosDB-Nano 4.41.1",
       "test": "indexed point-read (50k rows) [proto=extended]",
       "clients": 32,
-      "tps": 122028.527932,
-      "latency_ms": 0.262
+      "tps": 120342.022735,
+      "latency_ms": 0.266
      },
      {
       "engine": "HeliosDB-Nano 4.41.1",
       "test": "indexed point-read (50k rows) [proto=extended]",
       "clients": 64,
-      "tps": 122901.6177,
-      "latency_ms": 0.521
+      "tps": 120567.138211,
+      "latency_ms": 0.531
      },
      {
       "engine": "HeliosDB-Nano 4.41.1",
       "test": "indexed point-read (50k rows) [proto=prepared]",
       "clients": 1,
-      "tps": 15851.626981,
-      "latency_ms": 0.063
+      "tps": 14582.071576,
+      "latency_ms": 0.069
      },
      {
       "engine": "HeliosDB-Nano 4.41.1",
       "test": "indexed point-read (50k rows) [proto=prepared]",
       "clients": 8,
-      "tps": 83488.882063,
+      "tps": 83095.951808,
       "latency_ms": 0.096
      },
      {
       "engine": "HeliosDB-Nano 4.41.1",
       "test": "indexed point-read (50k rows) [proto=prepared]",
       "clients": 16,
-      "tps": 150415.807836,
-      "latency_ms": 0.106
+      "tps": 143636.893494,
+      "latency_ms": 0.111
      },
      {
       "engine": "HeliosDB-Nano 4.41.1",
       "test": "indexed point-read (50k rows) [proto=prepared]",
       "clients": 32,
-      "tps": 192176.840128,
-      "latency_ms": 0.167
+      "tps": 200804.845276,
+      "latency_ms": 0.159
      },
      {
       "engine": "HeliosDB-Nano 4.41.1",
       "test": "indexed point-read (50k rows) [proto=prepared]",
       "clients": 64,
-      "tps": 210020.566822,
-      "latency_ms": 0.305
+      "tps": 199468.536107,
+      "latency_ms": 0.321
      },
      {
       "engine": "HeliosDB-Nano 4.41.1",
       "test": "DROP TABLE (100k rows -> ms)",
       "size": "100k",
-      "ms": 138
+      "ms": 134
      },
      {
       "engine": "HeliosDB-Nano 4.42.0",
       "test": "SELECT 1",
       "clients": 1,
-      "tps": 25448.492491,
-      "latency_ms": 0.039
+      "tps": 26323.437736,
+      "latency_ms": 0.038
      },
      {
       "engine": "HeliosDB-Nano 4.42.0",
       "test": "SELECT 1",
       "clients": 8,
-      "tps": 122795.075215,
-      "latency_ms": 0.065
+      "tps": 116656.940358,
+      "latency_ms": 0.069
      },
      {
       "engine": "HeliosDB-Nano 4.42.0",
       "test": "SELECT 1",
       "clients": 16,
-      "tps": 192614.123748,
-      "latency_ms": 0.083
+      "tps": 198472.911195,
+      "latency_ms": 0.081
      },
      {
       "engine": "HeliosDB-Nano 4.42.0",
       "test": "SELECT 1",
       "clients": 32,
-      "tps": 251798.12039,
-      "latency_ms": 0.127
+      "tps": 232005.608671,
+      "latency_ms": 0.138
      },
      {
       "engine": "HeliosDB-Nano 4.42.0",
       "test": "SELECT 1",
       "clients": 64,
-      "tps": 246211.021798,
-      "latency_ms": 0.26
+      "tps": 272851.616598,
+      "latency_ms": 0.235
      },
      {
       "engine": "HeliosDB-Nano 4.42.0",
@@ -2256,124 +2256,124 @@
       "engine": "HeliosDB-Nano 4.42.0",
       "test": "bulk-load COPY (rows -> ms)",
       "size": "50000",
-      "ms": 105
+      "ms": 108
      },
      {
       "engine": "HeliosDB-Nano 4.42.0",
       "test": "bulk-load COPY (rows -> ms)",
       "size": "100000",
-      "ms": 182
+      "ms": 179
      },
      {
       "engine": "HeliosDB-Nano 4.42.0",
       "test": "indexed point-read (50k rows) [proto=simple]",
       "clients": 1,
-      "tps": 13730.380149,
-      "latency_ms": 0.073
+      "tps": 13281.416704,
+      "latency_ms": 0.075
      },
      {
       "engine": "HeliosDB-Nano 4.42.0",
       "test": "indexed point-read (50k rows) [proto=simple]",
       "clients": 8,
-      "tps": 69902.232935,
-      "latency_ms": 0.114
+      "tps": 74333.558698,
+      "latency_ms": 0.108
      },
      {
       "engine": "HeliosDB-Nano 4.42.0",
       "test": "indexed point-read (50k rows) [proto=simple]",
       "clients": 16,
-      "tps": 125926.317648,
-      "latency_ms": 0.127
+      "tps": 127118.644068,
+      "latency_ms": 0.126
      },
      {
       "engine": "HeliosDB-Nano 4.42.0",
       "test": "indexed point-read (50k rows) [proto=simple]",
       "clients": 32,
-      "tps": 159196.176939,
-      "latency_ms": 0.201
+      "tps": 176918.360299,
+      "latency_ms": 0.181
      },
      {
       "engine": "HeliosDB-Nano 4.42.0",
       "test": "indexed point-read (50k rows) [proto=simple]",
       "clients": 64,
-      "tps": 164022.761456,
-      "latency_ms": 0.39
+      "tps": 163347.433649,
+      "latency_ms": 0.392
      },
      {
       "engine": "HeliosDB-Nano 4.42.0",
       "test": "indexed point-read (50k rows) [proto=extended]",
       "clients": 1,
-      "tps": 8610.434048,
+      "tps": 8975.498605,
+      "latency_ms": 0.111
+     },
+     {
+      "engine": "HeliosDB-Nano 4.42.0",
+      "test": "indexed point-read (50k rows) [proto=extended]",
+      "clients": 8,
+      "tps": 46125.643009,
+      "latency_ms": 0.173
+     },
+     {
+      "engine": "HeliosDB-Nano 4.42.0",
+      "test": "indexed point-read (50k rows) [proto=extended]",
+      "clients": 16,
+      "tps": 83603.972314,
+      "latency_ms": 0.191
+     },
+     {
+      "engine": "HeliosDB-Nano 4.42.0",
+      "test": "indexed point-read (50k rows) [proto=extended]",
+      "clients": 32,
+      "tps": 106634.394095,
+      "latency_ms": 0.3
+     },
+     {
+      "engine": "HeliosDB-Nano 4.42.0",
+      "test": "indexed point-read (50k rows) [proto=extended]",
+      "clients": 64,
+      "tps": 108281.715531,
+      "latency_ms": 0.591
+     },
+     {
+      "engine": "HeliosDB-Nano 4.42.0",
+      "test": "indexed point-read (50k rows) [proto=prepared]",
+      "clients": 1,
+      "tps": 14199.331154,
+      "latency_ms": 0.07
+     },
+     {
+      "engine": "HeliosDB-Nano 4.42.0",
+      "test": "indexed point-read (50k rows) [proto=prepared]",
+      "clients": 8,
+      "tps": 68806.943189,
       "latency_ms": 0.116
      },
      {
       "engine": "HeliosDB-Nano 4.42.0",
-      "test": "indexed point-read (50k rows) [proto=extended]",
-      "clients": 8,
-      "tps": 46444.812125,
-      "latency_ms": 0.172
-     },
-     {
-      "engine": "HeliosDB-Nano 4.42.0",
-      "test": "indexed point-read (50k rows) [proto=extended]",
-      "clients": 16,
-      "tps": 85270.003676,
-      "latency_ms": 0.188
-     },
-     {
-      "engine": "HeliosDB-Nano 4.42.0",
-      "test": "indexed point-read (50k rows) [proto=extended]",
-      "clients": 32,
-      "tps": 105668.819586,
-      "latency_ms": 0.303
-     },
-     {
-      "engine": "HeliosDB-Nano 4.42.0",
-      "test": "indexed point-read (50k rows) [proto=extended]",
-      "clients": 64,
-      "tps": 108015.082795,
-      "latency_ms": 0.593
-     },
-     {
-      "engine": "HeliosDB-Nano 4.42.0",
-      "test": "indexed point-read (50k rows) [proto=prepared]",
-      "clients": 1,
-      "tps": 13961.250209,
-      "latency_ms": 0.072
-     },
-     {
-      "engine": "HeliosDB-Nano 4.42.0",
-      "test": "indexed point-read (50k rows) [proto=prepared]",
-      "clients": 8,
-      "tps": 71323.191776,
-      "latency_ms": 0.112
-     },
-     {
-      "engine": "HeliosDB-Nano 4.42.0",
       "test": "indexed point-read (50k rows) [proto=prepared]",
       "clients": 16,
-      "tps": 121727.166803,
-      "latency_ms": 0.131
+      "tps": 127204.064553,
+      "latency_ms": 0.126
      },
      {
       "engine": "HeliosDB-Nano 4.42.0",
       "test": "indexed point-read (50k rows) [proto=prepared]",
       "clients": 32,
-      "tps": 168923.249349,
-      "latency_ms": 0.189
+      "tps": 165257.686831,
+      "latency_ms": 0.194
      },
      {
       "engine": "HeliosDB-Nano 4.42.0",
       "test": "indexed point-read (50k rows) [proto=prepared]",
       "clients": 64,
-      "tps": 169995.0717,
-      "latency_ms": 0.376
+      "tps": 170456.053299,
+      "latency_ms": 0.375
      },
      {
       "engine": "HeliosDB-Nano 4.42.0",
       "test": "DROP TABLE (100k rows -> ms)",
       "size": "100k",
-      "ms": 155
+      "ms": 139
      }
     ]
    },
@@ -2384,35 +2384,35 @@
       "engine": "PostgreSQL",
       "test": "SELECT 1",
       "clients": 1,
-      "tps": 18959.747909,
-      "latency_ms": 0.053
+      "tps": 19155.263161,
+      "latency_ms": 0.052
      },
      {
       "engine": "PostgreSQL",
       "test": "SELECT 1",
       "clients": 8,
-      "tps": 142936.069268,
-      "latency_ms": 0.056
+      "tps": 138577.869894,
+      "latency_ms": 0.058
      },
      {
       "engine": "PostgreSQL",
       "test": "SELECT 1",
       "clients": 16,
-      "tps": 212816.451438,
-      "latency_ms": 0.075
+      "tps": 214960.457561,
+      "latency_ms": 0.074
      },
      {
       "engine": "PostgreSQL",
       "test": "SELECT 1",
       "clients": 32,
-      "tps": 290574.169286,
-      "latency_ms": 0.11
+      "tps": 288326.913352,
+      "latency_ms": 0.111
      },
      {
       "engine": "PostgreSQL",
       "test": "SELECT 1",
       "clients": 64,
-      "tps": 327458.646533,
+      "tps": 327653.956566,
       "latency_ms": 0.195
      },
      {
@@ -2425,452 +2425,452 @@
       "engine": "PostgreSQL",
       "test": "bulk-load COPY (rows -> ms)",
       "size": "50000",
-      "ms": 78
+      "ms": 82
      },
      {
       "engine": "PostgreSQL",
       "test": "bulk-load COPY (rows -> ms)",
       "size": "100000",
-      "ms": 131
+      "ms": 95
      },
      {
       "engine": "PostgreSQL",
       "test": "indexed point-read (50k rows) [proto=simple]",
       "clients": 1,
-      "tps": 11201.525416,
-      "latency_ms": 0.089
+      "tps": 10756.353719,
+      "latency_ms": 0.093
      },
      {
       "engine": "PostgreSQL",
       "test": "indexed point-read (50k rows) [proto=simple]",
       "clients": 8,
-      "tps": 80838.194886,
-      "latency_ms": 0.099
+      "tps": 81671.456942,
+      "latency_ms": 0.098
      },
      {
       "engine": "PostgreSQL",
       "test": "indexed point-read (50k rows) [proto=simple]",
       "clients": 16,
-      "tps": 133265.052623,
+      "tps": 132949.559242,
       "latency_ms": 0.12
      },
      {
       "engine": "PostgreSQL",
       "test": "indexed point-read (50k rows) [proto=simple]",
       "clients": 32,
-      "tps": 193548.383058,
+      "tps": 193727.095982,
       "latency_ms": 0.165
      },
      {
       "engine": "PostgreSQL",
       "test": "indexed point-read (50k rows) [proto=simple]",
       "clients": 64,
-      "tps": 221722.017291,
-      "latency_ms": 0.289
+      "tps": 219591.4899,
+      "latency_ms": 0.291
      },
      {
       "engine": "PostgreSQL",
       "test": "indexed point-read (50k rows) [proto=extended]",
       "clients": 1,
-      "tps": 10449.648392,
-      "latency_ms": 0.096
+      "tps": 10113.387486,
+      "latency_ms": 0.099
      },
      {
       "engine": "PostgreSQL",
       "test": "indexed point-read (50k rows) [proto=extended]",
       "clients": 8,
-      "tps": 73601.093928,
+      "tps": 73482.352173,
       "latency_ms": 0.109
      },
      {
       "engine": "PostgreSQL",
       "test": "indexed point-read (50k rows) [proto=extended]",
       "clients": 16,
-      "tps": 126035.387419,
+      "tps": 125987.537749,
       "latency_ms": 0.127
      },
      {
       "engine": "PostgreSQL",
       "test": "indexed point-read (50k rows) [proto=extended]",
       "clients": 32,
-      "tps": 170857.590361,
-      "latency_ms": 0.187
+      "tps": 170018.261152,
+      "latency_ms": 0.188
      },
      {
       "engine": "PostgreSQL",
       "test": "indexed point-read (50k rows) [proto=extended]",
       "clients": 64,
-      "tps": 202510.642137,
-      "latency_ms": 0.316
+      "tps": 201671.737542,
+      "latency_ms": 0.317
      },
      {
       "engine": "PostgreSQL",
       "test": "indexed point-read (50k rows) [proto=prepared]",
       "clients": 1,
-      "tps": 17499.081523,
-      "latency_ms": 0.057
+      "tps": 18175.338471,
+      "latency_ms": 0.055
      },
      {
       "engine": "PostgreSQL",
       "test": "indexed point-read (50k rows) [proto=prepared]",
       "clients": 8,
-      "tps": 129558.302331,
+      "tps": 128200.813515,
       "latency_ms": 0.062
      },
      {
       "engine": "PostgreSQL",
       "test": "indexed point-read (50k rows) [proto=prepared]",
       "clients": 16,
-      "tps": 200308.115112,
+      "tps": 200077.406647,
       "latency_ms": 0.08
      },
      {
       "engine": "PostgreSQL",
       "test": "indexed point-read (50k rows) [proto=prepared]",
       "clients": 32,
-      "tps": 269102.032204,
+      "tps": 267840.511855,
       "latency_ms": 0.119
      },
      {
       "engine": "PostgreSQL",
       "test": "indexed point-read (50k rows) [proto=prepared]",
       "clients": 64,
-      "tps": 310733.1109,
-      "latency_ms": 0.206
+      "tps": 317645.630178,
+      "latency_ms": 0.201
      },
      {
       "engine": "PostgreSQL",
       "test": "DROP TABLE (100k rows -> ms)",
       "size": "100k",
-      "ms": 55
+      "ms": 51
      },
      {
       "engine": "HeliosDB-Nano 4.42.0",
       "test": "SELECT 1",
       "clients": 1,
-      "tps": 25898.245829,
+      "tps": 25397.378585,
       "latency_ms": 0.039
      },
      {
       "engine": "HeliosDB-Nano 4.42.0",
       "test": "SELECT 1",
       "clients": 8,
-      "tps": 121701.299166,
-      "latency_ms": 0.066
+      "tps": 124639.391522,
+      "latency_ms": 0.064
      },
      {
       "engine": "HeliosDB-Nano 4.42.0",
       "test": "SELECT 1",
       "clients": 16,
-      "tps": 192894.624585,
+      "tps": 192904.730888,
       "latency_ms": 0.083
      },
      {
       "engine": "HeliosDB-Nano 4.42.0",
       "test": "SELECT 1",
       "clients": 32,
-      "tps": 250526.939888,
-      "latency_ms": 0.128
+      "tps": 253258.684313,
+      "latency_ms": 0.126
      },
      {
       "engine": "HeliosDB-Nano 4.42.0",
       "test": "SELECT 1",
       "clients": 64,
-      "tps": 250178.111066,
-      "latency_ms": 0.256
+      "tps": 259371.539512,
+      "latency_ms": 0.247
      },
      {
       "engine": "HeliosDB-Nano 4.42.0",
       "test": "bulk-load COPY (rows -> ms)",
       "size": "10000",
-      "ms": 51
+      "ms": 55
      },
      {
       "engine": "HeliosDB-Nano 4.42.0",
       "test": "bulk-load COPY (rows -> ms)",
       "size": "50000",
-      "ms": 104
+      "ms": 105
      },
      {
       "engine": "HeliosDB-Nano 4.42.0",
       "test": "bulk-load COPY (rows -> ms)",
       "size": "100000",
-      "ms": 172
+      "ms": 177
      },
      {
       "engine": "HeliosDB-Nano 4.42.0",
       "test": "indexed point-read (50k rows) [proto=simple]",
       "clients": 1,
-      "tps": 12923.756251,
+      "tps": 13055.018282,
       "latency_ms": 0.077
      },
      {
       "engine": "HeliosDB-Nano 4.42.0",
       "test": "indexed point-read (50k rows) [proto=simple]",
       "clients": 8,
-      "tps": 70405.207733,
-      "latency_ms": 0.114
+      "tps": 74201.734125,
+      "latency_ms": 0.108
      },
      {
       "engine": "HeliosDB-Nano 4.42.0",
       "test": "indexed point-read (50k rows) [proto=simple]",
       "clients": 16,
-      "tps": 127495.566715,
-      "latency_ms": 0.125
+      "tps": 131007.784405,
+      "latency_ms": 0.122
      },
      {
       "engine": "HeliosDB-Nano 4.42.0",
       "test": "indexed point-read (50k rows) [proto=simple]",
       "clients": 32,
-      "tps": 163902.586378,
-      "latency_ms": 0.195
+      "tps": 167575.816985,
+      "latency_ms": 0.191
      },
      {
       "engine": "HeliosDB-Nano 4.42.0",
       "test": "indexed point-read (50k rows) [proto=simple]",
       "clients": 64,
-      "tps": 177524.048291,
-      "latency_ms": 0.361
+      "tps": 167317.332119,
+      "latency_ms": 0.383
      },
      {
       "engine": "HeliosDB-Nano 4.42.0",
       "test": "indexed point-read (50k rows) [proto=extended]",
       "clients": 1,
-      "tps": 8991.471415,
-      "latency_ms": 0.111
+      "tps": 8424.866482,
+      "latency_ms": 0.119
      },
      {
       "engine": "HeliosDB-Nano 4.42.0",
       "test": "indexed point-read (50k rows) [proto=extended]",
       "clients": 8,
-      "tps": 48051.963638,
-      "latency_ms": 0.166
+      "tps": 46863.439941,
+      "latency_ms": 0.171
      },
      {
       "engine": "HeliosDB-Nano 4.42.0",
       "test": "indexed point-read (50k rows) [proto=extended]",
       "clients": 16,
-      "tps": 85677.740088,
-      "latency_ms": 0.187
+      "tps": 85896.09067,
+      "latency_ms": 0.186
      },
      {
       "engine": "HeliosDB-Nano 4.42.0",
       "test": "indexed point-read (50k rows) [proto=extended]",
       "clients": 32,
-      "tps": 107675.339528,
-      "latency_ms": 0.297
+      "tps": 104532.574503,
+      "latency_ms": 0.306
      },
      {
       "engine": "HeliosDB-Nano 4.42.0",
       "test": "indexed point-read (50k rows) [proto=extended]",
       "clients": 64,
-      "tps": 110085.745895,
-      "latency_ms": 0.581
+      "tps": 107532.959417,
+      "latency_ms": 0.595
      },
      {
       "engine": "HeliosDB-Nano 4.42.0",
       "test": "indexed point-read (50k rows) [proto=prepared]",
       "clients": 1,
-      "tps": 13857.528601,
-      "latency_ms": 0.072
+      "tps": 12680.674581,
+      "latency_ms": 0.079
      },
      {
       "engine": "HeliosDB-Nano 4.42.0",
       "test": "indexed point-read (50k rows) [proto=prepared]",
       "clients": 8,
-      "tps": 73438.727282,
-      "latency_ms": 0.109
+      "tps": 71220.218856,
+      "latency_ms": 0.112
      },
      {
       "engine": "HeliosDB-Nano 4.42.0",
       "test": "indexed point-read (50k rows) [proto=prepared]",
       "clients": 16,
-      "tps": 123545.523444,
+      "tps": 123420.587547,
       "latency_ms": 0.13
      },
      {
       "engine": "HeliosDB-Nano 4.42.0",
       "test": "indexed point-read (50k rows) [proto=prepared]",
       "clients": 32,
-      "tps": 175097.904821,
-      "latency_ms": 0.183
+      "tps": 168616.520611,
+      "latency_ms": 0.19
      },
      {
       "engine": "HeliosDB-Nano 4.42.0",
       "test": "indexed point-read (50k rows) [proto=prepared]",
       "clients": 64,
-      "tps": 176573.979923,
-      "latency_ms": 0.362
+      "tps": 172033.372009,
+      "latency_ms": 0.372
      },
      {
       "engine": "HeliosDB-Nano 4.42.0",
       "test": "DROP TABLE (100k rows -> ms)",
       "size": "100k",
-      "ms": 139
+      "ms": 145
      },
      {
       "engine": "HeliosDB-Nano 4.41.1",
       "test": "SELECT 1",
       "clients": 1,
-      "tps": 26918.138802,
+      "tps": 26887.850328,
       "latency_ms": 0.037
      },
      {
       "engine": "HeliosDB-Nano 4.41.1",
       "test": "SELECT 1",
       "clients": 8,
-      "tps": 118354.08928,
-      "latency_ms": 0.068
+      "tps": 121183.746723,
+      "latency_ms": 0.066
      },
      {
       "engine": "HeliosDB-Nano 4.41.1",
       "test": "SELECT 1",
       "clients": 16,
-      "tps": 201783.471948,
-      "latency_ms": 0.079
+      "tps": 196214.531785,
+      "latency_ms": 0.082
      },
      {
       "engine": "HeliosDB-Nano 4.41.1",
       "test": "SELECT 1",
       "clients": 32,
-      "tps": 229898.754171,
-      "latency_ms": 0.139
+      "tps": 249404.166266,
+      "latency_ms": 0.128
      },
      {
       "engine": "HeliosDB-Nano 4.41.1",
       "test": "SELECT 1",
       "clients": 64,
-      "tps": 264020.746457,
-      "latency_ms": 0.242
+      "tps": 238557.559293,
+      "latency_ms": 0.268
      },
      {
       "engine": "HeliosDB-Nano 4.41.1",
       "test": "bulk-load COPY (rows -> ms)",
       "size": "10000",
-      "ms": 48
+      "ms": 53
      },
      {
       "engine": "HeliosDB-Nano 4.41.1",
       "test": "bulk-load COPY (rows -> ms)",
       "size": "50000",
-      "ms": 105
+      "ms": 101
      },
      {
       "engine": "HeliosDB-Nano 4.41.1",
       "test": "bulk-load COPY (rows -> ms)",
       "size": "100000",
-      "ms": 155
+      "ms": 164
      },
      {
       "engine": "HeliosDB-Nano 4.41.1",
       "test": "indexed point-read (50k rows) [proto=simple]",
       "clients": 1,
-      "tps": 14163.391264,
+      "tps": 13989.98874,
       "latency_ms": 0.071
      },
      {
       "engine": "HeliosDB-Nano 4.41.1",
       "test": "indexed point-read (50k rows) [proto=simple]",
       "clients": 8,
-      "tps": 77159.188903,
-      "latency_ms": 0.104
+      "tps": 75907.302361,
+      "latency_ms": 0.105
      },
      {
       "engine": "HeliosDB-Nano 4.41.1",
       "test": "indexed point-read (50k rows) [proto=simple]",
       "clients": 16,
-      "tps": 135943.03051,
-      "latency_ms": 0.118
+      "tps": 139601.943861,
+      "latency_ms": 0.115
      },
      {
       "engine": "HeliosDB-Nano 4.41.1",
       "test": "indexed point-read (50k rows) [proto=simple]",
       "clients": 32,
-      "tps": 176262.372282,
+      "tps": 175644.676391,
       "latency_ms": 0.182
      },
      {
       "engine": "HeliosDB-Nano 4.41.1",
       "test": "indexed point-read (50k rows) [proto=simple]",
       "clients": 64,
-      "tps": 174124.841111,
-      "latency_ms": 0.368
+      "tps": 180856.031323,
+      "latency_ms": 0.354
      },
      {
       "engine": "HeliosDB-Nano 4.41.1",
       "test": "indexed point-read (50k rows) [proto=extended]",
       "clients": 1,
-      "tps": 9642.413067,
-      "latency_ms": 0.104
+      "tps": 10280.028846,
+      "latency_ms": 0.097
      },
      {
       "engine": "HeliosDB-Nano 4.41.1",
       "test": "indexed point-read (50k rows) [proto=extended]",
       "clients": 8,
-      "tps": 51362.146821,
-      "latency_ms": 0.156
+      "tps": 51586.653702,
+      "latency_ms": 0.155
      },
      {
       "engine": "HeliosDB-Nano 4.41.1",
       "test": "indexed point-read (50k rows) [proto=extended]",
       "clients": 16,
-      "tps": 91398.84293,
-      "latency_ms": 0.175
+      "tps": 95584.777917,
+      "latency_ms": 0.167
      },
      {
       "engine": "HeliosDB-Nano 4.41.1",
       "test": "indexed point-read (50k rows) [proto=extended]",
       "clients": 32,
-      "tps": 121265.9004,
-      "latency_ms": 0.264
+      "tps": 119944.960621,
+      "latency_ms": 0.267
      },
      {
       "engine": "HeliosDB-Nano 4.41.1",
       "test": "indexed point-read (50k rows) [proto=extended]",
       "clients": 64,
-      "tps": 121405.077207,
-      "latency_ms": 0.527
+      "tps": 122125.999101,
+      "latency_ms": 0.524
      },
      {
       "engine": "HeliosDB-Nano 4.41.1",
       "test": "indexed point-read (50k rows) [proto=prepared]",
       "clients": 1,
-      "tps": 15535.745916,
-      "latency_ms": 0.064
+      "tps": 15444.683894,
+      "latency_ms": 0.065
      },
      {
       "engine": "HeliosDB-Nano 4.41.1",
       "test": "indexed point-read (50k rows) [proto=prepared]",
       "clients": 8,
-      "tps": 81935.592754,
-      "latency_ms": 0.098
+      "tps": 84751.714621,
+      "latency_ms": 0.094
      },
      {
       "engine": "HeliosDB-Nano 4.41.1",
       "test": "indexed point-read (50k rows) [proto=prepared]",
       "clients": 16,
-      "tps": 146787.836963,
-      "latency_ms": 0.109
+      "tps": 143895.046467,
+      "latency_ms": 0.111
      },
      {
       "engine": "HeliosDB-Nano 4.41.1",
       "test": "indexed point-read (50k rows) [proto=prepared]",
       "clients": 32,
-      "tps": 200561.56167,
-      "latency_ms": 0.16
+      "tps": 203093.35942,
+      "latency_ms": 0.158
      },
      {
       "engine": "HeliosDB-Nano 4.41.1",
       "test": "indexed point-read (50k rows) [proto=prepared]",
       "clients": 64,
-      "tps": 202328.630128,
-      "latency_ms": 0.316
+      "tps": 205284.883853,
+      "latency_ms": 0.312
      },
      {
       "engine": "HeliosDB-Nano 4.41.1",
       "test": "DROP TABLE (100k rows -> ms)",
       "size": "100k",
-      "ms": 130
+      "ms": 131
      }
     ]
    }

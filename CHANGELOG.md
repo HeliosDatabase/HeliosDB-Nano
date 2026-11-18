@@ -690,8 +690,8 @@ In pg35 itself (release builds, 300 statements per category, 2 rounds, one run o
 4.41.1 / 4.42.0 before this pass / 4.42.0 now) 13 categories got 13% or more faster and none
 slower, among them `Transaction ctl` 50.1 / 64.4 / 36.3 µs, `UPSERT` 62.4 / 100.2 / 61.2,
 `DROP TABLE` 153.9 / 352.0 / 234.9, `CREATE TABLE` 168.2 / 355.5 / 255.6, `CREATE INDEX`
-316.4 / 480.6 / 325.3 and `SET/SHOW/RESET` 2.4 / 2.9 / 2.4. The full table is in
-`docs/benchmarks/RELEASE_4_42_0.md`.
+316.4 / 480.6 / 325.3 and `SET/SHOW/RESET` 2.4 / 2.9 / 2.4. That run was made before the third
+pass below; the table in `docs/benchmarks/RELEASE_4_42_0.md` is the later run of the release.
 
 - **A transaction's own maps have four shards, not four per CPU** (19db35dd). dashmap gives a map
   four shards per CPU unless told otherwise, 128 on 32 CPUs. A transaction's write set, the
@@ -742,19 +742,74 @@ What this pass did not change, and why:
 - `TRUNCATE` and `REFRESH MATERIALIZED VIEW` cost more the more often they ran, because their
   scans step over the rows deleted by the earlier runs; 4.41.1 does the same.
 
+### Performance — a third pass: joins under a filter, and a baseline of best times
+
+The run of the release (`docs/benchmarks/RELEASE_4_42_0.md`; pg35 numbers below are 4.41.1 /
+4.42.0 before the passes / 4.42.0, µs per statement, median of 2 rounds):
+
+- **A filter pushed below a join is estimated from its index, so a join chain keeps its index
+  lookups** (6b4a663e). The optimizer pushes a single-table `WHERE` term below the joins, where it
+  is a filter over a plain scan. The estimate that chooses between an index nested loop and a hash
+  join knew only the fused filtered scan of single-table queries: `WHERE pk = 42` under a join was
+  taken for a third of the table, and a left-deep chain of three or more joins got no estimate at
+  all for its inner joins, so every join above scanned its whole right-hand table and built a hash
+  table. The filter is now estimated from the index its equality names, by counting the rows the
+  index holds under that value (a literal or a bound parameter of the column's own type; the
+  fewest of an `AND` chain's terms). The estimate chooses the join strategy only.
+  pg35 `4-table JOIN` 641 / 858 / 58.7 µs, against PostgreSQL 18.4's 522 µs: it was the one category
+  slower than PostgreSQL, in 4.41.1 too, and **4.42.0 is now faster than PostgreSQL 18.4 in all 35
+  categories**. `tests/join_pushed_filter_estimate.rs` checks 17 join shapes for the same answer
+  with the index nested loop available and switched off.
+- **The result-cache eligibility check reads the statement once, not once per marker** (1e20624b).
+  Before running a statement that is not answered from a cache, the engine looks in its text for
+  anything that makes its result unfit for the result cache (`nextval`, `now(`, the advisory-lock
+  and replication probes: 27 markers), and it walked the whole text once per marker: 6.5 µs for a
+  130-byte join statement. One pass now, same markers. pg35 `INNER JOIN` 28.9 / 29.6 / 23.6,
+  `LEFT JOIN` 20.6 / 22.6 / 17.6, `UPDATE+subquery` 124 / 200 / 155.
+- **Not explained:** `IN subquery` measured 6.1 µs against 5.0 for the build before the passes
+  in this run, and 6.0 against 6.1 in the run before it. The category has two modes about 1 µs apart
+  across runs of every build measured; the release build was in the slower one in all of its
+  eight rounds. It is listed as slower below.
+
+**The pg35 baseline.** `benches/public/pg35_baseline.json` holds, for each of the 35 categories,
+the best time per statement a release has reached under the strict harness and the release that
+reached it. A release that reaches a new best sets that category's baseline; nothing else moves
+it, so a slower release is measured against the best the engine has done.
+`benches/public/pg35_baseline.py` adds a release's rounds (`update`), compares a run with the
+baseline (`check`, `--fail-over 1.15` to gate on it) and prints it (`table`). Best of eight rounds
+of each release (4.41.1's harness binary is the same file in all four release-benchmark runs;
+4.42.0's was run six more rounds):
+
+- **4.42.0 sets a new baseline in 9 categories:** ALTER TABLE (863 µs → 252 µs), INSERT..SELECT
+  (1.27 ms → 162 µs), UPSERT (61.0 µs → 60.1 µs), INNER JOIN (22.8 µs → 22.0 µs), LEFT JOIN (17.2 µs
+  → 16.7 µs), 4-table JOIN (570 µs → 56.1 µs), Window funcs (19.2 µs → 18.4 µs), LIKE/BETWEEN/IN
+  (9.99 µs → 9.82 µs), Transaction ctl (47.0 µs → 35.4 µs).
+- **The baseline stays with 4.41.1 in 26:** 4.42.0 is within 15% of it in 13 and more than 15%
+  slower in 13: INSERT single 3.81×, UPDATE point 3.76×, DELETE point 2.94×, CREATE TABLE 1.58×,
+  DROP TABLE 1.49×, SET/SHOW/RESET 1.40×, TRUNCATE 1.40×, REFRESH MATVIEW 1.36×, Prepared stmts
+  1.28×, IN subquery 1.27×, INSERT multi-row 1.25×, DISTINCT 1.22×, UPDATE+subquery 1.19×. The first
+  three are the one-row writes that record history (see below); the rest carry the work every
+  statement now does to be atomic.
+- With two rounds, a 15% line is not settled everywhere: the report names the categories whose
+  class depends on which rounds are paired. Best times are compared for that reason.
+
+`docs/release-notes/v4.42.0.md` is this release as one page (what is new, what breaks, how to
+upgrade, the benchmark summary, a FAQ), with `v4.42.0.jsonld` as schema.org data and
+`v4.42.0.files.json` listing what to publish and what to link.
+
 ### Performance — primary-key writes over the wire, against 4.41.1
 
 4.42.0 is slower than 4.41.1 on single-row primary-key writes, and most of that is deliberate:
 since this release a fast-path `UPDATE` or `DELETE` records the row's history and its snapshot in
-the same write group (four keys where 4.41.1 wrote one), so `AS OF` is correct after it. Checked
-on both releases: after a fast-path `DELETE`, a query `AS OF` a moment before it does not find the
+the same write group (seven keys on disk where 4.41.1 wrote one), so `AS OF` is correct after it.
+Checked on both releases: after a fast-path `DELETE`, a query `AS OF` a moment before it does not find the
 row in 4.41.1 and finds it in 4.42.0; after an `UPDATE` both return the old value.
 
 The release build measures the same over 1 to 64 clients
-(`docs/benchmarks/RELEASE_4_42_0.md`, 4 alternating rounds of 20 s): prepared 0.71 / 0.59 / 0.65 /
-0.67 / 0.62 / 0.49 / 0.46 of 4.41.1 at 1 / 2 / 4 / 8 / 16 / 32 / 64 clients, as text 0.62 / 0.53 /
-0.59 / 0.64 / 0.59 / 0.50 / 0.46. The table below is the earlier measurement that shows what the
-two performance changes above bought.
+(`docs/benchmarks/RELEASE_4_42_0.md`, 4 alternating rounds of 20 s): prepared
+0.74 / 0.59 / 0.65 / 0.68 / 0.62 / 0.47 / 0.45 of 4.41.1 at 1 / 2 / 4 / 8 / 16 / 32 / 64 clients, as
+text 0.62 / 0.54 / 0.58 / 0.65 / 0.59 / 0.50 / 0.46. The table below is the earlier measurement that
+shows what the two performance changes above bought.
 
 `benches/public/wire_pk_ab.sh` with `examples/wire_pk_bench.rs` (a `tokio-postgres` client; no
 `psql`, `pgbench` or Docker needed), 32 CPUs, clients on the same host, 64,000 rows,
@@ -771,8 +826,8 @@ this release without the two performance changes above. Ops/s:
 | | 64 | 143,561 | 56,022 | 73,759 | 0.51 | 12.3 ms | 4.3 ms |
 
 - **With `[storage] time_travel_enabled = false`** 4.42.0 writes what 4.41.1 wrote. The release
-  build, started with a configuration file holding only that setting, measures 0.99 / 0.95 / 0.93 of
-  4.41.1 prepared and 0.94 / 0.95 / 0.95 as text at 1 / 16 / 64 clients (12,670 / 101,555 / 132,110
+  build, started with a configuration file holding only that setting, measures 0.90 / 0.96 / 0.95 of
+  4.41.1 prepared and 0.91 / 0.96 / 0.94 as text at 1 / 16 / 64 clients (12,280 / 102,924 / 134,791
   ops/s prepared, 2 rounds). A store that does not use `AS OF`, branches from the past or
   `VERSIONS BETWEEN` can run that way.
 - **Not improved in this release:** a prepared primary-key `SELECT` at 16 clients measures 0.92 of
