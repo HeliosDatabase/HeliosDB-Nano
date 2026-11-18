@@ -587,7 +587,7 @@ fire and the physical replication source sent nothing (standbys flapped `reconne
 past 30 s; `SELECT pg_promote(…)` on a standby waited for a running query). The server
 now hands its worker off for every executed statement (`block_in_place`); primary-key
 point reads and result-cache hits stay on the worker. Cost: about one 10 µs handoff per
-other executed statement — measured with local clients on the same host, short
+other executed statement — measured on a 32-CPU host with local clients, short
 range scans lose 6 % of throughput at 1 client and up to 28 % at 32 clients, point reads
 nothing. `HELIOSDB_NANO_STATEMENT_OFFLOAD=off` restores the previous behaviour. The
 embedded library is unchanged unless it opts in.
@@ -630,7 +630,7 @@ eviction watermarks still move before an entry leaves memory.
 On the same build with and without this change (prepared `UPDATE`, median of 6 alternating
 rounds): 16 clients 65,367 → 69,542 ops/s (+6%), p99 0.79 → 0.50 ms; 32 clients +2%, p95 0.80 →
 0.64 ms; 64 clients +1%, p95 1.50 → 1.34 ms. **The far tail above the worker count got slower**:
-p99.9 at 32 clients 5.7 → 7.4 ms and p99 at 64 clients 2.0 → 3.2 ms on a host that also
+p99.9 at 32 clients 5.7 → 7.4 ms and p99 at 64 clients 2.0 → 3.2 ms on a 32-CPU host that also
 ran the clients (4.9–5.7 ms in the three-server runs below, against 12.9–16.0 ms before this
 release's performance work). The pause this removes was also spacing out writers when there are
 twice as many of them as worker threads; if that regime matters more to you than the median and
@@ -694,7 +694,7 @@ slower, among them `Transaction ctl` 50.1 / 64.4 / 36.3 µs, `UPSERT` 62.4 / 100
 `docs/benchmarks/RELEASE_4_42_0.md`.
 
 - **A transaction's own maps have four shards, not four per CPU** (075b8a51). dashmap gives a map
-  four shards per CPU unless told otherwise, hundreds on a large host. A transaction's write set, the
+  four shards per CPU unless told otherwise, 128 on 32 CPUs. A transaction's write set, the
   set of tables it wrote and its write-census sets hold a few keys, yet a commit counted, walked
   and cleared every shard of them several times, and every transaction (each autocommit
   statement's included) allocated all of them as it began: about 21 µs per DDL or DML statement.
@@ -757,7 +757,7 @@ The release build measures the same over 1 to 64 clients
 two performance changes above bought.
 
 `benches/public/wire_pk_ab.sh` with `examples/wire_pk_bench.rs` (a `tokio-postgres` client; no
-`psql`, `pgbench` or Docker needed), clients on the same host, 64,000 rows,
+`psql`, `pgbench` or Docker needed), 32 CPUs, clients on the same host, 64,000 rows,
 each client on its own rows, perf profile, median of 4 alternating rounds of 15 s. "Before" is
 this release without the two performance changes above. Ops/s:
 

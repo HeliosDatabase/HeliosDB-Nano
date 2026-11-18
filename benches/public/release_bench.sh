@@ -133,8 +133,10 @@ if has_phase report; then
         echo "| | |"
         echo "|---|---|"
         echo "| date (UTC) | $(date -u +%FT%TZ) |"
-        # The platform only: a report meant to be published names no machine.
-        echo "| platform | $(uname -sm) |"
+        # A hardware class, not a machine: what a reader needs to compare a run (how
+        # many CPUs the client counts are measured against, and that memory is ample)
+        # and nothing that identifies the host (no CPU model, kernel build or name).
+        echo "| platform | $(uname -sm), $(nproc) logical CPUs, at least $(awk '/MemTotal/{g=$2/1048576; b=1; while (b*2<=g) b*=2; print b}' /proc/meminfo) GiB of memory |"
         echo "| toolchain | $(cd "$ROOT" && rustc -V); $(cd "$ROOT" && ${CARGO} -V) |"
         echo "| $CAND_LABEL | commit \`$(git -C "$ROOT" rev-parse HEAD)\`, $(git -C "$ROOT" status --porcelain | wc -l) uncommitted file(s) |"
         echo "| $BASE_LABEL | commit \`$BASE_COMMIT\`, pg35 harness files copied from $CAND_LABEL |"

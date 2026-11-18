@@ -28,15 +28,28 @@ their order between rounds.
 
 | | version of the published run | needed by |
 |---|---|---|
-| Linux x86-64 | | all |
+| Linux x86-64 | 32 logical CPUs, at least 64 GiB of memory | all |
 | Rust toolchain | rustc 1.100.0, cargo 1.100.0 | builds |
 | git, Python 3 (standard library only) | | all |
 | Docker | `postgres:18.4-bookworm` image | the PostgreSQL reference; pgbench |
 | Disk | about 5 GB for the two release build directories | builds |
 
-The published reports name the toolchain, the commits and the checksums of what was measured,
-and nothing about the machine: compare ratios between releases, which carry from one machine to
-another far better than absolute times do.
+**How much the hardware matters.** The published reports give the hardware class of the run
+(architecture, number of logical CPUs, a memory class) and nothing that identifies the machine;
+the CPU model, kernel build and exact memory size are not needed to reproduce a result.
+
+- *CPU count* is the one figure to read the wire and pgbench tables against: clients and server
+  share the host, so the cells at and above the CPU count (32 and 64 clients in the published
+  run) measure an oversubscribed machine. On fewer CPUs those cells saturate earlier; compare
+  cells at the same clients-per-CPU, or the ratio between the two releases, which holds.
+- *Memory* only has to be ample: the pg35 data set is a few megabytes and the wire table 64,000
+  rows; 8 GiB is enough to run them. The published run had far more, so nothing was paged.
+  Building the release binaries (LTO) needs more than running them; the published builds ran
+  under a 24 GiB cap.
+- *Storage* matters little here: commits are not synced to disk in these configurations
+  (`durable_commit` is off by default), and pg35's Nano side runs in memory.
+- *Absolute times* will differ on your machine. The ratios between the two releases, and whether
+  Nano or PostgreSQL is faster in a category, are what should agree.
 
 The wire benchmark needs neither Docker nor `psql`. pg35 needs the PostgreSQL reference but no
 `psql`.
@@ -103,7 +116,7 @@ tables are the mean of the two runs, with each run's ratio beside it.
   run: the binary and source hashes it ran, the PostgreSQL instance it measured, and every
   category's result check. A run whose result disagrees with the oracle produces no number.
 - **Machine-readable copy.** `benches/public/export_results.py out [bench-engines-dir]` writes
-  the whole run as one JSON document without file paths or anything about the machine; the published one is in
+  the whole run as one JSON document without file paths or anything that identifies the machine; the published one is in
   `docs/benchmarks/results/`.
 
 ## 5. Read the results

@@ -42,7 +42,7 @@ run as one JSON document: [`results/release-4.42.0/summary.json`](results/releas
 | | |
 |---|---|
 | date (UTC) | 2026-11-18T00:52:12Z |
-| platform | Linux x86_64 |
+| platform | Linux x86_64, 32 logical CPUs, at least 64 GiB of memory |
 | toolchain | rustc 1.100.0 (0ef1bc386 2026-11-09); cargo 1.100.0 (3acc79c0c 2026-11-05) |
 | v4.42.0 | commit `c65978604c3add569043e281077c8b77d90667fe`, 2 uncommitted file(s) |
 | v4.41.1 | commit `4af19e1c447b8b9f8a621a984e8cc0558195bf3b`, pg35 harness files copied from v4.42.0 |
