@@ -2530,6 +2530,19 @@ impl CompiledCheckConstraints {
 /// — is resolved here, once. The text family previously called
 /// `load_table_constraints` (a catalog read + deserialize) and re-parsed every
 /// CHECK expression PER ROW on what is a bulk path.
+/// Which foreign keys of a table one check covers.
+///
+/// A row an `INSERT … SELECT` stages is checked before its chunk is staged, when
+/// no row of the chunk can be found yet. A foreign key of the table to itself may
+/// name such a row, so that key is left out of the first check and checked alone
+/// once the chunk is staged.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FkCheckScope {
+    All,
+    ExceptSelfReferences,
+    OnlySelfReferences,
+}
+
 struct InsertSelectGate<'a> {
     /// Target table schema; owned by the calling arm for the whole statement.
     schema: &'a Schema,
@@ -2551,6 +2564,11 @@ struct InsertSelectGate<'a> {
     /// Whether the table has any enforceable FOREIGN KEY at all, so the
     /// FK-free bulk path never builds a column map or re-reads the catalog.
     has_foreign_keys: bool,
+    /// Whether one of those foreign keys points back at the table itself. A
+    /// row of the statement may then name a row the same statement supplies,
+    /// which is only there to be found once the rows are staged
+    /// ([`FkCheckScope`]).
+    self_referencing: bool,
     /// Schema handle for the BEFORE-row rewrite hook; `None` when the table has
     /// no rewrite recipe (the common case — answered from one atomic load).
     rewrite_schema: Option<std::sync::Arc<Schema>>,
@@ -8243,6 +8261,10 @@ impl EmbeddedDatabase {
         }
 
         let has_foreign_keys = !constraints.foreign_keys.is_empty();
+        let self_referencing = constraints.foreign_keys.iter().any(|fk| {
+            fk.enforcement != sql::ConstraintEnforcement::NotEnforced
+                && fk.references_table.eq_ignore_ascii_case(table_name)
+        });
 
         // Hoisted exactly as the single-row INSERT arms hoist it: with no
         // rewrite recipe registered anywhere, `has_row_mutations` answers from
@@ -8261,6 +8283,7 @@ impl EmbeddedDatabase {
             checks,
             unique_checks,
             has_foreign_keys,
+            self_referencing,
             rewrite_schema,
             evaluator: sql::Evaluator::new(std::sync::Arc::new(Schema { columns: vec![] })),
             empty_tuple: Tuple::new(vec![]),
@@ -8282,20 +8305,46 @@ impl EmbeddedDatabase {
     /// HNSW indexes are maintained here per row WITH an undo entry, mirroring
     /// the single-row text arm; the multi-row primitive does not do it and the
     /// params single-row arm omits it — do not copy that omission.
+    ///
+    /// `self_referencing` (the gate's): the table has a foreign key to itself,
+    /// which the gate left unchecked. It is checked here, with the chunk staged,
+    /// so a row may name a row of the same chunk on either side of it, or a row
+    /// of an earlier chunk. Streaming, each row was written before the next one
+    /// was checked, and `INSERT INTO tree SELECT …` loaded a tree whose parents
+    /// came first; checked before staging, every such statement was refused. A
+    /// row whose parent is nowhere fails the statement, and the statement's
+    /// transaction takes the staged rows back.
     fn stage_insert_select_chunk_in_transaction(
         &self,
         table_name: &str,
         chunk: Vec<Tuple>,
         schema: &Schema,
         txn: &storage::Transaction,
+        self_referencing: bool,
     ) -> Result<Vec<u64>> {
         if chunk.is_empty() {
             return Ok(Vec::new());
         }
         let vector_gate = self.vector_dml_gate(table_name);
         let snapshot: Vec<Tuple> = if vector_gate { chunk.clone() } else { Vec::new() };
+        let staged_rows: Vec<Tuple> = if self_referencing { chunk.clone() } else { Vec::new() };
         let ids = self.insert_validated_tuples_in_transaction_ids(table_name, chunk, schema, txn)?;
         self.defer_inserted_fk_rows(txn, table_name, &ids)?;
+        for tuple in &staged_rows {
+            let mut col_values = std::collections::HashMap::with_capacity(schema.columns.len());
+            for (i, col) in schema.columns.iter().enumerate() {
+                if let Some(v) = tuple.values.get(i) {
+                    col_values.insert(col.name.clone(), v.clone());
+                }
+            }
+            self.check_fk_constraints_in_scope(
+                table_name,
+                &col_values,
+                Some(txn),
+                None,
+                FkCheckScope::OnlySelfReferences,
+            )?;
+        }
         if vector_gate {
             for (row_id, tuple) in ids.iter().zip(snapshot.iter()) {
                 let vops = self
@@ -8360,6 +8409,7 @@ impl EmbeddedDatabase {
         gate: &InsertSelectGate<'_>,
         source_row: &Tuple,
         active_txn: Option<&storage::Transaction>,
+        staged: bool,
     ) -> Result<Option<Tuple>> {
         let schema = gate.schema;
         let column_count = schema.columns.len();
@@ -8517,7 +8567,16 @@ impl EmbeddedDatabase {
                     fk_col_values.insert(col.name.clone(), v.clone());
                 }
             }
-            self.check_fk_constraints_on_write(table_name, &fk_col_values, active_txn, None)?;
+            // A staged row is not there to be found until its chunk is staged, so
+            // a foreign key of the table to itself is checked then
+            // (`stage_insert_select_chunk_in_transaction`): the parent may be an
+            // earlier row of this statement.
+            let scope = if staged && gate.self_referencing {
+                FkCheckScope::ExceptSelfReferences
+            } else {
+                FkCheckScope::All
+            };
+            self.check_fk_constraints_in_scope(table_name, &fk_col_values, active_txn, None, scope)?;
         }
 
         // CHECK — same evaluate() and same result→bool mapping as the per-row
@@ -11391,7 +11450,9 @@ impl EmbeddedDatabase {
                     //
                     // `None` is the rewrite recipe's `RETURN NULL`: the row is
                     // skipped — not written, not counted, no RETURNING tuple.
-                    let Some(tuple) = self.build_insert_select_row(table_name, &gate, source_row, Some(txn))? else {
+                    let Some(tuple) =
+                        self.build_insert_select_row(table_name, &gate, source_row, Some(txn), staging)?
+                    else {
                         continue;
                     };
 
@@ -11445,6 +11506,7 @@ impl EmbeddedDatabase {
                                 std::mem::take(&mut pending),
                                 &schema,
                                 txn,
+                                gate.self_referencing,
                             )?;
                             count += ids.len() as u64;
                             for (mut t, id) in pending_returning.drain(..).zip(ids) {
@@ -11534,7 +11596,13 @@ impl EmbeddedDatabase {
                 }
                 // #100: flush the final (or only) chunk.
                 if staging && !pending.is_empty() {
-                    let ids = self.stage_insert_select_chunk_in_transaction(table_name, pending, &schema, txn)?;
+                    let ids = self.stage_insert_select_chunk_in_transaction(
+                        table_name,
+                        pending,
+                        &schema,
+                        txn,
+                        gate.self_referencing,
+                    )?;
                     count += ids.len() as u64;
                     for (mut t, id) in pending_returning.into_iter().zip(ids) {
                         t.row_id = Some(id);
@@ -23101,7 +23169,9 @@ impl EmbeddedDatabase {
                     // `None` is the BEFORE-row rewrite recipe's `RETURN NULL`:
                     // the row is skipped — not written, not counted, and it
                     // contributes no RETURNING tuple.
-                    let Some(tuple) = self.build_insert_select_row(table_name, &gate, source_row, active_txn)? else {
+                    let Some(tuple) =
+                        self.build_insert_select_row(table_name, &gate, source_row, active_txn, staging)?
+                    else {
                         continue;
                     };
 
@@ -23122,6 +23192,7 @@ impl EmbeddedDatabase {
                                 std::mem::take(&mut pending),
                                 &schema,
                                 txn,
+                                gate.self_referencing,
                             )?;
                             count += ids.len() as u64;
                             for (mut t, id) in pending_returning.drain(..).zip(ids) {
@@ -23152,7 +23223,13 @@ impl EmbeddedDatabase {
                     count += 1;
                 }
                 if let (true, Some(txn), false) = (staging, active_txn, pending.is_empty()) {
-                    let ids = self.stage_insert_select_chunk_in_transaction(table_name, pending, &schema, txn)?;
+                    let ids = self.stage_insert_select_chunk_in_transaction(
+                        table_name,
+                        pending,
+                        &schema,
+                        txn,
+                        gate.self_referencing,
+                    )?;
                     count += ids.len() as u64;
                     for (mut t, id) in pending_returning.into_iter().zip(ids) {
                         t.row_id = Some(id);
@@ -32216,6 +32293,18 @@ impl EmbeddedDatabase {
         active_txn: Option<&storage::Transaction>,
         row_id: Option<u64>,
     ) -> Result<()> {
+        self.check_fk_constraints_in_scope(table_name, col_values, active_txn, row_id, FkCheckScope::All)
+    }
+
+    /// [`Self::check_fk_constraints_on_write`] over the foreign keys `scope` names.
+    fn check_fk_constraints_in_scope(
+        &self,
+        table_name: &str,
+        col_values: &std::collections::HashMap<String, Value>,
+        active_txn: Option<&storage::Transaction>,
+        row_id: Option<u64>,
+        scope: FkCheckScope,
+    ) -> Result<()> {
         let catalog = self.storage.catalog();
         let constraints = match catalog.load_table_constraints(table_name) {
             Ok(c) => c,
@@ -32232,6 +32321,13 @@ impl EmbeddedDatabase {
         for fk in &constraints.foreign_keys {
             if fk.enforcement == sql::ConstraintEnforcement::NotEnforced {
                 continue;
+            }
+            let to_itself = fk.references_table.eq_ignore_ascii_case(table_name);
+            match scope {
+                FkCheckScope::All => {}
+                FkCheckScope::ExceptSelfReferences if to_itself => continue,
+                FkCheckScope::OnlySelfReferences if !to_itself => continue,
+                FkCheckScope::ExceptSelfReferences | FkCheckScope::OnlySelfReferences => {}
             }
             // Gather the FK column values from the new tuple.
             let mut parent_values: Vec<Value> = Vec::with_capacity(fk.columns.len());
