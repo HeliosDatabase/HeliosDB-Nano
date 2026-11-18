@@ -13701,8 +13701,7 @@ async fn extended_bound_parameter_casts_to_vector() {
     let _ = drain(&mut client).await;
 }
 
-// ===========================================================================
-// v01.1: a leading comment does not change the answer, on either protocol
+// ====================================================================// v01.1: a leading comment does not change the answer, on either protocol
 // ===========================================================================
 
 /// One statement over the extended protocol, Describe(Portal) included and
@@ -13957,4 +13956,94 @@ fn pg_comment_scanners_nest_block_comments() {
         pg_split_sql_respecting_quotes("/* a /* ; */ ; */ SELECT 1; SELECT 2"),
         vec!["/* a /* ; */ ; */ SELECT 1".to_string(), "SELECT 2".to_string()]
     );
+=======
+/// GH#40: two connections over the in-module helpers — A LISTENs, B NOTIFYs.
+/// The NotificationResponse (`A`: sender pid, channel, payload) reaches A
+/// right before its next ReadyForQuery, only once B's transaction committed;
+/// a rolled-back NOTIFY never arrives. (The idle push and the extended
+/// protocol are covered against a real server in `tests/listen_notify.rs`.)
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::large_futures,
+    clippy::assert_is_empty
+)]
+fn listen_notify_between_two_wire_connections() {
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime")
+                .block_on(async move {
+                    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+                    let (mut a, mut ca) = test_handler(db.clone());
+                    let (mut b, mut cb) = test_handler(db.clone());
+                    let notifications = |bytes: &[u8]| -> Vec<(i32, String, String)> {
+                        parse_messages(bytes)
+                            .into_iter()
+                            .filter(|(ty, _)| *ty == b'A')
+                            .map(|(_, body)| {
+                                let pid = i32::from_be_bytes([body[0], body[1], body[2], body[3]]);
+                                let mut parts = body[4..].split(|b| *b == 0);
+                                let channel = String::from_utf8(parts.next().unwrap().to_vec()).unwrap();
+                                let payload = String::from_utf8(parts.next().unwrap().to_vec()).unwrap();
+                                (pid, channel, payload)
+                            })
+                            .collect()
+                    };
+
+                    a.handle_single_query("LISTEN gh40").await.expect("listen");
+                    assert_eq!(command_tags(&drain(&mut ca).await), vec!["LISTEN".to_string()]);
+
+                    // Inside B's block nothing is delivered; COMMIT releases it.
+                    b.handle_single_query("BEGIN").await.expect("begin");
+                    b.handle_single_query("NOTIFY gh40, 'committed'").await.expect("notify");
+                    assert_eq!(command_tags(&drain(&mut cb).await), vec!["BEGIN", "NOTIFY"]);
+                    a.handle_single_query("SELECT 1").await.expect("poll");
+                    assert!(notifications(&drain(&mut ca).await).is_empty());
+                    b.handle_single_query("COMMIT").await.expect("commit");
+                    let _ = drain(&mut cb).await;
+
+                    a.handle_single_query("SELECT 1").await.expect("poll");
+                    let bytes = drain(&mut ca).await;
+                    let b_pid = db.session_backend_pid(b.session_id).unwrap();
+                    assert_eq!(
+                        notifications(&bytes),
+                        vec![(b_pid, "gh40".to_string(), "committed".to_string())]
+                    );
+                    // PostgreSQL's order: the notification, then ReadyForQuery.
+                    let types: Vec<u8> = parse_messages(&bytes).into_iter().map(|(t, _)| t).collect();
+                    let a_at = types.iter().position(|t| *t == b'A').unwrap();
+                    assert_eq!(types.last(), Some(&b'Z'));
+                    assert!(a_at < types.len() - 1);
+
+                    // A rolled-back NOTIFY / pg_notify is never delivered.
+                    b.handle_single_query("BEGIN").await.expect("begin");
+                    b.handle_single_query("NOTIFY gh40, 'rolled back'")
+                        .await
+                        .expect("notify");
+                    b.handle_single_query("SELECT pg_notify('gh40', 'also rolled back')")
+                        .await
+                        .expect("pg_notify");
+                    b.handle_single_query("ROLLBACK").await.expect("rollback");
+                    let _ = drain(&mut cb).await;
+                    a.handle_single_query("SELECT 1").await.expect("poll");
+                    assert!(notifications(&drain(&mut ca).await).is_empty());
+
+                    // Autocommit pg_notify arrives.
+                    b.handle_single_query("SELECT pg_notify('gh40', 'auto')")
+                        .await
+                        .expect("pg_notify");
+                    let _ = drain(&mut cb).await;
+                    a.handle_single_query("SELECT 1").await.expect("poll");
+                    assert_eq!(notifications(&drain(&mut ca).await).len(), 1);
+                });
+        })
+        .expect("spawn")
+        .join()
+        .expect("test thread");
 }

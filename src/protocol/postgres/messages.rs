@@ -46,6 +46,7 @@ pub enum BackendMessageType {
     ErrorResponse = b'E',
     NoData = b'n',
     NoticeResponse = b'N',
+    NotificationResponse = b'A',
     ParameterDescription = b't',
     ParameterStatus = b'S',
     ParseComplete = b'1',
@@ -177,6 +178,16 @@ pub enum BackendMessage {
         severity: String,
         code: String,
         message: String,
+    },
+
+    /// GH#40: asynchronous notification (`LISTEN` / `NOTIFY`).
+    NotificationResponse {
+        /// Backend pid of the notifying session.
+        process_id: i32,
+        /// Channel name.
+        channel: String,
+        /// Payload.
+        payload: String,
     },
 
     /// Parameter description
@@ -571,6 +582,18 @@ impl BackendMessage {
                 buf.put_i32(len as i32);
                 write_cstring(buf, name);
                 write_cstring(buf, value);
+            }
+            BackendMessage::NotificationResponse {
+                process_id,
+                channel,
+                payload,
+            } => {
+                buf.put_u8(BackendMessageType::NotificationResponse as u8);
+                let len = 4 + 4 + channel.len() + 1 + payload.len() + 1;
+                buf.put_i32(len as i32);
+                buf.put_i32(*process_id);
+                write_cstring(buf, channel);
+                write_cstring(buf, payload);
             }
             BackendMessage::ReadyForQuery { status } => {
                 buf.put_u8(BackendMessageType::ReadyForQuery as u8);

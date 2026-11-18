@@ -1428,6 +1428,10 @@ pub enum LogicalPlan {
     /// `DROP TABLE ... CASCADE`. Append-only: persisted plans encode the
     /// existing `DropTable` variant's fields and positional discriminant.
     DropTableCascade { name: String, if_exists: bool },
+
+    /// GH#40: `LISTEN` / `UNLISTEN` / `NOTIFY`. No output rows.
+    /// APPEND-ONLY — see [`LogicalPlan::Noop`].
+    Notification(crate::notify::NotifyCommand),
 }
 
 /// Function/Procedure parameter
@@ -2961,6 +2965,7 @@ impl LogicalPlan {
             | LogicalPlan::AlterTableAddUnique { .. }
             | LogicalPlan::AlterTableAddPrimaryKey { .. }
             | LogicalPlan::AlterTableAddCheck { .. }
+            | LogicalPlan::Notification(_)
             | LogicalPlan::Noop => {
                 // KanttBan #20 (v3.31.0): DDL — no output rows.
                 Arc::new(Schema { columns: vec![] })

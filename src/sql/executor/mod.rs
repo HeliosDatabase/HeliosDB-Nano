@@ -5017,6 +5017,20 @@ impl<'a> Executor<'a> {
                     .with_timeout(self.timeout_ctx()),
                 ))
             }
+            // GH#40: LISTEN / UNLISTEN / NOTIFY for the calling session.
+            LogicalPlan::Notification(command) => {
+                crate::notify::run_command(command)?;
+                Ok(Box::new(
+                    ScanOperator::new(
+                        String::new(),
+                        Arc::new(crate::Schema { columns: vec![] }),
+                        None,
+                        vec![],
+                        vec![],
+                    )
+                    .with_timeout(self.timeout_ctx()),
+                ))
+            }
             LogicalPlan::Noop => {
                 // Any statement the planner maps to Noop parses and succeeds
                 // with zero effect — same empty-result shape as CreateSchema

@@ -539,6 +539,9 @@ pub struct PgConnectionHandler<S = BufWriter<TcpStream>> {
     /// until Sync, then ReadyForQuery. Sending ReadyForQuery early can make
     /// drivers close or wedge the connection after an Execute-time error.
     awaiting_sync_after_error: bool,
+    /// GH#40: this connection's LISTEN mailbox (`crate::notify`), drained
+    /// before each ReadyForQuery outside a transaction block and while idle.
+    notify_mailbox: Option<Arc<crate::notify::Mailbox>>,
     /// Per-connection database session (R0.1). Transactions opened by this
     /// connection live in the session, not in the process-global slot, so
     /// concurrent connections get isolated transactions.
@@ -650,6 +653,14 @@ async fn next_termination(
 }
 
 /// Until a termination owed mid-cycle must go out anyway; never without one.
+/// GH#40: resolves when a notification reaches `mailbox`; never without one.
+async fn wait_for_notification(mailbox: Option<&crate::notify::Mailbox>) {
+    match mailbox {
+        Some(mailbox) => mailbox.wait().await,
+        None => std::future::pending().await,
+    }
+}
+
 async fn sleep_until_owed(deadline: Option<tokio::time::Instant>) {
     match deadline {
         Some(at) => tokio::time::sleep_until(at).await,
@@ -715,6 +726,7 @@ impl PgConnectionHandler<BufWriter<TcpStream>> {
             statement_error_reported: false,
             implicit_transaction: false,
             awaiting_sync_after_error: false,
+            notify_mailbox: None,
             session_id,
             policy,
             idle_guc_overridden: false,
@@ -751,6 +763,7 @@ impl PgConnectionHandler<BufWriter<UnixStream>> {
             statement_error_reported: false,
             implicit_transaction: false,
             awaiting_sync_after_error: false,
+            notify_mailbox: None,
             session_id,
             policy,
             idle_guc_overridden: false,
@@ -851,6 +864,7 @@ impl PgConnectionHandler<BufWriter<SecureConnection<TcpStream>>> {
             statement_error_reported: false,
             implicit_transaction: false,
             awaiting_sync_after_error: false,
+            notify_mailbox: None,
             session_id,
             policy,
             idle_guc_overridden: false,
@@ -872,7 +886,7 @@ where
     /// private, so tests outside this module need a builder.
     #[cfg(test)]
     pub(super) fn new_for_tests(database: Arc<EmbeddedDatabase>, stream: S) -> Self {
-        Self {
+        let mut handler = Self {
             stream,
             policy: ConnectionPolicy::embedded_default(&database),
             idle_guc_overridden: false,
@@ -898,7 +912,10 @@ where
             statement_error_reported: false,
             implicit_transaction: false,
             awaiting_sync_after_error: false,
-        }
+            notify_mailbox: None,
+        };
+        handler.attach_notify_mailbox();
+        handler
     }
 
     /// sprinter 1703dba8e82d: publish THIS connection's session-private table
@@ -1105,6 +1122,9 @@ where
         if let Some(ticket) = &self.session_ticket {
             ticket.established(self.database.session_backend_pid(self.session_id).ok());
         }
+        if self.notify_mailbox.is_none() {
+            self.attach_notify_mailbox();
+        }
         loop {
             if let Some(watch) = terminations.as_mut() {
                 if watch.has_changed().unwrap_or(false) {
@@ -1128,6 +1148,15 @@ where
                 (true, TransactionStatus::Idle) => SessionActivity::Idle,
             };
             let owed_by = self.terminating.as_ref().map(|pending| pending.deadline);
+            // GH#40: an idle session (at ReadyForQuery, outside a block) is told
+            // of a notification as soon as it arrives, not at its next query.
+            let idle_listener = match (&self.notify_mailbox, activity) {
+                (Some(mailbox), SessionActivity::Idle) => Some(Arc::clone(mailbox)),
+                _ => None,
+            };
+            if idle_listener.is_some() && self.write_pending_notifications().await? {
+                self.flush().await?;
+            }
             // `read_message_deadlined` is cancel-safe (module documentation
             // of that function): a dropped read consumed nothing.
             let outcome = tokio::select! {
@@ -1142,6 +1171,7 @@ where
                     continue;
                 }
                 () = sleep_until_owed(owed_by) => continue,
+                () = wait_for_notification(idle_listener.as_deref()) => continue,
                 outcome = self.read_message_deadlined(activity) => outcome,
             };
             match outcome {
@@ -2701,6 +2731,7 @@ where
         self.database = placeholder;
         self.transaction_status = TransactionStatus::Idle;
         self.implicit_transaction = false;
+        self.attach_notify_mailbox();
         // Spec P5.2 §8.A: the store is let go of (both handles above were
         // replaced): the promotion stops counting this session as a holder.
         if let Some(ticket) = &self.session_ticket {
@@ -4601,11 +4632,46 @@ where
         if self.suppress_ready_for_query {
             return Ok(());
         }
+        // GH#40: PostgreSQL sends pending NotificationResponses just before
+        // ReadyForQuery, and never inside a transaction block.
+        self.write_pending_notifications().await?;
         self.send_message(BackendMessage::ReadyForQuery {
             status: self.transaction_status,
         })
         .await?;
         self.flush().await
+    }
+
+    /// GH#40: look up this connection's LISTEN mailbox (once per session).
+    pub(super) fn attach_notify_mailbox(&mut self) {
+        self.notify_mailbox = self
+            .database
+            .session_backend_pid(self.session_id)
+            .ok()
+            .and_then(|pid| crate::notify::hub().mailbox(pid));
+    }
+
+    /// GH#40: write every notification waiting for this connection as a
+    /// NotificationResponse — outside a transaction block only. One atomic
+    /// load when nothing is waiting. Does not flush; says whether it wrote.
+    async fn write_pending_notifications(&mut self) -> Result<bool> {
+        if self.transaction_status != TransactionStatus::Idle {
+            return Ok(false);
+        }
+        let Some(mailbox) = self.notify_mailbox.as_ref() else {
+            return Ok(false);
+        };
+        let pending = mailbox.take();
+        let wrote = !pending.is_empty();
+        for notification in pending {
+            self.send_message(BackendMessage::NotificationResponse {
+                process_id: notification.sender_pid,
+                channel: notification.channel,
+                payload: notification.payload,
+            })
+            .await?;
+        }
+        Ok(wrote)
     }
 
     /// Send command complete
@@ -4879,6 +4945,13 @@ where
             "ALTER ROLE".to_string()
         } else if starts_with_icase(trimmed, "DROP ROLE") || starts_with_icase(trimmed, "DROP USER") {
             "DROP ROLE".to_string()
+        // GH#40: PostgreSQL tags these with the bare statement name.
+        } else if pg_first_word_is(trimmed, "LISTEN") {
+            "LISTEN".to_string()
+        } else if pg_first_word_is(trimmed, "UNLISTEN") {
+            "UNLISTEN".to_string()
+        } else if pg_first_word_is(trimmed, "NOTIFY") {
+            "NOTIFY".to_string()
         } else if starts_with_icase(trimmed, "GRANT") {
             "GRANT".to_string()
         } else if starts_with_icase(trimmed, "REVOKE") {
@@ -5890,6 +5963,15 @@ fn pg_contains_keyword(upper: &str, word: &str) -> bool {
 /// transactional in this engine: it auto-commits even inside a session
 /// transaction (`test_ddl_in_transaction_rollback_is_not_undone`), so the block
 /// could never undo it anyway.
+/// GH#40: is `word` the statement's first keyword (followed by whitespace,
+/// `;` or the end)?
+fn pg_first_word_is(stmt: &str, word: &str) -> bool {
+    starts_with_icase(stmt, word)
+        && stmt
+            .get(word.len()..)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(|c: char| c.is_whitespace() || c == ';'))
+}
+
 fn statement_can_write_data(stmt: &str) -> bool {
     let trimmed = pg_skip_leading_comments(stmt).trim();
     if trimmed.is_empty() {
@@ -5911,7 +5993,14 @@ fn statement_can_write_data(stmt: &str) -> bool {
         // `SELECT … INTO new_table` writes; every other SELECT reads.
         // `SELECT … INTO t` writes; `pg_advisory_xact_lock(k)` must live until
         // the end of the message (transaction scope), so it opens the block too.
-        "SELECT" => pg_contains_keyword(&upper, "INTO") || upper.contains("ADVISORY_XACT_LOCK"),
+        // GH#40: so does `pg_notify(…)`, whose notification must wait for the
+        // batch to commit (and be folded with the batch's other ones).
+        "SELECT" => {
+            pg_contains_keyword(&upper, "INTO") || upper.contains("ADVISORY_XACT_LOCK") || upper.contains("PG_NOTIFY")
+        }
+        // GH#40: a NOTIFY is delivered when its transaction commits — the
+        // batch's implicit block, so a later failing statement drops it.
+        "NOTIFY" => true,
         // A CTE is a write if its body is (`WITH x AS (…) INSERT …`, or the
         // data-modifying-CTE form `WITH x AS (DELETE … RETURNING *) SELECT …`).
         "WITH" => {
@@ -5937,8 +6026,8 @@ fn statement_can_write_data(stmt: &str) -> bool {
         "USE" if crate::sql::Parser::is_use_branch(trimmed) => false,
         // Read-only, session-local, or non-transactional by nature.
         "SHOW" | "SET" | "RESET" | "VALUES" | "TABLE" | "DISCARD" | "VACUUM" | "ANALYZE" | "REINDEX" | "CHECKPOINT"
-        | "PREPARE" | "DEALLOCATE" | "LISTEN" | "UNLISTEN" | "NOTIFY" | "COMMENT" | "GRANT" | "REVOKE" | "ALTER"
-        | "DROP" | "SAVEPOINT" | "RELEASE" => false,
+        | "PREPARE" | "DEALLOCATE" | "LISTEN" | "UNLISTEN" | "COMMENT" | "GRANT" | "REVOKE" | "ALTER" | "DROP"
+        | "SAVEPOINT" | "RELEASE" => false,
         // INSERT / UPDATE / DELETE / MERGE / TRUNCATE / COPY / CALL / DO /
         // REFRESH / LOCK / EXECUTE — and anything this classifier has never
         // heard of.
@@ -5974,6 +6063,16 @@ mod statement_write_classifier_tests {
         }
     }
 
+    /// GH#40: a notification is delivered when its transaction commits, so a
+    /// batch's `NOTIFY` / `pg_notify` waits for the batch (and a later failing
+    /// statement drops it).
+    #[test]
+    fn notify_and_pg_notify_open_the_implicit_block() {
+        for sql in ["NOTIFY chan", "notify chan, 'x'", "SELECT pg_notify('chan', 'x')"] {
+            assert!(can_write(sql), "{sql:?} must open the implicit block");
+        }
+    }
+
     #[test]
     fn read_only_and_non_transactional_statements_do_not_open_a_block() {
         for sql in [
@@ -5998,7 +6097,8 @@ mod statement_write_classifier_tests {
             "DEALLOCATE p",
             "LISTEN chan",
             "UNLISTEN chan",
-            "NOTIFY chan",
+            // GH#40: `NOTIFY chan` moved to the test below — it is delivered
+            // when its transaction commits, so it opens the implicit block.
             "COMMENT ON TABLE items IS 'x'",
             "GRANT SELECT ON items TO alice",
             "REVOKE SELECT ON items FROM alice",
@@ -6934,6 +7034,11 @@ fn sqlstate_for_query_execution_message(message: &str) -> &'static str {
     if message.contains(crate::error::SEQUENCE_PARAMETER_INVALID_MARKER) {
         return sqlstate::INVALID_PARAMETER_VALUE; // 22023
     }
+    // GH#40: PostgreSQL's NOTIFY / pg_notify refusals (payload of 8000 bytes or
+    // more, empty or over-long channel name).
+    if crate::notify::is_invalid_parameter_message(message) {
+        return sqlstate::INVALID_PARAMETER_VALUE; // 22023
+    }
     // sprinter 6dc0cc115db9: `lastval()` before any `nextval()` in this session.
     // PostgreSQL reports 55000 object_not_in_prerequisite_state, and a DB-API
     // shim branches on it to decide that `cursor.lastrowid` is simply unknown
@@ -7584,6 +7689,7 @@ mod failed_transaction_state_tests {
                 statement_error_reported: false,
                 implicit_transaction: false,
                 awaiting_sync_after_error: false,
+                notify_mailbox: None,
             },
             client,
         )
@@ -7731,6 +7837,7 @@ mod show_branches_wire_tests {
                 statement_error_reported: false,
                 implicit_transaction: false,
                 awaiting_sync_after_error: false,
+                notify_mailbox: None,
             },
             client,
         )
@@ -8391,6 +8498,7 @@ mod md5_auth_wire_tests {
                 statement_error_reported: false,
                 implicit_transaction: false,
                 awaiting_sync_after_error: false,
+                notify_mailbox: None,
             },
             client,
         )

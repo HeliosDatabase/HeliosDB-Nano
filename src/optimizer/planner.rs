@@ -360,6 +360,7 @@ impl Planner {
             | LogicalPlan::GrantPrivileges { .. }
             | LogicalPlan::RevokePrivileges { .. }
             | LogicalPlan::Noop
+            | LogicalPlan::Notification(_)
             | LogicalPlan::CreateExtension { .. }
             | LogicalPlan::DropExtension { .. }
             | LogicalPlan::CreateDatabase { .. }

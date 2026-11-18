@@ -90,6 +90,22 @@ Reports from users of earlier releases (GitHub numbers) and defects found while 
   table sees it as it was (a de-duplicating `DELETE … WHERE EXISTS (… b.k = t.k AND b.id <>
   t.id)` removes every duplicate, as in PostgreSQL). `NOT IN` beside a NULL keeps no row.
   `tests/gh_issue_32.rs`.
+- **`LISTEN` / `UNLISTEN` / `NOTIFY` and `pg_notify()` were not implemented (GitHub #40).**
+  Every spelling was refused, so clients had to poll. They now work over the PostgreSQL wire: a
+  session that ran `LISTEN ch` receives a NotificationResponse (sender's backend pid, channel,
+  payload) for each `NOTIFY ch [, 'payload']` or `SELECT pg_notify('ch', 'payload')` — pushed
+  at once while it is idle, otherwise just before its next ReadyForQuery, and never inside its own
+  transaction block. A notification sent inside a transaction is delivered when it commits and
+  dropped on ROLLBACK (`ROLLBACK TO SAVEPOINT` drops the ones sent after the savepoint);
+  identical channel and payload pairs of one transaction are folded into one. A payload of 8000
+  bytes or more is refused with PostgreSQL's `22023 payload string too long`. `UNLISTEN ch` and
+  `UNLISTEN *` stop listening, and a session's listens end when it disconnects. The embedded
+  API, the REPL and the MySQL wire can send (to the PostgreSQL wire listeners of the same
+  database) but refuse `LISTEN` with `0A000`. Notifications stay on the node that sent them;
+  they are not replicated to standbys. `LISTEN` takes effect at once rather than at the
+  listener's COMMIT, and `pg_listening_channels()` is not provided.
+  `tests/listen_notify.rs`.
+
 - **`ORDER BY … NULLS FIRST / NULLS LAST` was ignored (GitHub #43).** The clause was read and
   dropped: `ORDER BY due ASC NULLS LAST` returned the NULLs first. An explicit placement is now
   obeyed, in a query, over `GROUP BY`, over a set operation, under `LIMIT` and in a window's

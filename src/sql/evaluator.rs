@@ -1129,6 +1129,24 @@ impl Evaluator {
             // connection in this process would then report the same number);
             // the per-connection id minted by `session::scoped`, which is also
             // what `pg_stat_activity.pid` reports, so the join holds.
+            // GH#40: `pg_notify(channel, payload)` — NOTIFY with a computed
+            // channel or payload. A NULL channel is PostgreSQL's "channel name
+            // cannot be empty"; a NULL payload is an empty one. Returns void,
+            // rendered as NULL.
+            "pg_notify" => {
+                let [channel, payload] = arg_values.as_slice() else {
+                    return Err(Error::query_execution(
+                        "function pg_notify requires exactly 2 arguments (channel, payload)",
+                    ));
+                };
+                let text = |value: &Value| match value {
+                    Value::Null => String::new(),
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                crate::notify::pg_notify(&text(channel), &text(payload))?;
+                Ok(Value::Null)
+            }
             "pg_backend_pid" | "pg_catalog.pg_backend_pid" => Ok(Value::Int4(
                 crate::session_scoped_state_tls().map_or(0, |state| state.backend_pid()),
             )),

@@ -253,6 +253,7 @@ pub mod git_integration; // Git workflow integration
 pub mod graph; // Native graph adjacency lists & traversal (RAG-native)
 pub mod multi_tenant; // Multi-tenant support
 pub mod network;
+pub mod notify; // GH#40: LISTEN / UNLISTEN / NOTIFY / pg_notify (process-wide registry)
 pub mod optimizer;
 pub mod protocol;
 pub mod protocols; // Protocol integration layer (adapters)
@@ -5460,7 +5461,9 @@ impl EmbeddedDatabase {
 
     /// What makes a statement's result unfit for the result cache
     /// ([`Self::query_is_non_deterministic`]): text it contains in any ASCII case.
-    const NON_DETERMINISTIC_MARKERS: [&[u8]; 29] = [
+    const NON_DETERMINISTIC_MARKERS: [&[u8]; 30] = [
+        // GH#40: `pg_notify` sends a notification on every call.
+        b"PG_NOTIFY".as_slice(),
         // GH#47: a setting is written, and read, on every call.
         b"SET_CONFIG".as_slice(),
         b"CURRENT_SETTING".as_slice(),
@@ -6821,6 +6824,8 @@ impl EmbeddedDatabase {
         // Updated under the mutex: readers that skip the lock on a `false`
         // load behave exactly as if they had locked before this BEGIN.
         self.global_txn_active.store(true, std::sync::atomic::Ordering::Release);
+        // GH#40: this block's NOTIFYs wait for its COMMIT.
+        crate::notify::hub().txn_begin(self.embedded_scoped.backend_pid());
         // `SET CONSTRAINTS ... DEFERRED` is transaction-scoped — start clean.
         self.constraints_all_deferred
             .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -6841,7 +6846,18 @@ impl EmbeddedDatabase {
         // owns its transaction-scope locks for exactly its own duration (see
         // `embedded_advisory_context_guard`). Wire/embedded SESSION
         // transactions release theirs in `commit_transaction_for_session`.
-        self.commit_internal_locked()
+        let result = self.commit_internal_locked();
+        self.end_global_notifications(result.is_ok());
+        result
+    }
+
+    /// GH#40: the global slot's block ended — deliver its queued NOTIFYs on
+    /// `commit`, drop them otherwise. Only once the slot is really closed: a
+    /// refused COMMIT leaves the block (and its queue) as it was.
+    fn end_global_notifications(&self, commit: bool) {
+        if !self.global_txn_active.load(std::sync::atomic::Ordering::Acquire) {
+            crate::notify::hub().txn_end(self.embedded_scoped.backend_pid(), commit);
+        }
     }
 
     fn commit_internal_locked(&self) -> Result<()> {
@@ -6983,7 +6999,9 @@ impl EmbeddedDatabase {
         }
         // Spec 03: nothing to release here, for the same reason as
         // `commit_internal`.
-        self.rollback_internal_locked()
+        let result = self.rollback_internal_locked();
+        self.end_global_notifications(false);
+        result
     }
 
     fn rollback_internal_locked(&self) -> Result<()> {
@@ -7255,7 +7273,9 @@ impl EmbeddedDatabase {
     fn savepoint_establish(&self, txn: &storage::Transaction, name: &str) {
         let snapshot = txn.savepoint_snapshot();
         let art_undo_len = self.art_undo_len_for(txn);
-        txn.push_savepoint(name.to_string(), snapshot, art_undo_len);
+        // GH#40: the NOTIFYs queued so far survive a ROLLBACK TO this savepoint.
+        let notify_len = crate::notify::current_pid().map_or(0, |pid| crate::notify::hub().pending_len(pid));
+        txn.push_savepoint(name.to_string(), snapshot, art_undo_len, notify_len);
     }
 
     /// `RELEASE SAVEPOINT name` — the ONE body both statement families run.
@@ -7276,10 +7296,14 @@ impl EmbeddedDatabase {
     /// ghost entries that would survive COMMIT.
     fn savepoint_rollback_to(&self, txn: &storage::Transaction, name: &str) -> Result<()> {
         match txn.resolve_savepoint_target(name) {
-            Some((snapshot, art_undo_len)) => {
+            Some((snapshot, art_undo_len, notify_len)) => {
                 txn.rollback_to_savepoint_with_index_undo(&snapshot, || {
                     self.rollback_art_undo_to(txn, art_undo_len);
                 });
+                // GH#40: the NOTIFYs queued after the savepoint are dropped.
+                if let Some(pid) = crate::notify::current_pid() {
+                    crate::notify::hub().truncate_pending(pid, notify_len);
+                }
                 // Spec R5.4 (review F9): after the index undo.
                 txn.release_row_locks_after_savepoint(&snapshot);
                 Ok(())
@@ -25902,6 +25926,11 @@ impl EmbeddedDatabase {
     /// The body of [`Self::destroy_session`], which runs it through
     /// `offload_statement` (sprinter ccebc95977f1).
     fn destroy_session_body(&self, session_id: crate::session::SessionId) -> Result<()> {
+        // GH#40: the session's listens end with it, and an open block's queued
+        // NOTIFYs are dropped with the rollback below.
+        if let Ok(pid) = self.session_backend_pid(session_id) {
+            crate::notify::hub().release(pid);
+        }
         // A dropped connection must not leak its open transaction (write-set
         // buffers, row locks) or its eager ART index mutations. Taking the
         // slot's write lock waits out any statement still borrowing the
@@ -26167,6 +26196,9 @@ impl EmbeddedDatabase {
         self.constraints_all_deferred
             .store(false, std::sync::atomic::Ordering::Relaxed);
 
+        // GH#40: this block's NOTIFYs wait for its COMMIT.
+        crate::notify::hub().txn_begin(session.scoped.backend_pid());
+
         Ok(())
     }
 
@@ -26206,6 +26238,14 @@ impl EmbeddedDatabase {
         }
     }
 
+    /// GH#40: the end of a session's transaction block for its queued
+    /// notifications — delivered on `commit`, dropped otherwise.
+    fn end_session_notifications(&self, session_id: crate::session::SessionId, commit: bool) {
+        if let Ok(pid) = self.session_backend_pid(session_id) {
+            crate::notify::hub().txn_end(pid, commit);
+        }
+    }
+
     pub fn commit_transaction_for_session(&self, session_id: crate::session::SessionId) -> Result<()> {
         // sprinter ccebc95977f1: off the async worker serving the client (`runtime_offload`).
         offload_statement(|| -> Result<()> {
@@ -26228,6 +26268,9 @@ impl EmbeddedDatabase {
             // listener calls directly rather than through
             // `handle_transaction_control_for_session`.
             self.end_session_transaction_scoped_state(session_id);
+            // GH#40: a committed block delivers its NOTIFYs; a failed COMMIT
+            // (which rolled the block back) drops them.
+            self.end_session_notifications(session_id, result.is_ok());
             // Spec 03: `pg_advisory_xact_lock` locks end with the transaction, and
             // the transaction is over on EVERY exit below — a clean commit, a
             // deferred-FK failure, a serialization failure (all of which abort it).
@@ -26382,6 +26425,8 @@ impl EmbeddedDatabase {
             let result = self.rollback_transaction_for_session_inner(session_id);
             // sprinter f4f5d450e816: see `commit_transaction_for_session`.
             self.end_session_transaction_scoped_state(session_id);
+            // GH#40: a rolled-back block's NOTIFYs are never delivered.
+            self.end_session_notifications(session_id, false);
             // Spec 03: `pg_advisory_xact_lock` locks end with the transaction —
             // ROLLBACK releases them exactly as COMMIT does. Same lock-free gate as
             // the commit path.
@@ -26925,8 +26970,16 @@ impl EmbeddedDatabase {
     /// bounded by the server's `max_connections` semaphore instead.
     pub fn create_wire_session(&self, user_name: &str) -> Result<crate::session::SessionId> {
         let user = crate::session::User::new_passwordless(user_name);
-        self.session_manager
-            .create_session_unchecked(&user, crate::session::IsolationLevel::ReadCommitted)
+        let session_id = self
+            .session_manager
+            .create_session_unchecked(&user, crate::session::IsolationLevel::ReadCommitted)?;
+        // GH#40: a PostgreSQL wire session is the one kind that can LISTEN — it
+        // has a connection to deliver NotificationResponse on.
+        if let Ok(session_lock) = self.session_manager.get_session(session_id) {
+            let session = session_lock.read();
+            crate::notify::hub().attach(session.scoped.backend_pid(), session.scoped.engine_instance());
+        }
+        Ok(session_id)
     }
 
     /// Set the isolation level used by the session's next transaction.

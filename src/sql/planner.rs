@@ -2454,6 +2454,23 @@ impl<'a> Planner<'a> {
                     Ok(LogicalPlan::Rollback)
                 }
             }
+            // GH#40: PostgreSQL's asynchronous notifications. Channel names
+            // fold to lower case unless quoted, as every identifier does.
+            Statement::LISTEN { channel } => Ok(LogicalPlan::Notification(crate::notify::NotifyCommand::Listen(
+                Self::normalize_ident(&channel),
+            ))),
+            Statement::UNLISTEN { channel } => {
+                let all = channel.quote_style.is_none() && channel.value == "*";
+                Ok(LogicalPlan::Notification(crate::notify::NotifyCommand::Unlisten(
+                    (!all).then(|| Self::normalize_ident(&channel)),
+                )))
+            }
+            Statement::NOTIFY { channel, payload } => {
+                Ok(LogicalPlan::Notification(crate::notify::NotifyCommand::Notify {
+                    channel: Self::normalize_ident(&channel),
+                    payload,
+                }))
+            }
             Statement::Savepoint { name } => Ok(LogicalPlan::Savepoint {
                 name: name.value.clone(),
             }),
@@ -2923,12 +2940,12 @@ impl<'a> Planner<'a> {
                 let name = debug.split(|c: char| !c.is_ascii_alphanumeric() && c != '_').next();
                 let kind = name.filter(|n| !n.is_empty()).unwrap_or("This statement");
                 // Plus the object the user actually wrote, for the kinds that
-                // carry exactly one name (PostgreSQL's LISTEN/NOTIFY family).
+                // carry exactly one name (a cursor's `CLOSE name`; the
+                // LISTEN/NOTIFY family has its own arms since GH#40).
                 let subject = match &statement {
-                    Statement::LISTEN { channel } | Statement::UNLISTEN { channel } => {
-                        format!("{kind} \"{}\"", channel.value)
-                    }
-                    Statement::NOTIFY { channel, .. } => format!("{kind} \"{}\"", channel.value),
+                    Statement::Close {
+                        cursor: sqlparser::ast::CloseCursor::Specific { name },
+                    } => format!("{kind} \"{}\"", name.value),
                     _ => kind.to_string(),
                 };
                 let marker = crate::error::UNSUPPORTED_STATEMENT_KIND_MARKER;

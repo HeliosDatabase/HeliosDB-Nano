@@ -1033,6 +1033,8 @@ struct SavepointEntry {
     snapshot: TransactionSavepointSnapshot,
     /// The owning engine's ART/vector undo-log length at establishment time.
     art_undo_len: usize,
+    /// GH#40: how many NOTIFYs the block had queued at establishment time.
+    notify_len: usize,
 }
 
 impl Transaction {
@@ -4155,11 +4157,18 @@ impl Transaction {
     /// A repeated name is PUSHED again rather than replacing the earlier entry:
     /// PostgreSQL keeps both, and `RELEASE` / `ROLLBACK TO` resolve the most
     /// recent (the `rposition` searches below).
-    pub fn push_savepoint(&self, name: String, snapshot: TransactionSavepointSnapshot, art_undo_len: usize) {
+    pub fn push_savepoint(
+        &self,
+        name: String,
+        snapshot: TransactionSavepointSnapshot,
+        art_undo_len: usize,
+        notify_len: usize,
+    ) {
         self.savepoints.write().push(SavepointEntry {
             name,
             snapshot,
             art_undo_len,
+            notify_len,
         });
     }
 
@@ -4191,10 +4200,12 @@ impl Transaction {
     /// them.
     ///
     /// `None` when no savepoint of that name exists in THIS transaction.
-    pub fn resolve_savepoint_target(&self, name: &str) -> Option<(TransactionSavepointSnapshot, usize)> {
+    pub fn resolve_savepoint_target(&self, name: &str) -> Option<(TransactionSavepointSnapshot, usize, usize)> {
         let mut stack = self.savepoints.write();
         let pos = stack.iter().rposition(|s| s.name == name)?;
-        let restore = stack.get(pos).map(|s| (s.snapshot.clone(), s.art_undo_len))?;
+        let restore = stack
+            .get(pos)
+            .map(|s| (s.snapshot.clone(), s.art_undo_len, s.notify_len))?;
         stack.truncate(pos + 1);
         Some(restore)
     }
