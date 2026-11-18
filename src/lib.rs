@@ -4071,7 +4071,8 @@ impl EmbeddedDatabase {
         sql: &str,
     ) -> Result<Option<(Vec<Tuple>, std::sync::Arc<Schema>)>> {
         let Some(statement) = Self::parse_db_setting_statement(sql) else {
-            return Ok(None);
+            // GH#47: `SELECT set_config(…)` is a SET that answers with a row.
+            return self.try_handle_set_config(sql, None);
         };
 
         if let Some(handled) = self.try_handle_search_path_setting(&statement)? {
@@ -5459,7 +5460,10 @@ impl EmbeddedDatabase {
 
     /// What makes a statement's result unfit for the result cache
     /// ([`Self::query_is_non_deterministic`]): text it contains in any ASCII case.
-    const NON_DETERMINISTIC_MARKERS: [&[u8]; 27] = [
+    const NON_DETERMINISTIC_MARKERS: [&[u8]; 29] = [
+        // GH#47: a setting is written, and read, on every call.
+        b"SET_CONFIG".as_slice(),
+        b"CURRENT_SETTING".as_slice(),
         b"NEXTVAL".as_slice(),
         b"SETVAL".as_slice(),
         b"CURRVAL".as_slice(),
@@ -5802,6 +5806,148 @@ impl EmbeddedDatabase {
     /// `Statement` value at all. Real multi-tablespace semantics (LOCATION
     /// handling, DROP TABLESPACE, ALTER ... SET TABLESPACE) are explicitly
     /// out of scope.
+    /// `SELECT [pg_catalog.]set_config('name', 'value', is_local)` as a
+    /// statement of its own (GitHub #47): its three parts, and the name of its
+    /// result column. Only literal arguments, and nothing else in the SELECT.
+    fn parse_set_config_statement(sql: &str) -> Option<(String, String, bool, String)> {
+        use sqlparser::ast::{
+            Expr, FunctionArg, FunctionArgExpr, FunctionArguments, SelectItem, SetExpr, Statement, Value as Literal,
+        };
+        if !crate::starts_with_icase(sql.trim_start(), "SELECT")
+            || !Self::contains_any_ascii_case_insensitive(sql, &[b"SET_CONFIG".as_slice()])
+        {
+            return None;
+        }
+        let Statement::Query(query) = sql::Parser::new().parse_one(sql).ok()? else {
+            return None;
+        };
+        if query.with.is_some() || query.order_by.is_some() || query.limit.is_some() || query.offset.is_some() {
+            return None;
+        }
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            return None;
+        };
+        if !select.from.is_empty() || select.selection.is_some() || select.having.is_some() || select.distinct.is_some()
+        {
+            return None;
+        }
+        let (call, column) = match select.projection.as_slice() {
+            [SelectItem::UnnamedExpr(Expr::Function(call))] => (call, "set_config".to_string()),
+            [SelectItem::ExprWithAlias {
+                expr: Expr::Function(call),
+                alias,
+            }] => (call, alias.value.clone()),
+            _ => return None,
+        };
+        match call.name.0.as_slice() {
+            [function] if function.value.eq_ignore_ascii_case("set_config") => {}
+            [schema, function]
+                if schema.value.eq_ignore_ascii_case("pg_catalog")
+                    && function.value.eq_ignore_ascii_case("set_config") => {}
+            _ => return None,
+        }
+        if call.over.is_some() || call.filter.is_some() {
+            return None;
+        }
+        let FunctionArguments::List(list) = &call.args else {
+            return None;
+        };
+        let literal = |arg: &FunctionArg| match arg {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(value))) => Some(value.clone()),
+            _ => None,
+        };
+        let [name, value, is_local] = list.args.as_slice() else {
+            return None;
+        };
+        let Literal::SingleQuotedString(name) = literal(name)? else {
+            return None;
+        };
+        let value = match literal(value)? {
+            Literal::SingleQuotedString(value) => value,
+            Literal::Null => String::new(),
+            _ => return None,
+        };
+        let is_local = match literal(is_local)? {
+            Literal::Boolean(is_local) => is_local,
+            Literal::SingleQuotedString(word) if ["t", "true", "on"].contains(&word.to_lowercase().as_str()) => true,
+            Literal::SingleQuotedString(word) if ["f", "false", "off"].contains(&word.to_lowercase().as_str()) => false,
+            _ => return None,
+        };
+        let name = name.trim().to_lowercase();
+        let plain = !name.is_empty()
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'.');
+        plain.then_some((name, value, is_local, column))
+    }
+
+    /// `SELECT set_config('name', 'value', is_local)` is `SET name = 'value'`
+    /// (`SET LOCAL` when `is_local`) that answers with the value (GitHub #47).
+    ///
+    /// A dump made by `pg_dump` opens with
+    /// `SELECT pg_catalog.set_config('search_path', '', false)`; the function
+    /// did not exist and the restore stopped at that line. The setting goes
+    /// where the `SET` statement of the same entry point puts it: on the
+    /// session of a connection (`session`), on this handle otherwise. An empty
+    /// `search_path` is the default path (`RESET search_path`): names that a
+    /// dump writes with their schema resolve either way, and there is no path
+    /// here on which an unqualified name resolves nowhere. `search_path` has no
+    /// transaction-local form: `is_local` sets it for the session.
+    fn try_handle_set_config(
+        &self,
+        sql: &str,
+        session: Option<crate::session::SessionId>,
+    ) -> Result<Option<(Vec<Tuple>, std::sync::Arc<Schema>)>> {
+        let Some((name, value, is_local, column)) = Self::parse_set_config_statement(sql) else {
+            return Ok(None);
+        };
+        let search_path_schema = |entry: &str| {
+            let entry = entry.trim().trim_matches('"');
+            !entry.is_empty()
+                && entry
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$')
+        };
+        let statement = if name == "search_path" && value.trim().is_empty() {
+            "RESET search_path".to_string()
+        } else if name == "search_path" {
+            if !value.split(',').all(search_path_schema) {
+                return Err(Error::query_execution(format!(
+                    "invalid value for parameter \"search_path\": \"{value}\""
+                )));
+            }
+            format!("SET search_path = {value}")
+        } else {
+            let scope = if is_local { "LOCAL " } else { "" };
+            format!("SET {scope}{name} = '{}'", value.replace('\'', "''"))
+        };
+        match session {
+            Some(session_id) => {
+                // A connection acknowledges a SET of a name it does not keep.
+                if self.try_handle_session_search_path(session_id, &statement)?.is_none()
+                    && self
+                        .try_handle_session_application_name(session_id, &statement)?
+                        .is_none()
+                {
+                    self.try_handle_session_guc(session_id, &statement)?;
+                }
+            }
+            None => {
+                if self.try_handle_db_setting_statement_with_schema(&statement)?.is_none() {
+                    return Err(Error::query_execution(format!(
+                        "unrecognized configuration parameter '{name}'"
+                    )));
+                }
+            }
+        }
+        let row = Tuple {
+            values: vec![Value::String(value)],
+            row_id: None,
+            branch_id: None,
+        };
+        Ok(Some((vec![row], Self::typed_result_schema(&column, DataType::Text))))
+    }
+
     /// `COMMENT ON <object> IS '…'` is accepted and not stored (GitHub #66).
     ///
     /// Dumps, migration tools and ORMs emit it beside the DDL it describes,
@@ -26464,6 +26610,10 @@ impl EmbeddedDatabase {
         if let Some((rows, _schema)) = handled {
             return Ok(rows);
         }
+        // GH#47: `SELECT set_config(…)` sets on THIS session, as its SET would.
+        if let Some((rows, _schema)) = self.try_handle_set_config(sql, Some(session_id))? {
+            return Ok(rows);
+        }
         // sprinter f4f5d450e816: `SET` / `SET LOCAL` / `RESET` / `SHOW`
         // application_name lands on THIS session's backend, ahead of the
         // open-transaction fork below — the in-transaction branch is
@@ -27686,6 +27836,10 @@ impl EmbeddedDatabase {
         if let Some(result) = handled {
             return Ok(result);
         }
+        // GH#47: `SELECT set_config(…)` sets on THIS session, as its SET would.
+        if let Some(result) = self.try_handle_set_config(sql, Some(session_id))? {
+            return Ok(result);
+        }
         // sprinter f4f5d450e816: `SET` / `SET LOCAL` / `RESET` / `SHOW`
         // application_name lands on THIS session's backend, ahead of the
         // open-transaction fork below — the in-transaction branch is
@@ -28270,6 +28424,10 @@ impl EmbeddedDatabase {
         if let Some((rows, _schema)) = handled {
             return Ok(rows);
         }
+        // GH#47: `SELECT set_config(…)` sets on THIS session, as its SET would.
+        if let Some((rows, _schema)) = self.try_handle_set_config(sql, Some(session_id))? {
+            return Ok(rows);
+        }
         // sprinter f4f5d450e816: `SET` / `SET LOCAL` / `RESET` / `SHOW`
         // application_name lands on THIS session's backend, ahead of the
         // open-transaction fork below — the in-transaction branch is
@@ -28413,6 +28571,10 @@ impl EmbeddedDatabase {
         let branch_in_txn = self.session_has_open_transaction(session_id);
         let (handled, _branch_scope) = self.branch_statement_gate(sql, branch_in_txn)?;
         if let Some(result) = handled {
+            return Ok(result);
+        }
+        // GH#47: `SELECT set_config(…)` sets on THIS session, as its SET would.
+        if let Some(result) = self.try_handle_set_config(sql, Some(session_id))? {
             return Ok(result);
         }
         // sprinter f4f5d450e816: `SET` / `SET LOCAL` / `RESET` / `SHOW`

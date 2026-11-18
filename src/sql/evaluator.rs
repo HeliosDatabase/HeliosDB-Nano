@@ -1340,6 +1340,16 @@ impl Evaluator {
             // string when `missing_ok = true` (the default for the
             // single-arg form), or an error otherwise — matching PG
             // semantics. (KanttBan bug #9 against v3.27.0.)
+            // GH#47: a setting is written by the statement's entry point, which
+            // knows whose it is (`EmbeddedDatabase::try_handle_set_config`).
+            // Reaching here, the call is part of a larger statement or its
+            // arguments are not literals.
+            "set_config" => Err(Error::query_execution(
+                "set_config() is supported as a statement of its own with literal arguments: \
+                 SELECT set_config('name', 'value', false)"
+                    .to_string(),
+            )),
+
             "current_setting" => {
                 let name = match arg_values.first() {
                     Some(Value::String(s)) => s.to_lowercase(),
@@ -1384,7 +1394,18 @@ impl Evaluator {
                             .map(|state| state.application_name())
                             .unwrap_or_default(),
                     ),
-                    "search_path" => Some("\"$user\", public".to_string()),
+                    // The session's own path, as `SHOW search_path` renders it.
+                    "search_path" => {
+                        let mut path = crate::session_search_path_tls();
+                        Some(if path.is_empty() {
+                            "\"$user\", public".to_string()
+                        } else {
+                            if !path.iter().any(|schema| schema == "public") {
+                                path.push("public".to_string());
+                            }
+                            path.join(", ")
+                        })
+                    }
                     // sprinter 6bc4a4040eb7 (B1): THIS session's branch — the
                     // same binding `USE BRANCH`, `SET heliosdb.branch` and the
                     // PostgreSQL startup forms write, read from the per-statement
