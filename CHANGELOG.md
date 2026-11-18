@@ -22,6 +22,57 @@ changes.
   leads with the prebuilt binaries and Docker. The stated binary size is the measured one:
   about 53 MB on Linux x86_64 (a 20 MB download), not ~32 MB.
 
+### Fixed — five regressions against 4.41.1 found before release
+
+Found while the work after 4.42.0 was being prepared, each reproduced with the release
+candidate's binary beside the 4.41.1 binary. None of them was in a released version.
+
+- **`CREATE TABLE … AS SELECT … AS OF …` copied today's rows.** The documented way to take back
+  a bad `UPDATE` (`CREATE TABLE restored AS SELECT * FROM t AS OF …`) stored the rows as they are
+  now and reported success, and an anchor that names no snapshot was accepted. Since statements
+  are atomic, the source of `CREATE TABLE AS` and of `INSERT … SELECT` runs under the statement's
+  transaction, and a scan under a transaction did not look at the clause. `AS OF TIMESTAMP`,
+  `AS OF TRANSACTION`, `AS OF SCN` and `VERSIONS BETWEEN` now read committed history wherever
+  the read stands, including `INSERT … SELECT … AS OF` and a `SELECT … AS OF` inside `BEGIN`,
+  where the clause had always been ignored. Nothing a transaction has staged is part of a
+  historical read. `AS OF NOW` inside a transaction stays the transaction's own view.
+  `tests/as_of_under_statement_transaction.rs`.
+- **`UPDATE t SET c = (SELECT … FROM t WHERE t.x = …)` wrote wrong values.** With the updated
+  table read again in the subquery under its own name, `t.x` is the subquery's column and every
+  row gets the same value. The row binder went by the name alone and bound it to the row being
+  updated: `UPDATE acct SET n = (SELECT COUNT(*) FROM acct WHERE acct.grp = 2)` wrote the size of
+  the table to the rows of group 2 and 0 to the others, where 4.41.1 wrote the count to every
+  row. A subquery that has a relation of its own under the updated table's name is no longer
+  bound. This also corrects the same statement without an aggregate
+  (`SET c = (SELECT id FROM t WHERE t.id = 3)`), which 4.41.1 got wrong too. A subquery on
+  another table still sees the row being updated. `tests/update_set_subquery_scope.rs`.
+- **The shell printed no rows for a `SELECT` on a branch.** A table that exists only on the
+  branch printed `Query returned 1 row(s)`, and a column added on the branch had no header. The
+  engine's answer was right; the shell planned the statement a second time for its headers,
+  against main's catalog. `tests/cli_shell_branch_display.rs`.
+- **Changes to tables in a foreign-key relationship read whole tables per row.** With
+  foreign-key actions following parent changes (above), a parent `UPDATE` or `DELETE` read the
+  child table once for every changed row and every foreign key pointing at it, again for each
+  `NO ACTION` check, and an `UPDATE` of a table that has a foreign key read that table to find
+  the rows it had just changed. On the release candidate a one-row `UPDATE` of such a table
+  with 20,000 rows took 12 ms (4.41.1: 0.1 to 0.2 ms), and deleting the 100 symbols of one file
+  from a code graph of 50,000 symbols and 50,000 references took 27.6 s (4.41.1: 61 ms). A
+  command now reads a child table once and keeps it until it stages a write to that table, the
+  final checks read each relationship once, and changed rows are read by their id. What a
+  command decides is unchanged, including an action that must see what an earlier action of
+  the same command staged. `tests/fk_parent_change_scan_cost.rs`.
+- **`INSERT … SELECT` into a table with a foreign key to itself refused rows that name a row of
+  the same statement.** Loading a tree with `INSERT INTO node SELECT …`, or restoring one from
+  a copy, failed with a foreign-key violation: the rows are staged and committed as one group,
+  and each was checked before any of them could be found. The key of the table to itself is
+  now checked once the rows are staged, so the parent may come before or after the child in
+  the statement, as in PostgreSQL. A row whose parent is nowhere still fails the statement and
+  leaves nothing. `tests/insert_select_self_reference.rs`.
+
+Known and not fixed in 4.42.0: `DROP TABLE` reads the constraint record of every table that
+has a key, so its time grows with the number of such tables (measured in an in-memory shell:
+0.3 ms with 50 keyed tables, 3.6 ms with 1,600; 4.41.1: 0.1 ms at both sizes).
+
 ### Fixed — a key-moving UPDATE waits for a key an open transaction took out
 
 - An `UPDATE` that moves a row's PRIMARY KEY or UNIQUE value to one another open transaction
