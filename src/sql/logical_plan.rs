@@ -2373,6 +2373,26 @@ pub enum IndexOption {
     /// persisted and replicated with it. Absent for the single-column case,
     /// where `column_name` is the whole key.
     UniqueColumns(Vec<String>),
+    /// GH#34: an index whose key includes an EXPRESSION —
+    /// `CREATE INDEX ON t ((payload->>'user_id'))`, `ON t (lower(email))`,
+    /// `USING gin (to_tsvector('simple', body))`.
+    ///
+    /// Such an index is recorded under the `expression` index-type tag, which
+    /// [`crate::storage::index_family`] classifies as DDL-only: the definition
+    /// is persisted, replicated, listed in `pg_indexes` and dropped like any
+    /// other index, but no backing structure is built, so the planner never
+    /// reads through it and every query answers from the rows themselves.
+    /// `method` is the access method the user named (`btree` when none),
+    /// `key` the rendered key list for `indexdef`, and `columns` the table
+    /// columns the key refers to (checked against the table at CREATE).
+    Expression {
+        /// The access method of the `USING` clause, `btree` when omitted.
+        method: String,
+        /// The key list as `pg_indexes.indexdef` shows it.
+        key: String,
+        /// The table columns the key expressions read.
+        columns: Vec<String>,
+    },
 }
 
 /// Quantization type for vector indexes

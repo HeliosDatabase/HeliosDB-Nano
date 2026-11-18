@@ -5445,7 +5445,26 @@ impl SystemViewRegistry {
         // redefined by the session's branch. An index still being built has no
         // definition until its group is written, exactly when it becomes visible.
         let mut manual: Vec<(String, String, String)> = Vec::new();
+        // GH#34: indexes over an expression, with their access method.
+        let mut expression: Vec<(String, String, String, String)> = Vec::new();
         for (index_name, definition) in catalog.list_index_definitions()? {
+            if definition.index_type.as_deref() == Some("expression") {
+                if !listed.contains(definition.table_name.as_str()) || catalog.branch_overrides(&definition.table_name)
+                {
+                    continue;
+                }
+                for option in &definition.options {
+                    if let crate::sql::logical_plan::IndexOption::Expression { method, key, .. } = option {
+                        expression.push((
+                            definition.table_name.clone(),
+                            index_name.clone(),
+                            method.clone(),
+                            key.clone(),
+                        ));
+                    }
+                }
+                continue;
+            }
             if crate::storage::index_family(definition.index_type.as_deref()) != Some(crate::storage::IndexFamily::Art)
             {
                 continue;
@@ -5464,6 +5483,22 @@ impl SystemViewRegistry {
             let indexdef = format!(
                 "CREATE INDEX {} ON {}.{} USING btree ({})",
                 index_name, schema_name, bare_table, column
+            );
+            rows.push(Tuple::new(vec![
+                Value::String(schema_name),
+                Value::String(bare_table),
+                Value::String(index_name),
+                Value::Null,
+                Value::String(indexdef),
+            ]));
+        }
+
+        expression.sort();
+        for (table_key, index_name, method, key) in expression {
+            let (schema_name, bare_table) = crate::sql::Planner::split_schema_key(&table_key);
+            let indexdef = format!(
+                "CREATE INDEX {} ON {}.{} USING {} ({})",
+                index_name, schema_name, bare_table, method, key
             );
             rows.push(Tuple::new(vec![
                 Value::String(schema_name),

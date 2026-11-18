@@ -128,7 +128,9 @@ pub enum IndexFamily {
 pub fn index_family(tag: Option<&str>) -> Option<IndexFamily> {
     match tag {
         None | Some("art") | Some("btree") | Some("hash") => Some(IndexFamily::Art),
-        Some("gin") | Some("gist") => Some(IndexFamily::DdlOnly),
+        // GH#34: `expression` is the tag of an index over an expression
+        // (`IndexOption::Expression`) — recorded, never built.
+        Some("gin") | Some("gist") | Some("expression") => Some(IndexFamily::DdlOnly),
         Some("hnsw") | Some("hnsw_pq") | Some("persistent_hnsw") => Some(IndexFamily::Vector),
         Some(_) => None,
     }
@@ -9041,6 +9043,8 @@ mod tests {
             (Some("hash"), IndexFamily::Art),
             (Some("gin"), IndexFamily::DdlOnly),
             (Some("gist"), IndexFamily::DdlOnly),
+            // GH#34: an index over an expression is recorded, never built.
+            (Some("expression"), IndexFamily::DdlOnly),
             (Some("hnsw"), IndexFamily::Vector),
             (Some("hnsw_pq"), IndexFamily::Vector),
             (Some("persistent_hnsw"), IndexFamily::Vector),

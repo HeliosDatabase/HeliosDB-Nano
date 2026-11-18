@@ -1458,6 +1458,71 @@ impl<'a> Planner<'a> {
         )))
     }
 
+    /// GH#34: the [`IndexOption::Expression`] record of a `CREATE INDEX` whose
+    /// key contains an expression. Every key expression must be one this
+    /// planner can translate (so a key it could never compute is refused at
+    /// CREATE rather than recorded), and the columns it reads are collected
+    /// for the executor to check against the table.
+    ///
+    /// [`IndexOption::Expression`]: crate::sql::logical_plan::IndexOption::Expression
+    fn expression_index_option(
+        &self,
+        method: Option<&str>,
+        columns: &[sqlparser::ast::OrderByExpr],
+    ) -> Result<crate::sql::logical_plan::IndexOption> {
+        use std::ops::ControlFlow;
+        if crate::storage::index_family(method).is_none() {
+            return Err(Error::query_execution(format!(
+                "Unsupported index type '{}' for an expression index",
+                method.unwrap_or("?")
+            )));
+        }
+        let mut keys = Vec::with_capacity(columns.len());
+        let mut referenced: Vec<String> = Vec::new();
+        for col in columns {
+            match &col.expr {
+                Expr::Identifier(ident) => {
+                    let name = Self::normalize_ident(ident);
+                    keys.push(name.clone());
+                    if !referenced.contains(&name) {
+                        referenced.push(name);
+                    }
+                }
+                expr => {
+                    self.expr_to_logical(expr)?;
+                    let _ = sqlparser::ast::visit_expressions(expr, |e| {
+                        let name = match e {
+                            Expr::Identifier(ident) => Some(Self::normalize_ident(ident)),
+                            Expr::CompoundIdentifier(parts) => parts.last().map(Self::normalize_ident),
+                            _ => None,
+                        };
+                        if let Some(name) = name {
+                            if !referenced.contains(&name) {
+                                referenced.push(name);
+                            }
+                        }
+                        ControlFlow::<()>::Continue(())
+                    });
+                    // PostgreSQL's own `pg_get_indexdef` spelling: a function
+                    // call stands bare, anything else is parenthesised.
+                    let mut shown = expr;
+                    while let Expr::Nested(inner) = shown {
+                        shown = inner;
+                    }
+                    keys.push(match shown {
+                        Expr::Function(_) => shown.to_string(),
+                        _ => format!("({shown})"),
+                    });
+                }
+            }
+        }
+        Ok(crate::sql::logical_plan::IndexOption::Expression {
+            method: method.unwrap_or("btree").to_string(),
+            key: keys.join(", "),
+            columns: referenced,
+        })
+    }
+
     /// The name component a single indexed column contributes to a generated
     /// index name. A plain (or qualified) column reference contributes the bare
     /// column name; anything else contributes PostgreSQL's `expr` placeholder.
@@ -2210,8 +2275,42 @@ impl<'a> Planner<'a> {
                     .columns
                     .first()
                     .ok_or_else(|| Error::query_execution("At least one column required for index"))?;
-                let column = match &first_col.expr {
-                    Expr::Identifier(ident) => Self::normalize_ident(ident),
+
+                // GH#34: a key with an EXPRESSION in it —
+                // `((payload->>'user_id'))`, `(lower(email))`,
+                // `USING gin (to_tsvector('simple', body))` — used to fail
+                // here with "Column name expected in CREATE INDEX", which
+                // stopped mem0's pgvector store from initialising. It is now
+                // accepted and recorded as an `expression` index: persisted,
+                // replicated, listed and droppable, but with no backing
+                // structure, so no plan reads through it and every answer
+                // comes from the rows (see `IndexOption::Expression`).
+                let has_expression = create_index
+                    .columns
+                    .iter()
+                    .any(|col| !matches!(col.expr, Expr::Identifier(_)));
+                let expression = if has_expression {
+                    if is_vector_index {
+                        return Err(Error::query_execution(
+                            "Vector indexes (HNSW/IVF) require a VECTOR column, not an expression",
+                        ));
+                    }
+                    if create_index.unique {
+                        // Uniqueness over an expression would need the key
+                        // computed on every write; nothing does that yet, and
+                        // a UNIQUE index that checks nothing would be a
+                        // silent wrong answer. Fail closed.
+                        return Err(Error::query_execution(
+                            "CREATE UNIQUE INDEX on an expression is not supported",
+                        ));
+                    }
+                    Some(self.expression_index_option(index_type.as_deref(), &create_index.columns)?)
+                } else {
+                    None
+                };
+                let column = match (&first_col.expr, &expression) {
+                    (Expr::Identifier(ident), _) => Self::normalize_ident(ident),
+                    (_, Some(crate::sql::logical_plan::IndexOption::Expression { key, .. })) => key.clone(),
                     _ => return Err(Error::query_execution("Column name expected in CREATE INDEX")),
                 };
 
@@ -2309,6 +2408,13 @@ impl<'a> Planner<'a> {
                         options.push(crate::sql::logical_plan::IndexOption::UniqueColumns(unique_columns));
                     }
                 }
+
+                let index_type = if let Some(expression) = expression {
+                    options.push(expression);
+                    Some("expression".to_string())
+                } else {
+                    index_type
+                };
 
                 Ok(LogicalPlan::CreateIndex {
                     name: index_name,

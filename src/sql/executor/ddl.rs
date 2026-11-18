@@ -349,6 +349,46 @@ fn encoded_index_options(options: &[crate::sql::logical_plan::IndexOption]) -> V
     bincode::serialize(options).unwrap_or_default()
 }
 
+/// GH#34: the checks an expression index passes before its definition is
+/// recorded. `Ok(false)` when `IF NOT EXISTS` found the name taken (nothing to
+/// do); an error when the name is taken otherwise or the key reads a column the
+/// table does not have.
+fn check_expression_index(
+    storage: &crate::storage::StorageEngine,
+    name: &str,
+    table_name: &str,
+    options: &[crate::sql::logical_plan::IndexOption],
+    if_not_exists: bool,
+) -> Result<bool> {
+    let catalog = storage.catalog();
+    let taken = storage.art_indexes().index_exists(name)
+        || storage.vector_indexes().index_exists(name)
+        || catalog
+            .list_index_definitions()?
+            .iter()
+            .any(|(existing, _)| existing == name);
+    if taken {
+        if if_not_exists {
+            return Ok(false);
+        }
+        return Err(Error::query_execution(format!("Index '{}' already exists", name)));
+    }
+    let schema = catalog.get_table_schema(table_name)?;
+    for option in options {
+        if let crate::sql::logical_plan::IndexOption::Expression { columns, .. } = option {
+            for column in columns {
+                if !schema.columns.iter().any(|c| &c.name == column) {
+                    return Err(Error::query_execution(format!(
+                        "Column '{}' not found in table '{}'",
+                        column, table_name
+                    )));
+                }
+            }
+        }
+    }
+    Ok(true)
+}
+
 /// Handle CREATE INDEX logical plan node.
 ///
 /// The `USING <type>` spelling is routed through the SHARED
@@ -437,6 +477,11 @@ pub(super) fn handle_create_index(executor: &Executor, plan: &LogicalPlan) -> Re
                         table_name,
                         column_name
                     );
+                    if idx_type == "expression"
+                        && !check_expression_index(storage, name, table_name, options, *if_not_exists)?
+                    {
+                        return Ok(empty_ddl_result(executor));
+                    }
                     let mut ddl = crate::storage::DdlBatch::new(storage);
                     stage_index_definition(
                         storage,

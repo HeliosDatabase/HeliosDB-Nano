@@ -106,6 +106,15 @@ Reports from users of earlier releases (GitHub numbers) and defects found while 
   listener's COMMIT, and `pg_listening_channels()` is not provided.
   `tests/listen_notify.rs`.
 
+- **`CREATE INDEX` on an expression was rejected (GitHub #34).** `CREATE INDEX ON t
+  ((payload->>'user_id'))`, `ON t (lower(email))` and `USING gin (to_tsvector('simple', …))`
+  failed with "Column name expected in CREATE INDEX", which stopped mem0's pgvector store from
+  starting. They are now accepted: the definition is kept across a restart, sent to standbys,
+  shown in `pg_indexes`, honours `IF NOT EXISTS`, and goes with `DROP INDEX` and `DROP TABLE`. The
+  index is recorded only — no structure is built and queries do not use it, so a query on the
+  expression scans the table and its answer is always correct. `CREATE UNIQUE INDEX` on an
+  expression is refused with an error, because nothing would enforce it.
+  `tests/expression_index_tests.rs`.
 - **`ORDER BY … NULLS FIRST / NULLS LAST` was ignored (GitHub #43).** The clause was read and
   dropped: `ORDER BY due ASC NULLS LAST` returned the NULLs first. An explicit placement is now
   obeyed, in a query, over `GROUP BY`, over a set operation, under `LIMIT` and in a window's
