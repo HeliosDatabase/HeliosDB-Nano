@@ -47,6 +47,12 @@ Reports from users of earlier releases (GitHub numbers) and defects found while 
   so `INSERT ... VALUES (LAST_INSERT_ID())` works. A `SELECT` is routed to the `@@variable` and
   `information_schema` handlers only when those appear in its code, not in a literal. Test files:
   `tests/mysql_session_fn_interception.rs`, `tests/mysql_stmt_execute_tests.rs`.
+- **`dump` and `restore` could not read a data directory created with encryption at rest (GitHub #45).**
+  Both opened the directory with the default configuration, so an encrypted store failed with "written
+  with encryption enabled, but [encryption] enabled is false" and no option existed to supply the key.
+  Both now take `-c/--config <file>` (the same TOML as `start`, honouring `[encryption]` and its
+  `key_source`, for example an environment variable); `restore` creates the target encrypted. Without it
+  the error now names `--config`. Test: `tests/dump_restore_encrypted_config.rs`.
 - **`ORDER BY … NULLS FIRST / NULLS LAST` was ignored (GitHub #43).** The clause was read and
   dropped: `ORDER BY due ASC NULLS LAST` returned the NULLs first. An explicit placement is now
   obeyed, in a query, over `GROUP BY`, over a set operation, under `LIMIT` and in a window's

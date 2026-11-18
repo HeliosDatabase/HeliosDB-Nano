@@ -1,7 +1,7 @@
 //! Dump command implementation
 
 use crate::storage::{DumpCompressionType, DumpManager, DumpMode, DumpOptions};
-use crate::{EmbeddedDatabase, Error, Result};
+use crate::{Config, EmbeddedDatabase, Error, Result};
 use colored::Colorize;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::path::PathBuf;
@@ -22,6 +22,9 @@ pub struct DumpCommand {
     pub data_dir: Option<PathBuf>,
     /// In-memory mode
     pub memory: bool,
+    /// Config file (`-c/--config`): its `[encryption]` section opens a data
+    /// directory written with encryption at rest.
+    pub config: Option<PathBuf>,
 }
 
 impl DumpCommand {
@@ -56,7 +59,15 @@ impl DumpCommand {
         };
 
         // Open database for reading
-        let db = EmbeddedDatabase::new(&data_dir)?;
+        let db = match self.config {
+            Some(ref path) => {
+                let mut config = Config::from_file(path)?;
+                config.storage.memory_only = false;
+                config.storage.path = Some(data_dir.clone());
+                EmbeddedDatabase::with_config(config)?
+            }
+            None => EmbeddedDatabase::new(&data_dir).map_err(crate::cli::name_config_option)?,
+        };
 
         // Create dump manager
         let dump_manager = DumpManager::new(data_dir, compression);

@@ -1599,6 +1599,11 @@ enum Commands {
         #[arg(long)]
         connection: Option<String>,
 
+        /// Config file (same TOML as `start`); its [encryption] section and
+        /// key_source open a data directory written with encryption at rest
+        #[arg(short, long, value_name = "FILE")]
+        config: Option<PathBuf>,
+
         /// Verbose output
         #[arg(short, long)]
         verbose: bool,
@@ -1630,6 +1635,11 @@ enum Commands {
         /// Connection string (for server mode)
         #[arg(long)]
         connection: Option<String>,
+
+        /// Config file (same TOML as `start`); its [encryption] section and
+        /// key_source create the target directory encrypted at rest
+        #[arg(short, long, value_name = "FILE")]
+        config: Option<PathBuf>,
 
         /// Verbose output
         #[arg(short, long)]
@@ -2108,6 +2118,7 @@ async fn run(cli: Cli) -> Result<()> {
             append,
             compression,
             connection,
+            config,
             verbose,
         } => {
             use heliosdb_nano::cli::DumpCommand;
@@ -2119,6 +2130,7 @@ async fn run(cli: Cli) -> Result<()> {
                 verbose,
                 data_dir,
                 memory: false,
+                config,
             };
             cmd.execute()
         }
@@ -2128,6 +2140,7 @@ async fn run(cli: Cli) -> Result<()> {
             verify,
             no_validate,
             connection,
+            config,
             verbose,
         } => {
             use heliosdb_nano::cli::RestoreCommand;
@@ -2138,6 +2151,7 @@ async fn run(cli: Cli) -> Result<()> {
                 connection,
                 verbose,
                 no_validate,
+                config,
             };
             cmd.execute()
         }

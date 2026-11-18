@@ -1,7 +1,7 @@
 //! Restore command implementation
 
 use crate::storage::{DumpCompressionType, DumpManager, RestoreOptions};
-use crate::{EmbeddedDatabase, Error, Result};
+use crate::{Config, EmbeddedDatabase, Error, Result};
 use colored::Colorize;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::path::PathBuf;
@@ -28,6 +28,9 @@ pub struct RestoreCommand {
     /// target database a CLI restore opens, so without this switch a backup of
     /// such a database would not be restorable through this command at all.
     pub no_validate: bool,
+    /// Config file (`-c/--config`): its `[encryption]` section creates (or
+    /// opens) the target directory encrypted at rest.
+    pub config: Option<PathBuf>,
 }
 
 impl RestoreCommand {
@@ -70,7 +73,15 @@ impl RestoreCommand {
             if self.verbose {
                 println!("{}", "Opening target database...".dimmed());
             }
-            EmbeddedDatabase::new(&target_dir)?
+            match self.config {
+                Some(ref path) => {
+                    let mut config = Config::from_file(path)?;
+                    config.storage.memory_only = false;
+                    config.storage.path = Some(target_dir.clone());
+                    EmbeddedDatabase::with_config(config)?
+                }
+                None => EmbeddedDatabase::new(&target_dir).map_err(crate::cli::name_config_option)?,
+            }
         };
 
         // Create dump manager
