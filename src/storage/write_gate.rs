@@ -254,6 +254,9 @@ pub struct WriteGate {
     /// Writes of main's constraint records, counted as they start and as they end
     /// ([`Self::constraint_write_stamp`]).
     constraint_writes: ConstraintWrites,
+    /// The store seals its values (encryption at rest): this gate cannot read
+    /// a constraint record out of a batch ([`OwnerDelta`]).
+    constraint_records_sealed: AtomicBool,
 }
 
 /// The prefix of main's constraint records (`table_constraints:{table}`).
@@ -272,26 +275,117 @@ fn touches_constraint_records(key: &[u8], range_end: Option<&[u8]>) -> bool {
 /// RocksDB sees it) and when it ends (after RocksDB returned, whatever it
 /// returned). While the two counts are equal no such write is in flight, and the
 /// count names the records' state: a reader that listed them under one count may
-/// trust the list while the count is unchanged (`StorageEngine::foreign_key_owners`).
+/// trust the list while the count is unchanged.
+///
+/// `owners` is that list: the tables whose record names a foreign key
+/// (`StorageEngine::foreign_key_owners`). A walk of every record seeds it
+/// ([`WriteGate::remember_foreign_key_owners`]); after that each write keeps it
+/// current from the records it puts and deletes, so a `CREATE TABLE` or a
+/// `DROP TABLE` of a table with a key does not send the next `DROP TABLE` over
+/// every record again. The list is given up (`None`, and the next reader walks)
+/// whenever a write cannot be followed exactly: its records are sealed or do
+/// not decode, it deletes a range, its keys could not be walked, RocksDB
+/// returned an error, or another such write was in flight beside it. A list
+/// that misses an owner would let a DROP leave a foreign key to a table that
+/// is gone; a walk too many costs time only.
 #[derive(Debug, Default)]
 struct ConstraintWrites {
     started: AtomicU64,
     finished: AtomicU64,
+    owners: parking_lot::Mutex<Option<std::collections::BTreeSet<String>>>,
 }
 
-/// One write of [`ConstraintWrites`], ended when dropped.
-struct ConstraintWrite<'g>(&'g ConstraintWrites);
+/// What one write does to the list of foreign-key owners.
+#[derive(Debug)]
+enum OwnerDelta {
+    /// Each constraint record the write puts or deletes, by table, with
+    /// whether the table names a foreign key afterwards. The last entry of a
+    /// table is the one that stands, as in the batch.
+    Known(Vec<(String, bool)>),
+    /// The write cannot be followed.
+    Unknown,
+}
+
+impl OwnerDelta {
+    /// Fold one batch operation into the delta of its batch. `sealed`: the
+    /// store's values are encrypted and this gate cannot read a record.
+    fn note(delta: &mut Option<Self>, operation: super::layout_epochs::BatchKey<'_>, sealed: bool) {
+        use super::layout_epochs::BatchKey;
+        let (key, value, readable) = match operation {
+            BatchKey::Put(key, value) => (key, Some(value), true),
+            BatchKey::Delete(key) => (key, None, true),
+            BatchKey::Merge(key) => (key, None, false),
+            BatchKey::Range(start, end) => {
+                if touches_constraint_records(start, Some(end)) {
+                    *delta = Some(Self::Unknown);
+                }
+                return;
+            }
+        };
+        let Some(table) = key.strip_prefix(CONSTRAINT_RECORD_PREFIX) else {
+            return;
+        };
+        let entry = match (readable, std::str::from_utf8(table), value) {
+            (true, Ok(table), None) => Some((table.to_string(), false)),
+            (true, Ok(table), Some(value)) if !sealed => bincode::deserialize::<crate::sql::TableConstraints>(value)
+                .ok()
+                .map(|constraints| (table.to_string(), !constraints.foreign_keys.is_empty())),
+            _ => None,
+        };
+        match (delta.as_mut(), entry) {
+            (Some(Self::Unknown), _) => {}
+            (Some(Self::Known(entries)), Some(entry)) => entries.push(entry),
+            (None, Some(entry)) => *delta = Some(Self::Known(vec![entry])),
+            (_, None) => *delta = Some(Self::Unknown),
+        }
+    }
+}
+
+/// One write of [`ConstraintWrites`]. Dropped without [`Self::finish`] (an
+/// early return, a panic) it ends as a write that could not be followed.
+struct ConstraintWrite<'g> {
+    writes: &'g ConstraintWrites,
+    delta: OwnerDelta,
+}
 
 impl<'g> ConstraintWrite<'g> {
-    fn begin(writes: &'g ConstraintWrites) -> Self {
-        writes.started.fetch_add(1, Ordering::SeqCst);
-        Self(writes)
+    fn begin(writes: &'g ConstraintWrites, delta: OwnerDelta) -> Self {
+        let mut owners = writes.owners.lock();
+        let started = writes.started.fetch_add(1, Ordering::SeqCst) + 1;
+        // Beside another write in flight the order of the two is not known here.
+        if matches!(delta, OwnerDelta::Unknown) || started != writes.finished.load(Ordering::SeqCst) + 1 {
+            *owners = None;
+        }
+        drop(owners);
+        Self { writes, delta }
+    }
+
+    /// End the write; `applied` is whether RocksDB took it.
+    fn finish(mut self, applied: bool) {
+        if !applied {
+            self.delta = OwnerDelta::Unknown;
+        }
+        // `Drop` does the rest.
     }
 }
 
 impl Drop for ConstraintWrite<'_> {
     fn drop(&mut self) {
-        self.0.finished.fetch_add(1, Ordering::SeqCst);
+        let mut owners = self.writes.owners.lock();
+        match (&self.delta, owners.as_mut()) {
+            (OwnerDelta::Known(entries), Some(list)) => {
+                for (table, names_a_foreign_key) in entries {
+                    if *names_a_foreign_key {
+                        list.insert(table.clone());
+                    } else {
+                        list.remove(table);
+                    }
+                }
+            }
+            (OwnerDelta::Unknown, _) => *owners = None,
+            (OwnerDelta::Known(_), None) => {}
+        }
+        self.writes.finished.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -592,6 +686,7 @@ impl WriteGate {
             delta_ids_installed: AtomicBool::new(false),
             delta_floor_locks: std::array::from_fn(|_| parking_lot::Mutex::new(())),
             constraint_writes: ConstraintWrites::default(),
+            constraint_records_sealed: AtomicBool::new(false),
         })
     }
 
@@ -605,6 +700,31 @@ impl WriteGate {
         let finished = self.constraint_writes.finished.load(Ordering::SeqCst);
         let started = self.constraint_writes.started.load(Ordering::SeqCst);
         (started == finished).then_some(started)
+    }
+
+    /// This gate's store seals its values: no constraint record can be read
+    /// out of a batch, and every write of one gives the owner list up.
+    pub(crate) fn mark_constraint_records_sealed(&self) {
+        self.constraint_records_sealed.store(true, Ordering::SeqCst);
+    }
+
+    /// The tables whose constraint record names a foreign key, when the list is
+    /// current: seeded by a walk and followed through every write since, none
+    /// of them in flight now ([`ConstraintWrites`]).
+    pub(crate) fn foreign_key_owners(&self) -> Option<Vec<String>> {
+        let owners = self.constraint_writes.owners.lock();
+        self.constraint_write_stamp()?;
+        owners.as_ref().map(|list| list.iter().cloned().collect())
+    }
+
+    /// Seed the list with `owners`, listed by a walk of every constraint record
+    /// that began under `stamp` ([`Self::constraint_write_stamp`]), unless a
+    /// constraint write has started since.
+    pub(crate) fn remember_foreign_key_owners(&self, stamp: u64, owners: Vec<String>) {
+        let mut slot = self.constraint_writes.owners.lock();
+        if self.constraint_write_stamp() == Some(stamp) {
+            *slot = Some(owners.into_iter().collect());
+        }
     }
 
     pub(crate) fn install_delta_ids(&self, recovered: u64) {
@@ -776,21 +896,27 @@ impl WriteGate {
     /// Spec R5.6: mark the tables whose layout `batch` changes in flight, before
     /// RocksDB sees it. No change for a batch with no layout key: a walk of the
     /// batch's bytes in place, one or two byte comparisons per key.
-    /// Also whether the batch touches main's constraint records (`true` when its
-    /// keys could not be walked), which the caller counts ([`ConstraintWrites`]).
-    fn begin_batch_change(&self, db: &DB, batch: &WriteBatch) -> Result<(LayoutChange, DeltaFloors, bool)> {
+    /// Also what the batch does to main's constraint records, when it touches
+    /// any (`Unknown` when its keys could not be walked), which the caller counts
+    /// and follows ([`ConstraintWrites`]).
+    fn begin_batch_change(
+        &self,
+        db: &DB,
+        batch: &WriteBatch,
+    ) -> Result<(LayoutChange, DeltaFloors, Option<OwnerDelta>)> {
         use super::layout_epochs::BatchKey;
         let wiring = self.layout.get();
         let delta_ids = self.delta_ids_installed.load(Ordering::Acquire);
         let mut floors = DeltaFloors::default();
         if wiring.is_none() && !delta_ids {
             // No wiring: no stamp is ever given (`constraint_write_stamp`).
-            return Ok((LayoutChange::none(), floors, false));
+            return Ok((LayoutChange::none(), floors, None));
         }
         let mut tables: Vec<String> = Vec::new();
         let mut branches = Vec::new();
         let mut branch_wide = false;
-        let mut constraints = false;
+        let mut constraints: Option<OwnerDelta> = None;
+        let sealed = self.constraint_records_sealed.load(Ordering::SeqCst);
         let mut inspected = Ok(());
         // One borrowed key pass, shared with the layout detector already on the
         // hot write path. Values are skipped in place; only metadata is decoded.
@@ -798,14 +924,7 @@ impl WriteGate {
             if delta_ids && inspected.is_ok() {
                 inspected = floors.inspect(db, operation);
             }
-            if !constraints {
-                constraints = match operation {
-                    BatchKey::Put(key, _) | BatchKey::Delete(key) | BatchKey::Merge(key) => {
-                        touches_constraint_records(key, None)
-                    }
-                    BatchKey::Range(start, end) => touches_constraint_records(start, Some(end)),
-                };
-            }
+            OwnerDelta::note(&mut constraints, operation, sealed);
             if let Some(wiring) = wiring {
                 if let BatchKey::Range(start, end) = operation {
                     branch_wide |= super::layout_epochs::branch_catalog_range(start, end);
@@ -826,8 +945,8 @@ impl WriteGate {
                     "Cannot inspect MV delta allocator operations in this write batch",
                 ));
             }
-            // Unknown keys: counted as a constraint write.
-            constraints = true;
+            // Unknown keys: counted as a constraint write that cannot be followed.
+            constraints = Some(OwnerDelta::Unknown);
             tables.clear();
             branches.clear();
             let mut collector = LayoutKeyCollector(Vec::new());
@@ -1232,7 +1351,7 @@ impl WriteGate {
             super::layout_epochs::at_durable_effect()?;
         }
         let (change, floors, constraints) = self.begin_batch_change(db, &batch)?;
-        let constraint_write = constraints.then(|| ConstraintWrite::begin(&self.constraint_writes));
+        let constraint_write = constraints.map(|delta| ConstraintWrite::begin(&self.constraint_writes, delta));
         let applied = if self.freeze_active.load(Ordering::SeqCst) {
             self.write_frozen(db, batch, opts, slot, floors, attempt)
         } else {
@@ -1240,7 +1359,9 @@ impl WriteGate {
             drop(slot);
             applied
         };
-        drop(constraint_write);
+        if let Some(constraint_write) = constraint_write {
+            constraint_write.finish(applied.is_ok());
+        }
         self.end_layout_change(change);
         applied
     }
@@ -1271,8 +1392,8 @@ impl WriteGate {
         super::layout_epochs::at_durable_effect()?;
         let change = self.begin_layout_change_of_key(key, Some(value));
         // Ends when this function returns, after RocksDB has.
-        let _constraint_write =
-            touches_constraint_records(key, None).then(|| ConstraintWrite::begin(&self.constraint_writes));
+        let _constraint_write = touches_constraint_records(key, None)
+            .then(|| ConstraintWrite::begin(&self.constraint_writes, OwnerDelta::Unknown));
         let applied = if self.freeze_active.load(Ordering::SeqCst) {
             let mut batch = WriteBatch::default();
             batch.put(key, value);
@@ -1332,8 +1453,8 @@ impl WriteGate {
         super::layout_epochs::at_durable_effect()?;
         let change = self.begin_layout_change_of_key(key, None);
         // Ends when this function returns, after RocksDB has.
-        let _constraint_write =
-            touches_constraint_records(key, None).then(|| ConstraintWrite::begin(&self.constraint_writes));
+        let _constraint_write = touches_constraint_records(key, None)
+            .then(|| ConstraintWrite::begin(&self.constraint_writes, OwnerDelta::Unknown));
         let applied = if self.freeze_active.load(Ordering::SeqCst) {
             let mut batch = WriteBatch::default();
             batch.delete(key);

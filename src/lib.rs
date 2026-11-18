@@ -47440,6 +47440,10 @@ mod direct_copy_native_outcome_tests;
 mod direct_cache_publication_tests;
 
 #[cfg(test)]
+#[path = "fk_owner_list_tests.rs"]
+mod fk_owner_list_tests;
+
+#[cfg(test)]
 mod non_deterministic_marker_tests {
     use super::EmbeddedDatabase;
 

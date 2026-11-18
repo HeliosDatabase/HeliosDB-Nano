@@ -2640,10 +2640,6 @@ pub struct StorageEngine {
     consolidation_worker: Option<Arc<FilterConsolidationWorker>>,
     /// Temporary directory for in-memory mode (kept alive for RocksDB)
     _temp_dir: Option<tempfile::TempDir>,
-    /// The tables whose stored constraint record names a foreign key, as a walk of
-    /// every record listed them, with the write gate's constraint-write stamp under
-    /// which the walk ran (`Self::foreign_key_owners`).
-    foreign_key_owners: parking_lot::Mutex<Option<(u64, Arc<Vec<String>>)>>,
     /// In-memory atomic counters for row IDs (table_name -> counter)
     row_counters: Arc<dashmap::DashMap<String, std::sync::atomic::AtomicU64>>,
     /// Bulk load mode flag - when enabled, skips per-row metrics and tracking
@@ -3397,27 +3393,21 @@ impl StorageEngine {
         self.key_manager.as_deref()
     }
 
-    /// The tables whose stored constraint record names a foreign key, when they
-    /// were listed by a walk of every record and no constraint record has been
-    /// written since (the write gate's constraint-write stamp is the walk's). A
-    /// DROP TABLE reads these records by name instead of walking all of them,
-    /// whose deleted keys a store churning tables accumulates.
-    pub(crate) fn foreign_key_owners(&self) -> Option<Arc<Vec<String>>> {
-        let stamp = self.gate.constraint_write_stamp()?;
-        match &*self.foreign_key_owners.lock() {
-            Some((listed, owners)) if *listed == stamp => Some(Arc::clone(owners)),
-            _ => None,
-        }
+    /// The tables whose stored constraint record names a foreign key, when the
+    /// write gate's list of them is current: seeded by a walk of every record
+    /// and followed through every constraint write since
+    /// (`WriteGate::foreign_key_owners`). A DROP TABLE reads these records by
+    /// name instead of walking all of them, whose deleted keys a store churning
+    /// tables accumulates.
+    pub(crate) fn foreign_key_owners(&self) -> Option<Vec<String>> {
+        self.gate.foreign_key_owners()
     }
 
     /// Keep `owners`, listed by a walk of every constraint record that began
     /// under `stamp` (`WriteGate::constraint_write_stamp`), unless a constraint
     /// write has started since.
     pub(crate) fn remember_foreign_key_owners(&self, stamp: u64, owners: Vec<String>) {
-        let mut slot = self.foreign_key_owners.lock();
-        if self.gate.constraint_write_stamp() == Some(stamp) {
-            *slot = Some((stamp, Arc::new(owners)));
-        }
+        self.gate.remember_foreign_key_owners(stamp, owners);
     }
 
     /// The gate every raw write of this engine — and of every component built
@@ -4429,7 +4419,6 @@ impl StorageEngine {
             cpu_monitor,
             consolidation_worker,
             _temp_dir: None,
-            foreign_key_owners: parking_lot::Mutex::new(None),
             row_counters,
             bulk_load_mode: Arc::new(AtomicBool::new(false)),
             temp_tables_present: Arc::new(AtomicBool::new(false)),
@@ -4816,7 +4805,6 @@ impl StorageEngine {
             cpu_monitor,
             consolidation_worker,
             _temp_dir: Some(temp_dir),
-            foreign_key_owners: parking_lot::Mutex::new(None),
             row_counters,
             bulk_load_mode: Arc::new(AtomicBool::new(false)),
             temp_tables_present: Arc::new(AtomicBool::new(false)),
@@ -6223,6 +6211,10 @@ impl StorageEngine {
             write_watermarks: Arc::clone(&self.write_watermarks),
         });
         self.gate.install_layout(Arc::clone(&self.layout_epochs), hook);
+        if self.key_manager.is_some() {
+            // Sealed values: the gate cannot follow constraint records.
+            self.gate.mark_constraint_records_sealed();
+        }
     }
 
     /// Spec R5.6, on a physical standby: what [`EngineLayoutHook`]'s publication does

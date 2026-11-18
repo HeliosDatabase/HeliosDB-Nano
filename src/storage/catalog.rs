@@ -2902,12 +2902,13 @@ impl<'a> Catalog<'a> {
     /// The stored constraint records a DROP of `targets` depends on: every record
     /// that names a foreign key (a child of a target, or a target's own edges to
     /// its parents) and the targets' own. Read from the store, never from a cache
-    /// of records. Which tables name a foreign key is known without a walk while no
-    /// constraint record has been written since the last walk listed them (the
-    /// write gate counts every such write, `StorageEngine::foreign_key_owners`):
-    /// those records, and the targets', are then read by name. Otherwise every
-    /// record is walked, and the list kept for the next statement. The walk steps
-    /// over the deleted keys of every table dropped since the store last compacted.
+    /// of records. Which tables name a foreign key is known without a walk once a
+    /// walk has listed them and while the write gate could follow every write of
+    /// a constraint record since (`StorageEngine::foreign_key_owners`): those
+    /// records, and the targets', are then read by name. Otherwise every record
+    /// is walked, and the list kept for the next statement. The walk steps over
+    /// the deleted keys of every table dropped since the store last compacted,
+    /// and its cost grows with the number of tables that have a key.
     fn drop_dependency_records(
         &self,
         targets: &[(String, bool)],
