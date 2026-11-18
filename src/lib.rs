@@ -32837,7 +32837,8 @@ impl EmbeddedDatabase {
         match expr {
             LogicalExpr::ScalarSubquery { subquery } => {
                 // Substitute any outer-table column refs with literals.
-                let bound_plan = Self::bind_outer_refs_in_plan(subquery.as_ref(), outer_row, outer_schema, outer_table);
+                let bound_plan =
+                    Self::bind_outer_refs_in_subquery(subquery.as_ref(), outer_row, outer_schema, outer_table);
                 // Execute the (now-uncorrelated) plan. Thread the outer
                 // statement's bound parameters so `$n` placeholders INSIDE the
                 // subquery (e.g. `SET n = (SELECT count(*) FROM t WHERE a=$1)`)
@@ -32899,6 +32900,63 @@ impl EmbeddedDatabase {
             }),
             // Everything else passes through unchanged.
             other => Ok(other.clone()),
+        }
+    }
+
+    /// Bind the outer row into one scalar subquery, unless the subquery has a
+    /// relation of its own under the outer table's name.
+    ///
+    /// A name is resolved in the nearest scope that has it. In
+    /// `UPDATE acct SET n = (SELECT COUNT(*) FROM acct WHERE acct.grp = 2)` the
+    /// subquery reads `acct` itself, so `acct.grp` is the subquery's column and
+    /// the statement writes one count to every row. Binding it to the row being
+    /// updated compared that row's group with 2 and counted the whole table or
+    /// nothing. An alias hides the table's name (`FROM acct AS a`): there
+    /// `acct.grp` can only be the row being updated, and it is bound.
+    ///
+    /// Everything nested inside such a subquery sees the same relation first, so
+    /// the whole subquery is left as it is.
+    fn bind_outer_refs_in_subquery(
+        plan: &sql::LogicalPlan,
+        outer_row: &Tuple,
+        outer_schema: &Schema,
+        outer_table: &str,
+    ) -> sql::LogicalPlan {
+        if Self::subquery_has_relation_named(plan, outer_table) {
+            return plan.clone();
+        }
+        Self::bind_outer_refs_in_plan(plan, outer_row, outer_schema, outer_table)
+    }
+
+    /// Whether the FROM of this query level exposes a relation under `name`: a
+    /// table read without an alias, or any relation whose alias is `name`. A
+    /// derived table exposes its alias and hides what is inside it.
+    fn subquery_has_relation_named(plan: &sql::LogicalPlan, name: &str) -> bool {
+        use sql::LogicalPlan;
+        let is = |exposed: &str| {
+            exposed.eq_ignore_ascii_case(name)
+                || exposed
+                    .rsplit_once('.')
+                    .is_some_and(|(_, bare)| bare.eq_ignore_ascii_case(name))
+        };
+        match plan {
+            LogicalPlan::Scan { table_name, alias, .. } | LogicalPlan::FilteredScan { table_name, alias, .. } => {
+                is(alias.as_deref().unwrap_or(table_name))
+            }
+            LogicalPlan::Project {
+                source_alias: Some(alias),
+                ..
+            } => is(alias),
+            LogicalPlan::TableFunction { alias: Some(alias), .. } => is(alias),
+            LogicalPlan::Project { input, .. }
+            | LogicalPlan::Filter { input, .. }
+            | LogicalPlan::Aggregate { input, .. }
+            | LogicalPlan::Sort { input, .. }
+            | LogicalPlan::Limit { input, .. } => Self::subquery_has_relation_named(input, name),
+            LogicalPlan::Join { left, right, .. } => {
+                Self::subquery_has_relation_named(left, name) || Self::subquery_has_relation_named(right, name)
+            }
+            _ => false,
         }
     }
 
@@ -33092,7 +33150,7 @@ impl EmbeddedDatabase {
                 negated: *negated,
             },
             LogicalExpr::ScalarSubquery { subquery } => LogicalExpr::ScalarSubquery {
-                subquery: Box::new(Self::bind_outer_refs_in_plan(
+                subquery: Box::new(Self::bind_outer_refs_in_subquery(
                     subquery,
                     outer_row,
                     outer_schema,
