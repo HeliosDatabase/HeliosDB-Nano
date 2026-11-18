@@ -1071,7 +1071,17 @@ impl Evaluator {
                 // `try_nextval`; the process-global persistence handle lets this
                 // storage-less evaluator reach storage without any per-statement
                 // hot-path cost.
-                let value = crate::sql::sequences::try_nextval(&name)?;
+                // GH#51: the sequence of a serial column is its generator.
+                let (name, value) = match crate::sql::sequences::resolve_target(&name)? {
+                    crate::sql::sequences::SequenceTarget::Serial { table } => {
+                        let value = crate::sql::sequences::next_serial_value(&table)?;
+                        (name, value)
+                    }
+                    crate::sql::sequences::SequenceTarget::Named(stored) => {
+                        let value = crate::sql::sequences::try_nextval(&stored)?;
+                        (stored, value)
+                    }
+                };
                 // sprinter 6dc0cc115db9: `lastval()` is "the value most recently
                 // returned by nextval IN THIS SESSION", so it is recorded HERE,
                 // on the one arm that returns such a value — never derived from
@@ -1261,6 +1271,15 @@ impl Evaluator {
                 // error rather than swallowing it. `try_setval` also fsyncs the
                 // new high-water before returning, so a pg_dump-emitted
                 // `setval(seq, max(col))` survives a restart.
+                // GH#51: the sequence of a serial column is its generator.
+                let name = match crate::sql::sequences::resolve_target(&name)? {
+                    crate::sql::sequences::SequenceTarget::Serial { table } => {
+                        let applied = crate::sql::sequences::set_serial_generator(&table, value, is_called)?;
+                        crate::note_session_currval(&name, applied);
+                        return Ok(Value::Int8(applied));
+                    }
+                    crate::sql::sequences::SequenceTarget::Named(name) => name,
+                };
                 let applied = crate::sql::sequences::try_setval(&name, value, is_called)?;
                 // sprinter 7903b7111cb4: PostgreSQL documents `setval` as setting
                 // `currval` for the CALLING session, so record it here — but NOT

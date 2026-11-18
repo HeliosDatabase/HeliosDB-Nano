@@ -1105,6 +1105,130 @@ fn peek_in(ns: &SeqNamespace, name: &str) -> Option<i64> {
     }
 }
 
+/// What the name given to `nextval` / `setval` stands for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SequenceTarget {
+    /// A sequence of its own, under this stored name.
+    Named(String),
+    /// The generator of a SERIAL / IDENTITY primary key: its table's row
+    /// counter. `pg_get_serial_sequence` names it `public.<table>_<column>_seq`,
+    /// and no sequence object stands behind that name.
+    Serial { table: String },
+}
+
+/// Resolutions of [`resolve_target`], by engine and name, valid for the schema
+/// generation they were made under.
+static TARGETS: std::sync::LazyLock<dashmap::DashMap<(u64, String), (u64, SequenceTarget)>> =
+    std::sync::LazyLock::new(dashmap::DashMap::new);
+
+/// Largest value a serial generator is moved to: the bound explicit keys are
+/// held to when they raise it (`note_explicit_identity_pk`).
+const SERIAL_GENERATOR_MAX: i64 = 1 << 40;
+
+/// Resolve the name given to `nextval` / `setval` (GitHub #51).
+///
+/// The name of a serial column's sequence, with or without `public.`, is the
+/// column's generator. It used to be taken as a new sequence of that literal
+/// name, created on the spot: `setval('public.jobs_id_seq', 30)` answered 30,
+/// moved an object nothing reads, and the next generated id was the old one. A
+/// store on which that was done keeps the stray sequence; the name no longer
+/// reaches it. A name that carries a schema and is no sequence under that
+/// spelling is the sequence of the bare name, which is how `CREATE SEQUENCE`
+/// stores it.
+pub(crate) fn resolve_target(raw: &str) -> Result<SequenceTarget> {
+    let Some(engine) = persist_handle() else {
+        return Ok(SequenceTarget::Named(raw.to_string()));
+    };
+    let generation = engine.schema_generation();
+    let key = (engine.instance_id(), raw.to_string());
+    if let Some(known) = TARGETS.get(&key) {
+        if known.0 == generation {
+            return Ok(known.1.clone());
+        }
+    }
+    let target = resolve_target_uncached(&engine, raw)?;
+    if TARGETS.len() > 4096 {
+        TARGETS.clear();
+    }
+    TARGETS.insert(key, (generation, target.clone()));
+    Ok(target)
+}
+
+fn resolve_target_uncached(engine: &StorageEngine, raw: &str) -> Result<SequenceTarget> {
+    let catalog = engine.catalog();
+    let trimmed = raw.trim();
+    let (schema, bare) = match trimmed.rsplit_once('.') {
+        Some((schema, bare)) => (Some(schema.trim_matches('"')), bare.trim_matches('"')),
+        None => (None, trimmed.trim_matches('"')),
+    };
+    let schema =
+        schema.filter(|schema| !schema.eq_ignore_ascii_case("public") && !schema.eq_ignore_ascii_case("pg_catalog"));
+    if let Some(stem) = bare.strip_suffix("_seq") {
+        for (at, _) in stem.match_indices('_') {
+            let (Some(table), Some(column)) = (stem.get(..at), stem.get(at + 1..)) else {
+                continue;
+            };
+            if table.is_empty() || column.is_empty() {
+                continue;
+            }
+            let table = schema.map_or_else(|| table.to_string(), |schema| format!("{schema}.{table}"));
+            if !catalog.is_identity_column(&table, column).unwrap_or(false) {
+                continue;
+            }
+            // Only a primary key is filled from the row counter.
+            let generated_key = catalog.get_table_schema(&table).is_ok_and(|table_schema| {
+                table_schema
+                    .columns
+                    .iter()
+                    .any(|known| known.primary_key && known.name.eq_ignore_ascii_case(column))
+            });
+            if generated_key {
+                return Ok(SequenceTarget::Serial { table });
+            }
+        }
+    }
+    if bare != trimmed && catalog.get_sequence(trimmed)?.is_none() && catalog.get_sequence(bare)?.is_some() {
+        return Ok(SequenceTarget::Named(bare.to_string()));
+    }
+    Ok(SequenceTarget::Named(raw.to_string()))
+}
+
+/// `setval` on a serial column's generator: the next generated key is
+/// `value + 1` (`value` itself when `is_called` is false). Persisted before it
+/// returns. The generator only moves up, because a generated key is the row's
+/// id and a lower one may belong to a stored row: a `value` below its position
+/// leaves it where it is.
+pub(crate) fn set_serial_generator(table: &str, value: i64, is_called: bool) -> Result<i64> {
+    crate::storage::layout_epochs::note_side_effect("a sequence was set");
+    let engine = persist_handle().ok_or_else(|| Error::query_execution("setval() needs a database"))?;
+    if engine.is_branch_active() {
+        return Err(Error::query_execution(
+            "setval() on a serial column's sequence is not supported on a branch",
+        ));
+    }
+    let position = if is_called { value } else { value.saturating_sub(1) };
+    if !(0..=SERIAL_GENERATOR_MAX).contains(&position) || value < 1 {
+        return Err(Error::query_execution(format!(
+            "setval: value {value} is out of bounds for the sequence of a serial column (1..{SERIAL_GENERATOR_MAX})"
+        )));
+    }
+    engine.set_row_counter_at_least(table, u64::try_from(position).unwrap_or(0))?;
+    Ok(value)
+}
+
+/// `nextval` on a serial column's generator: the key the next row would get.
+pub(crate) fn next_serial_value(table: &str) -> Result<i64> {
+    crate::storage::layout_epochs::note_side_effect("a sequence advanced");
+    let engine = persist_handle().ok_or_else(|| Error::query_execution("nextval() needs a database"))?;
+    if engine.is_branch_active() {
+        return Err(Error::query_execution(
+            "nextval() on a serial column's sequence is not supported on a branch",
+        ));
+    }
+    i64::try_from(engine.next_row_id(table)?)
+        .map_err(|_| Error::query_execution("nextval: the serial generator is out of range"))
+}
+
 /// `setval(name, value, is_called)` — durable. Validates `value` is within
 /// `[min, max]` (else `Err`), updates the runtime, forces the window to refill
 /// on the next `nextval`, and fsyncs the new high-water so it survives restart

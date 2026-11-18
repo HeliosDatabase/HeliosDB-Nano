@@ -19484,6 +19484,41 @@ impl StorageEngine {
     /// EXPLICIT key above it must move it: otherwise the next generated key
     /// lands below the largest key (SQLite continues after it) and, once the
     /// counter climbs, collides with an explicit one.
+    /// Raise the table's row counter to at least `value` and persist it, the
+    /// way [`Self::next_row_id`] persists an allocation. Returns the counter.
+    ///
+    /// `setval()` on the sequence of a SERIAL / IDENTITY primary key lands here
+    /// (GitHub #51): that key is the row id, so this counter is the generator.
+    /// It only moves up: a row id below the counter may be a stored row's.
+    pub fn set_row_counter_at_least(&self, table_name: &str, value: u64) -> Result<u64> {
+        let _table_scope = self.lock_table_for_write(table_name)?;
+        let allocation_lock = self.gate.counter_lock(table_name);
+        let _allocation = allocation_lock.lock();
+        let current = self
+            .row_counters
+            .entry(table_name.to_string())
+            .or_insert_with(|| std::sync::atomic::AtomicU64::new(0))
+            .fetch_max(value, Ordering::Relaxed)
+            .max(value);
+        let key = format!("counter:{}", table_name).into_bytes();
+        let encoded =
+            bincode::serialize(&current).map_err(|e| Error::storage(format!("Failed to serialize counter: {}", e)))?;
+        let stored = super::tde::seal(self.key_manager.as_deref(), &encoded)?;
+        let barrier = if let Some(wal) = self.wal.as_ref().filter(|_| !self.is_replaying.load(Ordering::Acquire)) {
+            wal.read()
+                .append_counter_with_value(table_name, current, stored.as_ref())?
+                .1
+        } else {
+            self.gate
+                .put(&self.db, &key, stored.as_ref(), self.memory_write_options.as_ref())
+                .map_err(|error| Error::storage(format!("Failed to persist row counter: {error}")))?;
+            None
+        };
+        drop(_allocation);
+        Self::wait_for_direct_replication(barrier);
+        Ok(current)
+    }
+
     pub fn raise_row_counter_to(&self, table_name: &str, value: u64) {
         if let Some(counter) = self.row_counters.get(table_name) {
             counter.fetch_max(value, Ordering::Relaxed);
