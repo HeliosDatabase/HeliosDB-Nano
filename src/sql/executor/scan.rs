@@ -270,6 +270,30 @@ fn txn_base_tuples(
     txn.merge_with_write_set_shaped(actual_table_name, base_tuples, &shape)
 }
 
+/// The transaction a table scan reads through, or `None` when the scan reads
+/// history.
+///
+/// `AS OF TIMESTAMP / TRANSACTION / SCN / COMMIT` and `VERSIONS BETWEEN` name
+/// committed state of the past. A transaction on the executor does not change
+/// what that state is, so the scan is answered from version history and nothing
+/// staged is merged into it. This matters outside `BEGIN` too: since statements
+/// became atomic, the source of `CREATE TABLE … AS SELECT` and of
+/// `INSERT … SELECT` runs under the statement's own transaction, and a scan that
+/// took the transaction first read today's rows for
+/// `CREATE TABLE restored AS SELECT * FROM t AS OF …` and reported success.
+///
+/// `AS OF NOW` is the reader's present. Inside a transaction that is the
+/// transaction's view, staged rows included, so it keeps the transaction.
+fn transaction_for_scan<'a>(
+    executor: &Executor<'a>,
+    as_of: Option<&crate::sql::logical_plan::AsOfClause>,
+) -> Option<&'a crate::storage::Transaction> {
+    match as_of {
+        None | Some(crate::sql::logical_plan::AsOfClause::Now) => executor.transaction(),
+        Some(_) => None,
+    }
+}
+
 pub(crate) fn storage_predicates_are_sql_safe(schema: &Schema, predicates: &[AnalyzedPredicate]) -> bool {
     predicates.iter().all(|predicate| {
         let Some(column) = schema.columns.get(predicate.column_index) else {
@@ -2283,8 +2307,10 @@ pub(super) fn handle_scan(executor: &Executor, plan: &LogicalPlan) -> Result<Box
             #[cfg(test)]
             after_scan_layout_check(table_name)?;
 
-            // Handle time-travel or transactional queries
-            let tuples = if let Some(txn) = executor.transaction() {
+            // Handle time-travel or transactional queries. A clause that names the
+            // past is answered from history whether or not the executor carries a
+            // transaction: see `transaction_for_scan`.
+            let tuples = if let Some(txn) = transaction_for_scan(executor, as_of.as_ref()) {
                 // Transactional scan: at the txn snapshot (W2.5 fast-outs to a
                 // direct current-`data:` read for tables unchanged since it).
                 txn_base_tuples(storage, txn, &actual_table_name, table_name, &schema, as_of.is_none())?
@@ -2739,7 +2765,7 @@ pub(super) fn handle_filtered_scan(executor: &Executor, plan: &LogicalPlan) -> R
             );
 
             // Handle time-travel or transactional queries with filtered scan
-            let tuples = if let Some(txn) = executor.transaction() {
+            let tuples = if let Some(txn) = transaction_for_scan(executor, as_of.as_ref()) {
                 // Transactional scan (W2.5 fast-outs to a direct current-`data:`
                 // read for tables unchanged since the txn snapshot), then apply
                 // the same storage-level pushdown filtering.
