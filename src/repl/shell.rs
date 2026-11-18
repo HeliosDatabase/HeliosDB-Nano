@@ -411,11 +411,21 @@ impl ReplShell {
                 Ok(results) => {
                     let duration = start.elapsed();
 
-                    // Get schema from the first tuple if available
+                    // The headers come from planning the statement again. That plan
+                    // reads the catalog directly, outside the engine, so the
+                    // shell's session and its branch are published first, as the
+                    // `\d` family does. Without the scope a SELECT on a branch
+                    // was planned against main: a table that exists only on the
+                    // branch printed "Query returned N row(s)" and no rows, and a
+                    // column added on the branch had no header.
                     if let Ok(parser) = crate::sql::Parser::new().parse_one(sql) {
-                        let catalog = self.db.storage.catalog();
-                        let planner = crate::sql::Planner::with_catalog(&catalog);
-                        if let Ok(plan) = planner.statement_to_plan(parser) {
+                        let planned = {
+                            let _catalog_scope = self.db.embedded_catalog_scope();
+                            let catalog = self.db.storage.catalog();
+                            let planner = crate::sql::Planner::with_catalog(&catalog);
+                            planner.statement_to_plan(parser)
+                        };
+                        if let Ok(plan) = planned {
                             let schema = plan.schema();
                             println!("\n{}", formatter::format_results(&results, &schema));
                             if self.show_timing {
