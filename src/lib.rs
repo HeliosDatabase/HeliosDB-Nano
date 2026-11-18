@@ -5408,83 +5408,113 @@ impl EmbeddedDatabase {
     }
 
     fn query_is_non_deterministic(sql: &str) -> bool {
-        [
-            b"NEXTVAL".as_slice(),
-            b"SETVAL".as_slice(),
-            b"CURRVAL".as_slice(),
-            b"GEN_RANDOM_UUID".as_slice(),
-            b"UUID_GENERATE_V4".as_slice(),
-            b"RANDOM(".as_slice(),
-            b"NOW(".as_slice(),
-            b"CLOCK_TIMESTAMP".as_slice(),
-            // Spec 03: the advisory-lock family MUTATES the process-global lock
-            // table and must run on every call. A cached result row would report
-            // "lock acquired" for a lock that was never taken — and a cached
-            // `pg_try_advisory_lock` = false would keep reporting false after the
-            // holder released. `PG_ADVISORY` covers the plain and `_xact_`
-            // spellings plus the unlocks; `PG_TRY_ADVISORY` the `try` ones.
-            b"PG_ADVISORY".as_slice(),
-            b"PG_TRY_ADVISORY".as_slice(),
-            // sprinter 6dc0cc115db9 / f4f5d450e816: PER-CONNECTION answers.
-            //
-            // This is a correctness requirement, not an optimisation. The result
-            // cache is keyed by SQL TEXT and tagged only with the login
-            // principal ([`CachedRows`]), and two wire connections that have not
-            // published a login identity share that principal — so a cached
-            // `SELECT lastval()` row from connection A would be served verbatim
-            // to connection B. That is precisely the cross-connection leak these
-            // items exist to prevent, and it would be worse than the absence
-            // they replace: a driver would report another connection's row id as
-            // its own `cursor.lastrowid`.
-            //
-            // `APPLICATION_NAME` covers `SHOW application_name`,
-            // `current_setting('application_name')` and any projection of the
-            // `pg_stat_activity` column; `PG_STAT_ACTIVITY` covers the view
-            // itself, whose `state` column is relative to the scanning backend.
-            b"LASTVAL".as_slice(),
-            b"PG_BACKEND_PID".as_slice(),
-            b"APPLICATION_NAME".as_slice(),
-            b"PG_STAT_ACTIVITY".as_slice(),
-            // sprinter 6bc4a4040eb7 (B1): `current_setting('heliosdb.branch')`
-            // is the SESSION's branch. A branch session never touches the cache
-            // (`result_cache_bypassed`), so this is belt-and-braces: no row that
-            // names a branch binding is ever served by SQL text.
-            b"HELIOSDB.BRANCH".as_slice(),
-            // Spec P1.3: the standby probes answer from the replication
-            // posture and the physical sequence, neither of which moves the
-            // storage generation the cache is keyed on — a cached
-            // `heliosdb_require_ready()` would keep a standby "ready" after its
-            // primary was lost, and a cached LSN would freeze the lag a proxy
-            // routes on. The two prefixes cover `pg_current_wal_lsn` /
-            // `_insert_lsn` / `_flush_lsn` and `pg_last_wal_replay_lsn` /
-            // `_receive_lsn`.
-            b"PG_IS_IN_RECOVERY".as_slice(),
-            b"PG_CURRENT_WAL".as_slice(),
-            b"PG_LAST_WAL".as_slice(),
-            b"PG_CONTROL_CHECKPOINT".as_slice(),
-            b"HELIOSDB_REQUIRE_READY".as_slice(),
-            b"HELIOSDB_STANDBY_STATUS".as_slice(),
-            // Spec P5.2 §2: a promotion is an action, never a cached row (a
-            // cached `t` would answer a second call without promoting).
-            b"PG_PROMOTE".as_slice(),
-            // `internal-tests`: a statement held inside the engine (spec
-            // P5.2 §8.K) runs every time it is asked.
-            b"HELIOSDB_TEST_HOLD".as_slice(),
-            // sprinter ccebc95977f1: the `internal-tests` handoff counter.
-            b"HELIOSDB_TEST_OFFLOADS".as_slice(),
-            // Spec P3.1: the archive views answer from the archiver's catalog
-            // and pruner, which never move the storage generation either — a
-            // cached `heliosdb_recovery_window` row kept reporting an archive
-            // as empty and unshortened long after segments were sealed and
-            // pruned (the row was evaluated twice across fourteen identical
-            // queries during the P3.1 gate).
-            b"HELIOSDB_ARCHIVED_WAL".as_slice(),
-            b"HELIOSDB_ARCHIVE_GAPS".as_slice(),
-            b"HELIOSDB_RECOVERY_WINDOW".as_slice(),
-        ]
-        .iter()
-        .any(|needle| Self::contains_ascii_case_insensitive(sql, needle))
+        Self::contains_any_ascii_case_insensitive(sql, &Self::NON_DETERMINISTIC_MARKERS)
     }
+
+    /// Whether `haystack` contains any of `needles`, ignoring ASCII case, in one
+    /// pass: at each byte that begins some needle, the needles beginning with it
+    /// are compared. The answer of `needles.iter().any(|n|
+    /// contains_ascii_case_insensitive(haystack, n))`, which walked the text once
+    /// per needle: 6.5 us for a 130-byte join statement against thirty markers,
+    /// on every statement that is not answered from a cache.
+    fn contains_any_ascii_case_insensitive(haystack: &str, needles: &[&[u8]]) -> bool {
+        let mut begins = [false; 256];
+        for needle in needles {
+            if let Some(first) = needle.first() {
+                if let Some(slot) = begins.get_mut(usize::from(first.to_ascii_uppercase())) {
+                    *slot = true;
+                }
+            }
+        }
+        let bytes = haystack.as_bytes();
+        bytes.iter().enumerate().any(|(at, byte)| {
+            let upper = byte.to_ascii_uppercase();
+            begins.get(usize::from(upper)).copied().unwrap_or(false)
+                && needles.iter().any(|needle| {
+                    needle.first().is_some_and(|first| first.to_ascii_uppercase() == upper)
+                        && bytes
+                            .get(at..at.saturating_add(needle.len()))
+                            .is_some_and(|window| window.eq_ignore_ascii_case(needle))
+                })
+        })
+    }
+
+    /// What makes a statement's result unfit for the result cache
+    /// ([`Self::query_is_non_deterministic`]): text it contains in any ASCII case.
+    const NON_DETERMINISTIC_MARKERS: [&[u8]; 27] = [
+        b"NEXTVAL".as_slice(),
+        b"SETVAL".as_slice(),
+        b"CURRVAL".as_slice(),
+        b"GEN_RANDOM_UUID".as_slice(),
+        b"UUID_GENERATE_V4".as_slice(),
+        b"RANDOM(".as_slice(),
+        b"NOW(".as_slice(),
+        b"CLOCK_TIMESTAMP".as_slice(),
+        // Spec 03: the advisory-lock family MUTATES the process-global lock
+        // table and must run on every call. A cached result row would report
+        // "lock acquired" for a lock that was never taken — and a cached
+        // `pg_try_advisory_lock` = false would keep reporting false after the
+        // holder released. `PG_ADVISORY` covers the plain and `_xact_`
+        // spellings plus the unlocks; `PG_TRY_ADVISORY` the `try` ones.
+        b"PG_ADVISORY".as_slice(),
+        b"PG_TRY_ADVISORY".as_slice(),
+        // sprinter 6dc0cc115db9 / f4f5d450e816: PER-CONNECTION answers.
+        //
+        // This is a correctness requirement, not an optimisation. The result
+        // cache is keyed by SQL TEXT and tagged only with the login
+        // principal ([`CachedRows`]), and two wire connections that have not
+        // published a login identity share that principal — so a cached
+        // `SELECT lastval()` row from connection A would be served verbatim
+        // to connection B. That is precisely the cross-connection leak these
+        // items exist to prevent, and it would be worse than the absence
+        // they replace: a driver would report another connection's row id as
+        // its own `cursor.lastrowid`.
+        //
+        // `APPLICATION_NAME` covers `SHOW application_name`,
+        // `current_setting('application_name')` and any projection of the
+        // `pg_stat_activity` column; `PG_STAT_ACTIVITY` covers the view
+        // itself, whose `state` column is relative to the scanning backend.
+        b"LASTVAL".as_slice(),
+        b"PG_BACKEND_PID".as_slice(),
+        b"APPLICATION_NAME".as_slice(),
+        b"PG_STAT_ACTIVITY".as_slice(),
+        // sprinter 6bc4a4040eb7 (B1): `current_setting('heliosdb.branch')`
+        // is the SESSION's branch. A branch session never touches the cache
+        // (`result_cache_bypassed`), so this is belt-and-braces: no row that
+        // names a branch binding is ever served by SQL text.
+        b"HELIOSDB.BRANCH".as_slice(),
+        // Spec P1.3: the standby probes answer from the replication
+        // posture and the physical sequence, neither of which moves the
+        // storage generation the cache is keyed on — a cached
+        // `heliosdb_require_ready()` would keep a standby "ready" after its
+        // primary was lost, and a cached LSN would freeze the lag a proxy
+        // routes on. The two prefixes cover `pg_current_wal_lsn` /
+        // `_insert_lsn` / `_flush_lsn` and `pg_last_wal_replay_lsn` /
+        // `_receive_lsn`.
+        b"PG_IS_IN_RECOVERY".as_slice(),
+        b"PG_CURRENT_WAL".as_slice(),
+        b"PG_LAST_WAL".as_slice(),
+        b"PG_CONTROL_CHECKPOINT".as_slice(),
+        b"HELIOSDB_REQUIRE_READY".as_slice(),
+        b"HELIOSDB_STANDBY_STATUS".as_slice(),
+        // Spec P5.2 §2: a promotion is an action, never a cached row (a
+        // cached `t` would answer a second call without promoting).
+        b"PG_PROMOTE".as_slice(),
+        // `internal-tests`: a statement held inside the engine (spec
+        // P5.2 §8.K) runs every time it is asked.
+        b"HELIOSDB_TEST_HOLD".as_slice(),
+        // sprinter ccebc95977f1: the `internal-tests` handoff counter.
+        b"HELIOSDB_TEST_OFFLOADS".as_slice(),
+        // Spec P3.1: the archive views answer from the archiver's catalog
+        // and pruner, which never move the storage generation either — a
+        // cached `heliosdb_recovery_window` row kept reporting an archive
+        // as empty and unshortened long after segments were sealed and
+        // pruned (the row was evaluated twice across fourteen identical
+        // queries during the P3.1 gate).
+        b"HELIOSDB_ARCHIVED_WAL".as_slice(),
+        b"HELIOSDB_ARCHIVE_GAPS".as_slice(),
+        b"HELIOSDB_RECOVERY_WINDOW".as_slice(),
+    ];
 
     /// Check if a SQL statement is a transaction control statement.
     ///
@@ -46963,3 +46993,56 @@ mod direct_copy_native_outcome_tests;
 #[cfg(all(test, feature = "vector-search"))]
 #[path = "direct_cache_publication_tests.rs"]
 mod direct_cache_publication_tests;
+
+#[cfg(test)]
+mod non_deterministic_marker_tests {
+    use super::EmbeddedDatabase;
+
+    /// The one-pass search answers what a search per marker answers, for every
+    /// marker in every position and case, and for text that only comes close.
+    #[test]
+    fn the_one_pass_search_answers_what_a_search_per_marker_answers() {
+        let markers = EmbeddedDatabase::NON_DETERMINISTIC_MARKERS;
+        let per_marker = |sql: &str| {
+            markers
+                .iter()
+                .any(|marker| EmbeddedDatabase::contains_ascii_case_insensitive(sql, marker))
+        };
+        let mut corpus: Vec<String> = vec![
+            String::new(),
+            "SELECT 1".to_string(),
+            "SELECT c.name, o.order_id FROM customers c INNER JOIN orders o ON c.id = o.customer_id WHERE c.id = 42"
+                .to_string(),
+            "SELECT now FROM t".to_string(),
+            "SELECT random FROM t".to_string(),
+            "SELECT nextva, setva, pg_advisor, lastva FROM t".to_string(),
+            "SELECT 'héllo naïve' FROM t".to_string(),
+            "NOW(".to_string(),
+            "x NOW".to_string(),
+        ];
+        for marker in markers {
+            let text = String::from_utf8_lossy(marker).into_owned();
+            let lower = text.to_ascii_lowercase();
+            let mixed: String = text
+                .chars()
+                .enumerate()
+                .map(|(i, c)| if i % 2 == 0 { c.to_ascii_lowercase() } else { c })
+                .collect();
+            corpus.push(text.clone());
+            corpus.push(format!("SELECT {lower}('s') FROM t"));
+            corpus.push(format!("select x from t where y = {mixed}"));
+            corpus.push(format!("é{lower}"));
+            // One byte short at the end of the text, and one byte wrong.
+            corpus.push(format!("SELECT {}", &text[..text.len() - 1]));
+            corpus.push(format!("SELECT {}#", &text[..text.len() - 1]));
+        }
+        let mut hits = 0;
+        for sql in &corpus {
+            let expected = per_marker(sql);
+            assert_eq!(EmbeddedDatabase::query_is_non_deterministic(sql), expected, "{sql}");
+            hits += usize::from(expected);
+        }
+        assert!(hits >= markers.len() * 4, "the corpus exercises every marker: {hits}");
+        assert!(!EmbeddedDatabase::query_is_non_deterministic("SELECT 1"));
+    }
+}
