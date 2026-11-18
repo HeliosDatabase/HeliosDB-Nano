@@ -93,6 +93,9 @@ switchover.
 | `USE BRANCH` moves only its own session | Connections that relied on another connection's `USE BRANCH` must select the branch themselves |
 | A branch created before 4.42.0 | `MERGE BRANCH` refuses it (`55000`) for tables whose rows it changed: recreate it |
 | The server hands each statement to a blocking thread | Short range scans cost a little more per statement; `HELIOSDB_NANO_STATEMENT_OFFLOAD=off` restores 4.41 behaviour, long statements stalling the server included |
+| A role made with `CREATE USER` or `CREATE ROLE … LOGIN` and given a password can log in (`scram-sha-256` and `password` authentication) | Privileges are still not enforced: such a role can read and change everything. Give a password only to roles that should connect |
+| A role whose password was set before 4.42.0 | It still cannot log in: its password was stored as written and is not used. Run `ALTER ROLE <name> PASSWORD '…'` once to enable it; from 4.42.0 a role's password is stored as a SCRAM-SHA-256 verifier |
+| `ORDER BY … NULLS FIRST` / `NULLS LAST` is obeyed | A query that wrote the clause and relied on it being ignored returns its NULLs at the other end |
 
 **Building from source.** The minimum Rust version is 1.88 (1.92 with `--features
 code-embed`, which also needs glibc 2.38 or later).

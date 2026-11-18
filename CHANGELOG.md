@@ -60,6 +60,29 @@ Reports from users of earlier releases (GitHub numbers) and defects found while 
   its position is answered and leaves it where it is. `setval('public.s', …)` on a sequence made
   with `CREATE SEQUENCE s` now moves `s` instead of creating `public.s`. Not done:
   `SELECT last_value FROM <sequence>`. `tests/serial_sequence_setval.rs`.
+- **A role made with SQL could not log in (GitHub #49).** `CREATE USER claude WITH LOGIN
+  PASSWORD '…'` succeeded and `claude` was refused with `28P01` under every authentication
+  method: the server checked only the accounts given at start, and the role's record kept the
+  password as written without anything reading it. A role with `LOGIN` and a password now logs
+  in under `scram-sha-256` and `password` authentication, before and after a restart.
+  `CREATE ROLE` and `ALTER ROLE … PASSWORD` store a SCRAM-SHA-256 verifier
+  (`SCRAM-SHA-256$4096:salt$StoredKey:ServerKey`), never the password; a value that already is
+  a verifier is kept as given. A role without `LOGIN`, a role past its `VALID UNTIL`, and a role
+  whose `VALID UNTIL` is not a time are refused with the message a wrong password gets, and a
+  name with a role behind it does the same work during the exchange as a name without one.
+  Three things to know. Privileges are still not enforced: a role that can log in can read and
+  change everything. A password set by an earlier release is not used, so an upgrade does not
+  turn recorded roles into accounts: `ALTER ROLE … PASSWORD` enables each one. Under `md5`
+  authentication and over HTTP only the accounts given at start authenticate.
+  `src/protocol/postgres/handler.rs` tests.
+- **A database made with `CREATE DATABASE` was gone after a restart (GitHub #48).** The name was
+  kept in memory: after a restart a connection by it was refused (`3D000`), and `pg_database`
+  never listed it. The name is now a record of the store (`meta:database:`, a key class a physical
+  standby applies with the rest of the catalog), listed in `pg_database`, and bound to its limits
+  again on the first connection after a restart. `DROP DATABASE` removes the record. The PostgreSQL
+  command tags are `CREATE DATABASE` and `DROP DATABASE`. Unchanged: a database does not
+  separate tables, and a dump does not carry database names.
+  `tests/create_database_and_dbname_validation.rs`.
 - **`COMMENT ON` was refused (GitHub #66).** `COMMENT ON TABLE`, `COLUMN` and every other object
   form is accepted, so a dump or a migration that carries comments runs through. The comment is
   not stored: `pg_description` stays empty and there is no `obj_description()`. A comment on a
