@@ -3475,13 +3475,26 @@ impl<'a> Planner<'a> {
                     ))
                 })
                 .collect();
-            let asc: Vec<_> = order_by
-                .exprs
-                .iter()
-                .map(|order_by_expr| order_by_expr.asc.unwrap_or(true))
-                .collect();
-
-            let (preferred, redirected): (Vec<_>, Vec<_>) = exprs?.into_iter().unzip();
+            let mut preferred = Vec::new();
+            let mut redirected = Vec::new();
+            let mut asc = Vec::new();
+            for ((preferred_key, redirected_key), order_by_expr) in exprs?.into_iter().zip(&order_by.exprs) {
+                let ascending = order_by_expr.asc.unwrap_or(true);
+                // GH#43: an explicit NULLS FIRST / LAST the engine's order
+                // does not already give is one more key, before its own.
+                if let Some(nulls_ascending) = Self::null_placement_key(ascending, order_by_expr.nulls_first) {
+                    for (keys, key) in [(&mut preferred, &preferred_key), (&mut redirected, &redirected_key)] {
+                        keys.push(LogicalExpr::IsNull {
+                            expr: Box::new(key.clone()),
+                            is_null: true,
+                        });
+                    }
+                    asc.push(nulls_ascending);
+                }
+                preferred.push(preferred_key);
+                redirected.push(redirected_key);
+                asc.push(ascending);
+            }
             plan = Self::place_order_by(plan, preferred, redirected, asc);
         }
 
@@ -4784,6 +4797,33 @@ impl<'a> Planner<'a> {
                         source_alias,
                     };
                 }
+                // GH#44: `GROUP BY s.id, s.name ORDER BY app_count DESC, s.name`.
+                // The group key was rewritten to the aggregate's `group_1`,
+                // which exists only below the Project; the alias `app_count`
+                // exists only above it. Neither side had every key, and the
+                // Sort went above with a key that is not there. Over an
+                // aggregate an output alias is the Project's own expression
+                // (`agg_0`), so name it by that and sort below.
+                if matches!(*input, LogicalPlan::Aggregate { .. }) {
+                    let below: Vec<LogicalExpr> = exprs
+                        .iter()
+                        .map(|key| Self::sort_key_below_projection(key, &project_exprs, &aliases, &input_schema))
+                        .collect();
+                    if Self::order_by_resolves_against_schema(&below, &input_schema) {
+                        return LogicalPlan::Project {
+                            input: Box::new(LogicalPlan::Sort {
+                                input,
+                                exprs: below,
+                                asc,
+                            }),
+                            exprs: project_exprs,
+                            aliases,
+                            distinct,
+                            distinct_on,
+                            source_alias,
+                        };
+                    }
+                }
 
                 LogicalPlan::Sort {
                     input: Box::new(LogicalPlan::Project {
@@ -4804,6 +4844,55 @@ impl<'a> Planner<'a> {
                 asc,
             },
         }
+    }
+
+    /// A sort key as the input of a Project sees it: a bare column that is not
+    /// one of the input's but is one of the Project's output names becomes the
+    /// expression the Project computes under that name. Looks through the
+    /// `IS NULL` key an explicit `NULLS FIRST / LAST` adds.
+    fn sort_key_below_projection(
+        key: &LogicalExpr,
+        project_exprs: &[LogicalExpr],
+        aliases: &[String],
+        input_schema: &Schema,
+    ) -> LogicalExpr {
+        match key {
+            LogicalExpr::IsNull { expr, is_null } => LogicalExpr::IsNull {
+                expr: Box::new(Self::sort_key_below_projection(
+                    expr,
+                    project_exprs,
+                    aliases,
+                    input_schema,
+                )),
+                is_null: *is_null,
+            },
+            LogicalExpr::Column { table: None, name } if !Self::expr_resolves_against_schema(key, input_schema) => {
+                let mut named = project_exprs
+                    .iter()
+                    .zip(aliases)
+                    .filter(|(_, alias)| alias.as_str() == name.as_str());
+                match (named.next(), named.next()) {
+                    (Some((expr, _)), None) => expr.clone(),
+                    _ => key.clone(),
+                }
+            }
+            _ => key.clone(),
+        }
+    }
+
+    /// The key that puts NULLs where an explicit `NULLS FIRST` / `NULLS LAST`
+    /// asks, as the direction of an `<expr> IS NULL` key sorted before the
+    /// expression itself; `None` when the engine's own order already does.
+    ///
+    /// The engine compares NULL as less than every value: `ASC` puts NULLs
+    /// first and `DESC` puts them last (the order of MySQL and SQLite, the
+    /// reverse of PostgreSQL's default, and unchanged here). The clause was
+    /// read by the parser and dropped, so `ORDER BY due ASC NULLS LAST`
+    /// returned the NULLs first. `false` sorts before `true`: ascending puts
+    /// the rows that have a value first.
+    fn null_placement_key(ascending: bool, nulls_first: Option<bool>) -> Option<bool> {
+        let nulls_first = nulls_first?;
+        (nulls_first != ascending).then_some(!nulls_first)
     }
 
     fn order_by_resolves_against_schema(exprs: &[LogicalExpr], schema: &Schema) -> bool {
@@ -5464,15 +5553,33 @@ impl<'a> Planner<'a> {
             .filter_map(|expr| self.expr_to_logical(expr).ok())
             .collect();
 
+        // A RANGE or GROUPS frame measures along its one ordering key: no
+        // NULL-placement key is added beside it (GH#43).
+        let frame_by_rows = spec_ref
+            .window_frame
+            .as_ref()
+            .is_none_or(|frame| matches!(frame.units, sqlparser::ast::WindowFrameUnits::Rows));
         let order_by: Vec<(LogicalExpr, bool)> = spec_ref
             .order_by
             .iter()
             .filter_map(|order_expr| {
                 self.expr_to_logical(&order_expr.expr).ok().map(|expr| {
                     let ascending = order_expr.asc.unwrap_or(true);
-                    (expr, ascending)
+                    let nulls = Self::null_placement_key(ascending, order_expr.nulls_first)
+                        .filter(|_| frame_by_rows)
+                        .map(|nulls_ascending| {
+                            (
+                                LogicalExpr::IsNull {
+                                    expr: Box::new(expr.clone()),
+                                    is_null: true,
+                                },
+                                nulls_ascending,
+                            )
+                        });
+                    nulls.into_iter().chain(std::iter::once((expr, ascending)))
                 })
             })
+            .flatten()
             .collect();
 
         let frame = spec_ref.window_frame.as_ref().map(|wf| {
