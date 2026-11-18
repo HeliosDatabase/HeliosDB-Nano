@@ -24883,9 +24883,18 @@ impl EmbeddedDatabase {
             // Spec R5.6: the planning's layout epochs.
             let collector = storage::layout_epochs::StampCollector::start();
             let plan_generation = self.storage.schema_generation();
+            // A literal is not a parameter everywhere SQL allows a literal
+            // (`DATE '…'`, `LIKE … ESCAPE '!'`, `INTERVAL '…'`). The normalizer
+            // declines the shapes it knows; for one it does not, an error from
+            // parsing or planning the NORMALIZED text says nothing about the
+            // statement the caller wrote. Decline, and let the raw path give
+            // the answer, or the error in the caller's own words.
             let (statement, _) = match self.parse_cached(&nsql) {
                 Ok(v) => v,
-                Err(e) => return Some(Err(e)),
+                Err(error) => {
+                    tracing::debug!(%error, sql, "normalized text does not parse; taking the raw path");
+                    return None;
+                }
             };
             let catalog = self.storage.catalog();
             let planner = sql::Planner::with_catalog(&catalog)
@@ -24894,7 +24903,10 @@ impl EmbeddedDatabase {
                 .with_search_path(self.current_search_path());
             let plan = match planner.statement_to_plan(statement) {
                 Ok(p) => p,
-                Err(e) => return Some(Err(e)),
+                Err(error) => {
+                    tracing::debug!(%error, sql, "normalized text does not plan; taking the raw path");
+                    return None;
+                }
             };
             let layout = collector.finish();
             let plan = match self.cold_optimizer().optimize_recursive(plan) {

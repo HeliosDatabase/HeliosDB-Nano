@@ -32,6 +32,46 @@
 use crate::sql::Planner;
 use crate::Value;
 
+/// Words after which a single-quoted string in a predicate is an ordinary
+/// value. Any other word directly before the quote (a type name, `ESCAPE`, `N`,
+/// something this lexer has never seen) makes the normalizer decline.
+const WORDS_BEFORE_A_STRING_VALUE: &[&str] = &[
+    "and", "or", "not", "like", "ilike", "between", "then", "else", "when", "case", "where", "from", "to",
+];
+
+/// Is the single-quoted string that opens at `quote` an ordinary value?
+fn string_literal_is_a_value(bytes: &[u8], quote: usize) -> bool {
+    let mut end = quote;
+    while end > 0 && bytes.get(end - 1).is_some_and(u8::is_ascii_whitespace) {
+        end -= 1;
+    }
+    let Some(&before) = end.checked_sub(1).and_then(|at| bytes.get(at)) else {
+        return false;
+    };
+    // `TIMESTAMP(3) '…'`, `VARCHAR(10) '…'`: nothing else puts a string
+    // directly after a closing parenthesis.
+    if before == b')' {
+        return false;
+    }
+    if !(before.is_ascii_alphanumeric() || before == b'_' || before == b'"') {
+        return true; // an operator, a comma, an opening parenthesis
+    }
+    let mut start = end;
+    while start > 0
+        && bytes
+            .get(start - 1)
+            .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
+    {
+        start -= 1;
+    }
+    let Some(word) = bytes.get(start..end) else {
+        return false;
+    };
+    WORDS_BEFORE_A_STRING_VALUE
+        .iter()
+        .any(|known| word.eq_ignore_ascii_case(known.as_bytes()))
+}
+
 /// Attempt to normalize a single SELECT statement's WHERE-predicate literals to
 /// positional parameters. Returns `Some((normalized_sql, params))` when the
 /// rewrite is provably result-preserving, else `None` (caller uses raw SQL).
@@ -80,6 +120,14 @@ pub(crate) fn normalize_select_literals(sql: &str) -> Option<(String, Vec<Value>
         if b == b'\'' {
             let end = skip_single_quoted(bytes, i)?; // index just past closing quote
             if in_where {
+                // A string is not always a value. After a type name it is a
+                // typed literal (`DATE '2024-06-01'`, `INTERVAL '1 year'`,
+                // `TIMESTAMP(3) '…'`, `N'…'`) and after ESCAPE it is syntax:
+                // none of them may become a parameter. Only a string that
+                // follows an operator, or a word known to take a value, does.
+                if !string_literal_is_a_value(bytes, i) {
+                    return None;
+                }
                 // Collapse the doubled-'' escapes to recover the content, then
                 // type it through the planner's own string path.
                 let raw = &sql[i + 1..end - 1]; // between the quotes, may contain ''
@@ -854,6 +902,50 @@ mod tests {
         let (s, p) = norm("SELECT x FROM t WHERE a = 5;").unwrap();
         assert_eq!(s, "SELECT x FROM t WHERE a = $1;");
         assert_eq!(p, vec![Value::Int4(5)]);
+    }
+
+    #[test]
+    fn typed_literals_and_escape_are_not_parameters() {
+        for sql in [
+            "SELECT x FROM t WHERE d > DATE '2024-06-01'",
+            "SELECT x FROM t WHERE d = date '2024-01-02' AND id = 1",
+            "SELECT x FROM t WHERE ts > TIMESTAMP '2024-06-01 00:00:00'",
+            "SELECT x FROM t WHERE ts > TIMESTAMP(3) '2024-06-01 00:00:00'",
+            "SELECT x FROM t WHERE ts > TIMESTAMP WITH TIME ZONE '2024-06-01 00:00:00+00'",
+            "SELECT x FROM t WHERE ts > now() - INTERVAL '1 year'",
+            "SELECT x FROM t WHERE d BETWEEN DATE '2024-01-01' AND DATE '2024-12-31'",
+            "SELECT x FROM t WHERE s LIKE '100!%' ESCAPE '!'",
+            "SELECT x FROM t WHERE s = N'abc'",
+            "SELECT x FROM t WHERE s = unknown_word 'abc'",
+        ] {
+            assert!(norm(sql).is_none(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn a_string_after_an_operator_or_a_value_word_is_a_parameter() {
+        for (sql, normalized) in [
+            ("SELECT x FROM t WHERE name = 'date'", "SELECT x FROM t WHERE name = $1"),
+            (
+                "SELECT x FROM t WHERE date = '2024-01-01'",
+                "SELECT x FROM t WHERE date = $1",
+            ),
+            (
+                "SELECT x FROM t WHERE a = 1 AND 'k' = name",
+                "SELECT x FROM t WHERE a = $1 AND $2 = name",
+            ),
+            (
+                "SELECT x FROM t WHERE NOT 'k' = name",
+                "SELECT x FROM t WHERE NOT $1 = name",
+            ),
+            (
+                "SELECT x FROM t WHERE name ILIKE 'a%'",
+                "SELECT x FROM t WHERE name ILIKE $1",
+            ),
+            ("SELECT x FROM t WHERE name<>'a'", "SELECT x FROM t WHERE name<>$1"),
+        ] {
+            assert_eq!(norm(sql).map(|(text, _)| text).as_deref(), Some(normalized), "{sql}");
+        }
     }
 
     #[test]

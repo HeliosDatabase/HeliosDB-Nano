@@ -149,3 +149,68 @@ fn normalized_reads_are_unaffected_by_another_sessions_open_transaction() {
 
     db.destroy_session(parked).unwrap();
 }
+
+/// A string after a type name is a typed literal, and after `ESCAPE` it is
+/// syntax. The normalizer made each a parameter, and the statement failed to
+/// parse (`Expected: end of statement, found: $1`) outside a transaction while
+/// the same text worked inside one. Each shape must give, outside a
+/// transaction, what it gives inside.
+#[test]
+fn typed_literals_and_escape_read_the_same_outside_a_transaction() {
+    let db = EmbeddedDatabase::new_in_memory().unwrap();
+    db.execute("CREATE TABLE nt (id INT PRIMARY KEY, s TEXT, d DATE, ts TIMESTAMP)")
+        .unwrap();
+    db.execute(
+        "INSERT INTO nt VALUES (1, '100%', '2024-01-02', '2024-01-02 10:00:00'), \
+         (2, '100x', '2024-07-01', '2024-07-01 10:00:00'), (3, 'abc', '2025-03-01', '2025-03-01 10:00:00')",
+    )
+    .unwrap();
+    let ids = |rows: &[heliosdb_nano::Tuple]| -> Vec<i32> {
+        rows.iter()
+            .map(|r| match r.values[0] {
+                Value::Int4(n) => n,
+                ref other => panic!("{other:?}"),
+            })
+            .collect()
+    };
+    // `ESCAPE`: the statement must run and agree with itself. Which rows an
+    // escape character selects is the matcher's business, not this path's.
+    for (sql, expected) in [
+        (
+            "SELECT id FROM nt WHERE d > DATE '2024-06-01' ORDER BY id",
+            Some(vec![2, 3]),
+        ),
+        (
+            "SELECT id FROM nt WHERE d = date '2024-01-02' AND id = 1",
+            Some(vec![1]),
+        ),
+        (
+            "SELECT id FROM nt WHERE ts > TIMESTAMP '2024-06-01 00:00:00' ORDER BY id",
+            Some(vec![2, 3]),
+        ),
+        (
+            "SELECT id FROM nt WHERE ts > '2024-01-01'::timestamp + INTERVAL '1 year' ORDER BY id",
+            Some(vec![3]),
+        ),
+        (
+            "SELECT id FROM nt WHERE d BETWEEN DATE '2024-01-01' AND DATE '2024-12-31' ORDER BY id",
+            Some(vec![1, 2]),
+        ),
+        ("SELECT id FROM nt WHERE s LIKE '100!%' ESCAPE '!' ORDER BY id", None),
+    ] {
+        let (outside, _) = db
+            .query_with_columns(sql)
+            .unwrap_or_else(|error| panic!("outside a transaction: {sql}: {error}"));
+        db.execute("BEGIN").unwrap();
+        let inside = db
+            .query(sql, &[])
+            .unwrap_or_else(|error| panic!("inside a transaction: {sql}: {error}"));
+        db.execute("COMMIT").unwrap();
+        assert_eq!(ids(&outside), ids(&inside), "{sql}");
+        // The embedded read entry point takes the same route.
+        assert_eq!(ids(&db.query(sql, &[]).unwrap()), ids(&inside), "{sql}");
+        if let Some(expected) = expected {
+            assert_eq!(ids(&outside), expected, "{sql}");
+        }
+    }
+}
