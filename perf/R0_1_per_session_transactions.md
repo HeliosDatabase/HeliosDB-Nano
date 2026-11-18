@@ -1,7 +1,7 @@
 # R0.1 — Per-session transactions for wire handlers
 
 **Branch:** `perf/r0-1-session-txns` (worktree `/home/gpc/HDB/Nano-r01`, off `98a868a` v3.37.3)
-**Date:** 2026-06-10 · 32-core EPYC · `--profile perf` · Baseline: `perf/BASELINE_2026_06_10.md`
+**Date:** 2026-06-10 · 32 cores · `--profile perf` · Baseline: `perf/BASELINE_2026_06_10.md`
 **Raw runs:** `perf/baseline_runs/` (before) vs `perf/r0_1_runs/` (after; runs 3/4 are final)
 
 ## What changed

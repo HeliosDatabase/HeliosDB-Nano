@@ -1,7 +1,7 @@
 # HeliosDB-Nano P0/P1/P2 performance work — consolidated report
 
 **Branch:** `perf/p0-p1-p2` (worktree `/home/gpc/HDB/Nano-perf`, off `030948b` v3.33.1)
-**Date:** 2026-05-29 · 32-core EPYC, 125 GiB RAM, XFS-on-`md` (fsync median ~11 ms)
+**Date:** 2026-05-29 · 32 cores, at least 64 GiB RAM (fsync median ~11 ms)
 
 This branch implements the P0/P1/P2 items from the TPS investigation. Each item
 has a detailed comparison file in this directory. Work was split with a concurrent

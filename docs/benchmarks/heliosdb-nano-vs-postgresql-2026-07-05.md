@@ -102,7 +102,7 @@ Comparable order of magnitude (PostgreSQL ~2× faster in absolute ms). The catas
 
 ## Environment & method
 
-- **Host:** 32-core Linux, 125 GiB RAM; shared/multi-tenant during runs (load average swung 2–14). PostgreSQL `18.4-bookworm` container, host networking.
+- **Host:** 32-core Linux, at least 64 GiB RAM; shared/multi-tenant during runs (load average swung 2–14). PostgreSQL `18.4-bookworm` container, host networking.
 - **HeliosDB-Nano:** native host binaries built from `git tag`; `heliosdb-nano start --auth trust --data-dir <fresh>` per version on dedicated ports.
 - **Workloads:** `SELECT 1`; indexed point-read over 50k rows; `COPY` of 10k/50k/100k CSVs; `DROP TABLE` of 100k rows; `nextval`-bound INSERT; durable-commit microbench.
 

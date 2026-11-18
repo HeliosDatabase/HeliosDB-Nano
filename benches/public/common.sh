@@ -99,13 +99,12 @@ stamp_md_header() {
     commit="$(git -C "$ROOT" rev-parse --short HEAD)"
     dirty=""
     [ -n "$(git -C "$ROOT" status --porcelain --untracked-files=no)" ] && dirty="-dirty"
-    cpu="$(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2- | sed 's/^ //' || echo unknown)"
     cat <<EOF
 # $1
 
 - Date (UTC): $(date -u +%Y-%m-%dT%H:%M:%SZ)
 - Commit: \`${commit}${dirty}\`
-- Host: ${cpu}, $(nproc) logical cores, $(awk '/MemTotal/{printf "%.0f GiB RAM", $2/1048576}' /proc/meminfo), $(uname -sr)
+- Host class: $(uname -sm), $(nproc) logical cores, at least $(awk '/MemTotal/{g=$2/1048576; b=1; while (b*2<=g) b*=2; print b}' /proc/meminfo) GiB RAM
 - rustc: $(rustc --version 2>/dev/null || echo unknown)
 EOF
 }

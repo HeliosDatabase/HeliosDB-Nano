@@ -693,7 +693,7 @@ slower, among them `Transaction ctl` 50.1 / 64.4 / 36.3 µs, `UPSERT` 62.4 / 100
 316.4 / 480.6 / 325.3 and `SET/SHOW/RESET` 2.4 / 2.9 / 2.4. The full table is in
 `docs/benchmarks/RELEASE_4_42_0.md`.
 
-- **A transaction's own maps have four shards, not four per CPU** (075b8a51). dashmap gives a map
+- **A transaction's own maps have four shards, not four per CPU** (19db35dd). dashmap gives a map
   four shards per CPU unless told otherwise, 128 on 32 CPUs. A transaction's write set, the
   set of tables it wrote and its write-census sets hold a few keys, yet a commit counted, walked
   and cleared every shard of them several times, and every transaction (each autocommit
@@ -701,24 +701,24 @@ slower, among them `Transaction ctl` 50.1 / 64.4 / 36.3 µs, `UPSERT` 62.4 / 100
   `BEGIN … SAVEPOINT … ROLLBACK TO … COMMIT` 85.8 → 55.5 µs (4.41.1: 55.8), `UPSERT` 129 → 86 µs
   (79), multi-row `INSERT` 311 → 250 µs (203).
 - **The stored values of columns added later are found without walking past their prefix**
-  (54539f44). Before a table scan, 4.42.0 loads the values of columns added after the rows were
+  (e94870fb). Before a table scan, 4.42.0 loads the values of columns added after the rows were
   written (spec R5.2). The seek had no upper bound, and a table with no such values (most tables)
   stepped over every deleted catalog key after its prefix, a cost that grew with every DDL:
   `CREATE INDEX` + `DROP INDEX` 995 → 462 µs (4.41.1: 414).
 - **`DROP TABLE` reads the constraint records it depends on by name while none has changed**
-  (0499c05e). The write gate counts every write of a constraint record; while none has been
+  (88541c08). The write gate counts every write of a constraint record; while none has been
   written since a walk listed the tables that name a foreign key, a DROP reads those records and its
   targets' by name instead of walking every record (and the deleted keys of every table dropped
   before it), and a statement that already holds every table the discovery named no longer makes
   a third one. The records read are still the stored ones. `DROP TABLE` 1,101 → 685 µs (4.41.1:
   644), `CREATE TABLE` + `DROP` 1,494 → 926 µs (804).
-- **The branch gate parses a setting statement only when it names a branch** (d1b77cdf): every
+- **The branch gate parses a setting statement only when it names a branch** (6c0e3c75): every
   `SET`, `SHOW` and `RESET` was parsed twice. The three statements 3.53 → 2.89 µs (4.41.1: 2.17).
-- **The in-memory engine pins its L0 index and filter blocks** (28b77354), as the disk-backed engine
+- **The in-memory engine pins its L0 index and filter blocks** (a27640ef), as the disk-backed engine
   does. An `UPDATE` or `DELETE` of one row opens an iterator to check the row's newest version, and
   once an in-memory store had flushed, each iterator read and decompressed the index blocks of
   every L0 file again: one-row `INSERT` + `DELETE` 55.9 → 45.8 µs.
-- **A memory-only snapshot pass writes its records outside the registry lock** (c6597860), as
+- **A memory-only snapshot pass writes its records outside the registry lock** (6c554c1e), as
   `gc_old_snapshots` was documented to, so writers publishing their snapshots meanwhile do not
   wait for its store work. Running the pass on a thread of its own was measured and not kept: its
   inserts contend with the committing thread's in the same memtable, and a single writer got

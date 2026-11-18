@@ -52,7 +52,10 @@ run as one JSON document: [`results/release-4.42.0/summary.json`](results/releas
 
 Both server binaries and both pg35 harnesses are built with `--release --locked` (LTO, one codegen unit).
 
-The 4.42.0 server binary is the one the release gates built and tested from the same commit. The
+The commit ids above and the label `v4.42.0-2a5d741a` are the ones the run recorded. The branch's
+commit messages were reworded afterwards without changing a file, which gave the same commits new
+ids: `c6597860…` is now `6c554c1ef002`, `2a5d741a` is now `255b19f9` (same trees, same binaries).
+The 4.42.0 server binary is the one the release gates built and tested from that commit. The
 host runs other workloads; each run waits for the 1-minute load to fall below 6 and the releases
 alternate, so the ratios between them are steadier than the absolute numbers.
 

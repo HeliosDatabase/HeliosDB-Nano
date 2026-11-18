@@ -1,6 +1,6 @@
 # P1#6 — Intra-query parallelism (parallel scan decode)
 
-**Branch:** `perf/p0-p1-p2`  ·  machine: 32-core EPYC, in-memory engine
+**Branch:** `perf/p0-p1-p2`  ·  machine: 32 cores, in-memory engine
 
 ## Change
 

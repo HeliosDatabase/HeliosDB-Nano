@@ -2,7 +2,7 @@
   "note": "CI perf-gate baseline: best-of-3 of run_tps_suite (mem, N=1000, M=200) + run_fk_bulk_insert_bench (1000 parents / 2000 children, one txn), rates pre-scaled by 0.5 for slower runners. Regenerate with benches/public/regen_ci_baseline.sh.",
   "generated_at": "2026-07-17T09:12:12+00:00",
   "commit": "45db679-dirty",
-  "host_cpu": "AMD EPYC 7371 16-Core Processor",
+  "host_cpu": "x86_64, 32 logical CPUs",
   "scale_applied": 0.5,
   "threshold_default": 2.5,
   "workloads": {

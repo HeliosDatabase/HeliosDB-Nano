@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """Export a release benchmark run as one machine-readable JSON document.
 
-    benches/public/export_results.py [--platform TEXT] <release-bench-out-dir> [<bench-engines-dir>] > summary.json
+    benches/public/export_results.py [--platform TEXT] [--note TEXT] <release-bench-out-dir> [<bench-engines-dir>] > summary.json
 
 <release-bench-out-dir> is what `benches/public/release_bench.sh` wrote (its `pg35/`,
 `wire/` and `RESULTS.md`); <bench-engines-dir> holds the `run-*.txt` outputs of
 `docs/benchmarks/bench-engines.sh` and, optionally, its `provenance.txt`. `--platform`
-states the hardware class of a run whose report predates the `platform` row.
+states the hardware class of a run whose report predates the `platform` row;
+`--note` adds one sentence to the document.
 
 The document carries every number the run produced, with what identifies it:
 the commits and sha256 of the binaries measured, the toolchain and the PostgreSQL
@@ -185,6 +186,11 @@ def main() -> None:
         at = sys.argv.index("--platform")
         platform = sys.argv[at + 1]
         del sys.argv[at:at + 2]
+    note = None
+    if "--note" in sys.argv:
+        at = sys.argv.index("--note")
+        note = sys.argv[at + 1]
+        del sys.argv[at:at + 2]
     if len(sys.argv) < 2:
         sys.exit(__doc__)
     out = Path(sys.argv[1])
@@ -193,6 +199,7 @@ def main() -> None:
     document = {
         "schema": SCHEMA,
         "produced_by": "benches/public/release_bench.sh",
+        **({"note": note} if note else {}),
         "run": {key: strip_paths(value) for key, value in {**table, **({"platform": platform} if platform else {})}.items()},
         "pg35": pg35(out) if (out / "pg35" / "results.json").exists() else None,
         "wire": wire(out) if (out / "wire" / "results.jsonl").exists() else None,

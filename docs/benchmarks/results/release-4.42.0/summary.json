@@ -1,6 +1,7 @@
 {
  "schema": "heliosdb-nano-release-benchmark/1",
  "produced_by": "benches/public/release_bench.sh",
+ "note": "Commit ids and the label v4.42.0-2a5d741a are as the run recorded them. Commit messages were reworded afterwards without changing a file: c65978604c3a is now 6c554c1ef002 and 2a5d741a is now 255b19f9 (same trees, same binaries).",
  "run": {
   "date (UTC)": "2026-11-18T00:52:12Z",
   "platform": "Linux x86_64, 32 logical CPUs, at least 64 GiB of memory",

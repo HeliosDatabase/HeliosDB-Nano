@@ -34,6 +34,7 @@ benches/external/sqlite_tps_mirror.py):
 import argparse
 import json
 import os
+import platform
 import re
 import subprocess
 import sys
@@ -106,29 +107,27 @@ def _run(cmd):
 
 
 def host_stamp():
-    cpu = "unknown"
-    try:
-        with open("/proc/cpuinfo") as fh:
-            for line in fh:
-                if line.startswith("model name"):
-                    cpu = line.split(":", 1)[1].strip()
-                    break
-    except OSError:
-        pass
-    mem_gb = None
+    """The hardware class of this host, for results meant to be published: the
+    architecture, the number of logical CPUs and a memory class (total memory
+    rounded down to a power of two). Nothing that identifies the machine: no CPU
+    model, no kernel build, no exact memory size."""
+    mem_floor_gb = None
     try:
         with open("/proc/meminfo") as fh:
             for line in fh:
                 if line.startswith("MemTotal"):
-                    mem_gb = round(int(line.split()[1]) / 1048576, 1)
+                    gib = int(line.split()[1]) / 1048576
+                    mem_floor_gb = 1
+                    while mem_floor_gb * 2 <= gib:
+                        mem_floor_gb *= 2
                     break
     except OSError:
         pass
     return {
-        "cpu": cpu,
+        "cpu": platform.machine() or "unknown",
         "logical_cores": os.cpu_count(),
-        "mem_total_gb": mem_gb,
-        "kernel": _run(["uname", "-sr"]),
+        "mem_at_least_gb": mem_floor_gb,
+        "kernel": platform.system(),
         "rustc": _run(["rustc", "--version"]),
         "python": sys.version.split()[0],
     }
@@ -224,7 +223,7 @@ def cmd_baseline(args):
         "note": args.note,
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "commit": git_stamp(),
-        "host_cpu": host_stamp()["cpu"],
+        "host_cpu": "{cpu}, {logical_cores} logical CPUs".format(**host_stamp()),
         "scale_applied": args.scale,
         "threshold_default": args.threshold,
         "workloads": workloads,

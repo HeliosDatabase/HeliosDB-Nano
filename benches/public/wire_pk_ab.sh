@@ -57,8 +57,7 @@ free_port() {
 
 {
     date -u +%FT%TZ
-    uname -srm
-    grep -m1 'model name' /proc/cpuinfo || true
+    uname -sm
     echo "cpus=$(nproc) rounds=$ROUNDS clients=[$CLIENTS] modes=[$MODES] protocols=[$PROTOCOLS]"
     echo "seconds=$SECONDS_PER_RUN warmup=$WARMUP rows=$ROWS server_args=[$SERVER_ARGS]"
     echo "client=$BENCH sha256=$(sha256sum "$BENCH" | cut -d' ' -f1)"

@@ -1,7 +1,7 @@
 # R0.2 — Write-write conflict detection (first-committer-wins)
 
 **Branch:** `perf/r0-2-conflict-detection` (worktree `/home/gpc/HDB/Nano-r01`, off `47ba1a1` v3.38.0)
-**Date:** 2026-06-10 · 32-core EPYC · `--profile perf`
+**Date:** 2026-06-10 · 32 cores · `--profile perf`
 **Baseline:** post-R0.1 numbers (`perf/R0_1_per_session_transactions.md`) + `perf/baseline_runs/conflict_baseline.txt`
 **Raw runs:** `perf/r0_2_runs/` (`*_final*` = quiet-machine runs; earlier files in that dir were taken under
 parallel-agent compile load and are kept only as contamination examples)

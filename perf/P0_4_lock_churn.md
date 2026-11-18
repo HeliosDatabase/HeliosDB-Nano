@@ -1,6 +1,6 @@
 # P0#4 — Reduce per-statement lock churn
 
-**Branch:** `perf/p0-p1-p2`  ·  32-core EPYC, in-memory, 2000-row hot set fully cached
+**Branch:** `perf/p0-p1-p2`  ·  32 cores, in-memory, 2000-row hot set fully cached
 
 ## Done: row-cache read path is now a shared lock
 
