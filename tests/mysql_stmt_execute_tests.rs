@@ -910,3 +910,26 @@ async fn prepared_select_with_session_call_in_where_runs_in_the_engine() {
     let (_cols, rows) = client.execute_query(stmt, &[BinParam::Long(5)]).await;
     assert_eq!(rows.len(), 1, "{rows:?}");
 }
+
+/// v01.1: COM_STMT_EXECUTE of a statement with a leading comment is still
+/// classified by its first keyword, so a SELECT returns its rows.
+#[tokio::test]
+async fn leading_comment_prepared_select_returns_rows() {
+    let db = test_db();
+    db.execute("CREATE TABLE lcp (id INT PRIMARY KEY)").unwrap();
+    db.execute("INSERT INTO lcp VALUES (5), (6)").unwrap();
+    let mut client = MySqlTestClient::connect(Arc::clone(&db)).await;
+
+    for sql in [
+        "/* c */ SELECT id FROM lcp WHERE id = ?",
+        "-- c\nSELECT id FROM lcp WHERE id = ?",
+    ] {
+        let (stmt, n) = client.prepare(sql).await;
+        assert_eq!(n, 1, "{sql:?}");
+        let (_cols, rows) = client.execute_query(stmt, &[BinParam::Long(6)]).await;
+        assert_eq!(rows, vec![vec![WireValue::Int(6)]], "{sql:?}");
+    }
+    let (stmt, _) = client.prepare("/* c */ INSERT INTO lcp VALUES (?)").await;
+    assert_eq!(client.execute_ok(stmt, &[BinParam::Long(7)]).await, 1);
+    assert_eq!(db.query("SELECT id FROM lcp", &[]).unwrap().len(), 3);
+}

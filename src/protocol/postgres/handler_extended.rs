@@ -23,6 +23,28 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
         // `SELECT FROM …` projection shorthand before parsing.
         // See the matching note in `handle_single_query`.
         let query = super::handler::pg_rewrite_empty_projection(&query);
+        // v01.1: store the text from its first keyword on, so every
+        // first-word classification at Execute (transaction control, SET,
+        // row-returning) sees the statement and not a leading comment.
+        let query = super::handler::pg_skip_leading_comments(&query).to_string();
+
+        // A statement that is only comments (or empty) is an empty query:
+        // ParseComplete now, NoData at Describe, EmptyQueryResponse at Execute.
+        if query.trim().is_empty() {
+            self.prepared_statements.store_statement(PreparedStatement {
+                name: statement_name,
+                query: String::new(),
+                param_types: Vec::new(),
+                result_schema: None,
+                cached_plan: None,
+                cached_plan_epoch: 0,
+                cached_plan_layout: crate::storage::LayoutStamp::empty(),
+                is_catalog: Some(false),
+                result_shape: Default::default(),
+            })?;
+            self.send_message(BackendMessage::ParseComplete).await?;
+            return Ok(());
+        }
 
         // sprinter 6bc4a4040eb7 (B1): `USE [DATABASE] BRANCH x` has no
         // sqlparser grammar, so the syntax check below would refuse it at Parse
@@ -354,6 +376,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
             .prepared_statements
             .get_statement(&portal.statement_name)?
             .ok_or_else(|| Error::query_execution(format!("Statement '{}' not found", portal.statement_name)))?;
+
+        if statement.query.trim().is_empty() {
+            self.prepared_statements
+                .update_portal_state(&portal_name, PortalState::Complete)?;
+            self.send_message(BackendMessage::EmptyQueryResponse).await?;
+            return Ok(());
+        }
 
         if self.reject_guarded_standby_statement(&statement.query, true).await? {
             return Ok(());

@@ -13700,3 +13700,261 @@ async fn extended_bound_parameter_casts_to_vector() {
     assert!(err.to_string().contains("dimension"), "{err}");
     let _ = drain(&mut client).await;
 }
+
+// ===========================================================================
+// v01.1: a leading comment does not change the answer, on either protocol
+// ===========================================================================
+
+/// One statement over the extended protocol, Describe(Portal) included and
+/// closed by Sync, so the reply carries RowDescription/NoData, the rows, the
+/// tag and the ReadyForQuery status. A handler error is rendered as text so two
+/// spellings of a statement can be compared even where both are refused.
+fn lc_extended<'a>(
+    handler: &'a mut PgConnectionHandler<DuplexStream>,
+    client: &'a mut DuplexStream,
+    sql: &'a str,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<(u8, Vec<u8>)>> + 'a>> {
+    use super::messages::{DescribeTarget, FrontendMessage};
+    Box::pin(async move {
+        let mut out = Vec::new();
+        for msg in [
+            FrontendMessage::Parse {
+                statement_name: "lc".into(),
+                query: sql.into(),
+                param_types: vec![],
+            },
+            FrontendMessage::Bind {
+                portal_name: "lc_portal".into(),
+                statement_name: "lc".into(),
+                param_formats: vec![],
+                params: vec![],
+                result_formats: vec![],
+            },
+            FrontendMessage::Describe {
+                target: DescribeTarget::Portal,
+                name: "lc_portal".into(),
+            },
+            FrontendMessage::Execute {
+                portal_name: "lc_portal".into(),
+                max_rows: 0,
+            },
+        ] {
+            if let Err(e) = handler.dispatch_message(msg).await {
+                out.push((b'!', e.to_string().into_bytes()));
+                break;
+            }
+        }
+        let _ = handler.dispatch_message(FrontendMessage::Sync).await;
+        out.extend(parse_messages(&drain(client).await));
+        out
+    })
+}
+
+fn lc_fresh() -> (PgConnectionHandler<DuplexStream>, DuplexStream) {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    test_handler(db)
+}
+
+/// Run `setup` then `sql` on a fresh database, simple protocol.
+fn lc_simple_run<'a>(
+    setup: &'a [&'a str],
+    sql: &'a str,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<(u8, Vec<u8>)>> + 'a>> {
+    Box::pin(async move {
+        let (mut handler, mut client) = lc_fresh();
+        for s in setup {
+            wire_setup(&mut handler, &mut client, s).await;
+        }
+        parse_messages(&wire_query(&mut handler, &mut client, sql).await)
+    })
+}
+
+/// Run `setup` then `sql` on a fresh database, extended protocol.
+fn lc_extended_run<'a>(
+    setup: &'a [&'a str],
+    sql: &'a str,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<(u8, Vec<u8>)>> + 'a>> {
+    Box::pin(async move {
+        let (mut handler, mut client) = lc_fresh();
+        for s in setup {
+            wire_setup(&mut handler, &mut client, s).await;
+        }
+        lc_extended(&mut handler, &mut client, sql).await
+    })
+}
+
+fn lc_tags(msgs: &[(u8, Vec<u8>)]) -> Vec<String> {
+    msgs.iter()
+        .filter(|(t, _)| *t == b'C')
+        .map(|(_, p)| String::from_utf8_lossy(p.split(|&b| b == 0).next().unwrap_or(&[])).to_string())
+        .collect()
+}
+
+fn lc_rows(msgs: &[(u8, Vec<u8>)]) -> Vec<Vec<Option<String>>> {
+    msgs.iter()
+        .filter(|(t, _)| *t == b'D')
+        .map(|(_, p)| {
+            decode_data_row(p)
+                .into_iter()
+                .map(|c| c.map(|b| String::from_utf8_lossy(&b).to_string()))
+                .collect()
+        })
+        .collect()
+}
+
+const LC_PREFIXES: [&str; 4] = [
+    "/* route=primary */ ",
+    "-- c\n",
+    "/* a /* b */ c */ ",
+    "/* x */ -- y\n  /* z */\n",
+];
+
+/// The same statement with and without a leading comment gives byte-identical
+/// replies (rows, RowDescription, command tag, ReadyForQuery status) on both
+/// protocol families.
+#[tokio::test]
+#[allow(clippy::expect_used, clippy::large_futures)]
+async fn leading_comment_gives_the_uncommented_answer_on_both_protocols() {
+    let setup: &[&str] = &[
+        "CREATE TABLE lc (id INT PRIMARY KEY, v INT)",
+        "INSERT INTO lc VALUES (1, 10), (2, 20)",
+        "CREATE SCHEMA s",
+    ];
+    // (statement, must the plain form succeed on both protocols)
+    let cases: &[(&str, bool)] = &[
+        ("SELECT 2 AS n", true),
+        ("WITH x AS (SELECT 1 AS a) SELECT * FROM x", true),
+        ("INSERT INTO lc VALUES (3, 30)", true),
+        ("UPDATE lc SET v = 11 WHERE id = 1", true),
+        ("DELETE FROM lc WHERE id = 1", true),
+        ("UPDATE lc SET v = 12 WHERE id = 1 RETURNING id", true),
+        ("SET search_path TO s", true),
+        ("SHOW server_version", true),
+        ("DISCARD ALL", false),
+        ("DO $$ BEGIN INSERT INTO lc VALUES (4, 40); END $$", false),
+        ("BEGIN", true),
+    ];
+    for (plain, must_succeed) in cases {
+        let simple_plain = lc_simple_run(setup, plain).await;
+        let ext_plain = lc_extended_run(setup, plain).await;
+        if *must_succeed {
+            assert!(
+                !simple_plain.iter().any(|(t, _)| *t == b'E'),
+                "plain simple `{plain}` errored: {simple_plain:?}"
+            );
+            assert!(
+                !ext_plain.iter().any(|(t, _)| *t == b'E' || *t == b'!'),
+                "plain extended `{plain}` errored: {ext_plain:?}"
+            );
+        }
+        for prefix in LC_PREFIXES {
+            let commented = format!("{prefix}{plain}");
+            let simple = lc_simple_run(setup, &commented).await;
+            assert_eq!(simple, simple_plain, "simple: {commented:?}");
+            let ext = lc_extended_run(setup, &commented).await;
+            assert_eq!(ext, ext_plain, "extended: {commented:?}");
+        }
+    }
+
+    // The pins the brief names, spelled out.
+    let out = lc_simple_run(setup, "/* route=primary */ SELECT 2 AS n").await;
+    assert_eq!(lc_rows(&out), vec![vec![Some("2".to_string())]]);
+    assert_eq!(lc_tags(&out), vec!["SELECT 1".to_string()]);
+    let out = lc_extended_run(setup, "/* route=primary */ SELECT 2 AS n").await;
+    assert_eq!(lc_rows(&out), vec![vec![Some("2".to_string())]]);
+    assert_eq!(lc_tags(&out), vec!["SELECT 1".to_string()]);
+    let out = lc_simple_run(setup, "/* c */ INSERT INTO lc VALUES (3, 30)").await;
+    assert_eq!(lc_tags(&out), vec!["INSERT 0 1".to_string()]);
+    let out = lc_extended_run(setup, "/* c */ UPDATE lc SET v = 12 WHERE id = 1 RETURNING id").await;
+    assert_eq!(lc_rows(&out), vec![vec![Some("1".to_string())]]);
+    assert_eq!(lc_tags(&out), vec!["UPDATE 1".to_string()]);
+}
+
+/// `/* c */ BEGIN` opens the CLIENT's transaction (ReadyForQuery 'T'), the
+/// INSERT inside it is undone by `/* c */ ROLLBACK`, and a second connection
+/// can still BEGIN — i.e. the comment did not open the engine's global block
+/// behind the connection's back.
+#[tokio::test]
+#[allow(clippy::expect_used, clippy::large_futures)]
+async fn commented_begin_and_rollback_drive_the_connection_transaction() {
+    for extended in [false, true] {
+        let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+        let (mut h1, mut c1) = test_handler(Arc::clone(&db));
+        let (mut h2, mut c2) = test_handler(Arc::clone(&db));
+        wire_setup(&mut h1, &mut c1, "CREATE TABLE lt (id INT PRIMARY KEY)").await;
+
+        let begin = "/* c */ BEGIN";
+        let out = if extended {
+            lc_extended(&mut h1, &mut c1, begin).await
+        } else {
+            parse_messages(&wire_query(&mut h1, &mut c1, begin).await)
+        };
+        let status: Vec<u8> = out
+            .iter()
+            .filter(|(t, _)| *t == b'Z')
+            .filter_map(|(_, p)| p.first().copied())
+            .collect();
+        assert_eq!(status, vec![b'T'], "extended={extended}: {out:?}");
+
+        let out = if extended {
+            lc_extended(&mut h1, &mut c1, "-- c\nINSERT INTO lt VALUES (1)").await
+        } else {
+            parse_messages(&wire_query(&mut h1, &mut c1, "-- c\nINSERT INTO lt VALUES (1)").await)
+        };
+        assert_eq!(lc_tags(&out), vec!["INSERT 0 1".to_string()], "extended={extended}");
+
+        // A second connection is not blocked by a global block the comment opened.
+        let out = parse_messages(&wire_query(&mut h2, &mut c2, "BEGIN").await);
+        assert!(!out.iter().any(|(t, _)| *t == b'E'), "second BEGIN failed: {out:?}");
+        let _ = wire_query(&mut h2, &mut c2, "ROLLBACK").await;
+
+        let out = if extended {
+            lc_extended(&mut h1, &mut c1, "/* c */ ROLLBACK").await
+        } else {
+            parse_messages(&wire_query(&mut h1, &mut c1, "/* c */ ROLLBACK").await)
+        };
+        let status: Vec<u8> = out
+            .iter()
+            .filter(|(t, _)| *t == b'Z')
+            .filter_map(|(_, p)| p.first().copied())
+            .collect();
+        assert_eq!(status, vec![b'I'], "extended={extended}: {out:?}");
+
+        let out = parse_messages(&wire_query(&mut h1, &mut c1, "SELECT id FROM lt").await);
+        assert!(
+            lc_rows(&out).is_empty(),
+            "the rolled-back row must be absent (extended={extended})"
+        );
+    }
+}
+
+/// A statement that is only comments is an empty query: EmptyQueryResponse on
+/// the simple protocol; ParseComplete, BindComplete, NoData,
+/// EmptyQueryResponse on the extended one.
+#[tokio::test]
+#[allow(clippy::expect_used, clippy::large_futures)]
+async fn comment_only_statement_is_an_empty_query_on_both_protocols() {
+    for sql in ["-- only a comment", "/* only */", "/* a /* nested */ b */ -- x\n"] {
+        let out = lc_simple_run(&[], sql).await;
+        let types: Vec<u8> = out.iter().map(|(t, _)| *t).collect();
+        assert_eq!(types, vec![b'I', b'Z'], "simple {sql:?}: {out:?}");
+        let out = lc_extended_run(&[], sql).await;
+        let types: Vec<u8> = out.iter().map(|(t, _)| *t).collect();
+        assert_eq!(types, vec![b'1', b'2', b'n', b'I', b'Z'], "extended {sql:?}: {out:?}");
+    }
+}
+
+/// The PG wire's comment skipper and statement splitter nest block comments as
+/// PostgreSQL does; an unterminated comment leaves nothing.
+#[test]
+fn pg_comment_scanners_nest_block_comments() {
+    use super::handler::{pg_skip_leading_comments, pg_split_sql_respecting_quotes};
+    assert_eq!(pg_skip_leading_comments("/* a /* b */ c */ SELECT 1"), "SELECT 1");
+    assert_eq!(pg_skip_leading_comments("/* a /* b */ c"), "");
+    assert_eq!(pg_skip_leading_comments("-- x\n/* y */SELECT 1"), "SELECT 1");
+    assert_eq!(pg_skip_leading_comments("SELECT 1"), "SELECT 1");
+    assert_eq!(
+        pg_split_sql_respecting_quotes("/* a /* ; */ ; */ SELECT 1; SELECT 2"),
+        vec!["/* a /* ; */ ; */ SELECT 1".to_string(), "SELECT 2".to_string()]
+    );
+}

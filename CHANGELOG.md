@@ -60,6 +60,15 @@ Reports from users of earlier releases (GitHub numbers) and defects found while 
   `{..}` form, SQL arrays and bound parameters of text or array type; a bare `::vector` takes the
   dimension from the value and `::vector(N)` refuses a different length. Both statement families and
   the extended protocol are pinned in `tests/vector_cast_params.rs` and `wire_tests.rs`.
+- **A comment before a statement changed its answer on the PostgreSQL and MySQL wires.** The
+  wire handlers decided by the first word, so `/* route=primary */ SELECT 2` got a tag and no
+  rows, `/* c */ INSERT` the wrong tag, and `/* c */ BEGIN` was not seen as BEGIN: the
+  connection stayed idle while the statement went to the engine. Leading `/* … */` and `-- …`
+  comments (and `# …` on MySQL) are now skipped before the statement is classified, on the simple
+  and extended PostgreSQL protocols and on MySQL COM_QUERY and COM_STMT_EXECUTE; the PostgreSQL
+  wire nests block comments as PostgreSQL does, and a statement that is only comments is an empty
+  query. `src/protocol/postgres/wire_tests.rs` (leading-comment tests),
+  `tests/mysql_wire_hygiene_batch_d.rs`, `tests/mysql_stmt_execute_tests.rs`.
 - **`ORDER BY … NULLS FIRST / NULLS LAST` was ignored (GitHub #43).** The clause was read and
   dropped: `ORDER BY due ASC NULLS LAST` returned the NULLs first. An explicit placement is now
   obeyed, in a query, over `GROUP BY`, over a set operation, under `LIMIT` and in a window's

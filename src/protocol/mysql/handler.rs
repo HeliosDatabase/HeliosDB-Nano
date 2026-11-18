@@ -1900,7 +1900,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
         } else if translated != raw_sql {
             debug!("MySQL→PG: {}", &sql[..sql.len().min(200)]);
         }
-        let trimmed = sql.trim();
+        // v01.1: classify (and run) from the first keyword, past any leading
+        // comment, so `/* c */ SELECT 2` returns its result set.
+        let trimmed = super::translator::skip_leading_comments(sql).trim();
         if trimmed.is_empty() {
             return self.send_ok(0, 0).await;
         }
@@ -3486,7 +3488,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
             Vec::new()
         };
 
-        let trimmed = stmt.param_sql.trim();
+        let trimmed = super::translator::skip_leading_comments(&stmt.param_sql).trim();
         let is_row_returning = starts_with_icase(trimmed, "SELECT")
             || starts_with_icase(trimmed, "WITH")
             || starts_with_icase(trimmed, "VALUES")

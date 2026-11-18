@@ -347,6 +347,17 @@ fn comment_len(rest: &str, prev: Option<char>) -> Option<usize> {
     line_comment.then(|| rest.find('\n').unwrap_or(rest.len()))
 }
 
+/// Skip the leading `/* … */`, `-- …` and `# …` comments of a statement so its
+/// first keyword can be classified. MySQL block comments do not nest; the
+/// comment boundaries are exactly the ones [`comment_len`] recognises.
+pub fn skip_leading_comments(sql: &str) -> &str {
+    let mut rest = sql.trim_start();
+    while let Some(len) = comment_len(rest, None) {
+        rest = rest.get(len..).unwrap_or("").trim_start();
+    }
+    rest
+}
+
 /// Append the placeholder for region `index` to `out`.
 ///
 /// Encoding: `U+E000`, the decimal index with digit `d` written as

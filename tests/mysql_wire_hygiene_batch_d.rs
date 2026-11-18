@@ -527,3 +527,41 @@ async fn ddl_in_a_transaction_commits_it_first_as_mysql_does() {
         "rolled back"
     );
 }
+
+// ===========================================================================
+// v01.1: a leading comment does not change the answer on COM_QUERY
+// ===========================================================================
+
+/// `/* c */ SELECT 2` used to be classified by its first word `/*`, sent to the
+/// DML path and answered with an OK packet instead of a result set.
+#[tokio::test]
+async fn leading_comment_keeps_the_statement_class_on_com_query() {
+    let mut c = MySqlTestClient::login(test_db()).await;
+    for sql in [
+        "/* route=primary */ SELECT 2",
+        "-- c\nSELECT 2",
+        "# c\nSELECT 2",
+        "/* a */ -- b\n/* c */ SELECT 2",
+    ] {
+        assert_eq!(c.scalar(sql).await, "2", "{sql:?}");
+    }
+    c.ok("CREATE TABLE lc (id INT PRIMARY KEY, v INT)").await;
+    let (affected, _) = c.ok_insert("/* c */ INSERT INTO lc VALUES (1, 10)").await;
+    assert_eq!(affected, 1);
+    let (affected, _) = c.ok_insert("-- c\nUPDATE lc SET v = 11 WHERE id = 1").await;
+    assert_eq!(affected, 1);
+
+    // A commented BEGIN opens the client's transaction; ROLLBACK undoes it.
+    let status = c.ok("/* c */ BEGIN").await;
+    assert_ne!(
+        status & SERVER_STATUS_IN_TRANS,
+        0,
+        "commented BEGIN must open a transaction"
+    );
+    c.ok_insert("INSERT INTO lc VALUES (2, 20)").await;
+    let status = c.ok("/* c */ ROLLBACK").await;
+    assert_eq!(status & SERVER_STATUS_IN_TRANS, 0);
+    assert_eq!(c.scalar("SELECT COUNT(*) FROM lc").await, "1");
+    // A comment-only statement is an empty statement: OK, no error.
+    c.ok("/* only a comment */").await;
+}

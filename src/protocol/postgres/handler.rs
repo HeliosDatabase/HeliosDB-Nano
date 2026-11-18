@@ -2714,6 +2714,13 @@ where
     // SAFETY: results[0] is guarded by !results.is_empty() check.
     #[allow(clippy::indexing_slicing)]
     pub(super) async fn handle_single_query(&mut self, query: &str) -> Result<()> {
+        tracing::debug!("Simple query: {}", query);
+        // v01.1: every classification below reads the first word, so a leading
+        // `/* … */` or `-- …` comment (Hibernate use_sql_comments, EF Core
+        // TagWith, proxy route hints) must not hide it. The comment is dropped
+        // here, once, for classification and execution alike; a statement that
+        // is only comments becomes empty and is answered EmptyQueryResponse.
+        let query = pg_skip_leading_comments(query);
         if self.reject_guarded_standby_statement(query, false).await? {
             return Ok(());
         }
@@ -5683,16 +5690,27 @@ pub(crate) fn pg_split_sql_respecting_quotes(sql: &str) -> Vec<String> {
         if b == b'/' && bytes.get(i + 1) == Some(&b'*') {
             current.push_str("/*");
             i += 2;
-            // Non-recursive, matching `pg_skip_leading_comments`: PostgreSQL
-            // nests block comments, this stops at the first `*/`. An
-            // unterminated comment consumes the rest of the input, which is
-            // what PostgreSQL does with it too.
+            // Nested, matching `pg_skip_leading_comments` and PostgreSQL:
+            // `/* a /* b */ ; */` is one comment. An unterminated comment
+            // consumes the rest of the input, which is what PostgreSQL does
+            // with it too.
+            let mut depth = 1usize;
             loop {
                 let Some(&c) = bytes.get(i) else { break };
+                if c == b'/' && bytes.get(i + 1) == Some(&b'*') {
+                    current.push_str("/*");
+                    i += 2;
+                    depth += 1;
+                    continue;
+                }
                 if c == b'*' && bytes.get(i + 1) == Some(&b'/') {
                     current.push_str("*/");
                     i += 2;
-                    break;
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                    continue;
                 }
                 i += copy_char(sql, i, &mut current);
             }
@@ -5762,11 +5780,11 @@ fn pg_stmt_is_only_comment(stmt: &str) -> bool {
 /// Skip the leading `-- …` / `/* … */` comments of a statement so the first
 /// real keyword can be read.
 ///
-/// Block comments are matched NON-recursively (PostgreSQL nests them). The
-/// failure mode of that simplification is benign: a nested comment leaves the
-/// scan inside the comment text, where an unrecognised first word classifies as
-/// "may write" — i.e. it falls back to opening the implicit block, the
-/// behaviour that was unconditional before this classifier existed.
+/// Block comments nest, as in PostgreSQL: `/* a /* b */ c */` is one comment.
+/// An unterminated comment leaves nothing (""), so a comment-only or
+/// unterminated statement reads as empty. This is the PG wire's own rule; the
+/// shared parser (also used by the MySQL wire and the SQLite dialect, which do
+/// not nest) is left alone.
 pub(crate) fn pg_skip_leading_comments(stmt: &str) -> &str {
     let mut rest = stmt.trim_start();
     loop {
@@ -5776,17 +5794,38 @@ pub(crate) fn pg_skip_leading_comments(stmt: &str) -> &str {
                 // A `-- …` comment with no newline is the whole statement.
                 None => "",
             };
-        } else if let Some(after) = rest.strip_prefix("/*") {
-            rest = match after.find("*/") {
-                Some(close) => after.get(close + 2..).unwrap_or(""),
-                // Unterminated: nothing after it can be a keyword.
-                None => "",
-            };
+        } else if rest.starts_with("/*") {
+            // Unterminated: nothing after it can be a keyword.
+            rest = rest.get(pg_block_comment_len(rest)..).unwrap_or("");
         } else {
             return rest;
         }
         rest = rest.trim_start();
     }
+}
+
+/// Byte length of the (possibly nested) block comment that `s` starts with
+/// (`s` must start with `/*`). An unterminated comment runs to the end.
+fn pg_block_comment_len(s: &str) -> usize {
+    let bytes = s.as_bytes();
+    let mut depth = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let pair = (bytes.get(i).copied(), bytes.get(i + 1).copied());
+        if pair == (Some(b'/'), Some(b'*')) {
+            depth += 1;
+            i += 2;
+        } else if pair == (Some(b'*'), Some(b'/')) {
+            depth = depth.saturating_sub(1);
+            i += 2;
+            if depth == 0 {
+                return i;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    bytes.len()
 }
 
 #[inline]
