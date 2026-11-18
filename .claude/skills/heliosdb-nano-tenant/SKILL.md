@@ -154,6 +154,7 @@ Limits per plan are at `src/tenant/mod.rs:494–510` (`ResourceLimits`); they're
 - **Plan deletion auto-downgrades.** If you delete the `pro` plan, every tenant on `pro` gets moved to the next-lower tier (`starter`). Read the cascade rules at `src/tenant/mod.rs:169+` (`PlanManager`) before deleting plans in production.
 - **`CREATE DATABASE` SQL DDL is not yet wired** to the tenant API as of v3.23.0 (tracked as dashboard-migration Bug 1). Until that lands, use `\tenant create … db` (REPL) or the library API.
 - **`current_tenant()` returns NULL when no context is set.** RLS predicates against NULL behave per SQL three-valued logic — typically meaning "no rows visible". For an unauthenticated public path, set a sentinel tenant or skip the policy on those tables.
+- **Where a read policy applies.** From 4.42.0, on every reference of the table in a statement: plain reads, joins, views, derived tables, `UNION` / `INTERSECT` / `EXCEPT`, CTEs, `IN` / `EXISTS` / scalar subqueries anywhere in the query, `INSERT … SELECT` and `CREATE TABLE AS` sources, and subqueries in `UPDATE … SET`. Not to a **materialized view's** stored rows (as in PostgreSQL): do not build one over a protected table for tenants to read.
 - **Cross-tenant queries.** RLS prevents them by default. Admin/reporting workflows that need cross-tenant aggregation must run as a privileged role that bypasses RLS — there is no per-query bypass syntax.
 
 ## See also

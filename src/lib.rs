@@ -11856,6 +11856,22 @@ impl EmbeddedDatabase {
                 // whether `tuples` holds one row or the whole table.
                 let rls_guard = self.build_rls_write_guard(table_name, "UPDATE", &schema)?;
 
+                // v05.6: a subquery in `SET col = (SELECT … FROM protected …)` is
+                // evaluated outside the plan rewrite, so apply read policies to its
+                // plan here, once per statement. Without a tenant context the
+                // assignments are used as planned.
+                let rls_assignments = if self.has_effective_tenant_context() {
+                    Some(
+                        assignments
+                            .iter()
+                            .map(|(col, expr)| Ok((col.clone(), self.apply_rls_to_expr(expr.clone())?)))
+                            .collect::<Result<Vec<_>>>()?,
+                    )
+                } else {
+                    None
+                };
+                let assignments = rls_assignments.as_ref().unwrap_or(assignments);
+
                 // Try PK point lookup optimization: if WHERE is `pk_col = literal`,
                 // fetch only the matching row instead of scanning the entire table.
                 // Skip optimization on non-main branches: branch-inherited rows are stored
@@ -23558,6 +23574,21 @@ impl EmbeddedDatabase {
                 // RLS (ROADMAP_V5 §1.1): same helpers as the text family's Update arm.
                 // Once per statement, before the row loop.
                 let rls_guard = self.build_rls_write_guard(table_name, "UPDATE", &schema)?;
+                // v05.6: a subquery in `SET col = (SELECT … FROM protected …)` is
+                // evaluated outside the plan rewrite, so apply read policies to its
+                // plan here, once per statement. Without a tenant context the
+                // assignments are used as planned.
+                let rls_assignments = if self.has_effective_tenant_context() {
+                    Some(
+                        assignments
+                            .iter()
+                            .map(|(col, expr)| Ok((col.clone(), self.apply_rls_to_expr(expr.clone())?)))
+                            .collect::<Result<Vec<_>>>()?,
+                    )
+                } else {
+                    None
+                };
+                let assignments = rls_assignments.as_ref().unwrap_or(assignments);
 
                 let mut _txn_guard = None;
                 let active_txn: Option<&storage::Transaction> = match session_txn {
@@ -33817,8 +33848,8 @@ impl EmbeddedDatabase {
             }
 
             sql::LogicalPlan::Filter { input, predicate } => Ok(sql::LogicalPlan::Filter {
-                input: Box::new(self.apply_rls_to_plan_recursive(*input)?),
-                predicate,
+                input: self.apply_rls_to_boxed_plan(input)?,
+                predicate: self.apply_rls_to_expr(predicate)?,
             }),
 
             sql::LogicalPlan::Project {
@@ -33829,11 +33860,11 @@ impl EmbeddedDatabase {
                 distinct_on,
                 source_alias,
             } => Ok(sql::LogicalPlan::Project {
-                input: Box::new(self.apply_rls_to_plan_recursive(*input)?),
-                exprs,
+                input: self.apply_rls_to_boxed_plan(input)?,
+                exprs: self.apply_rls_to_exprs(exprs)?,
                 aliases,
                 distinct,
-                distinct_on,
+                distinct_on: distinct_on.map(|d| self.apply_rls_to_exprs(d)).transpose()?,
                 source_alias,
             }),
 
@@ -33843,10 +33874,10 @@ impl EmbeddedDatabase {
                 aggr_exprs,
                 having,
             } => Ok(sql::LogicalPlan::Aggregate {
-                input: Box::new(self.apply_rls_to_plan_recursive(*input)?),
-                group_by,
-                aggr_exprs,
-                having,
+                input: self.apply_rls_to_boxed_plan(input)?,
+                group_by: self.apply_rls_to_exprs(group_by)?,
+                aggr_exprs: self.apply_rls_to_exprs(aggr_exprs)?,
+                having: self.apply_rls_to_opt_expr(having)?,
             }),
 
             sql::LogicalPlan::Join {
@@ -33856,16 +33887,16 @@ impl EmbeddedDatabase {
                 on,
                 lateral,
             } => Ok(sql::LogicalPlan::Join {
-                left: Box::new(self.apply_rls_to_plan_recursive(*left)?),
-                right: Box::new(self.apply_rls_to_plan_recursive(*right)?),
+                left: self.apply_rls_to_boxed_plan(left)?,
+                right: self.apply_rls_to_boxed_plan(right)?,
                 join_type,
-                on,
+                on: self.apply_rls_to_opt_expr(on)?,
                 lateral,
             }),
 
             sql::LogicalPlan::Sort { input, exprs, asc } => Ok(sql::LogicalPlan::Sort {
-                input: Box::new(self.apply_rls_to_plan_recursive(*input)?),
-                exprs,
+                input: self.apply_rls_to_boxed_plan(input)?,
+                exprs: self.apply_rls_to_exprs(exprs)?,
                 asc,
             }),
 
@@ -33876,7 +33907,7 @@ impl EmbeddedDatabase {
                 limit_param,
                 offset_param,
             } => Ok(sql::LogicalPlan::Limit {
-                input: Box::new(self.apply_rls_to_plan_recursive(*input)?),
+                input: self.apply_rls_to_boxed_plan(input)?,
                 limit,
                 offset,
                 limit_param,
@@ -33892,6 +33923,9 @@ impl EmbeddedDatabase {
                 predicate,
                 as_of,
             } => {
+                // A pushed-down predicate may itself hold a subquery over a
+                // protected table (`WHERE id IN (SELECT … FROM docs)`).
+                let predicate = self.apply_rls_to_opt_expr(predicate)?;
                 // Same rule, same parse (see `rls_read_predicate`): the policy
                 // becomes part of this scan's own predicate. AND-merged with
                 // any predicate already pushed here by the optimizer.
@@ -33928,9 +33962,323 @@ impl EmbeddedDatabase {
                 })
             }
 
-            // For plans that don't contain Scan operators, return as-is
-            other => Ok(other),
+            // Set operations: a policy applies to the relation on either side
+            // (v05.6; before, both inputs were returned unfiltered).
+            sql::LogicalPlan::Union { left, right, all } => Ok(sql::LogicalPlan::Union {
+                left: self.apply_rls_to_boxed_plan(left)?,
+                right: self.apply_rls_to_boxed_plan(right)?,
+                all,
+            }),
+            sql::LogicalPlan::Intersect { left, right, all } => Ok(sql::LogicalPlan::Intersect {
+                left: self.apply_rls_to_boxed_plan(left)?,
+                right: self.apply_rls_to_boxed_plan(right)?,
+                all,
+            }),
+            sql::LogicalPlan::Except { left, right, all } => Ok(sql::LogicalPlan::Except {
+                left: self.apply_rls_to_boxed_plan(left)?,
+                right: self.apply_rls_to_boxed_plan(right)?,
+                all,
+            }),
+
+            // Every CTE body and the main query.
+            sql::LogicalPlan::With { ctes, query, recursive } => Ok(sql::LogicalPlan::With {
+                ctes: ctes
+                    .into_iter()
+                    .map(|(name, plan, columns)| Ok((name, self.apply_rls_to_boxed_plan(plan)?, columns)))
+                    .collect::<Result<Vec<_>>>()?,
+                query: self.apply_rls_to_boxed_plan(query)?,
+                recursive,
+            }),
+
+            // EXPLAIN ANALYZE runs its input; plain EXPLAIN shows the plan that
+            // would run, which is the filtered one.
+            sql::LogicalPlan::Explain { input, options } => Ok(sql::LogicalPlan::Explain {
+                input: self.apply_rls_to_boxed_plan(input)?,
+                options,
+            }),
+
+            sql::LogicalPlan::TableFunction {
+                function_name,
+                args,
+                alias,
+                column_alias,
+            } => Ok(sql::LogicalPlan::TableFunction {
+                function_name,
+                args: self.apply_rls_to_exprs(args)?,
+                alias,
+                column_alias,
+            }),
+
+            // Not reached nested (their sources are rewritten at the call sites),
+            // given arms so the match stays exhaustive and a direct call is
+            // still correct.
+            sql::LogicalPlan::InsertSelect {
+                table_name,
+                columns,
+                source,
+                returning,
+            } => Ok(sql::LogicalPlan::InsertSelect {
+                table_name,
+                columns,
+                source: self.apply_rls_to_boxed_plan(source)?,
+                returning,
+            }),
+            sql::LogicalPlan::CreateTableAs {
+                name,
+                column_names,
+                if_not_exists,
+                query,
+                with_data,
+            } => Ok(sql::LogicalPlan::CreateTableAs {
+                name,
+                column_names,
+                if_not_exists,
+                query: self.apply_rls_to_boxed_plan(query)?,
+                with_data,
+            }),
+
+            // Nodes that read no table through this rewrite. Listed by name, with
+            // no wildcard, so a new plan-bearing variant fails to compile until
+            // it is classified. Notes on the less obvious members:
+            //   * Update / Delete / Insert: read policies on their own target
+            //     are write guards (`build_rls_write_guard`); the subqueries in
+            //     UPDATE … SET are rewritten in the Update executor arms.
+            //   * Prepare: the stored statement is rewritten when EXECUTE runs it
+            //     under the executing session's context, never baked in here.
+            //   * CreateView / CreateMaterializedView / CreateTrigger: stored
+            //     definitions; a view is filtered when it is expanded in a read,
+            //     a materialized view's stored rows are not (as in PostgreSQL).
+            plan @ (sql::LogicalPlan::Insert { .. }
+            | sql::LogicalPlan::CreateTable { .. }
+            | sql::LogicalPlan::DropTable { .. }
+            | sql::LogicalPlan::DropMulti { .. }
+            | sql::LogicalPlan::Truncate { .. }
+            | sql::LogicalPlan::Update { .. }
+            | sql::LogicalPlan::Delete { .. }
+            | sql::LogicalPlan::CreateIndex { .. }
+            | sql::LogicalPlan::CreateSequence { .. }
+            | sql::LogicalPlan::DropSequence { .. }
+            | sql::LogicalPlan::AlterSequence(_)
+            | sql::LogicalPlan::CreateEnumType { .. }
+            | sql::LogicalPlan::DropEnumType { .. }
+            | sql::LogicalPlan::CreateSchema { .. }
+            | sql::LogicalPlan::DropSchema { .. }
+            | sql::LogicalPlan::CreateExtension { .. }
+            | sql::LogicalPlan::CreateDatabase { .. }
+            | sql::LogicalPlan::DropDatabase { .. }
+            | sql::LogicalPlan::DropExtension { .. }
+            | sql::LogicalPlan::AlterColumnStorage { .. }
+            | sql::LogicalPlan::AlterTableAddColumn { .. }
+            | sql::LogicalPlan::AlterTableDropColumn { .. }
+            | sql::LogicalPlan::AlterTableRenameColumn { .. }
+            | sql::LogicalPlan::AlterTableAlterColumnNullability { .. }
+            | sql::LogicalPlan::AlterTableRename { .. }
+            | sql::LogicalPlan::AlterTableSetSchema { .. }
+            | sql::LogicalPlan::AlterTableAddForeignKey { .. }
+            | sql::LogicalPlan::AlterTableAlterConstraintEnforcement { .. }
+            | sql::LogicalPlan::AlterTableDropConstraint { .. }
+            | sql::LogicalPlan::AlterTableMulti { .. }
+            | sql::LogicalPlan::CreateBranch { .. }
+            | sql::LogicalPlan::DropBranch { .. }
+            | sql::LogicalPlan::MergeBranch { .. }
+            | sql::LogicalPlan::UseBranch { .. }
+            | sql::LogicalPlan::ShowBranches
+            | sql::LogicalPlan::CreateMaterializedView { .. }
+            | sql::LogicalPlan::RefreshMaterializedView { .. }
+            | sql::LogicalPlan::DropMaterializedView { .. }
+            | sql::LogicalPlan::AlterMaterializedView { .. }
+            | sql::LogicalPlan::CreateView { .. }
+            | sql::LogicalPlan::DropView { .. }
+            | sql::LogicalPlan::SystemView { .. }
+            | sql::LogicalPlan::CreateTrigger { .. }
+            | sql::LogicalPlan::DropTrigger { .. }
+            | sql::LogicalPlan::StartTransaction
+            | sql::LogicalPlan::Commit
+            | sql::LogicalPlan::Rollback
+            | sql::LogicalPlan::Savepoint { .. }
+            | sql::LogicalPlan::ReleaseSavepoint { .. }
+            | sql::LogicalPlan::RollbackToSavepoint { .. }
+            | sql::LogicalPlan::Prepare { .. }
+            | sql::LogicalPlan::Execute { .. }
+            | sql::LogicalPlan::Deallocate { .. }
+            | sql::LogicalPlan::SetConstraints { .. }
+            | sql::LogicalPlan::CreateFunction { .. }
+            | sql::LogicalPlan::CreateProcedure { .. }
+            | sql::LogicalPlan::DropFunction { .. }
+            | sql::LogicalPlan::DropProcedure { .. }
+            | sql::LogicalPlan::Call { .. }
+            | sql::LogicalPlan::DualScan
+            | sql::LogicalPlan::Noop
+            | sql::LogicalPlan::DropRole { .. }
+            | sql::LogicalPlan::CreateRole { .. }
+            | sql::LogicalPlan::AlterRole { .. }
+            | sql::LogicalPlan::GrantPrivileges { .. }
+            | sql::LogicalPlan::RevokePrivileges { .. }
+            | sql::LogicalPlan::DropIndex { .. }
+            | sql::LogicalPlan::AlterTableAddUnique { .. }
+            | sql::LogicalPlan::AlterTableAddPrimaryKey { .. }
+            | sql::LogicalPlan::AlterTableAddCheck { .. }
+            | sql::LogicalPlan::DropTableCascade { .. }) => Ok(plan),
+
+            #[cfg(feature = "ha-tier1")]
+            plan @ (sql::LogicalPlan::Switchover { .. }
+            | sql::LogicalPlan::SwitchoverCheck { .. }
+            | sql::LogicalPlan::ClusterStatus
+            | sql::LogicalPlan::SetNodeAlias { .. }
+            | sql::LogicalPlan::ShowTopology) => Ok(plan),
         }
+    }
+
+    /// Apply read policies to every plan embedded in `expr` (scalar, IN and
+    /// EXISTS subqueries, at any depth). The owning counterpart of the
+    /// executor's read-only `walk_expr_subplans`: the expression tree is rebuilt
+    /// unchanged except that each embedded plan goes through
+    /// [`apply_rls_to_plan_recursive`](Self::apply_rls_to_plan_recursive), so a
+    /// policy still becomes a predicate only in
+    /// [`rls_read_predicate`](Self::rls_read_predicate) and a parse error still
+    /// fails the statement.
+    ///
+    /// The subquery executors run the plan held in the expression, they do not
+    /// plan again from text, so rewriting the embedded plan is enough.
+    ///
+    /// Callers check `has_effective_tenant_context()` first (this walk is
+    /// skipped entirely without one). Used by the plan rewrite for every
+    /// expression-bearing node and by UPDATE … SET, whose assignment
+    /// expressions are evaluated outside the plan rewrite.
+    pub(crate) fn apply_rls_to_expr(&self, expr: sql::LogicalExpr) -> Result<sql::LogicalExpr> {
+        use sql::LogicalExpr as E;
+        Ok(match expr {
+            E::ScalarSubquery { subquery } => E::ScalarSubquery {
+                subquery: Box::new(self.apply_rls_to_plan_recursive(*subquery)?),
+            },
+            E::InSubquery {
+                expr,
+                subquery,
+                negated,
+            } => E::InSubquery {
+                expr: self.apply_rls_to_boxed_expr(expr)?,
+                subquery: Box::new(self.apply_rls_to_plan_recursive(*subquery)?),
+                negated,
+            },
+            E::Exists { subquery, negated } => E::Exists {
+                subquery: Box::new(self.apply_rls_to_plan_recursive(*subquery)?),
+                negated,
+            },
+            E::BinaryExpr { left, op, right } => E::BinaryExpr {
+                left: self.apply_rls_to_boxed_expr(left)?,
+                op,
+                right: self.apply_rls_to_boxed_expr(right)?,
+            },
+            E::UnaryExpr { op, expr } => E::UnaryExpr {
+                op,
+                expr: self.apply_rls_to_boxed_expr(expr)?,
+            },
+            E::AggregateFunction { fun, args, distinct } => E::AggregateFunction {
+                fun,
+                args: self.apply_rls_to_exprs(args)?,
+                distinct,
+            },
+            E::ScalarFunction { fun, args } => E::ScalarFunction {
+                fun,
+                args: self.apply_rls_to_exprs(args)?,
+            },
+            E::Case {
+                expr,
+                when_then,
+                else_result,
+            } => E::Case {
+                expr: match expr {
+                    Some(e) => Some(self.apply_rls_to_boxed_expr(e)?),
+                    None => None,
+                },
+                when_then: when_then
+                    .into_iter()
+                    .map(|(w, t)| Ok((self.apply_rls_to_expr(w)?, self.apply_rls_to_expr(t)?)))
+                    .collect::<Result<Vec<_>>>()?,
+                else_result: match else_result {
+                    Some(e) => Some(self.apply_rls_to_boxed_expr(e)?),
+                    None => None,
+                },
+            },
+            E::Cast { expr, data_type } => E::Cast {
+                expr: self.apply_rls_to_boxed_expr(expr)?,
+                data_type,
+            },
+            E::IsNull { expr, is_null } => E::IsNull {
+                expr: self.apply_rls_to_boxed_expr(expr)?,
+                is_null,
+            },
+            E::Between {
+                expr,
+                low,
+                high,
+                negated,
+            } => E::Between {
+                expr: self.apply_rls_to_boxed_expr(expr)?,
+                low: self.apply_rls_to_boxed_expr(low)?,
+                high: self.apply_rls_to_boxed_expr(high)?,
+                negated,
+            },
+            E::InList { expr, list, negated } => E::InList {
+                expr: self.apply_rls_to_boxed_expr(expr)?,
+                list: self.apply_rls_to_exprs(list)?,
+                negated,
+            },
+            E::InSet { expr, values, negated } => E::InSet {
+                expr: self.apply_rls_to_boxed_expr(expr)?,
+                values,
+                negated,
+            },
+            E::ArraySubscript { array, index } => E::ArraySubscript {
+                array: self.apply_rls_to_boxed_expr(array)?,
+                index: self.apply_rls_to_boxed_expr(index)?,
+            },
+            E::Tuple { items } => E::Tuple {
+                items: self.apply_rls_to_exprs(items)?,
+            },
+            E::WindowFunction {
+                fun,
+                args,
+                partition_by,
+                order_by,
+                frame,
+            } => E::WindowFunction {
+                fun,
+                args: self.apply_rls_to_exprs(args)?,
+                partition_by: self.apply_rls_to_exprs(partition_by)?,
+                order_by: order_by
+                    .into_iter()
+                    .map(|(e, asc)| Ok((self.apply_rls_to_expr(e)?, asc)))
+                    .collect::<Result<Vec<_>>>()?,
+                frame,
+            },
+            // Leaves: no child expression, no embedded plan. Listed by name (no
+            // wildcard) so a new expression variant must be classified here.
+            leaf @ (E::Column { .. }
+            | E::Literal(_)
+            | E::DefaultValue
+            | E::Wildcard
+            | E::Parameter { .. }
+            | E::NewRow { .. }
+            | E::OldRow { .. }
+            | E::BoundColumn { .. }) => leaf,
+        })
+    }
+
+    fn apply_rls_to_boxed_expr(&self, expr: Box<sql::LogicalExpr>) -> Result<Box<sql::LogicalExpr>> {
+        Ok(Box::new(self.apply_rls_to_expr(*expr)?))
+    }
+
+    fn apply_rls_to_exprs(&self, exprs: Vec<sql::LogicalExpr>) -> Result<Vec<sql::LogicalExpr>> {
+        exprs.into_iter().map(|e| self.apply_rls_to_expr(e)).collect()
+    }
+
+    fn apply_rls_to_opt_expr(&self, expr: Option<sql::LogicalExpr>) -> Result<Option<sql::LogicalExpr>> {
+        expr.map(|e| self.apply_rls_to_expr(e)).transpose()
+    }
+
+    fn apply_rls_to_boxed_plan(&self, plan: Box<sql::LogicalPlan>) -> Result<Box<sql::LogicalPlan>> {
+        Ok(Box::new(self.apply_rls_to_plan_recursive(*plan)?))
     }
 
     // ==================== Auto-Refresh Worker Methods ====================

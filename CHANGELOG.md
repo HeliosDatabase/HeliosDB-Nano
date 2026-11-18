@@ -69,6 +69,17 @@ Reports from users of earlier releases (GitHub numbers) and defects found while 
   wire nests block comments as PostgreSQL does, and a statement that is only comments is an empty
   query. `src/protocol/postgres/wire_tests.rs` (leading-comment tests),
   `tests/mysql_wire_hygiene_batch_d.rs`, `tests/mysql_stmt_execute_tests.rs`.
+- **Row-level security read policies were skipped under set operations, CTEs and subqueries
+  (security).** With a tenant context, a read policy only reached a table read directly or
+  through a join, view or derived table: `UNION` / `INTERSECT` / `EXCEPT`, `WITH`, `IN` /
+  `EXISTS` / scalar subqueries (in the select list, `WHERE`, `HAVING`, `JOIN … ON`, `ORDER BY`,
+  `CASE`), `INSERT … SELECT` and `CREATE TABLE AS` over such a source, and
+  `UPDATE t SET v = (SELECT … FROM protected …)` read the hidden rows, so one tenant could read
+  or copy another's. The policy now applies to every reference of the table in the statement,
+  through `query`/`execute`, `query_params`/`execute_params`, the wire paths and open
+  transactions; a policy that will not parse still fails the read. Sessions without a tenant
+  context are unchanged. A materialized view's stored rows are not filtered (as in PostgreSQL).
+  `tests/rls_query_shapes_tests.rs`.
 - **`ORDER BY … NULLS FIRST / NULLS LAST` was ignored (GitHub #43).** The clause was read and
   dropped: `ORDER BY due ASC NULLS LAST` returned the NULLs first. An explicit placement is now
   obeyed, in a query, over `GROUP BY`, over a set operation, under `LIMIT` and in a window's
@@ -5074,7 +5085,7 @@ the two disagreed about whether the policy is evaluated before or after the scan
   keep the policy column addressable would return 3 rows where 2 are correct, and would pass any
   test that only checked for `Ok`.
 - Still not applied inside CTE bodies, set operations, table functions or subquery expressions —
-  unchanged by this release, and tracked separately.
+  unchanged by this release (closed in 4.42.0).
 
 ## [4.12.1] - 2026-08-16
 
