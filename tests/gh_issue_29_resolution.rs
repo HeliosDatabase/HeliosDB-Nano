@@ -927,10 +927,9 @@ fn dml_target_alias_and_correlated_subqueries_resolve() {
             };
             out.unwrap_or_else(|e| panic!("[{family}] `{sql}` must run: {e}"))
         };
-        // A correlated EXISTS / IN inside a DML predicate is GH#32's shape
-        // (the DML evaluator has no executor context for subqueries — a
-        // pre-existing gap pinned in tests/gh_issue_32.rs), NOT this file's:
-        // here only the alias / qualifier half is asserted.
+        // A subquery inside a DML predicate is GH#32's shape (pinned in
+        // tests/gh_issue_32.rs), NOT this file's: here only the alias /
+        // qualifier half is asserted.
         // Contract change: `DELETE FROM t AS x WHERE x.id = …` now resolves
         // (v4.31.1: a runtime miss on the alias).
         assert_eq!(exec("DELETE FROM s AS x WHERE x.id = 11"), 1, "[{family}]");

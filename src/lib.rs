@@ -11855,6 +11855,11 @@ impl EmbeddedDatabase {
                 // below stays exactly as it was — the per-row loop is identical code
                 // whether `tuples` holds one row or the whole table.
                 let rls_guard = self.build_rls_write_guard(table_name, "UPDATE", &schema)?;
+                // GH#32: a subquery in WHERE — uncorrelated ones run once here,
+                // before the rows are fetched; correlated ones per row below.
+                let (dml_materialised, dml_per_row) =
+                    self.prepare_dml_predicate(selection.as_ref(), &schema, table_name, &[], Some(txn))?;
+                let dml_selection = dml_materialised.as_ref().or(selection.as_ref());
 
                 // v05.6: a subquery in `SET col = (SELECT … FROM protected …)` is
                 // evaluated outside the plan rewrite, so apply read policies to its
@@ -11963,9 +11968,7 @@ impl EmbeddedDatabase {
                 let row_epoch = self.row_epoch_for(branch_view.as_ref(), table_name);
                 let tuples = if let Some(view) = &branch_view {
                     view.scan(Some(txn), table_name, &schema)?
-                } else if let Some(candidates) =
-                    self.pk_in_write_candidates(table_name, &schema, selection.as_ref(), &[])?
-                {
+                } else if let Some(candidates) = self.pk_in_write_candidates(table_name, &schema, dml_selection, &[])? {
                     if merge_txn_writes {
                         txn.merge_with_write_set_shaped(
                             table_name,
@@ -11983,7 +11986,7 @@ impl EmbeddedDatabase {
                         base_tuples,
                         &self.storage.row_shape(table_name, width)?,
                     )?
-                } else if let Some(pk_value) = Self::try_extract_pk_value(selection.as_ref(), &schema) {
+                } else if let Some(pk_value) = Self::try_extract_pk_value(dml_selection, &schema) {
                     // Spec R5.4 (review F1): the row as stored, not the row cache's
                     // copy — `lock_row_for_change` trusts what it is handed while the
                     // epoch has not moved.
@@ -12011,7 +12014,19 @@ impl EmbeddedDatabase {
                 let index_unique_sets = self.storage.art_indexes().unique_column_sets(table_name);
 
                 let row_matches = |row: &Tuple| -> Result<bool> {
-                    Ok(match selection {
+                    Ok(match dml_selection {
+                        // GH#32: a correlated subquery runs for this row.
+                        Some(predicate) if dml_per_row => {
+                            let bound = self.materialize_scalar_subqueries_for_row(
+                                predicate,
+                                row,
+                                &schema,
+                                table_name,
+                                &[],
+                                Some(txn),
+                            )?;
+                            matches!(evaluator.evaluate(&bound, row)?, Value::Boolean(true))
+                        }
                         Some(predicate) => {
                             matches!(evaluator.evaluate(predicate, row)?, Value::Boolean(true))
                         }
@@ -12391,6 +12406,11 @@ impl EmbeddedDatabase {
                 // `WHERE "t"."col" = …` resolve (B31).
                 let eval_schema = std::sync::Arc::new((*schema_arc).clone().with_source_table_name(table_name));
                 let evaluator = sql::Evaluator::with_parameters(eval_schema, vec![]);
+                // GH#32: a subquery in WHERE — uncorrelated ones run once here,
+                // before the rows are fetched; correlated ones per row below.
+                let (dml_materialised, dml_per_row) =
+                    self.prepare_dml_predicate(selection.as_ref(), &schema_arc, table_name, &[], Some(txn))?;
+                let dml_selection = dml_materialised.as_ref().or(selection.as_ref());
 
                 // Initialize trigger context
                 let mut trigger_context = sql::TriggerContext::new();
@@ -12431,7 +12451,7 @@ impl EmbeddedDatabase {
                 let tuples = if let Some(view) = &branch_view {
                     view.scan(Some(txn), table_name, &schema_arc)?
                 } else if let Some(candidates) =
-                    self.pk_in_write_candidates(table_name, &schema_arc, selection.as_ref(), &[])?
+                    self.pk_in_write_candidates(table_name, &schema_arc, dml_selection, &[])?
                 {
                     if merge_txn_writes {
                         txn.merge_with_write_set_shaped(
@@ -12450,7 +12470,7 @@ impl EmbeddedDatabase {
                         base_tuples,
                         &self.storage.row_shape(table_name, width)?,
                     )?
-                } else if let Some(pk_value) = Self::try_extract_pk_value(selection.as_ref(), &schema_arc) {
+                } else if let Some(pk_value) = Self::try_extract_pk_value(dml_selection, &schema_arc) {
                     // Spec R5.4 (review F1): storage, not the row cache (see the
                     // UPDATE arm).
                     match self
@@ -12478,7 +12498,19 @@ impl EmbeddedDatabase {
                 };
 
                 let row_matches = |row: &Tuple| -> Result<bool> {
-                    Ok(match selection {
+                    Ok(match dml_selection {
+                        // GH#32: a correlated subquery runs for this row.
+                        Some(predicate) if dml_per_row => {
+                            let bound = self.materialize_scalar_subqueries_for_row(
+                                predicate,
+                                row,
+                                &schema_arc,
+                                table_name,
+                                &[],
+                                Some(txn),
+                            )?;
+                            matches!(evaluator.evaluate(&bound, row)?, Value::Boolean(true))
+                        }
                         Some(predicate) => {
                             matches!(evaluator.evaluate(predicate, row)?, Value::Boolean(true))
                         }
@@ -23602,6 +23634,11 @@ impl EmbeddedDatabase {
                         _txn_guard.as_ref().and_then(|guard| guard.as_ref())
                     }
                 };
+                // GH#32: a subquery in WHERE — uncorrelated ones run once here,
+                // before the rows are fetched; correlated ones per row below.
+                let (dml_materialised, dml_per_row) =
+                    self.prepare_dml_predicate(selection.as_ref(), &schema, table_name, params, active_txn)?;
+                let dml_selection = dml_materialised.as_ref().or(selection.as_ref());
 
                 // Use branch-aware scan to read tuples, then merge any active
                 // transaction writes, so an UPDATE inside a transaction matches
@@ -23630,7 +23667,7 @@ impl EmbeddedDatabase {
                 let row_epoch = self.row_epoch_for(branch_view.as_ref(), table_name);
                 let base_tuples = match &branch_view {
                     Some(view) => view.scan(active_txn, table_name, &schema)?,
-                    None => match self.pk_in_write_candidates(table_name, &schema, selection.as_ref(), params)? {
+                    None => match self.pk_in_write_candidates(table_name, &schema, dml_selection, params)? {
                         Some(candidates) => candidates,
                         None => self.storage.scan_table_branch_aware(table_name)?,
                     },
@@ -23662,7 +23699,14 @@ impl EmbeddedDatabase {
                 let index_unique_sets = self.storage.art_indexes().unique_column_sets(table_name);
 
                 let row_matches = |row: &Tuple| -> Result<bool> {
-                    Ok(match selection {
+                    Ok(match dml_selection {
+                        // GH#32: a correlated subquery runs for this row.
+                        Some(predicate) if dml_per_row => {
+                            let bound = self.materialize_scalar_subqueries_for_row(
+                                predicate, row, &schema, table_name, params, active_txn,
+                            )?;
+                            matches!(evaluator.evaluate(&bound, row)?, Value::Boolean(true))
+                        }
                         Some(predicate) => {
                             matches!(evaluator.evaluate(predicate, row)?, Value::Boolean(true))
                         }
@@ -23925,6 +23969,11 @@ impl EmbeddedDatabase {
                         _txn_guard.as_ref().and_then(|guard| guard.as_ref())
                     }
                 };
+                // GH#32: a subquery in WHERE — uncorrelated ones run once here,
+                // before the rows are fetched; correlated ones per row below.
+                let (dml_materialised, dml_per_row) =
+                    self.prepare_dml_predicate(selection.as_ref(), &schema, table_name, params, active_txn)?;
+                let dml_selection = dml_materialised.as_ref().or(selection.as_ref());
 
                 // Use branch-aware scan to read tuples, then merge any active
                 // transaction writes, so a DELETE inside a transaction matches
@@ -23943,7 +23992,7 @@ impl EmbeddedDatabase {
                 let row_epoch = self.row_epoch_for(branch_view.as_ref(), table_name);
                 let base_tuples = match &branch_view {
                     Some(view) => view.scan(active_txn, table_name, &schema)?,
-                    None => match self.pk_in_write_candidates(table_name, &schema, selection.as_ref(), params)? {
+                    None => match self.pk_in_write_candidates(table_name, &schema, dml_selection, params)? {
                         Some(candidates) => candidates,
                         None => self.storage.scan_table_branch_aware(table_name)?,
                     },
@@ -23975,7 +24024,14 @@ impl EmbeddedDatabase {
                 };
 
                 let row_matches = |row: &Tuple| -> Result<bool> {
-                    Ok(match selection {
+                    Ok(match dml_selection {
+                        // GH#32: a correlated subquery runs for this row.
+                        Some(predicate) if dml_per_row => {
+                            let bound = self.materialize_scalar_subqueries_for_row(
+                                predicate, row, &schema, table_name, params, active_txn,
+                            )?;
+                            matches!(evaluator.evaluate(&bound, row)?, Value::Boolean(true))
+                        }
                         Some(predicate) => {
                             matches!(evaluator.evaluate(predicate, row)?, Value::Boolean(true))
                         }
@@ -33356,9 +33412,218 @@ impl EmbeddedDatabase {
                 )?),
                 data_type: data_type.clone(),
             }),
+            // GH#32: the predicate forms of a subquery, for UPDATE / DELETE
+            // WHERE. Bound and executed exactly like the scalar form above.
+            LogicalExpr::InSubquery {
+                expr: inner,
+                subquery,
+                negated,
+            } => {
+                let rows = self.run_bound_subquery(subquery, outer_row, outer_schema, outer_table, params, txn)?;
+                let inner = self.materialize_scalar_subqueries_for_row(
+                    inner,
+                    outer_row,
+                    outer_schema,
+                    outer_table,
+                    params,
+                    txn,
+                )?;
+                // Same shape the executor's materialiser produces: a set above
+                // 16 values (whose NULL rule matches the list's), else a list
+                // the primary-key IN path can use.
+                if rows.len() > 16 {
+                    Ok(LogicalExpr::InSet {
+                        expr: Box::new(inner),
+                        values: rows.into_iter().filter_map(|t| t.values.into_iter().next()).collect(),
+                        negated: *negated,
+                    })
+                } else {
+                    Ok(LogicalExpr::InList {
+                        expr: Box::new(inner),
+                        list: rows
+                            .into_iter()
+                            .filter_map(|t| t.values.into_iter().next().map(LogicalExpr::Literal))
+                            .collect(),
+                        negated: *negated,
+                    })
+                }
+            }
+            LogicalExpr::Exists { subquery, negated } => {
+                let exists = !self
+                    .run_bound_subquery(subquery, outer_row, outer_schema, outer_table, params, txn)?
+                    .is_empty();
+                Ok(LogicalExpr::Literal(Value::Boolean(exists != *negated)))
+            }
+            LogicalExpr::IsNull { expr: inner, is_null } => Ok(LogicalExpr::IsNull {
+                expr: Box::new(self.materialize_scalar_subqueries_for_row(
+                    inner,
+                    outer_row,
+                    outer_schema,
+                    outer_table,
+                    params,
+                    txn,
+                )?),
+                is_null: *is_null,
+            }),
+            LogicalExpr::Between {
+                expr: inner,
+                low,
+                high,
+                negated,
+            } => {
+                let mut m = |e: &LogicalExpr| {
+                    self.materialize_scalar_subqueries_for_row(e, outer_row, outer_schema, outer_table, params, txn)
+                };
+                Ok(LogicalExpr::Between {
+                    expr: Box::new(m(inner)?),
+                    low: Box::new(m(low)?),
+                    high: Box::new(m(high)?),
+                    negated: *negated,
+                })
+            }
+            LogicalExpr::InList {
+                expr: inner,
+                list,
+                negated,
+            } => {
+                let m = |e: &LogicalExpr| {
+                    self.materialize_scalar_subqueries_for_row(e, outer_row, outer_schema, outer_table, params, txn)
+                };
+                Ok(LogicalExpr::InList {
+                    expr: Box::new(m(inner)?),
+                    list: list.iter().map(m).collect::<Result<Vec<_>>>()?,
+                    negated: *negated,
+                })
+            }
+            LogicalExpr::ScalarFunction { fun, args } if args.iter().any(sql::Executor::expr_contains_subquery) => {
+                Ok(LogicalExpr::ScalarFunction {
+                    fun: fun.clone(),
+                    args: args
+                        .iter()
+                        .map(|e| {
+                            self.materialize_scalar_subqueries_for_row(
+                                e,
+                                outer_row,
+                                outer_schema,
+                                outer_table,
+                                params,
+                                txn,
+                            )
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                })
+            }
+            LogicalExpr::Case {
+                expr: operand,
+                when_then,
+                else_result,
+            } if sql::Executor::expr_contains_subquery(expr) => {
+                let m = |e: &LogicalExpr| {
+                    self.materialize_scalar_subqueries_for_row(e, outer_row, outer_schema, outer_table, params, txn)
+                };
+                Ok(LogicalExpr::Case {
+                    expr: operand.as_deref().map(m).transpose()?.map(Box::new),
+                    when_then: when_then
+                        .iter()
+                        .map(|(w, t)| Ok((m(w)?, m(t)?)))
+                        .collect::<Result<Vec<_>>>()?,
+                    else_result: else_result.as_deref().map(m).transpose()?.map(Box::new),
+                })
+            }
             // Everything else passes through unchanged.
             other => Ok(other.clone()),
         }
+    }
+
+    /// GH#32: bind the outer row into a subquery (see
+    /// [`Self::bind_outer_refs_in_subquery`]) and run it in the statement's
+    /// transaction, with its parameters and deadline.
+    fn run_bound_subquery(
+        &self,
+        subquery: &sql::LogicalPlan,
+        outer_row: &Tuple,
+        outer_schema: &Schema,
+        outer_table: &str,
+        params: &[Value],
+        txn: Option<&storage::Transaction>,
+    ) -> Result<Vec<Tuple>> {
+        let bound_plan = Self::bind_outer_refs_in_subquery(subquery, outer_row, outer_schema, outer_table);
+        let mut executor = sql::Executor::with_storage(&self.storage)
+            .with_timeout(self.effective_statement_timeout_ms())
+            .with_parameters(params.to_vec());
+        if let Some(txn) = txn {
+            executor = executor.with_transaction(txn);
+        }
+        executor.execute(&bound_plan)
+    }
+
+    /// GH#32: whether any subquery in `expr` reads a column of the outer
+    /// (target) row. Probed by binding an all-NULL row: a subquery the binder
+    /// changes is correlated.
+    fn dml_predicate_is_correlated(expr: &sql::LogicalExpr, outer_schema: &Schema, outer_table: &str) -> bool {
+        use sql::LogicalExpr as E;
+        let probe = Tuple::new(vec![Value::Null; outer_schema.columns.len()]);
+        fn walk(e: &E, f: &mut dyn FnMut(&sql::LogicalPlan) -> bool) -> bool {
+            match e {
+                E::InSubquery { expr, subquery, .. } => f(subquery) || walk(expr, f),
+                E::Exists { subquery, .. } | E::ScalarSubquery { subquery } => f(subquery),
+                E::BinaryExpr { left, right, .. } => walk(left, f) || walk(right, f),
+                E::UnaryExpr { expr, .. } | E::IsNull { expr, .. } | E::Cast { expr, .. } | E::InSet { expr, .. } => {
+                    walk(expr, f)
+                }
+                E::Between { expr, low, high, .. } => walk(expr, f) || walk(low, f) || walk(high, f),
+                E::InList { expr, list, .. } => walk(expr, f) || list.iter().any(|x| walk(x, f)),
+                E::ScalarFunction { args, .. } => args.iter().any(|x| walk(x, f)),
+                E::Case {
+                    expr,
+                    when_then,
+                    else_result,
+                } => {
+                    expr.as_deref().is_some_and(|x| walk(x, f))
+                        || when_then.iter().any(|(w, t)| walk(w, f) || walk(t, f))
+                        || else_result.as_deref().is_some_and(|x| walk(x, f))
+                }
+                _ => false,
+            }
+        }
+        walk(expr, &mut |plan| {
+            Self::bind_outer_refs_in_subquery(plan, &probe, outer_schema, outer_table) != *plan
+        })
+    }
+
+    /// GH#32: prepare an UPDATE / DELETE predicate that holds a subquery.
+    ///
+    /// Returns `(replacement, per_row)`:
+    /// * no subquery: `(None, false)` — the statement is untouched (one walk);
+    /// * uncorrelated: `(Some(materialised), false)` — every subquery ran ONCE,
+    ///   before the rows are fetched, so the point / IN-list paths can use it;
+    /// * correlated: `(None, true)` — the caller materialises per candidate row
+    ///   with [`Self::materialize_scalar_subqueries_for_row`].
+    ///
+    /// Both arms decide every row before the statement stages its first write
+    /// (the writes are applied after the row loop), so a subquery over the
+    /// target table sees the table as it was when the statement started.
+    fn prepare_dml_predicate(
+        &self,
+        selection: Option<&sql::LogicalExpr>,
+        schema: &Schema,
+        table_name: &str,
+        params: &[Value],
+        txn: Option<&storage::Transaction>,
+    ) -> Result<(Option<sql::LogicalExpr>, bool)> {
+        let Some(predicate) = selection else {
+            return Ok((None, false));
+        };
+        if !sql::Executor::expr_contains_subquery(predicate) {
+            return Ok((None, false));
+        }
+        if Self::dml_predicate_is_correlated(predicate, schema, table_name) {
+            return Ok((None, true));
+        }
+        let probe = Tuple::new(vec![Value::Null; schema.columns.len()]);
+        let materialised =
+            self.materialize_scalar_subqueries_for_row(predicate, &probe, schema, table_name, params, txn)?;
+        Ok((Some(materialised), false))
     }
 
     /// Bind the outer row into one scalar subquery, unless the subquery has a

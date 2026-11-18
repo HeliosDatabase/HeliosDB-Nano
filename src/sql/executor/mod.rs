@@ -2337,7 +2337,7 @@ impl<'a> Executor<'a> {
 
     /// Aggregate pushdown cannot evaluate dependent predicates. Decline before
     /// materializing any subquery; ordinary scan/filter owns its evaluation.
-    fn expr_contains_subquery(expr: &crate::sql::LogicalExpr) -> bool {
+    pub(crate) fn expr_contains_subquery(expr: &crate::sql::LogicalExpr) -> bool {
         use crate::sql::LogicalExpr as E;
         match expr {
             E::Exists { .. } | E::ScalarSubquery { .. } | E::InSubquery { .. } => true,

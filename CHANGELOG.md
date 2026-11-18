@@ -80,6 +80,16 @@ Reports from users of earlier releases (GitHub numbers) and defects found while 
   transactions; a policy that will not parse still fails the read. Sessions without a tenant
   context are unchanged. A materialized view's stored rows are not filtered (as in PostgreSQL).
   `tests/rls_query_shapes_tests.rs`.
+- **UPDATE and DELETE accept a subquery in WHERE (GitHub #32).** `DELETE … WHERE pid IN
+  (SELECT id FROM parent …)`, `NOT IN`, `EXISTS`, `NOT EXISTS` and a comparison with a scalar
+  subquery failed with "IN subquery evaluation requires executor context" (or its EXISTS / scalar
+  twin) once there was a row to test. They now run in both statement families, in autocommit and
+  inside `BEGIN` (the subquery sees the transaction's own rows), with `$n` inside the subquery and
+  with `RETURNING`. An uncorrelated subquery runs once per statement; a correlated one runs per
+  candidate row. Every row is decided before the statement writes, so a subquery over the target
+  table sees it as it was (a de-duplicating `DELETE … WHERE EXISTS (… b.k = t.k AND b.id <>
+  t.id)` removes every duplicate, as in PostgreSQL). `NOT IN` beside a NULL keeps no row.
+  `tests/gh_issue_32.rs`.
 - **`ORDER BY … NULLS FIRST / NULLS LAST` was ignored (GitHub #43).** The clause was read and
   dropped: `ORDER BY due ASC NULLS LAST` returned the NULLs first. An explicit placement is now
   obeyed, in a query, over `GROUP BY`, over a set operation, under `LIMIT` and in a window's
