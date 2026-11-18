@@ -133,7 +133,8 @@ if has_phase report; then
         echo "| | |"
         echo "|---|---|"
         echo "| date (UTC) | $(date -u +%FT%TZ) |"
-        echo "| host | $(uname -srm), $(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2 | sed 's/^ //'), $(nproc) CPUs |"
+        # The platform only: a report meant to be published names no machine.
+        echo "| platform | $(uname -sm) |"
         echo "| toolchain | $(cd "$ROOT" && rustc -V); $(cd "$ROOT" && ${CARGO} -V) |"
         echo "| $CAND_LABEL | commit \`$(git -C "$ROOT" rev-parse HEAD)\`, $(git -C "$ROOT" status --porcelain | wc -l) uncommitted file(s) |"
         echo "| $BASE_LABEL | commit \`$BASE_COMMIT\`, pg35 harness files copied from $CAND_LABEL |"

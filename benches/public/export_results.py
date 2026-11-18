@@ -8,9 +8,9 @@
 `docs/benchmarks/bench-engines.sh` and, optionally, its `provenance.txt`.
 
 The document carries every number the run produced, with what identifies it:
-the commits and sha256 of the binaries measured, the toolchain, the host's CPU, the
-PostgreSQL reference's version, settings and identity hash. It carries no file
-paths and no host name, so it can be published next to the prose report
+the commits and sha256 of the binaries measured, the toolchain and the PostgreSQL
+reference's version, settings and identity hash. It carries no file paths and
+nothing about the machine (no host name, CPU, memory or kernel), so it can be published next to the prose report
 (`docs/benchmarks/results/`). Standard library only.
 """
 import json
@@ -30,7 +30,11 @@ def results_table(results_md: str) -> dict:
             break
         m = re.match(r"\|\s*(.+?)\s*\|\s*(.+?)\s*\|$", line)
         if m and m.group(1).strip() and not set(m.group(1)) <= {"-", " "}:
-            table[m.group(1).strip("`")] = m.group(2).replace("`", "")
+            key = m.group(1).strip("`")
+            if key == "host":
+                # Reports of older runs named the machine; the published copy never does.
+                continue
+            table[key] = m.group(2).replace("`", "")
     return table
 
 

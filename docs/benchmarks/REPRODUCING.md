@@ -26,13 +26,17 @@ their order between rounds.
 
 ## What you need
 
-| | used for the published run | needed by |
+| | version of the published run | needed by |
 |---|---|---|
-| Linux x86-64 | Rocky Linux 9.7, kernel 5.14, AMD EPYC 7371 (32 CPUs) | all |
+| Linux x86-64 | | all |
 | Rust toolchain | rustc 1.100.0, cargo 1.100.0 | builds |
-| git, Python 3 (standard library only) | git 2.47, Python 3.9 | all |
-| Docker | 29.3, `postgres:18.4-bookworm` image | the PostgreSQL reference; pgbench |
+| git, Python 3 (standard library only) | | all |
+| Docker | `postgres:18.4-bookworm` image | the PostgreSQL reference; pgbench |
 | Disk | about 5 GB for the two release build directories | builds |
+
+The published reports name the toolchain, the commits and the checksums of what was measured,
+and nothing about the machine: compare ratios between releases, which carry from one machine to
+another far better than absolute times do.
 
 The wire benchmark needs neither Docker nor `psql`. pg35 needs the PostgreSQL reference but no
 `psql`.
@@ -73,8 +77,8 @@ It runs five phases, each of which can be rerun alone with `PHASES="..."`:
 5. **report** writes `out/RESULTS.md`.
 
 Each run waits until the host's 1-minute load average is below 6 (`MAX_LOAD`), for at most
-30 minutes (`LOAD_WAIT`). On the 32-CPU host above the published run took about two hours:
-about 50 minutes building both releases, 30 for pg35, 55 for the wire benchmark.
+30 minutes (`LOAD_WAIT`). The published run took about two hours: about 50 minutes building
+both releases, 30 for pg35, 55 for the wire benchmark.
 
 ## 3. Run the pgbench comparison
 
@@ -99,7 +103,7 @@ tables are the mean of the two runs, with each run's ratio beside it.
   run: the binary and source hashes it ran, the PostgreSQL instance it measured, and every
   category's result check. A run whose result disagrees with the oracle produces no number.
 - **Machine-readable copy.** `benches/public/export_results.py out [bench-engines-dir]` writes
-  the whole run as one JSON document without file paths or host names; the published one is in
+  the whole run as one JSON document without file paths or anything about the machine; the published one is in
   `docs/benchmarks/results/`.
 
 ## 5. Read the results
@@ -135,8 +139,8 @@ several keys per commit where 4.41.1 wrote one. The release report lists the mea
 `VERSIONS BETWEEN` or branches from the past, set `[storage] time_travel_enabled = false`; the
 single-row write path then writes what 4.41.1 wrote.
 
-**How long does a full run take?** About two hours for `release_bench.sh` and 20 minutes for two
-pgbench runs, on 32 CPUs.
+**How long does a full run take?** The published run took about two hours for `release_bench.sh`
+and 20 minutes for two pgbench runs; most of it is fixed run time, not build time.
 
 **Can I compare other releases?** Yes: `release_bench.sh <any-earlier-tag>`. The pg35 harness
 of the checkout is copied over the older tree, so the statements and checks are the same; a
