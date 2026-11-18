@@ -17,8 +17,10 @@ Stop the server, replace the binary, and start it again. Upgrading to
 4.42.0 from 4.41.x has its own section below: read it first.
 
 ```bash
-# Stop the running server (graceful)
-heliosdb-nano stop --data-dir ./mydata
+# Stop the running server (graceful). `stop` reads the PID file that
+# `start --daemon` wrote (default ./heliosdb.pid); a server running in the
+# foreground stops on Ctrl-C or SIGTERM.
+heliosdb-nano stop --pid-file ./heliosdb.pid
 
 # Swap the binary. crates.io (cargo), the prebuilt per-release GitHub binaries,
 # and the ghcr.io Docker image are the active channels today (Homebrew and npx
