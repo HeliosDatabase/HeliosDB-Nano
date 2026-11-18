@@ -1,0 +1,339 @@
+{
+ "schema_version": 1,
+ "benchmark": "pg35",
+ "releases": {
+  "4.41.1": {
+   "commit": "4af19e1c447b8b9f8a621a984e8cc0558195bf3b",
+   "harness_binaries_sha256": [
+    "3b9f1e27141492ead7507f06703b7dc09530fc38ce777a68225a36fddfd96c98"
+   ],
+   "rustc": [
+    "rustc 1.100.0 (0ef1bc386 2026-11-09)"
+   ],
+   "rounds": 8,
+   "measured": [
+    "2026-11-17",
+    "2026-11-18"
+   ],
+   "receipts_sha256": [
+    "9017da28f4ee6c86a149ee0262db6dd5e08a8d306c69dd734caedb777a6957b0",
+    "0564c382b06f9a4621284fc94a98c064c7ed43273f6765c3d21db08eb6037e7e",
+    "7ea7298eaf71a7f4a48c8749adb8f30faaa8fbe7a6ec9c9362e9d5239dbb43c8",
+    "d684c8faad4f01f4d39f41c5f643aacdd2c5845bc06f7a9b06129f928c5025c7",
+    "3a7706c122996bfb08ec1881bff287d3f1e022d0786db33204ffffe3a24c797d",
+    "61fd43c3b598c4c6c5701f5757cb4a41abcbac98876a6d2decd701b27252b469",
+    "851dd4e970914afb325bdeea6d36539110bac74d79c08e605215c9a167c5d9ba",
+    "6d31733ea6627f01b6ea115797ebeb9d4518e114657eafd5706bd4ee51dcd8f3"
+   ]
+  },
+  "4.42.0": {
+   "commit": "1e20624ba0883420b23fc065bb71a209d9d28cd3",
+   "harness_binaries_sha256": [
+    "3b29b3b3655f3946b46cb56b57cb1357b0331d6513c63f5817bffb3c3cc76757"
+   ],
+   "rustc": [
+    "rustc 1.100.0 (0ef1bc386 2026-11-09)"
+   ],
+   "rounds": 8,
+   "measured": [
+    "2026-11-18"
+   ],
+   "receipts_sha256": [
+    "e141b5bb15b4c7f6de79ab8062057ec8082a89319fe8c4f296609073ab7f7794",
+    "a8e60acc4089256eacfad3e333da7be61d83de6c28110bb94bbeaf1fb4e8a2a2",
+    "1e274409ecc93e1e1e35a9e4e30bcfb24634d678d638a10ed1b475d0541d16ef",
+    "aa552c2f6f868085ca81ab48c4b5b43a86ef38c9f7c3e6a838f11e9ab8bf9d91",
+    "40e762ba56a1d714c0c8d640c105d3dcb8addcc654c32f5261d90f06037e5437",
+    "214be5985aea89f130c7a6f650f317ea6d49cb56a42f5da2d4093bf3574f6c93",
+    "db88b33279b025415dca4e4e3dda156c0491deb944a45a016a9491bad53dba99",
+    "368df628cff9968ebb2233bccb4b4f16a241bf650c362cc54fec2b61f5b960e9"
+   ]
+  }
+ },
+ "categories": {
+  "CREATE TABLE": {
+   "best_us": {
+    "4.41.1": 149.56,
+    "4.42.0": 236.586
+   },
+   "baseline_us": 149.56,
+   "set_by": "4.41.1"
+  },
+  "CREATE INDEX": {
+   "best_us": {
+    "4.41.1": 269.711,
+    "4.42.0": 308.096
+   },
+   "baseline_us": 269.711,
+   "set_by": "4.41.1"
+  },
+  "ALTER TABLE": {
+   "best_us": {
+    "4.41.1": 863.261,
+    "4.42.0": 252.405
+   },
+   "baseline_us": 252.405,
+   "set_by": "4.42.0"
+  },
+  "DROP TABLE": {
+   "best_us": {
+    "4.41.1": 140.858,
+    "4.42.0": 210.233
+   },
+   "baseline_us": 140.858,
+   "set_by": "4.41.1"
+  },
+  "CREATE/DROP VIEW": {
+   "best_us": {
+    "4.41.1": 116.717,
+    "4.42.0": 117.348
+   },
+   "baseline_us": 116.717,
+   "set_by": "4.41.1"
+  },
+  "REFRESH MATVIEW": {
+   "best_us": {
+    "4.41.1": 530.706,
+    "4.42.0": 721.395
+   },
+   "baseline_us": 530.706,
+   "set_by": "4.41.1"
+  },
+  "TRUNCATE": {
+   "best_us": {
+    "4.41.1": 152.811,
+    "4.42.0": 213.385
+   },
+   "baseline_us": 152.811,
+   "set_by": "4.41.1"
+  },
+  "INSERT single": {
+   "best_us": {
+    "4.41.1": 6.543,
+    "4.42.0": 24.916
+   },
+   "baseline_us": 6.543,
+   "set_by": "4.41.1"
+  },
+  "INSERT multi-row": {
+   "best_us": {
+    "4.41.1": 149.578,
+    "4.42.0": 187.228
+   },
+   "baseline_us": 149.578,
+   "set_by": "4.41.1"
+  },
+  "INSERT..SELECT": {
+   "best_us": {
+    "4.41.1": 1273.109,
+    "4.42.0": 161.736
+   },
+   "baseline_us": 161.736,
+   "set_by": "4.42.0"
+  },
+  "UPDATE point": {
+   "best_us": {
+    "4.41.1": 9.175,
+    "4.42.0": 34.471
+   },
+   "baseline_us": 9.175,
+   "set_by": "4.41.1"
+  },
+  "DELETE point": {
+   "best_us": {
+    "4.41.1": 3.933,
+    "4.42.0": 11.563
+   },
+   "baseline_us": 3.933,
+   "set_by": "4.41.1"
+  },
+  "UPSERT": {
+   "best_us": {
+    "4.41.1": 61.014,
+    "4.42.0": 60.056
+   },
+   "baseline_us": 60.056,
+   "set_by": "4.42.0"
+  },
+  "UPDATE+subquery": {
+   "best_us": {
+    "4.41.1": 123.585,
+    "4.42.0": 147.04
+   },
+   "baseline_us": 123.585,
+   "set_by": "4.41.1"
+  },
+  "Point lookup": {
+   "best_us": {
+    "4.41.1": 2.657,
+    "4.42.0": 2.927
+   },
+   "baseline_us": 2.657,
+   "set_by": "4.41.1"
+  },
+  "Full scan+filter": {
+   "best_us": {
+    "4.41.1": 25.962,
+    "4.42.0": 26.704
+   },
+   "baseline_us": 25.962,
+   "set_by": "4.41.1"
+  },
+  "Aggregation": {
+   "best_us": {
+    "4.41.1": 0.989,
+    "4.42.0": 1.115
+   },
+   "baseline_us": 0.989,
+   "set_by": "4.41.1"
+  },
+  "INNER JOIN": {
+   "best_us": {
+    "4.41.1": 22.804,
+    "4.42.0": 22.009
+   },
+   "baseline_us": 22.009,
+   "set_by": "4.42.0"
+  },
+  "LEFT JOIN": {
+   "best_us": {
+    "4.41.1": 17.24,
+    "4.42.0": 16.679
+   },
+   "baseline_us": 16.679,
+   "set_by": "4.42.0"
+  },
+  "4-table JOIN": {
+   "best_us": {
+    "4.41.1": 569.531,
+    "4.42.0": 56.131
+   },
+   "baseline_us": 56.131,
+   "set_by": "4.42.0"
+  },
+  "Scalar subquery": {
+   "best_us": {
+    "4.41.1": 2.434,
+    "4.42.0": 2.456
+   },
+   "baseline_us": 2.434,
+   "set_by": "4.41.1"
+  },
+  "EXISTS subquery": {
+   "best_us": {
+    "4.41.1": 4.496,
+    "4.42.0": 4.7
+   },
+   "baseline_us": 4.496,
+   "set_by": "4.41.1"
+  },
+  "IN subquery": {
+   "best_us": {
+    "4.41.1": 4.543,
+    "4.42.0": 5.766
+   },
+   "baseline_us": 4.543,
+   "set_by": "4.41.1"
+  },
+  "CTE": {
+   "best_us": {
+    "4.41.1": 5.516,
+    "4.42.0": 5.611
+   },
+   "baseline_us": 5.516,
+   "set_by": "4.41.1"
+  },
+  "Recursive CTE": {
+   "best_us": {
+    "4.41.1": 2.862,
+    "4.42.0": 2.88
+   },
+   "baseline_us": 2.862,
+   "set_by": "4.41.1"
+  },
+  "Window funcs": {
+   "best_us": {
+    "4.41.1": 19.232,
+    "4.42.0": 18.448
+   },
+   "baseline_us": 18.448,
+   "set_by": "4.42.0"
+  },
+  "UNION": {
+   "best_us": {
+    "4.41.1": 7.085,
+    "4.42.0": 7.44
+   },
+   "baseline_us": 7.085,
+   "set_by": "4.41.1"
+  },
+  "DISTINCT": {
+   "best_us": {
+    "4.41.1": 0.638,
+    "4.42.0": 0.779
+   },
+   "baseline_us": 0.638,
+   "set_by": "4.41.1"
+  },
+  "ORDER+LIMIT": {
+   "best_us": {
+    "4.41.1": 83.804,
+    "4.42.0": 86.088
+   },
+   "baseline_us": 83.804,
+   "set_by": "4.41.1"
+  },
+  "CASE expr": {
+   "best_us": {
+    "4.41.1": 14.782,
+    "4.42.0": 15.244
+   },
+   "baseline_us": 14.782,
+   "set_by": "4.41.1"
+  },
+  "LIKE/BETWEEN/IN": {
+   "best_us": {
+    "4.41.1": 9.992,
+    "4.42.0": 9.816
+   },
+   "baseline_us": 9.816,
+   "set_by": "4.42.0"
+  },
+  "String ops": {
+   "best_us": {
+    "4.41.1": 11.827,
+    "4.42.0": 12.234
+   },
+   "baseline_us": 11.827,
+   "set_by": "4.41.1"
+  },
+  "Transaction ctl": {
+   "best_us": {
+    "4.41.1": 46.954,
+    "4.42.0": 35.385
+   },
+   "baseline_us": 35.385,
+   "set_by": "4.42.0"
+  },
+  "Prepared stmts": {
+   "best_us": {
+    "4.41.1": 3.203,
+    "4.42.0": 4.096
+   },
+   "baseline_us": 3.203,
+   "set_by": "4.41.1"
+  },
+  "SET/SHOW/RESET": {
+   "best_us": {
+    "4.41.1": 1.808,
+    "4.42.0": 2.539
+   },
+   "baseline_us": 1.808,
+   "set_by": "4.41.1"
+  }
+ },
+ "rule": "The baseline of a category is the best (lowest) time per statement any release has reached in it. A release that reaches a new best sets the baseline; nothing else moves it.",
+ "time": "mean time per statement over the timed iterations of a category in one round, in microseconds; the best round counts",
+ "harness": "tests/pg35_benchmark.rs through benches/public/pg35_run.py (strict: results checked, 300 timed iterations)",
+ "platform": "Linux x86_64, 32 logical CPUs, at least 64 GiB of memory"
+}

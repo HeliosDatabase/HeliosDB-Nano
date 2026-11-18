@@ -22,10 +22,26 @@ the per-category history lives in
 
 The run of the current release, beside 4.41.1 and with every binary identified, is in
 [`RELEASE_4_42_0.md`](RELEASE_4_42_0.md). With the strict harness (every result checked, exactly
-300 timed iterations) **Nano is faster than PostgreSQL 18.4 in 34 of the 35 categories and slower
-in one, the 4-table join**; 4.41.1 is the same in that run. Several write and schema
+300 timed iterations) **Nano is faster than PostgreSQL 18.4 in all 35 categories**; 4.41.1 is
+faster in 34 in that run and slower in one, the 4-table join. Several write and schema
 categories are slower than in 4.41.1; that page lists them with their causes. The v3.60.3 table
 below is kept as history and is not the current release's result.
+
+## The baseline — the best time each category has reached
+
+Since 4.42.0 the suite has a baseline under the strict harness:
+[`benches/public/pg35_baseline.json`](../../benches/public/pg35_baseline.json). For each of the 35
+categories it holds the best (lowest) time per statement a release has reached and the release
+that reached it. **A release that reaches a new best time in a category sets that category's
+baseline; nothing else moves it.** A release that is slower in a category leaves the baseline
+where it was, so the regression is measured against the best the engine has done, not against
+the previous release.
+
+`benches/public/pg35_baseline.py check` compares a run with it, `update` adds a release's rounds
+([how to](REPRODUCING.md#6-compare-a-run-with-the-baseline)). The older
+`perf/v358_program/pg35_category_history.json` is the history of the earlier, non-strict harness
+(ratios to PostgreSQL from v3.5x to v3.60.3); its times are not comparable with the strict
+harness and it is kept as history.
 
 ## Earlier run — v3.60.3 (2026-06-26)
 

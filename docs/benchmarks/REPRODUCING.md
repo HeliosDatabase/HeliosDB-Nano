@@ -125,10 +125,12 @@ tables are the mean of the two runs, with each run's ratio beside it.
   deployment differs (embedded and in memory against a server that syncs every commit), so the
   `x PG` column is not an engine-to-engine ratio for writes. The column to compare across
   releases is the time ratio between the two Nano builds.
-- **Noise.** On a shared host two rounds of pg35 agree to within about 10% for reads; a ratio
-  inside 0.9 to 1.1 is not a difference. Single-statement categories that commit (one-row
-  `INSERT`, `UPDATE`, `DELETE`) are sensitive to background work; look at both rounds
-  (`runs_us` in the JSON) before quoting a median.
+- **Noise.** On a shared host two rounds of a pg35 category usually agree to within 10%, but
+  not always: across the release runs the one 4.41.1 harness binary measured between 21% below
+  and 16% above its own earlier result in single categories. A ratio inside 0.9 to 1.1 is not a
+  difference, and a category near a 15% line can change class from one round to the next. Look at
+  every round (`runs_us` in the JSON) before quoting a median, or compare best times, as the
+  baseline does (section 6).
 - **Wire numbers** are medians of 4 rounds. `load` in the table is the host's load average
   when each round of the cell began; the 1-client cells begin right after a 64-client cell and
   carry its load.
@@ -136,10 +138,43 @@ tables are the mean of the two runs, with each run's ratio beside it.
   `heliosdb-nano-vs-postgresql-2026-08-28.md` for a wire-to-wire run), multi-statement
   transactions under contention, or datasets larger than memory.
 
+## 6. Compare a run with the baseline
+
+The pg35 baseline is the best time each category has reached in a release:
+[`benches/public/pg35_baseline.json`](../../benches/public/pg35_baseline.json). The rule is one
+sentence: a release that reaches a new best time in a category sets that category's baseline, and
+nothing else moves it. A slower release leaves the baseline with the release that set it, so a
+regression stays on the page until a later release beats the old time.
+
+The time compared is the best round, not the median: on a busy host noise only adds time, so the
+fastest round is the one least disturbed.
+
+```bash
+# your run against the published baseline (prints one row per category; changes nothing)
+benches/public/pg35_baseline.py check benches/public/pg35_baseline.json v4.42.0@out/pg35/results.json
+
+# the same, failing when a category is more than 15% slower than its baseline
+benches/public/pg35_baseline.py check --fail-over 1.15 benches/public/pg35_baseline.json v4.42.0@out/pg35/results.json
+
+# a baseline of your own machine class, from your runs of both releases
+benches/public/pg35_baseline.py update --platform "<architecture, CPU count, memory class>" my-baseline.json \
+    4.41.1=v4.41.1@out/pg35/results.json 4.42.0=v4.42.0@out/pg35/results.json
+```
+
+The published baseline was measured on the hardware class it names. Absolute times on another
+machine differ, so compare your run with a baseline built on your machine (the third command);
+which release holds each category's baseline is what should agree. `update` counts every round
+once (rounds are known by the hash of their receipt) and accepts only one commit per release.
+
 ## Frequently asked questions
 
+**What is the pg35 baseline?** The best time per statement each of the 35 categories has reached
+in a release, with the release that reached it
+([`benches/public/pg35_baseline.json`](../../benches/public/pg35_baseline.json)). A release that
+reaches a new best sets the baseline for that category; a slower release does not lower the bar.
+
 **Is HeliosDB-Nano faster than PostgreSQL?** In pg35, embedded Nano is faster than PostgreSQL
-18.4 in 34 of 35 categories and slower in one (the 4-table join). That compares an in-process,
+18.4 in all 35 categories (4.41.1 in 34; it is slower in the 4-table join). That compares an in-process,
 in-memory engine with a server over TCP that syncs every commit; over the wire, with both as
 servers, the margins are much smaller (pgbench tables in the release report).
 
