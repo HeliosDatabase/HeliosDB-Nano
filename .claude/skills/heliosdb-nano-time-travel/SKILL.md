@@ -32,6 +32,8 @@ SELECT id, balance
 The result reflects what was visible at that wall-clock time, regardless of writes since.
 
 ### Recipe 2: Diff between then and now
+The clause goes right after the table it reads (before or after its alias), also inside a CTE or sub-select; it is found by tokens, so aliases such as `AS offer_id` and the words "as of" in strings are ordinary SQL.
+
 ```sql
 WITH past AS (
     SELECT id, balance FROM accounts AS OF TIMESTAMP '2026-04-29 09:00:00'

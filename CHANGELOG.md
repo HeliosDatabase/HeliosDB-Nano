@@ -27,6 +27,16 @@ changes.
 Reports from users of earlier releases (GitHub numbers) and defects found while the work after
 4.42.0 was being prepared. Each has a test file.
 
+- **A column alias like `AS offer_id`, or the words "as of" in a string, turned a plain statement
+  into a time-travel one.** `AS OF` and `VERSIONS BETWEEN` were found by searching the SQL text:
+  `SELECT id AS offer_id FROM t` lost its FROM clause, `'balance as of yesterday'` in a DELETE or
+  INSERT … SELECT gave "Unterminated string literal", and non-ASCII text such as `'ŉ'` before a real
+  clause crashed the process. The clauses are now found by tokens, outside literals, comments,
+  dollar quotes and quoted identifiers, and only as `AS OF NOW | TIMESTAMP | TRANSACTION | SCN`
+  after a table; a clause binds to the table it follows (after an alias, inside a sub-select or CTE,
+  on the right side of a join). `AS OF TIMESTAMP` with no literal is now an error, and an index nested-loop join no longer
+  probes the live index for a `JOIN t AS OF …` right side. Test file:
+  `tests/as_of_token_scan.rs`, plus unit tests in `src/sql/phase3/time_travel.rs`.
 - **`ORDER BY … NULLS FIRST / NULLS LAST` was ignored (GitHub #43).** The clause was read and
   dropped: `ORDER BY due ASC NULLS LAST` returned the NULLs first. An explicit placement is now
   obeyed, in a query, over `GROUP BY`, over a set operation, under `LIMIT` and in a window's

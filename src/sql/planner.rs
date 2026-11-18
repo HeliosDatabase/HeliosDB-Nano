@@ -92,6 +92,10 @@ pub struct Planner<'a> {
     catalog: Option<&'a Catalog<'a>>,
     /// Original SQL for time-travel AS OF parsing
     original_sql: Option<String>,
+    /// Time-travel clauses found by token in `original_sql`
+    time_travel: Vec<super::phase3::time_travel::TimeTravelClause>,
+    /// Scans met so far per table name (binds a clause to its occurrence)
+    time_travel_seen: RefCell<HashMap<String, usize>>,
     /// CTE schemas in scope (name -> (schema, author-written select list))
     /// - uses RefCell for interior mutability. The flag travels with the
     /// schema so the two can never disagree; see
@@ -153,6 +157,8 @@ impl<'a> Planner<'a> {
         Self {
             catalog: None,
             original_sql: None,
+            time_travel: Vec::new(),
+            time_travel_seen: RefCell::new(HashMap::new()),
             cte_schemas: RefCell::new(HashMap::new()),
             named_windows: RefCell::new(HashMap::new()),
             current_schema: None,
@@ -168,6 +174,8 @@ impl<'a> Planner<'a> {
         Self {
             catalog: Some(catalog),
             original_sql: None,
+            time_travel: Vec::new(),
+            time_travel_seen: RefCell::new(HashMap::new()),
             cte_schemas: RefCell::new(HashMap::new()),
             named_windows: RefCell::new(HashMap::new()),
             current_schema: None,
@@ -180,6 +188,8 @@ impl<'a> Planner<'a> {
 
     /// Set the original SQL for time-travel AS OF parsing
     pub fn with_sql(mut self, sql: String) -> Self {
+        self.time_travel = super::TimeTravelParser::scan(&sql);
+        self.time_travel_seen = RefCell::new(HashMap::new());
         self.original_sql = Some(sql);
         self
     }
@@ -4520,74 +4530,41 @@ impl<'a> Planner<'a> {
     fn parse_as_of_for_table(&self, table_name: &str) -> Result<Option<super::logical_plan::AsOfClause>> {
         use crate::sql::TimeTravelParser;
 
-        // Return None if no original SQL is available
-        let sql = match &self.original_sql {
-            Some(s) => s,
-            None => return Ok(None),
+        if self.time_travel.is_empty() {
+            return Ok(None);
+        }
+
+        // The clause belongs to the n-th scan of this table name, n counted
+        // in text order.
+        let key = table_name
+            .rsplit('.')
+            .next()
+            .unwrap_or(table_name)
+            .trim_matches('"')
+            .to_lowercase();
+        let occurrence = {
+            let mut seen = self.time_travel_seen.borrow_mut();
+            let n = seen.entry(key.clone()).or_insert(0);
+            let cur = *n;
+            *n += 1;
+            cur
+        };
+        let Some(clause) = self
+            .time_travel
+            .iter()
+            .find(|c| c.table == key && c.occurrence == occurrence)
+        else {
+            return Ok(None);
         };
 
-        // Check if SQL contains time-travel syntax
-        if !TimeTravelParser::contains_time_travel_syntax(sql) {
-            return Ok(None);
+        if clause.is_versions {
+            let (start, end) = TimeTravelParser::parse_versions_between(&clause.operand)?;
+            return Ok(Some(super::logical_plan::AsOfClause::VersionsBetween {
+                start: Box::new(start),
+                end: Box::new(end),
+            }));
         }
-
-        let upper_sql = sql.to_uppercase();
-        let table_pattern = format!("FROM {}", table_name).to_uppercase();
-
-        // Check if this query is for the current table
-        if !upper_sql.contains(&table_pattern) {
-            return Ok(None);
-        }
-
-        // Check for VERSIONS BETWEEN first (more specific)
-        if upper_sql.contains("VERSIONS BETWEEN") {
-            if let Some(versions_clause) = Self::extract_versions_between_from_sql(sql) {
-                let (start, end) = TimeTravelParser::parse_versions_between(&versions_clause)?;
-                return Ok(Some(super::logical_plan::AsOfClause::VersionsBetween {
-                    start: Box::new(start),
-                    end: Box::new(end),
-                }));
-            }
-        }
-
-        // Extract AS OF clause from SQL
-        if let Some(as_of_str) = TimeTravelParser::extract_as_of_from_sql(sql) {
-            // Parse the AS OF clause
-            let as_of_clause = TimeTravelParser::parse_as_of_clause(&as_of_str)?;
-            return Ok(Some(as_of_clause));
-        }
-
-        Ok(None)
-    }
-
-    /// Extract VERSIONS BETWEEN clause from SQL
-    fn extract_versions_between_from_sql(sql: &str) -> Option<String> {
-        let upper = sql.to_uppercase();
-
-        if let Some(pos) = upper.find("VERSIONS BETWEEN") {
-            // Skip "VERSIONS BETWEEN " to get the clause content
-            let start = pos + "VERSIONS BETWEEN".len();
-            let remainder = sql.get(start..)?.trim_start();
-
-            // Find the end of the clause - look for SQL keywords or end
-            let keywords = ["WHERE", "GROUP BY", "ORDER BY", "LIMIT", "JOIN", ";"];
-            let mut end = remainder.len();
-
-            for keyword in &keywords {
-                if let Some(kw_pos) = remainder.to_uppercase().find(keyword) {
-                    if kw_pos < end {
-                        end = kw_pos;
-                    }
-                }
-            }
-
-            let clause = remainder.get(..end).unwrap_or_default().trim();
-            if !clause.is_empty() {
-                return Some(clause.to_string());
-            }
-        }
-
-        None
+        Ok(Some(TimeTravelParser::parse_as_of_clause(&clause.operand)?))
     }
 
     /// Convert SELECT items to expressions and aliases

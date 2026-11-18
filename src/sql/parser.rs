@@ -86,137 +86,15 @@ impl Parser {
 
     /// Preprocess SQL to handle Phase 3 time-travel syntax
     ///
-    /// sqlparser doesn't support AS OF or VERSIONS BETWEEN syntax, so we
-    /// temporarily remove them to allow parsing, then restore it later for
-    /// the planner to extract.
+    /// sqlparser doesn't support AS OF or VERSIONS BETWEEN syntax, so the
+    /// clauses are removed (by token, never by substring) to allow parsing;
+    /// the planner re-reads them from the original text.
     fn preprocess_time_travel_sql(&self, sql: &str) -> String {
-        let upper = sql.to_uppercase();
-
-        // Handle VERSIONS BETWEEN first (it's more specific)
-        if upper.contains("VERSIONS BETWEEN") {
-            return self.preprocess_versions_between(sql);
-        }
-
-        // Handle AS OF
-        if !upper.contains(" AS OF") && !upper.contains("AS OF ") {
+        let clauses = crate::sql::TimeTravelParser::scan(sql);
+        if clauses.is_empty() {
             return sql.to_string();
         }
-
-        // Find AS OF and remove the clause
-        if let Some(as_of_pos) = upper.find("AS OF") {
-            // Keep everything before AS OF
-            let before = sql[..as_of_pos].trim_end();
-
-            // Find where AS OF clause ends (at next keyword or end of statement)
-            let after_as_of = &sql[as_of_pos + 5..]; // "AS OF".len() = 5
-            let upper_after = after_as_of.to_uppercase();
-
-            // Look for keywords that end the AS OF clause
-            let end_keywords = [
-                "WHERE",
-                "GROUP",
-                "ORDER",
-                "LIMIT",
-                "UNION",
-                "INTERSECT",
-                "EXCEPT",
-                ")",
-                ";",
-                "HAVING",
-            ];
-
-            let mut end_pos = after_as_of.len();
-            for keyword in &end_keywords {
-                if let Some(pos) = upper_after.find(keyword) {
-                    // Make sure it's a word boundary (preceded by space or parenthesis)
-                    if pos == 0
-                        || after_as_of
-                            .chars()
-                            .nth(pos - 1)
-                            .map(|c| c.is_whitespace() || c == ')')
-                            .unwrap_or(false)
-                    {
-                        end_pos = pos;
-                        break;
-                    }
-                }
-            }
-
-            let after = after_as_of[end_pos..].trim_start();
-
-            if after.is_empty() {
-                before.to_string()
-            } else {
-                format!("{} {}", before, after)
-            }
-        } else {
-            sql.to_string()
-        }
-    }
-
-    /// Preprocess VERSIONS BETWEEN clause for sqlparser compatibility
-    ///
-    /// Removes: VERSIONS BETWEEN TIMESTAMP '...' AND TIMESTAMP '...'
-    /// from the SQL to allow sqlparser to parse the basic query structure.
-    fn preprocess_versions_between(&self, sql: &str) -> String {
-        let upper = sql.to_uppercase();
-
-        if let Some(versions_pos) = upper.find("VERSIONS BETWEEN") {
-            // Keep everything before VERSIONS BETWEEN
-            let before = sql[..versions_pos].trim_end();
-
-            // Find where VERSIONS BETWEEN clause ends
-            // The clause ends after "AND TIMESTAMP '...'" or "AND NOW" or "AND SCN ..."
-            let after_versions = &sql[versions_pos..];
-            let upper_after = after_versions.to_uppercase();
-
-            // Look for the AND keyword, then find end of the second timestamp/value
-            if let Some(and_pos) = upper_after.find(" AND ") {
-                let after_and = &after_versions[and_pos + 5..]; // " AND ".len() = 5
-                let upper_after_and = after_and.to_uppercase();
-
-                // Find end of the second clause (TIMESTAMP '...', NOW, SCN ...)
-                let end_pos = if upper_after_and.starts_with("TIMESTAMP") {
-                    // Find the closing quote
-                    if let Some(quote_start) = after_and.find('\'') {
-                        if let Some(quote_end) = after_and[quote_start + 1..].find('\'') {
-                            quote_start + 1 + quote_end + 1
-                        } else {
-                            after_and.len()
-                        }
-                    } else {
-                        after_and.len()
-                    }
-                } else if upper_after_and.starts_with("NOW") {
-                    3 // "NOW".len()
-                } else if upper_after_and.starts_with("SCN") || upper_after_and.starts_with("TRANSACTION") {
-                    // Find end of number
-                    let num_start = after_and.find(char::is_numeric).unwrap_or(after_and.len());
-                    if num_start < after_and.len() {
-                        let after_num = &after_and[num_start..];
-                        num_start + after_num.find(|c: char| !c.is_numeric()).unwrap_or(after_num.len())
-                    } else {
-                        after_and.len()
-                    }
-                } else {
-                    after_and.len()
-                };
-
-                let total_skip = versions_pos + (and_pos + 5) + end_pos;
-                let after = sql[total_skip..].trim_start();
-
-                if after.is_empty() {
-                    before.to_string()
-                } else {
-                    format!("{} {}", before, after)
-                }
-            } else {
-                // No AND found - malformed, return as-is
-                sql.to_string()
-            }
-        } else {
-            sql.to_string()
-        }
+        crate::sql::TimeTravelParser::strip_clauses(sql, &clauses)
     }
 
     /// Strip SQL comments from input

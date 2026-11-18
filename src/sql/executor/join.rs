@@ -3478,8 +3478,17 @@ fn extract_scan_info(plan: &crate::sql::LogicalPlan) -> Option<(String, Option<S
             table_name,
             alias,
             schema,
+            as_of,
             ..
-        } => Some((table_name.clone(), alias.clone(), schema.clone())),
+        } => {
+            // A time-travel scan must not be probed through the live index:
+            // `JOIN t AS OF …` would read the current rows of `t`.
+            if as_of.is_some() {
+                None
+            } else {
+                Some((table_name.clone(), alias.clone(), schema.clone()))
+            }
+        }
         crate::sql::LogicalPlan::Filter { input, .. } => extract_scan_info(input),
         // GH#29 (c2): see `is_plain_scan_like` — never see through a stamped
         // derived-table projection.
