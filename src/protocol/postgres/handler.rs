@@ -4861,6 +4861,11 @@ where
         // so the same tag is correct for both spellings.
         } else if starts_with_icase(trimmed, "COMMENT ON") {
             "COMMENT".to_string()
+        } else if starts_with_icase(trimmed, "CREATE DATABASE") && !starts_with_icase(trimmed, "CREATE DATABASE BRANCH")
+        {
+            "CREATE DATABASE".to_string()
+        } else if starts_with_icase(trimmed, "DROP DATABASE") && !starts_with_icase(trimmed, "DROP DATABASE BRANCH") {
+            "DROP DATABASE".to_string()
         } else if starts_with_icase(trimmed, "CREATE ROLE") || starts_with_icase(trimmed, "CREATE USER") {
             "CREATE ROLE".to_string()
         } else if starts_with_icase(trimmed, "ALTER ROLE") || starts_with_icase(trimmed, "ALTER USER") {

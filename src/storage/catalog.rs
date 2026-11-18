@@ -6542,6 +6542,53 @@ impl<'a> Catalog<'a> {
         self.storage.delete(&key)
     }
 
+    /// `meta:database:{name, lower case}` — a database made with
+    /// `CREATE DATABASE` (GitHub #48). The value is the name as it was written.
+    ///
+    /// A database is a name to connect by, with its own connection and rate
+    /// limits; it does not separate tables. The name used to live in memory
+    /// only, so a restart forgot it and an application configured with it
+    /// could no longer connect.
+    fn database_key(name: &str) -> Vec<u8> {
+        format!("meta:database:{}", name.to_lowercase()).into_bytes()
+    }
+
+    /// Record a database. `false` when one of that name (in any case) is
+    /// already recorded.
+    pub fn register_database(&self, name: &str) -> Result<bool> {
+        if self.database_exists(name)? {
+            return Ok(false);
+        }
+        self.storage.put(&Self::database_key(name), name.as_bytes())?;
+        self.storage.bump_schema_generation();
+        Ok(true)
+    }
+
+    /// Whether a database of that name (in any case) is recorded.
+    pub fn database_exists(&self, name: &str) -> Result<bool> {
+        Ok(self.storage.get(&Self::database_key(name))?.is_some())
+    }
+
+    /// Remove a database's record. `false` when there was none.
+    pub fn drop_database_record(&self, name: &str) -> Result<bool> {
+        if !self.database_exists(name)? {
+            return Ok(false);
+        }
+        self.storage.delete(&Self::database_key(name))?;
+        self.storage.bump_schema_generation();
+        Ok(true)
+    }
+
+    /// Every recorded database, by name as written, in key order.
+    pub fn list_databases(&self) -> Result<Vec<String>> {
+        Ok(self
+            .storage
+            .meta_blobs_with_prefix("meta:database:")?
+            .into_iter()
+            .map(|(key, written)| String::from_utf8(written).unwrap_or(key))
+            .collect())
+    }
+
     /// The PRIMARY KEY columns of `table` **in the order the key was DECLARED**,
     /// or an empty Vec if it has none. `table` must be a resolved storage key
     /// (schema-qualified when non-`public`). Used to default a foreign key's

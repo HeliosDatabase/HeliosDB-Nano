@@ -2386,6 +2386,7 @@ impl Touched {
                 }
             }
             KeyClass::MetaSchema
+            | KeyClass::MetaDatabase
             | KeyClass::MetaEnumType
             | KeyClass::MetaIdentity
             | KeyClass::MetaPartition

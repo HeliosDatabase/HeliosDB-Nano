@@ -84,6 +84,8 @@ pub enum KeyClass {
     MetaIndex,
     /// `meta:schema:{schema}` — declared schema marker.
     MetaSchema,
+    /// `meta:database:{database}` — a database made with `CREATE DATABASE`.
+    MetaDatabase,
     /// `meta:enum_type:{type}` — enum type labels.
     MetaEnumType,
     /// `meta:identity:{table}` — identity-column list.
@@ -291,6 +293,8 @@ pub const PREFIXES: &[(&[u8], KeyClass)] = &[
     (b"meta:index:", KeyClass::MetaIndex),
     // storage/catalog.rs:3914 `schema_metadata_key`
     (b"meta:schema:", KeyClass::MetaSchema),
+    // storage/catalog.rs `database_key`
+    (b"meta:database:", KeyClass::MetaDatabase),
     // storage/catalog.rs:4125 `enum_type_key`
     (b"meta:enum_type:", KeyClass::MetaEnumType),
     // storage/catalog.rs:4175 `identity_key`
@@ -589,6 +593,7 @@ mod tests {
         (b"meta:attmissing:users:bio", KeyClass::MetaAttMissing, None),
         (b"meta:index:users_name_idx", KeyClass::MetaIndex, None),
         (b"meta:schema:app", KeyClass::MetaSchema, None),
+        (b"meta:database:app_db", KeyClass::MetaDatabase, None),
         (b"meta:enum_type:mood", KeyClass::MetaEnumType, None),
         (b"meta:identity:users", KeyClass::MetaIdentity, None),
         (b"meta:partchild:events", KeyClass::MetaPartition, None),

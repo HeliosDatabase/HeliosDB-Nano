@@ -33049,18 +33049,23 @@ impl EmbeddedDatabase {
                 "database \"{trimmed}\" is a reserved system database and cannot be created"
             )));
         }
-        // Duplicate check.
-        let already_exists = self
-            .tenant_manager
-            .list_tenants()
-            .iter()
-            .any(|t| t.name.eq_ignore_ascii_case(trimmed));
+        // Duplicate check: the store's record (GH#48), or a tenant registered
+        // under the name by another route.
+        let already_exists = self.storage.catalog().database_exists(trimmed)?
+            || self
+                .tenant_manager
+                .list_tenants()
+                .iter()
+                .any(|t| t.name.eq_ignore_ascii_case(trimmed));
         if already_exists {
             if if_not_exists {
                 return Ok((0, vec![]));
             }
             return Err(Error::query_execution(format!("database \"{trimmed}\" already exists")));
         }
+        // GH#48: the record first. The name used to be kept in memory only: a
+        // restart forgot it and connections by that name were refused (3D000).
+        self.storage.catalog().register_database(trimmed)?;
         // sprinter d03de7fc3b22: the DEFAULT plan, not `"free"`.
         //
         // This used to say `"free"`, whose limits are `max_qps: 10` and
@@ -33101,8 +33106,11 @@ impl EmbeddedDatabase {
             .list_tenants()
             .into_iter()
             .find(|t| t.name.eq_ignore_ascii_case(trimmed));
+        // GH#48: the record may be all there is (no connection by that name
+        // since the store was opened).
+        let recorded = self.storage.catalog().drop_database_record(trimmed)?;
         let Some(tenant) = target else {
-            if if_exists {
+            if recorded || if_exists {
                 return Ok((0, vec![]));
             }
             return Err(Error::query_execution(format!("database \"{trimmed}\" does not exist")));
@@ -33111,6 +33119,41 @@ impl EmbeddedDatabase {
             .delete_tenant(tenant.id)
             .map_err(Error::query_execution)?;
         Ok((0, vec![]))
+    }
+
+    /// The tenant a recorded database connects through, registered on first
+    /// use (GH#48): after a restart, or on a standby that received the record,
+    /// nothing in memory knows the name yet.
+    fn database_tenant_is_current(&self, name: &str) -> bool {
+        let recorded = self.storage.catalog().database_exists(name).unwrap_or(false);
+        let tenant = self
+            .tenant_manager
+            .list_tenants()
+            .into_iter()
+            .find(|t| t.name.eq_ignore_ascii_case(name));
+        match (recorded, tenant) {
+            (true, Some(_)) => true,
+            (true, None) => {
+                let written = self
+                    .storage
+                    .catalog()
+                    .list_databases()
+                    .ok()
+                    .and_then(|names| names.into_iter().find(|known| known.eq_ignore_ascii_case(name)))
+                    .unwrap_or_else(|| name.to_string());
+                let default_plan = self.tenant_manager.plan_manager.get_default_plan();
+                self.tenant_manager.register_tenant_with_plan(
+                    written,
+                    crate::tenant::IsolationMode::DatabasePerTenant,
+                    &default_plan.id,
+                );
+                true
+            }
+            // A tenant registered by another route (the tenant API) has no
+            // record and is a name to connect by, as before.
+            (false, Some(_)) => true,
+            (false, None) => false,
+        }
     }
 
     /// Bug 5 — validate a StartupMessage `database` parameter. Returns
@@ -33125,10 +33168,7 @@ impl EmbeddedDatabase {
         if Self::database_name_is_reserved(trimmed) {
             return true;
         }
-        self.tenant_manager
-            .list_tenants()
-            .iter()
-            .any(|t| t.name.eq_ignore_ascii_case(trimmed))
+        self.database_tenant_is_current(trimmed)
     }
 
     /// Apply DEFAULT expressions to NULL-valued columns and enforce

@@ -147,3 +147,74 @@ fn pg_wire_database_validation_via_catalog_api() {
     assert!(!PgCatalog::is_valid_database_name(&db, "totally_made_up_db_12345"));
     assert!(!PgCatalog::is_valid_database_name(&db, ""));
 }
+
+// ---------------------------------------------------------------------------
+// GitHub #48: a database is still there after a restart
+// ---------------------------------------------------------------------------
+//
+// The name was kept in memory only. After a restart a connection by it was
+// refused with 3D000, and `pg_database` never listed it.
+
+fn database_names(db: &EmbeddedDatabase) -> Vec<String> {
+    db.query("SELECT datname FROM pg_database ORDER BY oid", &[])
+        .expect("pg_database")
+        .iter()
+        .map(|row| match &row.values[0] {
+            Value::String(name) => name.clone(),
+            other => panic!("datname: {other:?}"),
+        })
+        .collect()
+}
+
+#[test]
+fn a_created_database_is_listed_and_survives_a_reopen() {
+    let dir = tempfile::tempdir().expect("dir");
+    {
+        let db = EmbeddedDatabase::new(dir.path()).expect("db");
+        db.execute("CREATE DATABASE compat_db").expect("create");
+        db.execute("CREATE DATABASE \"Mixed_Db\"").expect("create");
+        assert!(db.database_name_is_valid("compat_db"));
+        assert_eq!(database_names(&db), ["heliosdb", "compat_db", "Mixed_Db"]);
+    }
+    let db = EmbeddedDatabase::new(dir.path()).expect("reopen");
+    // Nothing in memory knows the names yet; the store does.
+    assert!(db.tenant_manager.list_tenants().is_empty());
+    assert_eq!(database_names(&db), ["heliosdb", "compat_db", "Mixed_Db"]);
+    assert!(db.database_name_is_valid("compat_db"));
+    assert!(
+        db.database_name_is_valid("COMPAT_DB"),
+        "a database name is matched in any case"
+    );
+    assert!(db.database_name_is_valid("mixed_db"));
+    assert!(!db.database_name_is_valid("never_created"));
+    // The name is bound to a tenant again on first use, once.
+    assert!(db.database_name_is_valid("compat_db"));
+    let tenants = db.tenant_manager.list_tenants();
+    assert_eq!(tenants.iter().filter(|t| t.name == "compat_db").count(), 1);
+    // It still cannot be created twice.
+    assert!(db.execute("CREATE DATABASE compat_db").is_err());
+    db.execute("CREATE DATABASE IF NOT EXISTS compat_db")
+        .expect("if not exists");
+}
+
+#[test]
+fn a_dropped_database_does_not_come_back() {
+    let dir = tempfile::tempdir().expect("dir");
+    {
+        let db = EmbeddedDatabase::new(dir.path()).expect("db");
+        db.execute("CREATE DATABASE keep_db").expect("create");
+        db.execute("CREATE DATABASE gone_db").expect("create");
+        db.execute("DROP DATABASE gone_db").expect("drop");
+        assert!(!db.database_name_is_valid("gone_db"));
+        assert_eq!(database_names(&db), ["heliosdb", "keep_db"]);
+    }
+    let db = EmbeddedDatabase::new(dir.path()).expect("reopen");
+    assert!(!db.database_name_is_valid("gone_db"));
+    assert!(db.database_name_is_valid("keep_db"));
+    // Dropped after a reopen, before anything connected by the name.
+    db.execute("DROP DATABASE keep_db").expect("drop a recorded database");
+    assert!(!db.database_name_is_valid("keep_db"));
+    assert_eq!(database_names(&db), ["heliosdb"]);
+    assert!(db.execute("DROP DATABASE keep_db").is_err());
+    db.execute("DROP DATABASE IF EXISTS keep_db").expect("if exists");
+}

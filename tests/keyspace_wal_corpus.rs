@@ -72,6 +72,7 @@ const REQUIRED_CLASSES: &[KeyClass] = &[
     KeyClass::MetaAttMissing,
     KeyClass::MetaIndex,
     KeyClass::MetaSchema,
+    KeyClass::MetaDatabase,
     KeyClass::MetaEnumType,
     KeyClass::MetaIdentity,
     KeyClass::MetaPartition,
@@ -168,6 +169,7 @@ fn ints(db: &EmbeddedDatabase, sql: &str) -> Vec<i64> {
 fn session_one(db: &EmbeddedDatabase) {
     // Catalog side records.
     run(db, "CREATE SCHEMA ks_app");
+    run(db, "CREATE DATABASE ks_db");
     run(db, "CREATE TYPE ks_mood AS ENUM ('calm', 'busy')");
     run(db, "CREATE ROLE ks_reader");
 

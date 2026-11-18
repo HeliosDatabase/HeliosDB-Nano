@@ -4215,7 +4215,7 @@ impl SystemViewRegistry {
             "information_schema.referential_constraints" => {
                 Self::execute_information_schema_referential_constraints(storage)
             }
-            "pg_database" => Self::execute_pg_database(),
+            "pg_database" => Self::execute_pg_database(storage),
             // Empty-stub catalogue tables (v3.31.0 slice 5). Schema
             // already registered; rows are always empty because Nano
             // doesn't model these concepts.
@@ -5505,19 +5505,31 @@ impl SystemViewRegistry {
     /// a follow-up that widens the executor context. `\l` already
     /// renders only `heliosdb` (via try_psql_metacommand's own
     /// matcher), so there's no current-behaviour regression.
-    fn execute_pg_database() -> Result<Vec<Tuple>> {
-        Ok(vec![Tuple::new(vec![
-            Value::Int4(1),                            // oid
-            Value::String(HELIOS_CATALOG_NAME.into()), // datname
-            Value::Int4(10),                           // datdba
-            Value::Int4(6),                            // encoding = UTF8
-            Value::String("C.UTF-8".into()),           // datcollate
-            Value::String("C.UTF-8".into()),           // datctype
-            Value::Boolean(false),                     // datistemplate
-            Value::Boolean(true),                      // datallowconn
-            Value::Int4(-1),                           // datconnlimit
-            Value::Int4(1663),                         // dattablespace = pg_default
-        ])])
+    fn execute_pg_database(storage: &StorageEngine) -> Result<Vec<Tuple>> {
+        let row = |oid: i32, name: String| {
+            Tuple::new(vec![
+                Value::Int4(oid),                // oid
+                Value::String(name),             // datname
+                Value::Int4(10),                 // datdba
+                Value::Int4(6),                  // encoding = UTF8
+                Value::String("C.UTF-8".into()), // datcollate
+                Value::String("C.UTF-8".into()), // datctype
+                Value::Boolean(false),           // datistemplate
+                Value::Boolean(true),            // datallowconn
+                Value::Int4(-1),                 // datconnlimit
+                Value::Int4(1663),               // dattablespace = pg_default
+            ])
+        };
+        // GH#48: and every database `CREATE DATABASE` recorded, in name order,
+        // numbered from PostgreSQL's first user oid.
+        let mut rows = vec![row(1, HELIOS_CATALOG_NAME.into())];
+        for (position, name) in storage.catalog().list_databases()?.into_iter().enumerate() {
+            rows.push(row(
+                16384_i32.saturating_add(i32::try_from(position).unwrap_or(i32::MAX)),
+                name,
+            ));
+        }
+        Ok(rows)
     }
 
     fn execute_pg_namespace(storage: &StorageEngine) -> Result<Vec<Tuple>> {
