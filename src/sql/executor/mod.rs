@@ -4740,7 +4740,10 @@ impl<'a> Executor<'a> {
                     rolbypassrls: *bypassrls,
                     rolconnlimit: conn_limit.unwrap_or(-1),
                     rolvaliduntil: valid_until.clone(),
-                    password: password.clone(),
+                    // GH#49: a verifier, never the password.
+                    password: password.as_deref().map(|password| {
+                        crate::protocol::postgres::password_store::role_password_for_storage(name, password)
+                    }),
                 };
                 catalog.save_role(&record)?;
                 self.empty_ddl_result()
@@ -4793,7 +4796,9 @@ impl<'a> Executor<'a> {
                     record.rolvaliduntil = v.clone();
                 }
                 if let Some(v) = set_password {
-                    record.password = v.clone();
+                    record.password = v.as_deref().map(|password| {
+                        crate::protocol::postgres::password_store::role_password_for_storage(name, password)
+                    });
                 }
                 catalog.save_role(&record)?;
                 self.empty_ddl_result()

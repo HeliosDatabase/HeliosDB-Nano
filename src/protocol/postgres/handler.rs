@@ -1483,7 +1483,8 @@ where
                             .clone()
                             .ok_or_else(|| Error::authentication("No username provided"))?;
 
-                        if self.auth_manager.verify_cleartext(&username, &password)? {
+                        let role = self.role_login_credentials(&username);
+                        if self.auth_manager.verify_cleartext_with(&username, &password, role)? {
                             self.authenticated = true;
                             self.send_auth_ok().await?;
                         } else {
@@ -1807,6 +1808,14 @@ where
     ///
     /// The message is the BARE PostgreSQL text: it goes on the wire verbatim,
     /// with no `Protocol error: ` prefix in front of it.
+    /// The credential of the SQL role `username`, when a role of that name may
+    /// log in (GitHub #49). The catalog is read for every name, with a role
+    /// behind it or not; a read that fails is a name without a role.
+    fn role_login_credentials(&self, username: &str) -> Option<super::password_store::ScramCredentials> {
+        let role = self.database.storage.catalog().get_role(username).ok().flatten();
+        role.as_ref().and_then(super::password_store::role_login_credentials)
+    }
+
     fn password_rejection(username: &str) -> StartupError {
         // PostgreSQL truncates names to NAMEDATALEN-1 (63) characters; doing
         // the same bounds what a client can make the server echo back.
@@ -3723,6 +3732,9 @@ where
 
         tracing::info!("SCRAM authentication for user: {}", username);
 
+        // GH#49: the name may be a SQL role's (read for every name).
+        let role = self.role_login_credentials(username);
+
         // Get user credentials from password store
         let password_store = self
             .auth_manager
@@ -3737,7 +3749,7 @@ where
         // mandatory-rejection flag, NOT proof validity: it is honoured after
         // verification runs, so even a proof forged against the synthetic
         // credential cannot authenticate a name that does not exist.
-        let (credentials, must_fail) = password_store.credentials_for_scram(username);
+        let (credentials, must_fail) = password_store.credentials_for_scram_with(username, role);
 
         // Create SCRAM state FROM THE STORED CREDENTIAL's salt and iteration
         // count (GH#20). `ScramAuthState::new` generates a fresh random salt per
@@ -8643,6 +8655,185 @@ mod md5_auth_wire_tests {
         assert!(result.is_err(), "a wrong SCRAM proof must be rejected");
         assert!(!handler.authenticated, "failed SCRAM must leave authenticated=false");
         let _client = client_task.await.expect("client task");
+    }
+
+    // -----------------------------------------------------------------------
+    // GH#49: a role made with SQL logs in
+    // -----------------------------------------------------------------------
+    //
+    // Wire authentication knew the accounts given at start and nothing else:
+    // `CREATE USER claude WITH LOGIN PASSWORD '…'` succeeded and `claude` was
+    // refused with 28P01 under every method. The role's record kept the
+    // password as written and nothing read it.
+
+    /// One SCRAM login as `user` against `db`. The start-up store holds only
+    /// `postgres`, as a server started with `--password` holds it.
+    async fn role_scram_login(db: &Arc<EmbeddedDatabase>, user: &'static str, password: &'static str) -> bool {
+        let auth = scram_auth_manager("postgres", "Bootstrap_ExampleOnly");
+        let (mut handler, mut client) = test_handler_with_auth(Arc::clone(db), auth);
+        let client_task = tokio::spawn(async move { scram_client_exchange(&mut client, user, password).await });
+        // The start-up packet names no database, so the server looks for one
+        // named after the user and, for a role, refuses the connection after
+        // the login (3D000, as PostgreSQL does). What is asked here is whether
+        // the login itself was accepted.
+        let _ = tokio::time::timeout(Duration::from_secs(5), handler.handle_startup())
+            .await
+            .expect("startup did not hang");
+        let logged_in = handler.authenticated;
+        // A refused client is still waiting for its next message.
+        drop(handler);
+        let _ = tokio::time::timeout(Duration::from_secs(1), client_task).await;
+        logged_in
+    }
+
+    fn stored_password(db: &EmbeddedDatabase, role: &str) -> Option<String> {
+        db.storage
+            .catalog()
+            .get_role(role)
+            .expect("read role")
+            .and_then(|record| record.password)
+    }
+
+    #[tokio::test]
+    async fn a_role_made_with_sql_logs_in_with_its_password_and_no_other() {
+        let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+        db.execute("CREATE USER claude WITH LOGIN PASSWORD 'role-pw-1'")
+            .expect("create user");
+        assert!(
+            role_scram_login(&db, "claude", "role-pw-1").await,
+            "the role's own password"
+        );
+        assert!(!role_scram_login(&db, "claude", "role-pw-2").await, "a wrong password");
+        assert!(
+            !role_scram_login(&db, "claude", "Bootstrap_ExampleOnly").await,
+            "another account's password"
+        );
+        assert!(
+            !role_scram_login(&db, "nobody", "role-pw-1").await,
+            "a name with no role"
+        );
+        // The start-up account is what it was.
+        assert!(role_scram_login(&db, "postgres", "Bootstrap_ExampleOnly").await);
+        assert!(!role_scram_login(&db, "postgres", "role-pw-1").await);
+    }
+
+    #[tokio::test]
+    async fn a_role_keeps_a_verifier_never_its_password() {
+        let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+        db.execute("CREATE USER claude WITH LOGIN PASSWORD 'role-pw-1'")
+            .expect("create user");
+        let stored = stored_password(&db, "claude").expect("a stored credential");
+        assert!(stored.starts_with("SCRAM-SHA-256$4096:"), "{stored}");
+        assert!(!stored.contains("role-pw-1"));
+        // Two roles with one password do not share a verifier (a salt each).
+        db.execute("CREATE USER other WITH LOGIN PASSWORD 'role-pw-1'")
+            .expect("create user");
+        assert_ne!(stored_password(&db, "other"), Some(stored.clone()));
+
+        // ALTER ROLE replaces it, and the old password is gone with it.
+        db.execute("ALTER ROLE claude PASSWORD 'role-pw-2'")
+            .expect("alter role");
+        let replaced = stored_password(&db, "claude").expect("a stored credential");
+        assert!(replaced.starts_with("SCRAM-SHA-256$") && replaced != stored);
+        assert!(role_scram_login(&db, "claude", "role-pw-2").await);
+        assert!(!role_scram_login(&db, "claude", "role-pw-1").await);
+
+        // A verifier given as the password (a dump of roles) is kept as it is.
+        db.execute(&format!("CREATE USER restored WITH LOGIN PASSWORD '{replaced}'"))
+            .expect("create user from a verifier");
+        assert_eq!(stored_password(&db, "restored"), Some(replaced));
+        assert!(role_scram_login(&db, "restored", "role-pw-2").await);
+
+        // PASSWORD NULL takes the login away.
+        db.execute("ALTER ROLE claude PASSWORD NULL").expect("alter role");
+        assert_eq!(stored_password(&db, "claude"), None);
+        assert!(!role_scram_login(&db, "claude", "role-pw-2").await);
+    }
+
+    #[tokio::test]
+    async fn a_role_without_login_or_past_its_time_is_refused() {
+        let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+        // CREATE ROLE does not imply LOGIN.
+        db.execute("CREATE ROLE reader PASSWORD 'role-pw-1'")
+            .expect("create role");
+        assert!(!role_scram_login(&db, "reader", "role-pw-1").await, "NOLOGIN");
+        db.execute("ALTER ROLE reader LOGIN").expect("alter role");
+        assert!(role_scram_login(&db, "reader", "role-pw-1").await, "LOGIN");
+
+        db.execute("CREATE USER past WITH LOGIN PASSWORD 'role-pw-1' VALID UNTIL '2020-01-01 00:00:00'")
+            .expect("create user");
+        assert!(!role_scram_login(&db, "past", "role-pw-1").await, "expired");
+        db.execute("CREATE USER future WITH LOGIN PASSWORD 'role-pw-1' VALID UNTIL '2999-01-01'")
+            .expect("create user");
+        assert!(role_scram_login(&db, "future", "role-pw-1").await, "not expired");
+        db.execute("CREATE USER forever WITH LOGIN PASSWORD 'role-pw-1' VALID UNTIL 'infinity'")
+            .expect("create user");
+        assert!(role_scram_login(&db, "forever", "role-pw-1").await, "infinity");
+        // A text that is not a time closes the login instead of opening it.
+        db.execute("CREATE USER vague WITH LOGIN PASSWORD 'role-pw-1' VALID UNTIL 'next spring'")
+            .expect("create user");
+        assert!(!role_scram_login(&db, "vague", "role-pw-1").await, "not a time");
+    }
+
+    #[tokio::test]
+    async fn a_password_stored_by_an_earlier_release_does_not_log_in_until_it_is_set_again() {
+        let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+        db.execute("CREATE USER legacy WITH LOGIN PASSWORD 'placeholder'")
+            .expect("create user");
+        // The record as a release before 4.42.0 wrote it: the password as text.
+        let catalog = db.storage.catalog();
+        let mut record = catalog.get_role("legacy").expect("read role").expect("role");
+        record.password = Some("old-plain-pw".to_string());
+        catalog.save_role(&record).expect("save role");
+
+        assert!(!role_scram_login(&db, "legacy", "old-plain-pw").await);
+        db.execute("ALTER ROLE legacy PASSWORD 'old-plain-pw'")
+            .expect("alter role");
+        assert!(role_scram_login(&db, "legacy", "old-plain-pw").await);
+    }
+
+    #[tokio::test]
+    async fn a_role_logs_in_after_the_store_is_reopened() {
+        let dir = tempfile::tempdir().expect("dir");
+        {
+            let db = Arc::new(EmbeddedDatabase::new(dir.path()).expect("db"));
+            db.execute("CREATE USER claude WITH LOGIN PASSWORD 'role-pw-1'")
+                .expect("create user");
+            assert!(role_scram_login(&db, "claude", "role-pw-1").await);
+        }
+        let db = Arc::new(EmbeddedDatabase::new(dir.path()).expect("db"));
+        assert!(role_scram_login(&db, "claude", "role-pw-1").await);
+        assert!(!role_scram_login(&db, "claude", "role-pw-2").await);
+    }
+
+    #[tokio::test]
+    async fn a_role_logs_in_under_password_authentication_too() {
+        use super::super::password_store::{InMemoryPasswordStore, SharedPasswordStore};
+        let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+        db.execute("CREATE USER claude WITH LOGIN PASSWORD 'role-pw-1'")
+            .expect("create user");
+        for (user, password, expected) in [
+            ("claude", "role-pw-1", true),
+            ("claude", "role-pw-2", false),
+            ("nobody", "role-pw-1", false),
+            ("postgres", "Bootstrap_ExampleOnly", true),
+        ] {
+            let store = SharedPasswordStore::new(InMemoryPasswordStore::new());
+            store.add_user("postgres", "Bootstrap_ExampleOnly").expect("add user");
+            let auth = AuthManager::with_password_store(AuthMethod::CleartextPassword, store);
+            let (mut handler, mut client) = test_handler_with_auth(Arc::clone(&db), auth);
+            let client_task = tokio::spawn(async move {
+                client.write_all(&build_startup(user)).await.expect("startup");
+                let _ = read_auth_message(&mut client).await; // AuthenticationCleartextPassword
+                let _ = client.write_all(&build_password_message(password)).await;
+                client
+            });
+            let _ = tokio::time::timeout(Duration::from_secs(5), handler.handle_startup())
+                .await
+                .expect("startup did not hang");
+            assert_eq!(handler.authenticated, expected, "{user} / {password}");
+            let _ = tokio::time::timeout(Duration::from_secs(1), client_task).await;
+        }
     }
 }
 

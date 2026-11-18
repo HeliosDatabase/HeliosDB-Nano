@@ -233,6 +233,19 @@ impl AuthManager {
 
     /// Verify clear-text password
     pub fn verify_cleartext(&self, username: &str, password: &str) -> Result<bool> {
+        self.verify_cleartext_with(username, password, None)
+    }
+
+    /// [`Self::verify_cleartext`] for a name that may be a SQL role: `role` is
+    /// the credential of its catalog record, used when the store has no account
+    /// of that name (`SharedPasswordStore::credentials_for_scram_with`). One
+    /// key derivation is paid whichever credential is chosen.
+    pub(crate) fn verify_cleartext_with(
+        &self,
+        username: &str,
+        password: &str,
+        role: Option<super::password_store::ScramCredentials>,
+    ) -> Result<bool> {
         // If using SCRAM store, verify through that.
         //
         // HDB-001: go through the SAME mock-authentication credential the SCRAM
@@ -244,7 +257,7 @@ impl AuthManager {
         // (synthetic for an absent name), so the PBKDF2 is paid either way, and
         // `must_fail` rejects the synthetic one even if the proof matches it.
         if let Some(ref store) = self.password_store {
-            let (credentials, must_fail) = store.credentials_for_scram(username);
+            let (credentials, must_fail) = store.credentials_for_scram_with(username, role);
             let verified = credentials.verify_password(password);
             return Ok(verified && !must_fail);
         }

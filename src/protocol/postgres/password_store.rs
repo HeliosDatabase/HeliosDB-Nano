@@ -92,6 +92,44 @@ impl ScramCredentials {
         self.server_key = server_key;
     }
 
+    /// The credential in PostgreSQL's stored form,
+    /// `SCRAM-SHA-256$<iterations>:<salt>$<StoredKey>:<ServerKey>` (base64).
+    /// This is what a role's catalog record keeps instead of its password.
+    pub fn to_verifier(&self) -> String {
+        use base64::Engine;
+        let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+        format!(
+            "{SCRAM_VERIFIER_PREFIX}{}:{}${}:{}",
+            self.iterations,
+            b64(&self.salt),
+            b64(&self.stored_key),
+            b64(&self.server_key)
+        )
+    }
+
+    /// Read a credential back from its stored form. `None` for anything that is
+    /// not exactly one: a text that merely starts like a verifier is not a key.
+    pub fn from_verifier(username: &str, verifier: &str) -> Option<Self> {
+        use base64::Engine;
+        let b64 = |text: &str| base64::engine::general_purpose::STANDARD.decode(text).ok();
+        let (head, keys) = verifier.strip_prefix(SCRAM_VERIFIER_PREFIX)?.split_once('$')?;
+        let (iterations, salt) = head.split_once(':')?;
+        let (stored_key, server_key) = keys.split_once(':')?;
+        let iterations: u32 = iterations.parse().ok()?;
+        let (salt, stored_key, server_key) = (b64(salt)?, b64(stored_key)?, b64(server_key)?);
+        let well_formed = (1..=SCRAM_VERIFIER_MAX_ITERATIONS).contains(&iterations)
+            && (8..=64).contains(&salt.len())
+            && stored_key.len() == 32
+            && server_key.len() == 32;
+        well_formed.then(|| Self {
+            username: username.to_owned(),
+            salt,
+            iterations,
+            stored_key,
+            server_key,
+        })
+    }
+
     /// Verify that a password matches these credentials
     pub fn verify_password(&self, password: &str) -> bool {
         let salted_password = scram_salted_password(password, &self.salt, self.iterations);
@@ -106,6 +144,105 @@ impl ScramCredentials {
 /// Constant-time comparison to prevent timing attacks
 fn constant_time_compare(a: &[u8], b: &[u8]) -> bool {
     bool::from(a.ct_eq(b))
+}
+
+/// How a stored SCRAM-SHA-256 verifier begins (PostgreSQL's `pg_authid` form).
+const SCRAM_VERIFIER_PREFIX: &str = "SCRAM-SHA-256$";
+
+/// More iterations than this in a stored verifier is a record this server did
+/// not write and will not spend a connection's time on.
+const SCRAM_VERIFIER_MAX_ITERATIONS: u32 = 1_000_000;
+
+/// What `CREATE ROLE … PASSWORD` and `ALTER ROLE … PASSWORD` keep for a role:
+/// a SCRAM-SHA-256 verifier, never the password (GitHub #49).
+///
+/// A value that already is a verifier (a dump of roles writes them) is kept as
+/// it is. A PostgreSQL MD5 hash (`md5` and 32 hex digits) is kept too: it is
+/// not a password, and it cannot answer a SCRAM exchange, so such a role cannot
+/// log in until it is given a password. Anything else is a password: it is
+/// hashed with a fresh salt at the server's iteration count, the shape of
+/// every other credential this server challenges with.
+pub fn role_password_for_storage(role: &str, password: &str) -> String {
+    let md5_hash = password
+        .strip_prefix("md5")
+        .is_some_and(|digest| digest.len() == 32 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    if md5_hash || ScramCredentials::from_verifier(role, password).is_some() {
+        return password.to_owned();
+    }
+    ScramCredentials::from_password(role.to_owned(), password, super::auth::DEFAULT_SCRAM_ITERATIONS).to_verifier()
+}
+
+/// The credential a SQL role logs in with, when it may log in at all (GitHub #49).
+///
+/// `None`, and with it the uniform rejection every failed login gets, for a
+/// role without `LOGIN`, a role past its `VALID UNTIL` (or with one that is not
+/// a time), a role without a password, and a role whose password was stored by
+/// a release before 4.42.0. Those kept the password as written and never used
+/// it: an upgrade must not turn such a record into an account. Setting the
+/// password again (`ALTER ROLE … PASSWORD`) stores a verifier and enables the
+/// login.
+pub(crate) fn role_login_credentials(role: &crate::storage::RoleRecord) -> Option<ScramCredentials> {
+    if !role.rolcanlogin {
+        return None;
+    }
+    if let Some(until) = role.rolvaliduntil.as_deref() {
+        match role_valid_until(until) {
+            ValidUntil::At(end) if end <= chrono::Utc::now() => return None,
+            ValidUntil::At(_) | ValidUntil::Forever => {}
+            ValidUntil::NotATime => {
+                tracing::warn!(
+                    role = role.name.as_str(),
+                    "VALID UNTIL of this role is not a time; the role cannot log in"
+                );
+                return None;
+            }
+        }
+    }
+    let stored = role.password.as_deref()?;
+    let credentials = ScramCredentials::from_verifier(&role.name, stored);
+    if credentials.is_none() {
+        tracing::warn!(
+            role = role.name.as_str(),
+            "this role's password was not stored as a SCRAM verifier (set before 4.42.0, or an MD5 hash); \
+             ALTER ROLE … PASSWORD enables its login"
+        );
+    }
+    credentials
+}
+
+/// A role's `VALID UNTIL` text, read.
+enum ValidUntil {
+    /// `infinity`.
+    Forever,
+    At(chrono::DateTime<chrono::Utc>),
+    NotATime,
+}
+
+/// Read a `VALID UNTIL` text. A time without a zone is UTC, a date is its
+/// midnight.
+fn role_valid_until(text: &str) -> ValidUntil {
+    use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
+    let text = text.trim();
+    if text.eq_ignore_ascii_case("infinity") {
+        return ValidUntil::Forever;
+    }
+    if let Ok(time) = DateTime::parse_from_rfc3339(text) {
+        return ValidUntil::At(time.with_timezone(&Utc));
+    }
+    for format in ["%Y-%m-%d %H:%M:%S%.f%#z", "%Y-%m-%dT%H:%M:%S%.f%#z"] {
+        if let Ok(time) = DateTime::parse_from_str(text, format) {
+            return ValidUntil::At(time.with_timezone(&Utc));
+        }
+    }
+    for format in ["%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%d %H:%M"] {
+        if let Ok(time) = NaiveDateTime::parse_from_str(text, format) {
+            return ValidUntil::At(time.and_utc());
+        }
+    }
+    NaiveDate::parse_from_str(text, "%Y-%m-%d")
+        .ok()
+        .and_then(|date| date.and_hms_opt(0, 0, 0))
+        .map_or(ValidUntil::NotATime, |midnight| ValidUntil::At(midnight.and_utc()))
 }
 
 /// Password storage trait
@@ -319,6 +456,21 @@ impl SharedPasswordStore {
     /// validity: when it is set the caller must fail the login even if the
     /// client's proof verifies against the synthetic credential.
     pub(crate) fn credentials_for_scram(&self, username: &str) -> (ScramCredentials, bool) {
+        self.credentials_for_scram_with(username, None)
+    }
+
+    /// [`Self::credentials_for_scram`] for a name that may be a SQL role
+    /// (GitHub #49): `role` is the credential of the role's catalog record
+    /// ([`role_login_credentials`]), used when this store has no account of
+    /// that name. The caller reads the catalog for every name the store does
+    /// not hold, whether a role of that name exists or not, and the synthetic
+    /// credential is still built before anything is chosen: a name with a role
+    /// behind it does the work a name without one does.
+    pub(crate) fn credentials_for_scram_with(
+        &self,
+        username: &str,
+        role: Option<ScramCredentials>,
+    ) -> (ScramCredentials, bool) {
         let (lookup, policy_iterations) = {
             let store = self.inner.read();
             (store.get_credentials(username), store.default_scram_iterations())
@@ -364,7 +516,7 @@ impl SharedPasswordStore {
             server_key: derive(b"server", 32),
         };
 
-        match lookup {
+        match lookup.or(role) {
             Some(real) => (real, false),
             None => (synthetic, true),
         }
