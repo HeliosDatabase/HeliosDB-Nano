@@ -517,6 +517,12 @@ impl Evaluator {
             }
 
             LogicalExpr::InList { expr, list, negated } => {
+                // Nothing to compare with (a subquery that returned no row):
+                // `IN` is false and `NOT IN` true for every left value, NULL
+                // included.
+                if list.is_empty() {
+                    return Ok(Value::Boolean(*negated));
+                }
                 let value = self.evaluate(expr, tuple)?;
 
                 // Check if value is NULL - SQL semantics: NULL IN (...) = NULL
@@ -608,12 +614,23 @@ impl Evaluator {
             }
 
             LogicalExpr::InSet { expr, values, negated } => {
+                if values.is_empty() {
+                    return Ok(Value::Boolean(*negated));
+                }
                 let value = self.evaluate(expr, tuple)?;
                 if matches!(value, Value::Null) {
                     return Ok(Value::Null);
                 }
                 // Use values_equal for cross-type coercion (String("9") matches Int8(9))
-                let found = values.iter().any(|v| self.values_equal(&value, v));
+                let found = values
+                    .iter()
+                    .any(|v| !matches!(v, Value::Null) && self.values_equal(&value, v));
+                // The rule of the list form above: no match beside a NULL
+                // member is unknown, not false. `x NOT IN (…, NULL)` keeps no
+                // row, whatever the size of the set.
+                if !found && values.contains(&Value::Null) {
+                    return Ok(Value::Null);
+                }
                 Ok(Value::Boolean(if *negated { !found } else { found }))
             }
 
