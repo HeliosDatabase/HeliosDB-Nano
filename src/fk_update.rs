@@ -151,10 +151,127 @@ fn matches_key(schema: &Schema, row: &Tuple, columns: &[String], wanted: &[Value
         && key(schema, row, columns).is_ok_and(|have| have.iter().all(|v| !matches!(v, Value::Null)) && have == wanted)
 }
 
+/// A probe that can match a stored key at all: one value per column, none NULL.
+fn probe_is_complete(columns: &[String], wanted: &[Value]) -> bool {
+    !wanted.is_empty() && columns.len() == wanted.len() && wanted.iter().all(|v| !matches!(v, Value::Null))
+}
+
+/// Whether looking this value up in a hash table gives the same answer as
+/// comparing it with every stored value. Floats do not (`-0.0 == 0.0`, different
+/// bits), and neither do the containers that may hold them; storage references
+/// are kept out as well. A key with such a value is compared row by row.
+fn exactly_hashable(value: &Value) -> bool {
+    matches!(
+        value,
+        Value::Boolean(_)
+            | Value::Int2(_)
+            | Value::Int4(_)
+            | Value::Int8(_)
+            | Value::Numeric(_)
+            | Value::String(_)
+            | Value::Bytes(_)
+            | Value::Uuid(_)
+            | Value::Timestamp(_)
+            | Value::Date(_)
+            | Value::Time(_)
+            | Value::Interval(_)
+    )
+}
+
+/// The rows of one child table as the running command sees them: read once and
+/// kept until the command stages a write to that table.
+///
+/// A parent change asks, for every changed row and every foreign key that points
+/// at it, which child rows carry the old key. Reading the child table for each
+/// question made a `DELETE` of a hundred parent rows read it a few hundred times.
+struct ChildRows {
+    rows: Vec<Tuple>,
+    /// Row id to its place in `rows`.
+    position: HashMap<u64, usize>,
+    /// Per column list of a foreign key: complete, exactly hashable keys to the
+    /// places of the rows that carry them, in scan order.
+    by_key: HashMap<Vec<String>, HashMap<Vec<Value>, Vec<usize>>>,
+}
+
+impl ChildRows {
+    fn new(rows: Vec<Tuple>) -> Self {
+        let position = rows
+            .iter()
+            .enumerate()
+            .filter_map(|(place, row)| row.row_id.map(|id| (id, place)))
+            .collect();
+        Self {
+            rows,
+            position,
+            by_key: HashMap::new(),
+        }
+    }
+
+    /// The places of the rows whose key over `columns` is `wanted`, in scan
+    /// order: the rows `matches_key` accepts.
+    fn matching(&mut self, schema: &Schema, columns: &[String], wanted: &[Value]) -> Vec<usize> {
+        if !probe_is_complete(columns, wanted) {
+            return Vec::new();
+        }
+        let Self { rows, by_key, .. } = self;
+        if !wanted.iter().all(exactly_hashable) {
+            return rows
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| matches_key(schema, row, columns, wanted))
+                .map(|(place, _)| place)
+                .collect();
+        }
+        let index = by_key.entry(columns.to_vec()).or_insert_with(|| {
+            let mut index: HashMap<Vec<Value>, Vec<usize>> = HashMap::new();
+            for (place, row) in rows.iter().enumerate() {
+                if let Ok(have) = key(schema, row, columns) {
+                    if have.iter().all(exactly_hashable) {
+                        index.entry(have).or_default().push(place);
+                    }
+                }
+            }
+            index
+        });
+        index.get(wanted).cloned().unwrap_or_default()
+    }
+}
+
+/// What a command reads through: the engine, its transaction and the branch its
+/// session is on.
+struct CommandView<'a> {
+    storage: &'a storage::StorageEngine,
+    txn: &'a storage::Transaction,
+    branch: Option<&'a crate::session::BranchBinding>,
+}
+
+/// Whether any current row of `table` carries `wanted` over `columns`. The key
+/// set of a relationship is built once per command (`run`); a key that cannot be
+/// looked up exactly is compared row by row.
+fn key_is_present(
+    view: &CommandView<'_>,
+    run: &mut FkValidationRun,
+    table: &str,
+    schema: &Schema,
+    columns: &[String],
+    wanted: &[Value],
+) -> Result<bool> {
+    if !probe_is_complete(columns, wanted) {
+        return Ok(false);
+    }
+    if wanted.iter().all(exactly_hashable) {
+        return Ok(run
+            .keys(view.storage, view.txn, view.branch, table, schema, columns)?
+            .contains(wanted));
+    }
+    Ok(rows_at(view.storage, view.txn, view.branch, table, schema)?
+        .iter()
+        .any(|row| matches_key(schema, row, columns, wanted)))
+}
+
 fn validate_parent_change(
-    storage: &storage::StorageEngine,
-    txn: &storage::Transaction,
-    branch: Option<&crate::session::BranchBinding>,
+    view: &CommandView<'_>,
+    run: &mut FkValidationRun,
     fk: &ForeignKeyConstraint,
     child_schema: &Schema,
     parent_schema: &Schema,
@@ -163,17 +280,18 @@ fn validate_parent_change(
     // NO ACTION constrains the final relationship, not a particular parent's
     // identity. A replacement row restoring the old key is valid.
     let child_key = EmbeddedDatabase::coerce_fk_probe_values(child_schema, &fk.columns, old_key);
-    let references = rows_at(storage, txn, branch, &fk.table_name, child_schema)?
-        .iter()
-        .any(|row| matches_key(child_schema, row, &fk.columns, &child_key));
-    if !references {
+    if !key_is_present(view, run, &fk.table_name, child_schema, &fk.columns, &child_key)? {
         return Ok(());
     }
     let parent_key = EmbeddedDatabase::coerce_fk_probe_values(parent_schema, &fk.references_columns, old_key);
-    if rows_at(storage, txn, branch, &fk.references_table, parent_schema)?
-        .iter()
-        .any(|row| matches_key(parent_schema, row, &fk.references_columns, &parent_key))
-    {
+    if key_is_present(
+        view,
+        run,
+        &fk.references_table,
+        parent_schema,
+        &fk.references_columns,
+        &parent_key,
+    )? {
         return Ok(());
     }
     Err(Error::constraint_violation(format!(
@@ -551,6 +669,15 @@ impl EmbeddedDatabase {
             .iter()
             .filter_map(|(id, _, new)| new.as_ref().map(|new| ((table.to_string(), *id), new.clone())))
             .collect();
+        // The row ids `before` holds, per table, in the order they were added.
+        let mut before_ids: HashMap<String, Vec<u64>> = HashMap::new();
+        for (owner, id) in before.keys() {
+            before_ids.entry(owner.clone()).or_default().push(*id);
+        }
+        // Child tables as this command sees them. An entry is dropped when the
+        // command stages a write to its table, so an action that follows another
+        // reads the staged state.
+        let mut children: HashMap<String, ChildRows> = HashMap::new();
         let mut work: VecDeque<(String, Schema, Event)> = changes
             .iter()
             .cloned()
@@ -592,15 +719,31 @@ impl EmbeddedDatabase {
                 let child_schema = self.storage.catalog().get_table_schema(&fk.table_name)?;
                 let wanted = Self::coerce_fk_probe_values(&child_schema, &fk.columns, &old_key);
                 let epoch = self.row_epoch_for(view.as_ref(), &fk.table_name);
-                let current = rows_at(&self.storage, txn, branch.as_deref(), &fk.table_name, &child_schema)?;
+                let current = match children.entry(fk.table_name.clone()) {
+                    std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(entry) => entry.insert(ChildRows::new(rows_at(
+                        &self.storage,
+                        txn,
+                        branch.as_deref(),
+                        &fk.table_name,
+                        &child_schema,
+                    )?)),
+                };
                 // PostgreSQL implements RESTRICT as a non-deferred AFTER
                 // check of current child rows. A self-row whose FK was also
                 // changed in this command no longer references the old key.
-                let has_current_refs = current
-                    .iter()
-                    .any(|row| matches_key(&child_schema, row, &fk.columns, &wanted));
-                let members: Vec<Tuple> = current
+                let mut candidates = current.matching(&child_schema, &fk.columns, &wanted);
+                let has_current_refs = !candidates.is_empty();
+                // A row this command already changed is a member by its first
+                // image, whatever key it carries now.
+                if let Some(ids) = before_ids.get(&fk.table_name) {
+                    candidates.extend(ids.iter().filter_map(|id| current.position.get(id).copied()));
+                    candidates.sort_unstable();
+                    candidates.dedup();
+                }
+                let members: Vec<Tuple> = candidates
                     .into_iter()
+                    .filter_map(|place| current.rows.get(place))
                     .filter(|row| {
                         let original = row
                             .row_id
@@ -608,7 +751,10 @@ impl EmbeddedDatabase {
                             .unwrap_or(row);
                         matches_key(&child_schema, original, &fk.columns, &wanted)
                     })
+                    .cloned()
                     .collect();
+                let child_table = fk.table_name.clone();
+                let mut staged_child_write = false;
                 match if new.is_some() { fk.on_update } else { fk.on_delete } {
                     ReferentialAction::Restrict if has_current_refs => {
                         if *self.fk_validation_mode.read() == FkValidationMode::Audit
@@ -649,9 +795,13 @@ impl EmbeddedDatabase {
                             let row_id = current_child
                                 .row_id
                                 .ok_or_else(|| Error::internal("FK child has no row id"))?;
-                            before
-                                .entry((fk.table_name.clone(), row_id))
-                                .or_insert_with(|| current_child.clone());
+                            if let std::collections::hash_map::Entry::Vacant(entry) =
+                                before.entry((fk.table_name.clone(), row_id))
+                            {
+                                entry.insert(current_child.clone());
+                                before_ids.entry(fk.table_name.clone()).or_default().push(row_id);
+                            }
+                            staged_child_write = true;
                             if action == ReferentialAction::Cascade && new.is_none() {
                                 self.stage_fk_child_delete(
                                     txn,
@@ -765,18 +915,23 @@ impl EmbeddedDatabase {
                         }
                     }
                 }
+                if staged_child_write {
+                    children.remove(&child_table);
+                }
             }
         }
+        drop(children);
+        // Every action is staged: the checks below read the finished graph, each
+        // relationship once.
+        let mut run = FkValidationRun::default();
+        let command = CommandView {
+            storage: &self.storage,
+            txn,
+            branch: branch.as_deref(),
+        };
         for (fk, child_schema, parent_schema, old_key) in checks {
-            if let Err(error) = validate_parent_change(
-                &self.storage,
-                txn,
-                branch.as_deref(),
-                &fk,
-                &child_schema,
-                &parent_schema,
-                &old_key,
-            ) {
+            if let Err(error) = validate_parent_change(&command, &mut run, &fk, &child_schema, &parent_schema, &old_key)
+            {
                 if matches!(error, Error::ConstraintViolation(_))
                     && (*self.fk_validation_mode.read() == FkValidationMode::Audit
                         || fk.enforcement == ConstraintEnforcement::LockFree)
@@ -807,8 +962,13 @@ impl EmbeddedDatabase {
             {
                 continue;
             }
-            for row in rows_at(&self.storage, txn, branch.as_deref(), &table, &schema)? {
-                if row.row_id.is_some_and(|id| ids.contains(&id)) {
+            // Each touched row is read by its id. Reading the whole table to
+            // find them made a one-row UPDATE of a table with a foreign key
+            // cost a scan of that table.
+            let mut ids: Vec<u64> = ids.into_iter().collect();
+            ids.sort_unstable();
+            for id in ids {
+                if let Some(row) = row_at(&self.storage, txn, branch.as_deref(), &table, &schema, id)? {
                     self.check_updated_fk_row(txn, &table, &schema, &row)?;
                 }
             }
