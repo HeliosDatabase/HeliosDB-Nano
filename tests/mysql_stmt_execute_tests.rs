@@ -855,3 +855,58 @@ async fn hdb007_mysql_syntax_outside_literals_still_translates() {
         "the stored literal must be the MySQL text, not BOOLEAN"
     );
 }
+
+/// Plan brief v02.1: the prepared route used the same substring list as
+/// COM_QUERY, so an INSERT whose text or bound value mentioned a session
+/// function was replayed to the canned answer and never stored.
+#[tokio::test]
+async fn prepared_insert_mentioning_version_call_is_stored() {
+    let db = test_db();
+    let mut client = MySqlTestClient::connect(Arc::clone(&db)).await;
+    client
+        .query_ok("CREATE TABLE v021 (id INT PRIMARY KEY, note TEXT)")
+        .await;
+
+    // Parameterless: text carries FOUND_ROWS() in a literal.
+    let (stmt, n) = client
+        .prepare("INSERT INTO v021 VALUES (1, 'FOUND_ROWS() and VERSION()')")
+        .await;
+    assert_eq!(n, 0);
+    assert_eq!(client.execute_ok(stmt, &[]).await, 1);
+
+    // With a bound parameter and a call in code (evaluated, not canned).
+    let (stmt, n) = client
+        .prepare("INSERT INTO v021 VALUES (?, 'x') /* LAST_INSERT_ID() */")
+        .await;
+    assert_eq!(n, 1);
+    assert_eq!(client.execute_ok(stmt, &[BinParam::Long(2)]).await, 1);
+
+    let (stmt, _n) = client.prepare("INSERT INTO v021 VALUES (?, VERSION())").await;
+    assert_eq!(client.execute_ok(stmt, &[BinParam::Long(3)]).await, 1);
+
+    let rows = db.query("SELECT note FROM v021 ORDER BY id", &[]).unwrap();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].values[0], Value::String("FOUND_ROWS() and VERSION()".into()));
+    assert_eq!(rows[1].values[0], Value::String("x".into()));
+    assert!(
+        matches!(&rows[2].values[0], Value::String(s) if s.starts_with("8.0")),
+        "{rows:?}"
+    );
+}
+
+#[tokio::test]
+async fn prepared_select_with_session_call_in_where_runs_in_the_engine() {
+    let db = test_db();
+    let mut client = MySqlTestClient::connect(Arc::clone(&db)).await;
+    client
+        .query_ok("CREATE TABLE v021b (id INT PRIMARY KEY, note TEXT)")
+        .await;
+    client
+        .query_ok("INSERT INTO v021b VALUES (0, 'zero'), (5, 'five')")
+        .await;
+    let (stmt, _n) = client
+        .prepare("SELECT note FROM v021b WHERE id = FOUND_ROWS() + ?")
+        .await;
+    let (_cols, rows) = client.execute_query(stmt, &[BinParam::Long(5)]).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+}

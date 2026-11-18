@@ -37,6 +37,16 @@ Reports from users of earlier releases (GitHub numbers) and defects found while 
   on the right side of a join). `AS OF TIMESTAMP` with no literal is now an error, and an index nested-loop join no longer
   probes the live index for a `JOIN t AS OF …` right side. Test file:
   `tests/as_of_token_scan.rs`, plus unit tests in `src/sql/phase3/time_travel.rs`.
+- **A MySQL statement was answered with a canned result because its text mentioned `FOUND_ROWS()`,
+  `LAST_INSERT_ID()` or `VERSION()`.** The MySQL listener checked whether the statement text
+  merely contained one of those calls, in a string literal or a comment as well as in code, and
+  answered a one-row result without running it: an `INSERT` whose value read `'VERSION()'` came
+  back as a result set and stored nothing, and the prepared-statement path did the same. Only a
+  statement that is exactly the call, optionally aliased, is answered from the session now. In any
+  other statement the calls in its code are replaced by the session value and the statement runs,
+  so `INSERT ... VALUES (LAST_INSERT_ID())` works. A `SELECT` is routed to the `@@variable` and
+  `information_schema` handlers only when those appear in its code, not in a literal. Test files:
+  `tests/mysql_session_fn_interception.rs`, `tests/mysql_stmt_execute_tests.rs`.
 - **`ORDER BY … NULLS FIRST / NULLS LAST` was ignored (GitHub #43).** The clause was read and
   dropped: `ORDER BY due ASC NULLS LAST` returned the NULLs first. An explicit placement is now
   obeyed, in a query, over `GROUP BY`, over a set operation, under `LIMIT` and in a window's

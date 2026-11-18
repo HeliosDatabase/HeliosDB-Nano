@@ -435,6 +435,42 @@ fn scan_quoted_region(rest: &str, quote: char, doubling: bool) -> (&str, usize, 
     (&rest[quote_len..], rest.len(), false)
 }
 
+/// A length-preserving, ASCII upper-cased view of `sql` that holds only its
+/// code: the contents of `'...'` / `"..."` / `` `...` `` regions and of
+/// comments are replaced by spaces (one space per byte, delimiters kept), so a
+/// byte offset found in the view is the same offset in `sql`.  The handler
+/// uses it to decide whether a statement MENTIONS a construct (`VERSION()`,
+/// `@@x`, `information_schema`) in its code or only in a literal or comment.
+pub(crate) fn code_view(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let mut cursor = 0usize;
+    let mut prev: Option<char> = None;
+    let blank = |out: &mut String, text: &str| out.extend(std::iter::repeat(' ').take(text.len()));
+
+    while cursor < sql.len() {
+        let rest = &sql[cursor..];
+        let ch = first_char(rest);
+        let consumed = if let Some(len) = comment_len(rest, prev) {
+            blank(&mut out, &rest[..len]);
+            len
+        } else if ch == '\'' || ch == '"' || ch == '`' {
+            let (interior, len, closed) = scan_quoted_region(rest, ch, true);
+            out.push(ch);
+            blank(&mut out, interior);
+            if closed {
+                out.push(ch);
+            }
+            len
+        } else {
+            out.push(ch.to_ascii_uppercase());
+            ch.len_utf8()
+        };
+        prev = rest[..consumed].chars().next_back();
+        cursor += consumed;
+    }
+    out
+}
+
 /// Replace every region whose bytes must survive translation untouched with an
 /// opaque placeholder, returning the masked SQL and the region contents.
 ///
@@ -1338,6 +1374,25 @@ fn translate_misc(sql: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn code_view_blanks_literals_and_comments_and_keeps_length() {
+        let sql = "SELECT 'VERSION()', \"x\" /* LAST_INSERT_ID() */ , version() -- FOUND_ROWS()";
+        let v = code_view(sql);
+        assert_eq!(v.len(), sql.len());
+        assert!(v.contains("VERSION()"), "code call kept: {v}");
+        assert_eq!(v.matches("VERSION").count(), 1, "{v}");
+        assert!(!v.contains("LAST_INSERT_ID") && !v.contains("FOUND_ROWS"), "{v}");
+    }
+
+    #[test]
+    fn code_view_preserves_byte_offsets_for_multibyte_text() {
+        let sql = "SELECT 'caf\u{e9} \u{4e2d}', \u{e9}t\u{e9}, version()";
+        let v = code_view(sql);
+        assert_eq!(v.len(), sql.len());
+        let at = v.find("VERSION()").unwrap();
+        assert_eq!(&sql[at..at + 9], "version()");
+    }
 
     #[test]
     fn test_auto_increment() {

@@ -1027,6 +1027,160 @@ fn starts_with_icase(s: &str, prefix: &str) -> bool {
             .map_or(false, |b| b.eq_ignore_ascii_case(prefix.as_bytes()))
 }
 
+// ---------------------------------------------------------------------------
+// Session-function interception (FOUND_ROWS() / LAST_INSERT_ID() / VERSION())
+// ---------------------------------------------------------------------------
+
+/// The MySQL session functions the listener evaluates itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionFn {
+    FoundRows,
+    LastInsertId,
+    Version,
+}
+
+impl SessionFn {
+    const ALL: [(&'static str, SessionFn); 3] = [
+        ("FOUND_ROWS", SessionFn::FoundRows),
+        ("LAST_INSERT_ID", SessionFn::LastInsertId),
+        ("VERSION", SessionFn::Version),
+    ];
+
+    /// Column name MySQL gives the bare call.
+    fn column(self) -> &'static str {
+        match self {
+            SessionFn::FoundRows => "FOUND_ROWS()",
+            SessionFn::LastInsertId => "LAST_INSERT_ID()",
+            SessionFn::Version => "VERSION()",
+        }
+    }
+}
+
+/// Every `NAME()` call of a session function in `view` (the code-only view
+/// from `translator::code_view`), as `(start, end, function)` byte ranges.
+/// Text inside literals, quoted identifiers and comments is blank in the
+/// view, so it never matches.
+fn find_session_calls(view: &str) -> Vec<(usize, usize, SessionFn)> {
+    let bytes = view.as_bytes();
+    let mut found = Vec::new();
+    for (name, kind) in SessionFn::ALL {
+        let mut from = 0usize;
+        while let Some(rel) = view.get(from..).and_then(|t| t.find(name)) {
+            let start = from + rel;
+            from = start + name.len();
+            let before_ok = start == 0
+                || bytes.get(start - 1).map_or(true, |b| {
+                    !(b.is_ascii_alphanumeric() || matches!(b, b'_' | b'$' | b'.' | b'@'))
+                });
+            if !before_ok {
+                continue;
+            }
+            let mut i = start + name.len();
+            let skip_ws = |mut i: usize| {
+                while bytes.get(i).map_or(false, |b| b.is_ascii_whitespace()) {
+                    i += 1;
+                }
+                i
+            };
+            i = skip_ws(i);
+            if bytes.get(i) != Some(&b'(') {
+                continue;
+            }
+            i = skip_ws(i + 1);
+            if bytes.get(i) != Some(&b')') {
+                continue;
+            }
+            found.push((start, i + 1, kind));
+        }
+    }
+    found.sort_by_key(|c| c.0);
+    found
+}
+
+/// If the whole statement is `SELECT <session fn>() [[AS] alias]` (optionally
+/// `;`-terminated) return the function and the column name to answer with.
+/// Anything else (a FROM clause, more select items, an INSERT, a WHERE that
+/// mentions the call) is not exact and must be run by the engine.
+fn exact_session_select(sql: &str, view: &str, calls: &[(usize, usize, SessionFn)]) -> Option<(SessionFn, String)> {
+    let [(start, end, kind)] = calls else {
+        return None;
+    };
+    let head = view.get(..*start)?;
+    if !head.starts_with("SELECT") || !head.get(6..).map_or(false, |t| t.trim().is_empty()) {
+        return None;
+    }
+    if head.len() == 6 {
+        return None; // `SELECTVERSION()` is not a SELECT
+    }
+    let tail_view = view.get(*end..)?.trim().trim_end_matches(';').trim_end();
+    let tail_sql = sql.get(*end..)?.trim().trim_end_matches(';').trim_end();
+    if tail_view.is_empty() {
+        return Some((*kind, kind.column().to_string()));
+    }
+    // [AS] alias — one token, not a clause keyword.
+    let mut view_tokens = tail_view.split_whitespace();
+    let mut sql_tokens = tail_sql.split_whitespace();
+    let mut v = view_tokens.next()?;
+    let mut a = sql_tokens.next()?;
+    if v == "AS" {
+        v = view_tokens.next()?;
+        a = sql_tokens.next()?;
+    }
+    if view_tokens.next().is_some() {
+        return None;
+    }
+    const CLAUSES: [&str; 12] = [
+        "FROM",
+        "WHERE",
+        "LIMIT",
+        "UNION",
+        "ORDER",
+        "GROUP",
+        "HAVING",
+        "INTO",
+        "FOR",
+        "LOCK",
+        "PROCEDURE",
+        "WINDOW",
+    ];
+    let quoted = v.len() >= 2 && matches!(v.as_bytes().first(), Some(b'"' | b'`' | b'\''));
+    let word = v.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'$'));
+    if !(quoted || word) || (word && CLAUSES.contains(&v)) {
+        return None;
+    }
+    let alias = a.trim_matches(|c| c == '"' || c == '`' || c == '\'');
+    if alias.is_empty() {
+        return None;
+    }
+    Some((*kind, alias.to_string()))
+}
+
+/// First keyword of a code-only view is SELECT / WITH, or it opens a
+/// parenthesised SELECT.
+fn view_is_query(view: &str) -> bool {
+    let t = view.trim_start();
+    let word_is = |w: &str| {
+        t.starts_with(w)
+            && !t
+                .as_bytes()
+                .get(w.len())
+                .map_or(false, |b| b.is_ascii_alphanumeric() || *b == b'_')
+    };
+    word_is("SELECT") || word_is("WITH") || t.starts_with('(')
+}
+
+/// `SELECT ... @@var` — answered by the variable handler.
+fn view_selects_variable(view: &str) -> bool {
+    let t = view.trim_start();
+    t.starts_with("SELECT") && view.contains("@@")
+}
+
+/// A query reading `information_schema` — answered by the catalog handler.
+fn view_reads_information_schema(sql: &str, view: &str) -> bool {
+    view_is_query(view)
+        && (view.contains("INFORMATION_SCHEMA") || sql.to_ascii_lowercase().contains("\"information_schema\""))
+}
+
 // ============================================================================
 // MySqlHandler — the main connection handler
 // ============================================================================
@@ -1690,6 +1844,40 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
     // COM_QUERY  —  the core handler
     // ------------------------------------------------------------------
 
+    /// The session value a function stands for.
+    fn session_fn_value(&self, kind: SessionFn) -> Value {
+        match kind {
+            SessionFn::FoundRows => Value::Int8(self.last_row_count as i64),
+            SessionFn::LastInsertId => Value::Int8(self.last_insert_id as i64),
+            SessionFn::Version => Value::String(SERVER_VERSION.to_string()),
+        }
+    }
+
+    /// Replace each call (byte ranges found in the code-only view) by the
+    /// session value as a SQL literal.
+    fn substitute_session_calls(&self, sql: &str, calls: &[(usize, usize, SessionFn)]) -> String {
+        let mut out = String::with_capacity(sql.len());
+        let mut cursor = 0usize;
+        for &(start, end, kind) in calls {
+            let Some(before) = sql.get(cursor..start) else {
+                continue;
+            };
+            out.push_str(before);
+            match kind {
+                SessionFn::FoundRows => out.push_str(&self.last_row_count.to_string()),
+                SessionFn::LastInsertId => out.push_str(&self.last_insert_id.to_string()),
+                SessionFn::Version => {
+                    out.push('\'');
+                    out.push_str(&SERVER_VERSION.replace('\'', "''"));
+                    out.push('\'');
+                }
+            }
+            cursor = end;
+        }
+        out.push_str(sql.get(cursor..).unwrap_or(""));
+        out
+    }
+
     async fn handle_com_query(&mut self, payload: Bytes) -> Result<()> {
         // Strip trailing null bytes (some MySQL clients send NUL-terminated strings)
         let raw_bytes = payload.as_ref();
@@ -1800,38 +1988,28 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
             return self.handle_rollback().await;
         }
 
-        // ---- SELECT FOUND_ROWS() ----
-        {
-            let upper = trimmed.to_uppercase();
-            if upper.contains("FOUND_ROWS()") {
-                let cols = vec!["FOUND_ROWS()".to_string()];
-                let rows = vec![Tuple::new(vec![Value::Int8(self.last_row_count as i64)])];
-                return self.send_result_set(&cols, &rows).await;
+        // ---- Session functions: FOUND_ROWS() / LAST_INSERT_ID() / VERSION() ----
+        // Answered from the session only when the WHOLE statement is that one
+        // call. Anywhere else (an INSERT value, a WHERE, a literal that merely
+        // mentions the name) the statement runs; calls in its code are replaced
+        // by the session value first, and calls in literals are left alone.
+        let view = super::translator::code_view(trimmed);
+        let calls = find_session_calls(&view);
+        let substituted;
+        let (trimmed, view) = if calls.is_empty() {
+            (trimmed, view)
+        } else {
+            if let Some((kind, column)) = exact_session_select(trimmed, &view, &calls) {
+                let value = self.session_fn_value(kind);
+                return self.send_result_set(&[column], &[Tuple::new(vec![value])]).await;
             }
-        }
-
-        // ---- SELECT LAST_INSERT_ID() ----
-        {
-            let upper = trimmed.to_uppercase();
-            if upper.contains("LAST_INSERT_ID()") {
-                let cols = vec!["LAST_INSERT_ID()".to_string()];
-                let rows = vec![Tuple::new(vec![Value::Int8(self.last_insert_id as i64)])];
-                return self.send_result_set(&cols, &rows).await;
-            }
-        }
-
-        // ---- SELECT VERSION() — return MySQL-compatible version ----
-        {
-            let upper = trimmed.to_uppercase();
-            if upper.contains("VERSION()") && !upper.contains("@@") {
-                let cols = vec!["VERSION()".to_string()];
-                let rows = vec![Tuple::new(vec![Value::String(SERVER_VERSION.to_string())])];
-                return self.send_result_set(&cols, &rows).await;
-            }
-        }
+            substituted = self.substitute_session_calls(trimmed, &calls);
+            let t = substituted.trim();
+            (t, super::translator::code_view(t))
+        };
 
         // ---- SELECT @@variable — MySQL session/global variables ----
-        if starts_with_icase(trimmed, "SELECT") && trimmed.contains("@@") {
+        if view_selects_variable(&view) {
             return self.handle_select_variable(trimmed).await;
         }
 
@@ -1841,11 +2019,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
         }
 
         // ---- INFORMATION_SCHEMA queries — intercept before SQL parser ----
-        {
-            let lower = trimmed.to_lowercase();
-            if lower.contains("information_schema") {
-                return self.handle_information_schema(trimmed).await;
-            }
+        if view_reads_information_schema(trimmed, &view) {
+            return self.handle_information_schema(trimmed).await;
         }
 
         // Spec R5.1: MySQL commits the open transaction before a statement that defines
@@ -3322,19 +3497,27 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
         // COM_QUERY replay route when they carry no parameters. Engine-bound
         // SELECTs go through the binary result-set path below so
         // binary-protocol clients receive protocol-correct rows.
-        let needs_text_dispatch = !is_row_returning || {
-            let upper = trimmed.to_uppercase();
-            upper.contains("@@")
-                || upper.contains("FOUND_ROWS()")
-                || upper.contains("LAST_INSERT_ID()")
-                || upper.contains("VERSION()")
-                || upper.contains("INFORMATION_SCHEMA")
-        };
+        let exec_view = super::translator::code_view(trimmed);
+        let exec_calls = find_session_calls(&exec_view);
+        let needs_text_dispatch = !is_row_returning
+            || !exec_calls.is_empty()
+            || view_selects_variable(&exec_view)
+            || view_reads_information_schema(trimmed, &exec_view);
 
         if params.is_empty() && needs_text_dispatch {
             let sql_bytes = Bytes::from(stmt.sql.clone());
             return self.handle_com_query(sql_bytes).await;
         }
+
+        // A statement that carries parameters goes to the engine, so a session
+        // function in its code is replaced by the session value here.
+        let bound_sql;
+        let trimmed = if exec_calls.is_empty() {
+            trimmed
+        } else {
+            bound_sql = self.substitute_session_calls(trimmed, &exec_calls);
+            bound_sql.trim()
+        };
 
         if is_row_returning {
             // Note: an intercepted shape (@@vars etc.) that nevertheless
