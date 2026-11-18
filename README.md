@@ -137,6 +137,8 @@ Nano is one of four products in the HeliosDB family. SDKs and integrations are c
 
 **Benchmark (embedded, `pg35`):** [the 35-category suite, its history & evolution](docs/benchmarks/PG35_BENCHMARK.md) runs Nano *embedded and in-memory* against a *networked, fsyncing* PostgreSQL, so its large margins include deployment effects, not just engine speed. Read the methodology note before quoting those ratios.
 
+**Release 4.42.0:** [release notes](docs/release-notes/v4.42.0.md) (what changed, what breaks, how to upgrade, FAQ) and the [release benchmark](docs/benchmarks/RELEASE_4_42_0.md) against 4.41.1 and PostgreSQL 18.4, including what got slower, with [how to reproduce it](docs/benchmarks/REPRODUCING.md).
+
 ## Start the Server
 
 ```bash

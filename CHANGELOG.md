@@ -405,7 +405,7 @@ otherwise it refuses because no re-encryption exists.
 
 ### Security — `cargo audit --deny warnings` is clean again
 
-Four crates in `Cargo.lock` move to their patched releases, with no other entry changed:
+Five crates in `Cargo.lock` move to their patched releases, with no other entry changed:
 
 - `rustix` 1.1.3 → 1.1.6 (RUSTSEC-2026-0486, unsound: the xattr functions marked unwritten bytes as
   initialized for a zero-length buffer), with `linux-raw-sys` 0.11.0 → 0.12.1, which it requires. This one
@@ -418,7 +418,7 @@ Four crates in `Cargo.lock` move to their patched releases, with no other entry 
   path). Not compiled either: it is `librocksdb-sys`'s optional `zlib` dependency, which this crate does
   not enable (`cargo tree --all-features --target all -i libz-sys` prints nothing).
 
-None of these four needed an entry in `.cargo/audit.toml` or `deny.toml`.
+None of these five needed an entry in `.cargo/audit.toml` or `deny.toml`.
 
 One new maintenance exception: RUSTSEC-2026-0543, published 2026-11-17, declares `chrono` unmaintained.
 It reports no vulnerability and lists no patched version. chrono is a direct dependency whose types are

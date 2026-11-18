@@ -388,7 +388,7 @@ automatically after `git clone`; install globally with
   `claude mcp add heliosdb -- heliosdb-nano mcp serve --data-dir ./mydata`.
 - heliosdb-nano-server — daemon mode: `start | stop | status`, TOML config,
   auth modes (trust/password/md5/scram-sha-256), TLS, HA roles
-  (primary/standby/observer), sync modes, user management.
+  (standalone/primary/physical standby), sync modes, user management.
 - heliosdb-nano-tenant — multi-tenant isolation: SharedSchema+RLS,
   SchemaPerTenant, DatabasePerTenant; tiered plans, per-tenant quotas,
   `current_tenant()` RLS policies.
@@ -411,4 +411,11 @@ Verb lookup (every CLI flag / REPL command / Rust API / MCP tool):
 - README.md — full feature tour, ORM/driver matrix, HA, deploy templates.
 - config.example.toml — every config key, annotated.
 - docs/guides/ — auth, upgrades, HA tutorial, SQLite drop-in, audit.
+- docs/release-notes/v4.42.0.md — latest release (4.42.0, 2026-11-17): what
+  changed, what breaks, upgrade steps, benchmark summary, FAQ. Structured
+  data: docs/release-notes/v4.42.0.jsonld.
+- docs/benchmarks/RELEASE_4_42_0.md — release benchmark against 4.41.1 and
+  PostgreSQL 18.4; docs/benchmarks/REPRODUCING.md — how to rerun it;
+  docs/benchmarks/results/release-4.42.0/summary.json — the numbers as JSON.
+- CHANGELOG.md — every change per release.
 - https://heliosdb.com/llms.txt — hosted ecosystem-wide index.

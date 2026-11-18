@@ -1,0 +1,57 @@
+{
+ "release": "4.42.0",
+ "purpose": "What to publish as the 4.42.0 release notes, and where each fact comes from. Paths are relative to the repository root.",
+ "publish": [
+  {
+   "path": "docs/release-notes/v4.42.0.md",
+   "role": "release notes (canonical text)",
+   "use": "Render as the release-notes page. Question-shaped headings and the FAQ are written to be quoted on their own; keep them verbatim."
+  },
+  {
+   "path": "docs/release-notes/v4.42.0.jsonld",
+   "role": "structured data (schema.org JSON-LD)",
+   "use": "Embed in the page's <script type=\"application/ld+json\">. Set the page's own URL as mainEntityOfPage; the FAQPage answers match the FAQ section of the notes word for word."
+  }
+ ],
+ "link_from_the_page": [
+  {
+   "path": "docs/benchmarks/RELEASE_4_42_0.md",
+   "role": "full benchmark report: all 35 categories, wire and pgbench tables, causes"
+  },
+  {
+   "path": "docs/benchmarks/REPRODUCING.md",
+   "role": "how to reproduce the benchmarks and verify the binaries"
+  },
+  {
+   "path": "docs/benchmarks/results/release-4.42.0/summary.json",
+   "role": "every measurement as one JSON document (no file paths, hardware class only)"
+  },
+  {
+   "path": "docs/guides/upgrade.md",
+   "role": "upgrade guide from 4.41.x"
+  },
+  {
+   "path": "CHANGELOG.md",
+   "role": "complete change list; the section `## [4.42.0] - 2026-11-17`"
+  }
+ ],
+ "background_not_for_publication": [
+  {
+   "path": "docs/benchmarks/PG35_BENCHMARK.md",
+   "role": "what pg35 is and its history"
+  },
+  {
+   "path": "docs/PERFORMANCE.md",
+   "role": "performance overview"
+  },
+  {
+   "path": "docs/SECURITY_MAINTENANCE_EXCEPTIONS.md",
+   "role": "accepted dependency advisories and why"
+  }
+ ],
+ "rules": [
+  "Numbers in the notes are computed from the benchmark run; do not round further, re-order or recompute them.",
+  "Do not add hardware details beyond the hardware class the notes state (architecture, CPU count, memory class).",
+  "Slower results are part of the notes; keep the 'What is slower' section and the FAQ answers about it."
+ ]
+}

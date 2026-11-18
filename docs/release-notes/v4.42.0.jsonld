@@ -1,0 +1,123 @@
+{
+ "@context": "https://schema.org",
+ "@graph": [
+  {
+   "@type": "SoftwareApplication",
+   "@id": "https://github.com/HeliosDatabase/HeliosDB-Nano#software",
+   "name": "HeliosDB-Nano",
+   "applicationCategory": "DatabaseApplication",
+   "operatingSystem": "Linux (x86_64, aarch64), macOS (Apple Silicon), Windows (x86_64)",
+   "softwareVersion": "4.42.0",
+   "datePublished": "2026-11-17",
+   "license": "https://www.apache.org/licenses/LICENSE-2.0",
+   "codeRepository": "https://github.com/HeliosDatabase/HeliosDB-Nano",
+   "releaseNotes": "https://github.com/HeliosDatabase/HeliosDB-Nano/blob/v4.42.0/docs/release-notes/v4.42.0.md",
+   "description": "Apache-2.0 embedded ACID database in a single binary with PostgreSQL and MySQL wire compatibility, vector search, database branching and time-travel (AS OF) queries."
+  },
+  {
+   "@type": "TechArticle",
+   "@id": "https://github.com/HeliosDatabase/HeliosDB-Nano/blob/v4.42.0/docs/release-notes/v4.42.0.md",
+   "headline": "HeliosDB-Nano 4.42.0 release notes",
+   "datePublished": "2026-11-17",
+   "about": {
+    "@id": "https://github.com/HeliosDatabase/HeliosDB-Nano#software"
+   },
+   "isBasedOn": [
+    "https://github.com/HeliosDatabase/HeliosDB-Nano/blob/v4.42.0/CHANGELOG.md",
+    "https://github.com/HeliosDatabase/HeliosDB-Nano/blob/v4.42.0/docs/benchmarks/RELEASE_4_42_0.md"
+   ]
+  },
+  {
+   "@type": "Dataset",
+   "@id": "https://github.com/HeliosDatabase/HeliosDB-Nano/blob/v4.42.0/docs/benchmarks/results/release-4.42.0/summary.json",
+   "name": "HeliosDB-Nano 4.42.0 release benchmark (pg35, wire UPDATE, pgbench)",
+   "description": "Every measurement of the 4.42.0 release benchmark against 4.41.1 and PostgreSQL 18.4: 35 SQL categories, a primary-key UPDATE over the PostgreSQL wire at 1 to 64 clients, and pgbench, with the commits and SHA-256 of the binaries measured.",
+   "datePublished": "2026-11-17",
+   "license": "https://www.apache.org/licenses/LICENSE-2.0",
+   "creator": {
+    "@type": "Organization",
+    "name": "HeliosDB"
+   },
+   "distribution": {
+    "@type": "DataDownload",
+    "encodingFormat": "application/json",
+    "contentUrl": "https://github.com/HeliosDatabase/HeliosDB-Nano/raw/v4.42.0/docs/benchmarks/results/release-4.42.0/summary.json"
+   },
+   "measurementTechnique": "https://github.com/HeliosDatabase/HeliosDB-Nano/blob/v4.42.0/docs/benchmarks/REPRODUCING.md",
+   "variableMeasured": [
+    "time per SQL statement (microseconds)",
+    "operations per second",
+    "transactions per second"
+   ]
+  },
+  {
+   "@type": "FAQPage",
+   "mainEntity": [
+    {
+     "@type": "Question",
+     "name": "What is HeliosDB-Nano 4.42.0?",
+     "acceptedAnswer": {
+      "@type": "Answer",
+      "text": "HeliosDB-Nano 4.42.0 is the 2026-11-17 release of HeliosDB-Nano, an Apache-2.0 embedded ACID database in a single binary that speaks the PostgreSQL and MySQL wire protocols. It makes every statement atomic, replaces replication with physical standbys that can be promoted online, and turns a branch into a per-session fork."
+     }
+    },
+    {
+     "@type": "Question",
+     "name": "Is HeliosDB-Nano 4.42.0 faster than PostgreSQL?",
+     "acceptedAnswer": {
+      "@type": "Answer",
+      "text": "In the pg35 benchmark, embedded HeliosDB-Nano 4.42.0 is faster than PostgreSQL 18.4 in 34 of 35 SQL categories and slower in 1 (4-table JOIN). That compares an in-process, in-memory engine with a PostgreSQL server over TCP that syncs every commit; with both engines as servers the margins are much smaller (see the pgbench tables in the release benchmark)."
+     }
+    },
+    {
+     "@type": "Question",
+     "name": "Is HeliosDB-Nano 4.42.0 faster or slower than 4.41.1?",
+     "acceptedAnswer": {
+      "@type": "Answer",
+      "text": "Both. In pg35, 20 of 35 categories are within 15% of 4.41.1, 4 are faster and 11 are slower. One-row INSERT, UPDATE and DELETE are slower because each commit now records row history; over the wire a one-row UPDATE runs at 0.47–0.72 of 4.41.1's throughput between 1 and 64 clients."
+     }
+    },
+    {
+     "@type": "Question",
+     "name": "Why are single-row writes slower in 4.42.0 than in 4.41.1?",
+     "acceptedAnswer": {
+      "@type": "Answer",
+      "text": "Since 4.42.0 a one-row UPDATE or DELETE writes the row, its version and its version-index entry in one write group, and on disk also the commit's snapshot record: seven keys where 4.41.1 wrote one. That is what makes AS OF (time travel) queries correct after such a write; 4.41.1 lost a row deleted on its fast path from AS OF queries before the delete."
+     }
+    },
+    {
+     "@type": "Question",
+     "name": "How do I get 4.41.1's write speed back?",
+     "acceptedAnswer": {
+      "@type": "Answer",
+      "text": "If the store does not use AS OF, VERSIONS BETWEEN or branches from the past, set time_travel_enabled = false in the [storage] section of the configuration file. Measured that way, the 4.42.0 server runs a one-row UPDATE at 0.93–0.99 of 4.41.1's throughput at 1, 16 and 64 clients."
+     }
+    },
+    {
+     "@type": "Question",
+     "name": "How do I upgrade from HeliosDB-Nano 4.41.x to 4.42.0?",
+     "acceptedAnswer": {
+      "@type": "Answer",
+      "text": "Read docs/guides/upgrade.md first. Standbys must be rebuilt because replication is physical-only in 4.42.0, a data directory last written by an older build is adopted once at first start, and some application-visible behaviour changes (branches are selected per session)."
+     }
+    },
+    {
+     "@type": "Question",
+     "name": "How can I reproduce the HeliosDB-Nano 4.42.0 benchmarks?",
+     "acceptedAnswer": {
+      "@type": "Answer",
+      "text": "Start PostgreSQL 18.4 in a container, then run benches/public/release_bench.sh v4.41.1 out from a checkout of the release (pg35 plus the wire UPDATE at 1 to 64 clients, about two hours) and docs/benchmarks/bench-engines.sh for pgbench. docs/benchmarks/REPRODUCING.md has the exact commands and how to check the binaries' checksums."
+     }
+    },
+    {
+     "@type": "Question",
+     "name": "On what hardware were the benchmarks run?",
+     "acceptedAnswer": {
+      "@type": "Answer",
+      "text": "On one Linux x86_64 host with 32 logical CPUs and at least 64 GiB of memory, with client and server on the same host. Absolute times differ on other hardware; the ratios between the two releases are what should agree."
+     }
+    }
+   ]
+  }
+ ]
+}
