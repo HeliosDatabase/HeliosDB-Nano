@@ -5802,6 +5802,67 @@ impl EmbeddedDatabase {
     /// `Statement` value at all. Real multi-tablespace semantics (LOCATION
     /// handling, DROP TABLESPACE, ALTER ... SET TABLESPACE) are explicitly
     /// out of scope.
+    /// `COMMENT ON <object> IS '…'` is accepted and not stored (GitHub #66).
+    ///
+    /// Dumps, migration tools and ORMs emit it beside the DDL it describes,
+    /// and a refusal stopped the script there. A comment changes no row and
+    /// no answer of a query; nothing reads it back yet (`pg_description` is
+    /// empty and there is no `obj_description()`), which the changelog says.
+    /// `COMMENT ON TABLE` and `COMMENT ON COLUMN` still check that their
+    /// target exists, as PostgreSQL does, unless `IF EXISTS` is given. The
+    /// forms the parser does not know (`INDEX`, `VIEW`, `FUNCTION`,
+    /// `SEQUENCE`, `CONSTRAINT`, `TYPE`, …) are accepted as written.
+    fn try_handle_comment_statement(&self, sql: &str) -> Result<Option<u64>> {
+        let trimmed = sql.trim().trim_end_matches(';').trim_end();
+        let rest = match trimmed.get(..7) {
+            Some(word) if word.eq_ignore_ascii_case("COMMENT") => trimmed.get(7..).unwrap_or_default(),
+            _ => return Ok(None),
+        };
+        let on = rest.trim_start();
+        if rest.len() == on.len() || !on.get(..3).is_some_and(|word| word.eq_ignore_ascii_case("ON ")) {
+            return Ok(None);
+        }
+        let Ok(sqlparser::ast::Statement::Comment {
+            object_type,
+            object_name,
+            if_exists: false,
+            ..
+        }) = sql::Parser::new().parse_one(trimmed)
+        else {
+            return Ok(Some(0));
+        };
+        let catalog = self.storage.catalog();
+        let planner = sql::Planner::with_catalog(&catalog)
+            .with_current_schema(self.current_schema())
+            .with_search_path(self.current_search_path());
+        match object_type {
+            sqlparser::ast::CommentObject::Table => {
+                catalog.get_table_schema(&planner.resolve_table_ref(&object_name))?;
+            }
+            sqlparser::ast::CommentObject::Column => {
+                let mut table = object_name.0.clone();
+                let column = table
+                    .pop()
+                    .ok_or_else(|| Error::query_execution("COMMENT ON COLUMN needs table.column"))?;
+                if table.is_empty() {
+                    return Err(Error::query_execution("COMMENT ON COLUMN needs table.column"));
+                }
+                let table = planner.resolve_table_ref(&sqlparser::ast::ObjectName(table));
+                let schema = catalog.get_table_schema(&table)?;
+                let wanted = if column.quote_style.is_some() {
+                    column.value.clone()
+                } else {
+                    column.value.to_lowercase()
+                };
+                if !schema.columns.iter().any(|known| known.name == wanted) {
+                    return Err(sql::scope::undefined_column(Some(&table), &wanted));
+                }
+            }
+            _ => {}
+        }
+        Ok(Some(0))
+    }
+
     fn try_handle_create_tablespace_statement(&self, sql: &str) -> Result<Option<u64>> {
         if !sql::Parser::is_create_tablespace_statement(sql) {
             return Ok(None);
@@ -5923,6 +5984,9 @@ impl EmbeddedDatabase {
 
         // Priority #7: CREATE TABLESPACE accept-and-ignore no-op.
         if let Some(count) = self.try_handle_create_tablespace_statement(sql)? {
+            return Ok(Some(count));
+        }
+        if let Some(count) = self.try_handle_comment_statement(sql)? {
             return Ok(Some(count));
         }
 
@@ -21421,6 +21485,9 @@ impl EmbeddedDatabase {
         // `_for_session` wrapper has already consumed every session-scoped
         // statement before reaching here.
         if let Some(count) = self.try_handle_set_constraints(sql)? {
+            return Ok(count);
+        }
+        if let Some(count) = self.try_handle_comment_statement(sql)? {
             return Ok(count);
         }
         if let Some((rows, _schema)) = self.try_handle_params_family_setting_statement(sql)? {

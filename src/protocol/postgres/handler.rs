@@ -4847,6 +4847,8 @@ where
         // `CREATE/ALTER/DROP USER` are rewritten to ROLE before execution, but
         // PostgreSQL still tags them `CREATE ROLE` / `ALTER ROLE` / `DROP ROLE`,
         // so the same tag is correct for both spellings.
+        } else if starts_with_icase(trimmed, "COMMENT ON") {
+            "COMMENT".to_string()
         } else if starts_with_icase(trimmed, "CREATE ROLE") || starts_with_icase(trimmed, "CREATE USER") {
             "CREATE ROLE".to_string()
         } else if starts_with_icase(trimmed, "ALTER ROLE") || starts_with_icase(trimmed, "ALTER USER") {
