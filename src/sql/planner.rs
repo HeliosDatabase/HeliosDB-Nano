@@ -4084,6 +4084,63 @@ impl<'a> Planner<'a> {
         Ok(logical_args)
     }
 
+    /// `FROM f(args)` for a scalar `f`: one row, one column holding the value.
+    /// As in PostgreSQL the column is named by the column alias (`AS x(c)`),
+    /// else by the table alias (`AS x`), else by the function; the relation by
+    /// the table alias, else by the function.
+    fn scalar_function_in_from(
+        &self,
+        name: &sqlparser::ast::ObjectName,
+        tf_args: &sqlparser::ast::TableFunctionArgs,
+        alias: Option<&sqlparser::ast::TableAlias>,
+    ) -> Result<LogicalPlan> {
+        use sqlparser::ast::{Expr as SqlExpr, Function, FunctionArgumentList, FunctionArguments};
+        let function_name = name
+            .0
+            .last()
+            .map(|ident| ident.value.to_lowercase())
+            .unwrap_or_default();
+        let call = SqlExpr::Function(Function {
+            name: name.clone(),
+            uses_odbc_syntax: false,
+            parameters: FunctionArguments::None,
+            args: FunctionArguments::List(FunctionArgumentList {
+                duplicate_treatment: None,
+                args: tf_args.args.clone(),
+                clauses: Vec::new(),
+            }),
+            filter: None,
+            null_treatment: None,
+            over: None,
+            within_group: Vec::new(),
+        });
+        let value = self.expr_to_logical(&call)?;
+        if matches!(
+            value,
+            LogicalExpr::AggregateFunction { .. } | LogicalExpr::WindowFunction { .. }
+        ) {
+            return Err(Error::query_execution(format!(
+                "aggregate function {function_name}() cannot be used in FROM"
+            )));
+        }
+        let relation = alias
+            .map(|alias| Self::normalize_ident(&alias.name))
+            .unwrap_or_else(|| function_name.clone());
+        let column = alias
+            .and_then(|alias| alias.columns.first())
+            .map(|column| column.name.value.clone())
+            .unwrap_or_else(|| relation.clone());
+        let plan = LogicalPlan::Project {
+            input: Box::new(LogicalPlan::DualScan),
+            exprs: vec![value],
+            aliases: vec![column],
+            distinct: false,
+            distinct_on: None,
+            source_alias: None,
+        };
+        Self::stamp_derived_plan(plan, &relation, &[])
+    }
+
     /// Check if a table name is a known table-valued function
     fn is_table_function(name: &str) -> bool {
         matches!(name.to_lowercase().as_str(), "generate_series" | "unnest")
@@ -4270,6 +4327,20 @@ impl<'a> Planner<'a> {
                         let stamped = Self::stamp_derived_plan(view_plan, &known_as, &[])?;
                         self.set_written_select_list_of_factor(view_writes_out_its_select_list);
                         return Ok(stamped);
+                    }
+                }
+
+                // GH#46: `SELECT * FROM current_schema()`. A function call in
+                // FROM that is no table function, and names no relation, is
+                // the function's value as one row of one column. The call
+                // used to be read as a table of that name, its arguments
+                // dropped: "Table 'current_schema' does not exist".
+                if let Some(tf_args) = args {
+                    let names_a_relation = self
+                        .catalog
+                        .is_some_and(|catalog| catalog.get_table_schema(&table_name).is_ok());
+                    if !names_a_relation {
+                        return self.scalar_function_in_from(name, tf_args, alias.as_ref());
                     }
                 }
 
