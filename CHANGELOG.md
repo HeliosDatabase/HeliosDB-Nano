@@ -89,7 +89,7 @@ Reports from users of earlier releases (GitHub numbers) and defects found while 
   its stored recipe until it is dropped and created again. 4.41.1 does the same.
   `tests/trigger_row_mutation_tests.rs`.
 
-### Fixed — five regressions against 4.41.1 found before release
+### Fixed — six regressions against 4.41.1 found before release
 
 Found while the work after 4.42.0 was being prepared, each reproduced with the release
 candidate's binary beside the 4.41.1 binary. None of them was in a released version.
@@ -136,9 +136,17 @@ candidate's binary beside the 4.41.1 binary. None of them was in a released vers
   the statement, as in PostgreSQL. A row whose parent is nowhere still fails the statement and
   leaves nothing. `tests/insert_select_self_reference.rs`.
 
-Known and not fixed in 4.42.0: `DROP TABLE` reads the constraint record of every table that
-has a key, so its time grows with the number of such tables (measured in an in-memory shell:
-0.3 ms with 50 keyed tables, 3.6 ms with 1,600; 4.41.1: 0.1 ms at both sizes).
+- **`DROP TABLE` grew slower with every table that has a key.** It read the constraint record
+  of every such table: any write of a constraint record, which a `CREATE TABLE` with a key or a
+  `DROP TABLE` of one is, discarded the list of tables that name a foreign key, and the next
+  `DROP TABLE` walked every record to rebuild it. On the release candidate, in an in-memory
+  shell, a `DROP TABLE` took 0.2 ms beside 50 keyed tables, 0.8 ms beside 400 and 2.7 ms beside
+  1,600 (4.41.1: 0.1 ms at every size). The write gate now keeps the list current from the
+  records each write puts and deletes, and gives it up, so that the next `DROP TABLE` walks
+  again, whenever a write cannot be followed exactly: an encrypted store, a record that does not
+  decode, a range delete, a failed write, two such writes at once. What a `DROP TABLE` reads
+  under its locks before it refuses (`RESTRICT`) or removes a child's foreign key (`CASCADE`) is
+  unchanged. `src/fk_owner_list_tests.rs`.
 
 ### Fixed — a key-moving UPDATE waits for a key an open transaction took out
 
