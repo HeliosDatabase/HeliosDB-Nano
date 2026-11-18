@@ -6077,39 +6077,37 @@ impl Evaluator {
                 Ok(Value::String(padded))
             }
 
-            DataType::Vector(dimension) => match value {
-                Value::Vector(v) => {
-                    if v.len() == *dimension {
-                        Ok(Value::Vector(v))
-                    } else {
-                        Err(Error::query_execution(format!(
-                            "Vector dimension mismatch: got {}, expected {}",
-                            v.len(),
-                            dimension
-                        )))
-                    }
-                }
-                Value::String(s) => {
-                    // "[1.0, 2.0, 3.0]", "{1.0,2.0,3.0}" or "1.0, 2.0, 3.0" — one parser.
-                    let vec = crate::types::parse_vector_text(&s).ok_or_else(|| {
+            DataType::Vector(dimension) => {
+                // Text `[..]` / `{..}`, a SQL array or a bound array parameter all
+                // become the same f32 list; dimension 0 means "take the value's".
+                let vec = match value {
+                    Value::Vector(v) => v,
+                    Value::String(s) => crate::types::parse_vector_text(&s).ok_or_else(|| {
                         Error::query_execution(format!(
                             "Invalid vector literal {s:?}: expected '[1,2,3]' or '{{1,2,3}}' with numeric elements"
                         ))
-                    })?;
-                    if vec.len() != *dimension {
+                    })?,
+                    Value::Array(items) => items
+                        .iter()
+                        .map(Self::value_to_f32)
+                        .collect::<Result<Vec<f32>>>()
+                        .map_err(|_| Error::query_execution("Cannot cast array to VECTOR: elements must be numbers"))?,
+                    other => {
                         return Err(Error::query_execution(format!(
-                            "Vector dimension mismatch: got {}, expected {}",
-                            vec.len(),
-                            dimension
-                        )));
+                            "Cannot cast {:?} to VECTOR({})",
+                            other, dimension
+                        )))
                     }
-                    Ok(Value::Vector(vec))
+                };
+                if *dimension != 0 && vec.len() != *dimension {
+                    return Err(Error::query_execution(format!(
+                        "Vector dimension mismatch: got {}, expected {}",
+                        vec.len(),
+                        dimension
+                    )));
                 }
-                _ => Err(Error::query_execution(format!(
-                    "Cannot cast {:?} to VECTOR({})",
-                    value, dimension
-                ))),
-            },
+                Ok(Value::Vector(vec))
+            }
 
             DataType::Json => match value {
                 Value::Json(j) => Ok(Value::Json(j)),

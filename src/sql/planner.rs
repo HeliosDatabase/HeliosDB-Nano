@@ -6173,11 +6173,11 @@ impl<'a> Planner<'a> {
                                 ));
                             }
                         } else {
-                            return Err(Error::query_execution(
-                                "bare ::vector cast can only infer dimension from a literal string; \
-                                 use ::vector(N) explicitly otherwise"
-                                    .to_string(),
-                            ));
+                            // Not a literal string (an ARRAY[..], a bound parameter, a
+                            // column): the dimension is the value's own. Zero marks
+                            // "infer" for the evaluator, which never sees a real
+                            // VECTOR(0) because DDL and `::vector(0)` are refused.
+                            DataType::Vector(0)
                         }
                     }
                     _ => self.sql_data_type_to_data_type(data_type)?,

@@ -53,6 +53,13 @@ Reports from users of earlier releases (GitHub numbers) and defects found while 
   Both now take `-c/--config <file>` (the same TOML as `start`, honouring `[encryption]` and its
   `key_source`, for example an environment variable); `restore` creates the target encrypted. Without it
   the error now names `--config`. Test: `tests/dump_restore_encrypted_config.rs`.
+- **`::vector` failed on arrays and bound parameters (GitHub #33).** `ARRAY[1.0,2.0,3.0]::vector` was
+  refused ("bare ::vector cast can only infer dimension from a literal string") and a parameter cast
+  with `::vector` or `::vector(3)` failed whether it was the text `'[1,2,3]'` or a client array, so a
+  pgvector driver could not reach the type. `::vector` and `::vector(N)` now accept text in `[..]` or
+  `{..}` form, SQL arrays and bound parameters of text or array type; a bare `::vector` takes the
+  dimension from the value and `::vector(N)` refuses a different length. Both statement families and
+  the extended protocol are pinned in `tests/vector_cast_params.rs` and `wire_tests.rs`.
 - **`ORDER BY … NULLS FIRST / NULLS LAST` was ignored (GitHub #43).** The clause was read and
   dropped: `ORDER BY due ASC NULLS LAST` returned the NULLs first. An explicit placement is now
   obeyed, in a query, over `GROUP BY`, over a set operation, under `LIMIT` and in a window's

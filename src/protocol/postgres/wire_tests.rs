@@ -13648,3 +13648,55 @@ fn sequence_parameters_out_of_range_classify_as_22023() -> std::result::Result<(
     }
     Ok(())
 }
+
+/// GitHub #33: a pgvector client binds the embedding as text, either
+/// `'[1,2,3]'` or a client array `'{1,2,3}'`, and casts it with `::vector` or
+/// `::vector(3)`. Both forms must reach the evaluator and come back as the
+/// pgvector text form; a wrong dimension is an error, not a stored value.
+#[tokio::test]
+async fn extended_bound_parameter_casts_to_vector() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    for (sql, param) in [
+        ("SELECT $1::vector", "[1,2,3]"),
+        ("SELECT $1::vector", "{1,2,3}"),
+        ("SELECT $1::vector(3)", "[1,2,3]"),
+        ("SELECT $1::vector(3)", "{1,2,3}"),
+    ] {
+        let (mut handler, mut client) = test_handler(Arc::clone(&db));
+        handler
+            .handle_parse_extended("s".into(), sql.into(), vec![0])
+            .await
+            .expect("parse");
+        handler
+            .handle_bind_extended(
+                "p".into(),
+                "s".into(),
+                vec![0],
+                vec![Some(param.as_bytes().to_vec())],
+                vec![],
+            )
+            .await
+            .expect("bind");
+        handler.handle_execute_extended("p".into(), 0).await.expect("execute");
+        let rows = data_rows(&drain(&mut client).await);
+        assert_eq!(rows.len(), 1, "{sql} {param}");
+        let text = String::from_utf8(rows[0][0].clone().expect("value")).expect("utf8");
+        let parsed = crate::types::parse_vector_text(&text).expect("vector text");
+        assert_eq!(parsed, vec![1.0, 2.0, 3.0], "{sql} {param}: {text}");
+    }
+    let (mut handler, mut client) = test_handler(Arc::clone(&db));
+    handler
+        .handle_parse_extended("s".into(), "SELECT $1::vector(4)".into(), vec![0])
+        .await
+        .expect("parse");
+    handler
+        .handle_bind_extended("p".into(), "s".into(), vec![0], vec![Some(b"[1,2,3]".to_vec())], vec![])
+        .await
+        .expect("bind");
+    let err = handler
+        .handle_execute_extended("p".into(), 0)
+        .await
+        .expect_err("a wrong dimension must be an error");
+    assert!(err.to_string().contains("dimension"), "{err}");
+    let _ = drain(&mut client).await;
+}
