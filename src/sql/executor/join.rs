@@ -3026,7 +3026,23 @@ fn estimate_index_nested_loop_probe_rows(executor: &Executor<'_>, plan: &crate::
             ..
         } => indexed_equality_predicate_is_selective(executor, table_name, alias.as_deref(), schema, predicate)
             .then_some(1),
-        crate::sql::LogicalPlan::Filter { input, .. } => {
+        crate::sql::LogicalPlan::Filter { input, predicate } => {
+            // A filter the optimizer pushed below a join sits over a plain scan
+            // (`FilteredScan` is the single-table shape). An equality on an indexed
+            // column there selects what the index holds under that value: counted,
+            // not guessed, so `WHERE pk = 42` is one row, and a value half the table
+            // shares is not taken for a point.
+            if let crate::sql::LogicalPlan::Scan {
+                table_name,
+                alias,
+                schema,
+                ..
+            } = input.as_ref()
+            {
+                if let Some(rows) = indexed_equality_rows(executor, table_name, alias.as_deref(), schema, predicate) {
+                    return Some(rows);
+                }
+            }
             estimate_index_nested_loop_probe_rows(executor, input).map(estimate_filtered_rows)
         }
         crate::sql::LogicalPlan::Project { input, .. } | crate::sql::LogicalPlan::Sort { input, .. } => {
@@ -3050,6 +3066,69 @@ fn estimate_index_nested_loop_probe_rows(executor: &Executor<'_>, plan: &crate::
         }
         _ => None,
     }
+}
+
+/// How many rows of `table_name` an `AND` chain's indexed equalities leave, by
+/// the count of the entry each one names in its index: the fewest of them, at
+/// least one. `None` when no term is `column = value` on an indexed column of
+/// this scan with a value of the column's own type (a key of another width
+/// would name another entry). A row-count estimate for choosing a join
+/// strategy, never a result: the join reads its rows through the scan or the
+/// index as before.
+fn indexed_equality_rows(
+    executor: &Executor<'_>,
+    table_name: &str,
+    alias: Option<&str>,
+    schema: &Schema,
+    predicate: &crate::sql::LogicalExpr,
+) -> Option<usize> {
+    use crate::sql::{BinaryOperator, LogicalExpr};
+    use crate::storage::art_manager::ArtIndexManager;
+    let (left, right) = match predicate {
+        LogicalExpr::BinaryExpr {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
+            let l = indexed_equality_rows(executor, table_name, alias, schema, left);
+            let r = indexed_equality_rows(executor, table_name, alias, schema, right);
+            return match (l, r) {
+                (Some(l), Some(r)) => Some(l.min(r)),
+                (rows, None) | (None, rows) => rows,
+            };
+        }
+        LogicalExpr::BinaryExpr {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+        } => (left.as_ref(), right.as_ref()),
+        _ => return None,
+    };
+    let (table, name, value) = match (left, right) {
+        (LogicalExpr::Column { table, name }, value) | (value, LogicalExpr::Column { table, name }) => {
+            (table, name, value)
+        }
+        _ => return None,
+    };
+    if table
+        .as_deref()
+        .is_some_and(|q| !q.eq_ignore_ascii_case(table_name) && !alias.is_some_and(|a| q.eq_ignore_ascii_case(a)))
+    {
+        return None;
+    }
+    let value = match value {
+        LogicalExpr::Literal(value) => value,
+        LogicalExpr::Parameter { index } => executor.parameters().get(index.checked_sub(1)?)?,
+        _ => return None,
+    };
+    let column = schema.columns.iter().find(|col| col.name.eq_ignore_ascii_case(name))?;
+    if matches!(value, crate::Value::Null | crate::Value::Numeric(_)) || value.data_type() != column.data_type {
+        return None;
+    }
+    let storage = executor.storage()?;
+    let index = storage.art_indexes().find_column_index(table_name, name)?;
+    let key = ArtIndexManager::encode_key_from_values(std::iter::once(value));
+    Some(storage.art_indexes().index_get_all(&index, &key).len().max(1))
 }
 
 fn indexed_equality_predicate_is_selective(
