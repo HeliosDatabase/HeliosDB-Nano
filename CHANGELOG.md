@@ -22,6 +22,73 @@ changes.
   leads with the prebuilt binaries and Docker. The stated binary size is the measured one:
   about 53 MB on Linux x86_64 (a 20 MB download), not ~32 MB.
 
+### Fixed — open reports closed before release
+
+Reports from users of earlier releases (GitHub numbers) and defects found while the work after
+4.42.0 was being prepared. Each has a test file.
+
+- **`ORDER BY … NULLS FIRST / NULLS LAST` was ignored (GitHub #43).** The clause was read and
+  dropped: `ORDER BY due ASC NULLS LAST` returned the NULLs first. An explicit placement is now
+  obeyed, in a query, over `GROUP BY`, over a set operation, under `LIMIT` and in a window's
+  `ORDER BY` (a window with a `RANGE` or `GROUPS` frame keeps the engine's order). Without the
+  clause the order is unchanged: NULL sorts below every value, first under `ASC` and last under
+  `DESC`, as in MySQL and SQLite and the reverse of PostgreSQL's default. Write the clause when
+  the placement matters. `tests/order_by_nulls_and_group_alias.rs`.
+- **A grouped query could not be ordered by an output alias together with a group key
+  (GitHub #44).** `SELECT s.id, s.name, COUNT(DISTINCT sa.app_id) AS app_count … GROUP BY s.id,
+  s.name ORDER BY app_count DESC, s.name` failed with "Column 'group_1' not found in schema".
+  Same test file.
+- **`SELECT * FROM current_schema()` failed (GitHub #46).** A scalar function call in `FROM` was
+  read as a table of that name ("Table 'current_schema' does not exist"), which stopped TypeORM
+  at start-up. A function call in `FROM` that is no table function and names no relation is now
+  one row of one column, named by the column alias, else the table alias, else the function.
+  `tests/scalar_function_in_from.rs`.
+- **`set_config()` did not exist (GitHub #47).** A dump made by `pg_dump` opens with
+  `SELECT pg_catalog.set_config('search_path', '', false);` and a restore stopped at that line.
+  `SELECT set_config('name', 'value', is_local)` as a statement of its own, with literal
+  arguments, now sets what `SET name = 'value'` (`SET LOCAL` when `is_local`) sets on the same
+  connection, and answers with the value. An empty `search_path` is the default path. Inside a
+  larger statement, or with arguments that are not literals, the call is refused with a message
+  that says so. `current_setting('search_path')` now answers with the session's path instead of
+  a fixed text. `tests/set_config_statement.rs`.
+- **`setval()` did not move the generator of a `SERIAL` column (GitHub #51).**
+  `setval(pg_get_serial_sequence('jobs', 'id'), 30)` answered 30 and the next generated id was
+  the old one: the name stood for nothing, and `setval` created a sequence of that literal name
+  beside the column's generator. The name of a serial primary key's sequence, with or without
+  `public.`, now is that generator for `setval` and `nextval`, and the position survives a
+  restart. The generator only moves up, because a generated key is the row's id: a value below
+  its position is answered and leaves it where it is. `setval('public.s', …)` on a sequence made
+  with `CREATE SEQUENCE s` now moves `s` instead of creating `public.s`. Not done:
+  `SELECT last_value FROM <sequence>`. `tests/serial_sequence_setval.rs`.
+- **`COMMENT ON` was refused (GitHub #66).** `COMMENT ON TABLE`, `COLUMN` and every other object
+  form is accepted, so a dump or a migration that carries comments runs through. The comment is
+  not stored: `pg_description` stays empty and there is no `obj_description()`. A comment on a
+  table or column that does not exist is refused, as in PostgreSQL, unless `IF EXISTS` is
+  given. The PostgreSQL command tag is `COMMENT`. `tests/comment_on_accepted.rs`.
+- **`x NOT IN (subquery)` broke the NULL rule above 16 rows.** With a NULL among more than 16
+  values the subquery became a set whose NULL was ignored, and `id NOT IN (SELECT x FROM big)`
+  returned every row without a match where SQL (and PostgreSQL, MySQL and SQLite) return none.
+  And a NULL compared with a subquery that returns no row was unknown, where `NOT IN` of
+  nothing is true. 4.41.1 does the same. `tests/not_in_subquery_null_rule.rs`.
+- **Typed literals made a valid `SELECT` fail outside a transaction.**
+  `WHERE d > DATE '2024-06-01'`, `TIMESTAMP '…'`, `INTERVAL '1 year'`, `BETWEEN DATE '…' AND
+  DATE '…'` and `LIKE '100!%' ESCAPE '!'` failed with a parse error naming `$1`, while the same
+  text worked inside `BEGIN`: the plan cache's literal normalizer made a parameter of a string
+  that is part of the syntax. It now leaves such a statement alone, and an error from parsing
+  or planning its own rewritten text sends the statement down the ordinary path instead of to
+  the client. Whether `ESCAPE` is honoured by the matcher is unchanged (it is not). 4.41.1 does
+  the same. `tests/query_normalization.rs`.
+- **A trigger function with an `IF` dropped or rewrote every inserted row.** The `BEFORE INSERT`
+  recipe (`NEW.col = expr; RETURN NEW` or `RETURN NULL`) was read off the body one statement at
+  a time with no regard for control flow: `IF NEW.qty < 0 THEN RETURN NULL; END IF; RETURN NEW`
+  skipped every row, and an assignment under an `IF` was applied to every row. A body with
+  control flow, a `RETURN` of anything but `NEW` or `NULL`, a `RETURN` that is not its last
+  statement, or an assignment the engine cannot evaluate now registers no recipe: the trigger
+  changes nothing, which is what a body the engine cannot run has always done, and a warning
+  is logged. Straight-line bodies behave as before. A trigger created by an earlier build keeps
+  its stored recipe until it is dropped and created again. 4.41.1 does the same.
+  `tests/trigger_row_mutation_tests.rs`.
+
 ### Fixed — five regressions against 4.41.1 found before release
 
 Found while the work after 4.42.0 was being prepared, each reproduced with the release
