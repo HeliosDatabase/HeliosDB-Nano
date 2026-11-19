@@ -155,6 +155,7 @@ The MCP server also exposes Resources via `resources/list` and `resources/read`.
 - **Branches created via MCP persist** — agents that don't clean up `agent_run_*` branches leak state. Treat branches as fork-test-discard sandboxes: wrap agent runs with `branch_create` and always drop the branch in a `finally` block.
 - **`heliosdb_branch_merge` is last-writer-wins.** It moves the source's own changes with no conflict detection (see the MERGE section of `heliosdb-nano-branches`). An agent cannot verify that outcome: prefer discarding the branch and re-applying validated SQL via `heliosdb_query`.
 - **`heliosdb_embed_and_store` does not embed.** Despite its name it only adds the text to the in-process BM25 index (lost on restart); it computes no vector and writes no table.
+- **Read-tool answers are cached, and a write drops them.** `tools/call` results of the read-only tools (`helios_lsp_*`, `helios_graphrag_search`, `heliosdb_schema`, ...) are kept in a per-process LRU for up to 5 minutes, stamped with the database's write epoch: any write to that database (SQL, the embedded API, `code_index`, auto-reparse, a `heliosdb_query` DML) makes the next identical call recompute. `HELIOS_MCP_CACHE_CAPACITY=0` turns the cache off; `helios/info` reports `cache.hits`, `misses`, `stale_drops` and per-tool counts.
 
 ## See also
 - `heliosdb-nano-code-graph` / `heliosdb-nano-graph-rag` — the engines behind the graph tools.

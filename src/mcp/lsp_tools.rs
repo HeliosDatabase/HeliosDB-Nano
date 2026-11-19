@@ -278,33 +278,45 @@ fn lsp_document_symbols_handler(db: Option<&EmbeddedDatabase>, args: JsonValue) 
         Ok(v) => v,
         Err(e) => return ToolOutcome::err(format!("invalid arguments: {e}")),
     };
-    let mut sql = String::from(
-        "SELECT s.node_id, s.qualified, s.name, s.kind, s.signature, \
-                s.line_start, s.line_end \
-         FROM _hdb_code_symbols s \
-         JOIN _hdb_code_files f ON f.node_id = s.file_id \
-         WHERE f.path = $1",
-    );
-    if !input.kinds.is_empty() {
-        sql.push_str(" AND s.kind IN (");
-        for (i, _) in input.kinds.iter().enumerate() {
-            if i > 0 {
-                sql.push(',');
-            }
-            sql.push_str(&format!("${}", i + 2));
-        }
-        sql.push(')');
-    }
-    sql.push_str(" ORDER BY s.line_start, s.node_id");
-
-    let mut params: Vec<Value> = vec![Value::String(input.path.clone())];
-    for k in &input.kinds {
-        params.push(Value::String(k.clone()));
-    }
-    let rows = match db.query_params(&sql, &params) {
+    // Two steps instead of a join: every join is a hash join that scans the
+    // unfiltered symbols table, whereas `path = $1` on files and `file_id IN`
+    // on symbols are both index-served. A path can exist under several
+    // source tables, hence a list of file ids.
+    let file_rows = match db.query_params(
+        "SELECT node_id FROM _hdb_code_files WHERE path = $1",
+        &[Value::String(input.path.clone())],
+    ) {
         Ok(r) => r,
         Err(e) => return ToolOutcome::err(format!("document_symbols query failed: {e}")),
     };
+    let file_ids: Vec<i64> = file_rows
+        .iter()
+        .filter_map(|r| value_to_i64(r.values.first()))
+        .collect();
+    let mut rows = Vec::new();
+    if !file_ids.is_empty() {
+        let ids_csv = file_ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+        let mut sql = format!(
+            "SELECT s.node_id, s.qualified, s.name, s.kind, s.signature, s.line_start, s.line_end \
+             FROM _hdb_code_symbols s WHERE s.file_id IN ({ids_csv})"
+        );
+        if !input.kinds.is_empty() {
+            sql.push_str(" AND s.kind IN (");
+            for (i, _) in input.kinds.iter().enumerate() {
+                if i > 0 {
+                    sql.push(',');
+                }
+                sql.push_str(&format!("${}", i + 1));
+            }
+            sql.push(')');
+        }
+        sql.push_str(" ORDER BY s.line_start, s.node_id");
+        let params: Vec<Value> = input.kinds.iter().map(|k| Value::String(k.clone())).collect();
+        rows = match db.query_params(&sql, &params) {
+            Ok(r) => r,
+            Err(e) => return ToolOutcome::err(format!("document_symbols query failed: {e}")),
+        };
+    }
     let symbols: Vec<JsonValue> = rows
         .iter()
         .map(|r| {

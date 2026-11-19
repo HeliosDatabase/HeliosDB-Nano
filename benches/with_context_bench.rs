@@ -62,8 +62,8 @@ fn main() {
 }
 
 fn setup_graph(db: &EmbeddedDatabase) {
-    db.execute("CREATE TABLE _hdb_graph_nodes (node_id BIGSERIAL PRIMARY KEY, node_kind TEXT, source_ref TEXT, title TEXT, text TEXT, extra TEXT)").ok();
-    db.execute("CREATE TABLE _hdb_graph_edges (edge_id BIGSERIAL PRIMARY KEY, from_node BIGINT, to_node BIGINT, edge_kind TEXT, weight REAL, extra TEXT)").ok();
+    // The shipped schema (foreign keys and read indexes), not a hand-built copy.
+    heliosdb_nano::graph_rag::ensure_tables(db).expect("graph tables");
 
     // 8 k DocChunks.
     for i in 0..N_DOC_CHUNKS {

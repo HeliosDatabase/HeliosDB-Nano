@@ -52,10 +52,15 @@ use once_cell::sync::Lazy;
 use serde_json::Value as JsonValue;
 
 use super::tools::ToolOutcome;
+use crate::ResultCacheEpoch;
+
+/// The engine write signal an entry was computed under. `None` for the
+/// in-process (`nodb`) tool family, which has no database to write to.
+pub(crate) type DbEpoch = Option<ResultCacheEpoch>;
 
 /// Default LRU capacity. Tunable via env `HELIOS_MCP_CACHE_CAPACITY`
 /// at process start; mutating after the cache is built is not
-/// supported in v1.
+/// supported in v1. `HELIOS_MCP_CACHE_CAPACITY=0` disables the cache.
 pub const CACHE_CAPACITY: usize = 256;
 
 /// Default TTL. Past this, entries are dropped on read regardless of
@@ -68,6 +73,8 @@ struct CacheEntry {
     outcome: ToolOutcome,
     inserted_at: Instant,
     generation: u64,
+    /// Engine result-cache epoch taken BEFORE the handler ran.
+    epoch: DbEpoch,
 }
 
 struct Cache {
@@ -76,6 +83,10 @@ struct Cache {
     hits: u64,
     misses: u64,
     evictions: u64,
+    stale_drops: u64,
+    disabled: bool,
+    ignore_epoch: bool,
+    per_tool: std::collections::BTreeMap<String, (u64, u64)>,
 }
 
 static CACHE: Lazy<Mutex<Cache>> = Lazy::new(|| {
@@ -83,14 +94,20 @@ static CACHE: Lazy<Mutex<Cache>> = Lazy::new(|| {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(CACHE_CAPACITY);
-    let cap =
-        NonZeroUsize::new(cap.max(1)).unwrap_or_else(|| NonZeroUsize::new(CACHE_CAPACITY).expect("CACHE_CAPACITY > 0"));
+    let disabled = cap == 0;
+    let cap = NonZeroUsize::new(cap)
+        .or_else(|| NonZeroUsize::new(1))
+        .unwrap_or(NonZeroUsize::MIN);
     Mutex::new(Cache {
         lru: LruCache::new(cap),
         generation: 0,
         hits: 0,
         misses: 0,
         evictions: 0,
+        stale_drops: 0,
+        disabled,
+        ignore_epoch: false,
+        per_tool: std::collections::BTreeMap::new(),
     })
 });
 
@@ -125,12 +142,13 @@ pub fn read_only(tool_name: &str) -> bool {
 
 /// Tools that mutate engine state. A call to any of these bumps the
 /// generation counter, making all prior cache entries unreachable.
-/// `heliosdb_query` is intentionally **not** here — it could be a
-/// SELECT or a DML. Treated as never-cache, never-invalidate (the
-/// safe default; a DML through `heliosdb_query` will still write
-/// through to the engine, and the next read against affected tables
-/// just won't get a cache hit because that read tool wasn't called
-/// during this generation).
+/// This list only covers the in-process (`nodb`) tool family and is a
+/// belt-and-braces bump for DB-backed tools. It is NOT what keeps DB-backed
+/// answers fresh: every DB-backed entry is stamped with the engine's
+/// result-cache epoch (bumped by every SQL write, DDL and direct storage
+/// write of that database) and is dropped on read when the epoch has moved.
+/// `heliosdb_query` is therefore safe to leave off this list: a DML through
+/// it moves the epoch, which makes every cached answer of that database stale.
 pub fn writes(tool_name: &str) -> bool {
     matches!(
         tool_name,
@@ -174,43 +192,58 @@ fn cache_key(database: Option<u64>, tool_name: &str, args: &JsonValue) -> String
 }
 
 /// Look up `(database, tool_name, args)` in the cache. Returns `None` for
-/// non-read-only tools, on miss, on TTL expiry, or on
-/// generation-mismatch.
-pub fn try_get(database: Option<u64>, tool_name: &str, args: &JsonValue) -> Option<ToolOutcome> {
+/// non-read-only tools, on miss, on TTL expiry, on generation-mismatch and
+/// when the database was written since the entry was computed (`epoch` is the
+/// database's current engine epoch, `None` for in-process tools).
+pub(crate) fn try_get(database: Option<u64>, epoch: DbEpoch, tool_name: &str, args: &JsonValue) -> Option<ToolOutcome> {
     if !read_only(tool_name) {
         return None;
     }
     let key = cache_key(database, tool_name, args);
     let mut guard = CACHE.lock().ok()?;
+    if guard.disabled {
+        return None;
+    }
     let current_gen = guard.generation;
     let entry = match guard.lru.get(&key) {
         Some(e) => e.clone(),
         None => {
             guard.misses += 1;
+            guard.per_tool.entry(tool_name.to_string()).or_default().1 += 1;
             return None;
         }
     };
-    if entry.inserted_at.elapsed() > CACHE_TTL {
+    let stale = !guard.ignore_epoch && entry.epoch != epoch;
+    if stale || entry.inserted_at.elapsed() > CACHE_TTL || entry.generation != current_gen {
         guard.lru.pop(&key);
         guard.misses += 1;
         guard.evictions += 1;
-        return None;
-    }
-    if entry.generation != current_gen {
-        guard.lru.pop(&key);
-        guard.misses += 1;
-        guard.evictions += 1;
+        if stale {
+            guard.stale_drops += 1;
+        }
+        guard.per_tool.entry(tool_name.to_string()).or_default().1 += 1;
         return None;
     }
     guard.hits += 1;
+    guard.per_tool.entry(tool_name.to_string()).or_default().0 += 1;
     Some(entry.outcome)
 }
 
 /// Insert `(database, tool_name, args, outcome)` into the cache. No-op for
 /// non-read-only tools or for error outcomes (transient errors
-/// shouldn't poison-pill the cache).
-pub fn insert(database: Option<u64>, tool_name: &str, args: &JsonValue, outcome: &ToolOutcome) {
-    if !read_only(tool_name) || outcome.is_error {
+/// shouldn't poison-pill the cache). `epoch_before` is the engine epoch read
+/// BEFORE the handler ran and `epoch_now` the one read after it: when they
+/// differ a write happened while the handler was computing, so the outcome may
+/// mix old and new state and is not published.
+pub(crate) fn insert(
+    database: Option<u64>,
+    epoch_before: DbEpoch,
+    epoch_now: DbEpoch,
+    tool_name: &str,
+    args: &JsonValue,
+    outcome: &ToolOutcome,
+) {
+    if !read_only(tool_name) || outcome.is_error || epoch_before != epoch_now {
         return;
     }
     let key = cache_key(database, tool_name, args);
@@ -218,6 +251,9 @@ pub fn insert(database: Option<u64>, tool_name: &str, args: &JsonValue, outcome:
         Ok(g) => g,
         Err(_) => return,
     };
+    if guard.disabled {
+        return;
+    }
     let generation = guard.generation;
     guard.lru.put(
         key,
@@ -225,6 +261,7 @@ pub fn insert(database: Option<u64>, tool_name: &str, args: &JsonValue, outcome:
             outcome: outcome.clone(),
             inserted_at: Instant::now(),
             generation,
+            epoch: epoch_before,
         },
     );
 }
@@ -247,17 +284,29 @@ pub struct CacheStats {
     pub hits: u64,
     pub misses: u64,
     pub evictions: u64,
+    /// Entries dropped on read because the database was written since they
+    /// were computed.
+    pub stale_drops: u64,
+}
+
+/// Per-tool `(hits, misses)`, for `helios/info`.
+pub fn per_tool_stats() -> Vec<(String, u64, u64)> {
+    match CACHE.lock() {
+        Ok(g) => g.per_tool.iter().map(|(k, v)| (k.clone(), v.0, v.1)).collect(),
+        Err(_) => Vec::new(),
+    }
 }
 
 pub fn stats() -> CacheStats {
     match CACHE.lock() {
         Ok(g) => CacheStats {
             size: g.lru.len(),
-            capacity: g.lru.cap().get(),
+            capacity: if g.disabled { 0 } else { g.lru.cap().get() },
             generation: g.generation,
             hits: g.hits,
             misses: g.misses,
             evictions: g.evictions,
+            stale_drops: g.stale_drops,
         },
         Err(_) => CacheStats {
             size: 0,
@@ -266,6 +315,7 @@ pub fn stats() -> CacheStats {
             hits: 0,
             misses: 0,
             evictions: 0,
+            stale_drops: 0,
         },
     }
 }
@@ -279,6 +329,29 @@ pub fn _clear_for_tests() {
         g.hits = 0;
         g.misses = 0;
         g.evictions = 0;
+        g.stale_drops = 0;
+        g.per_tool.clear();
+    }
+}
+
+/// Test-only: make `try_get` ignore the engine epoch, i.e. restore the lookup
+/// the cache had before v09.2. Lets a test show that its staleness check
+/// really detects the defect.
+#[doc(hidden)]
+pub fn _set_ignore_epoch_for_tests(ignore: bool) {
+    if let Ok(mut g) = CACHE.lock() {
+        g.ignore_epoch = ignore;
+        g.lru.clear();
+    }
+}
+
+/// Test-only: switch the disabled flag (what `HELIOS_MCP_CACHE_CAPACITY=0`
+/// sets at start-up).
+#[doc(hidden)]
+pub fn _set_disabled_for_tests(disabled: bool) {
+    if let Ok(mut g) = CACHE.lock() {
+        g.disabled = disabled;
+        g.lru.clear();
     }
 }
 
@@ -320,36 +393,45 @@ mod tests {
         _clear_for_tests();
         let args = json!({ "name": "foo" });
         // Miss
-        assert!(try_get(Some(1), "helios_lsp_definition", &args).is_none());
+        assert!(try_get(Some(1), None, "helios_lsp_definition", &args).is_none());
         // Insert
         insert(
             Some(1),
+            None,
+            None,
             "helios_lsp_definition",
             &args,
             &ok_outcome(json!({ "rows": [] })),
         );
         // Hit
-        let hit = try_get(Some(1), "helios_lsp_definition", &args).expect("expected cache hit");
+        let hit = try_get(Some(1), None, "helios_lsp_definition", &args).expect("expected cache hit");
         assert_eq!(hit.payload, json!({ "rows": [] }));
         // Invalidate via write
         invalidate_for_writes();
-        assert!(try_get(Some(1), "helios_lsp_definition", &args).is_none());
+        assert!(try_get(Some(1), None, "helios_lsp_definition", &args).is_none());
     }
 
     #[test]
     fn errors_not_cached() {
         _clear_for_tests();
         let args = json!({ "name": "foo" });
-        insert(Some(1), "helios_lsp_definition", &args, &ToolOutcome::err("boom"));
-        assert!(try_get(Some(1), "helios_lsp_definition", &args).is_none());
+        insert(
+            Some(1),
+            None,
+            None,
+            "helios_lsp_definition",
+            &args,
+            &ToolOutcome::err("boom"),
+        );
+        assert!(try_get(Some(1), None, "helios_lsp_definition", &args).is_none());
     }
 
     #[test]
     fn non_readonly_tools_bypass_cache() {
         _clear_for_tests();
         let args = json!({});
-        insert(Some(1), "heliosdb_insert", &args, &ok_outcome(json!({})));
-        assert!(try_get(Some(1), "heliosdb_insert", &args).is_none());
+        insert(Some(1), None, None, "heliosdb_insert", &args, &ok_outcome(json!({})));
+        assert!(try_get(Some(1), None, "heliosdb_insert", &args).is_none());
     }
 
     /// The same tool, the same arguments, two DIFFERENT databases: the second
@@ -361,15 +443,17 @@ mod tests {
         let args = json!({ "branch": "main" });
         insert(
             Some(7),
+            None,
+            None,
             "heliosdb_list_tables",
             &args,
             &ok_outcome(json!({ "tables": ["a"] })),
         );
         assert!(
-            try_get(Some(8), "heliosdb_list_tables", &args).is_none(),
+            try_get(Some(8), None, "heliosdb_list_tables", &args).is_none(),
             "database 8 must not read database 7's cached tool result"
         );
-        let own = try_get(Some(7), "heliosdb_list_tables", &args).expect("database 7 still hits its own entry");
+        let own = try_get(Some(7), None, "heliosdb_list_tables", &args).expect("database 7 still hits its own entry");
         assert_eq!(own.payload, json!({ "tables": ["a"] }));
     }
 
@@ -379,8 +463,70 @@ mod tests {
     fn nodb_scope_is_distinct() {
         _clear_for_tests();
         let args = json!({});
-        insert(None, "heliosdb_hybrid_search", &args, &ok_outcome(json!({ "hits": 0 })));
-        assert!(try_get(Some(1), "heliosdb_hybrid_search", &args).is_none());
-        assert!(try_get(None, "heliosdb_hybrid_search", &args).is_some());
+        insert(
+            None,
+            None,
+            None,
+            "heliosdb_hybrid_search",
+            &args,
+            &ok_outcome(json!({ "hits": 0 })),
+        );
+        assert!(try_get(Some(1), None, "heliosdb_hybrid_search", &args).is_none());
+        assert!(try_get(None, None, "heliosdb_hybrid_search", &args).is_some());
+    }
+
+    fn epoch(n: u64) -> DbEpoch {
+        Some(ResultCacheEpoch {
+            local: n,
+            storage: 0,
+            generic_mutations: 0,
+        })
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+    fn epoch_mismatch_drops_entry() {
+        _clear_for_tests();
+        let args = json!({ "name": "foo" });
+        insert(
+            Some(1),
+            epoch(1),
+            epoch(1),
+            "helios_lsp_definition",
+            &args,
+            &ok_outcome(json!(1)),
+        );
+        assert!(try_get(Some(1), epoch(1), "helios_lsp_definition", &args).is_some());
+        let before = stats().stale_drops;
+        assert!(try_get(Some(1), epoch(2), "helios_lsp_definition", &args).is_none());
+        assert_eq!(stats().stale_drops, before + 1);
+        // The entry was popped: even the old epoch no longer hits.
+        assert!(try_get(Some(1), epoch(1), "helios_lsp_definition", &args).is_none());
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+    fn epoch_moved_during_handler_is_not_published() {
+        _clear_for_tests();
+        let args = json!({});
+        insert(
+            Some(1),
+            epoch(1),
+            epoch(2),
+            "helios_lsp_definition",
+            &args,
+            &ok_outcome(json!(1)),
+        );
+        assert!(try_get(Some(1), epoch(2), "helios_lsp_definition", &args).is_none());
+        assert!(try_get(Some(1), epoch(1), "helios_lsp_definition", &args).is_none());
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+    fn nodb_scope_unaffected_by_db_epoch() {
+        _clear_for_tests();
+        let args = json!({});
+        insert(None, None, None, "heliosdb_hybrid_search", &args, &ok_outcome(json!(1)));
+        assert!(try_get(None, None, "heliosdb_hybrid_search", &args).is_some());
     }
 }

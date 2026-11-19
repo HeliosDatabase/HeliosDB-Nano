@@ -28,7 +28,8 @@ compare    Print a markdown comparison table between two named runs inside an
 Recognised line shapes (see tests/tps_workloads.rs and
 benches/external/sqlite_tps_mirror.py):
   label   <ops> ops  <secs> s  <rate> ops/s  <us> us/op [p50=..us p95=..us p99=..us]
-  label   <rate> txn/s | commit/s | lookups/s | ops/s        (rate-only benches)
+  label   <rate> txn/s | commit/s | lookups/s | ops/s | files/s   (rate-only benches;
+          files/s is examples/code_graph_bench.rs: `code_graph.<phase>_<files>   <rate> files/s`)
 """
 
 import argparse
@@ -44,7 +45,7 @@ STD_RE = re.compile(
     r"^(\S+)\s+(\d+) ops\s+([\d.]+) s\s+([\d.]+) ops/s\s+([\d.]+) us/op"
     r"(?:\s+p50=([\d.]+)us p95=([\d.]+)us p99=([\d.]+)us)?\s*$"
 )
-RATE_RE = re.compile(r"^\s*(.+?)\s{2,}([\d.]+)\s+(ops|txn|commit|lookups)/s\b")
+RATE_RE = re.compile(r"^\s*(.+?)\s{2,}([\d.]+)\s+(ops|txn|commit|lookups|files)/s\b")
 
 
 def parse_lines(lines):

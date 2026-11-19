@@ -1592,7 +1592,7 @@ thread_local! {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ResultCacheEpoch {
+pub(crate) struct ResultCacheEpoch {
     local: u64,
     storage: u64,
     generic_mutations: u64,
@@ -5324,7 +5324,7 @@ impl EmbeddedDatabase {
     /// BEFORE it reads any data; passed back to `cache_query_result`, which
     /// refuses to publish if anything invalidated the cache in between.
     #[inline]
-    fn result_cache_epoch(&self) -> ResultCacheEpoch {
+    pub(crate) fn result_cache_epoch(&self) -> ResultCacheEpoch {
         ResultCacheEpoch {
             local: self.result_cache_epoch.load(std::sync::atomic::Ordering::Acquire),
             storage: self.storage.schema_generation(),
@@ -14157,14 +14157,30 @@ impl EmbeddedDatabase {
     pub fn code_index(&self, opts: code_graph::CodeIndexOptions) -> Result<code_graph::CodeIndexStats> {
         // Spec P1.4: indexing writes the `_hdb_code_*` tables.
         self.refuse_write_on_physical_standby("code_index")?;
-        let stats = code_graph::storage::code_index(self, opts)?;
+        #[allow(unused_mut)]
+        let mut stats = code_graph::storage::code_index(self, opts)?;
         // Incremental projection: when graph-rag is enabled, mirror
         // new code symbols + refs into the universal `_hdb_graph_*`
         // schema.  Keeps the projection in sync without callers
         // having to remember to call `graph_rag_project_symbols`.
         #[cfg(feature = "graph-rag")]
         {
-            let _ = self.graph_rag_project_symbols();
+            let projection_started = std::time::Instant::now();
+            // A run that parsed and removed nothing changes no symbol, so the
+            // projection is skipped when the graph already holds one code node
+            // per symbol. (A store indexed before graph-rag was enabled has no
+            // nodes yet: the counts differ and the projection runs.)
+            let unchanged = stats.files_parsed == 0 && stats.files_removed == 0 && self.graph_is_in_step_with_symbols();
+            if !unchanged {
+                // The code tables are already committed: a projection failure
+                // is reported through the stats and a warning, not by failing
+                // an index that succeeded.
+                if let Err(e) = self.graph_rag_project_symbols() {
+                    tracing::warn!("code_index: graph projection failed: {e}");
+                    stats.projection_error = Some(e.to_string());
+                }
+            }
+            stats.projection_ms = projection_started.elapsed().as_millis() as u64;
         }
         Ok(stats)
     }
@@ -14373,6 +14389,7 @@ impl EmbeddedDatabase {
             chunk_size: None,
             skip_cross_file_resolve: !meta.resolve_cross_file,
             skip_symbol_refs: false,
+            only_paths: None,
         };
         self.code_index(opts)?;
         Ok(0)
@@ -14453,6 +14470,7 @@ impl EmbeddedDatabase {
                 chunk_size: None,
                 skip_cross_file_resolve: !idx.resolve_cross_file,
                 skip_symbol_refs: false,
+                only_paths: None,
             };
             let _ = self.code_index(opts);
         }
@@ -14508,9 +14526,34 @@ impl EmbeddedDatabase {
     // Graph-RAG API (feature = "graph-rag", implies `code-graph`)
     // ------------------------------------------------------------------
 
+    /// True when `_hdb_graph_nodes` holds exactly one code node per code
+    /// symbol (counts only: the cheap test that lets a no-op re-index skip the
+    /// projection). Any failure to count (a table is missing) is "not in step".
+    #[cfg(feature = "graph-rag")]
+    fn graph_is_in_step_with_symbols(&self) -> bool {
+        let count = |sql: &str| -> Option<i64> {
+            match self.query(sql, &[]).ok()?.first()?.values.first()? {
+                Value::Int8(n) => Some(*n),
+                Value::Int4(n) => Some(i64::from(*n)),
+                _ => None,
+            }
+        };
+        match (
+            count("SELECT COUNT(*) FROM _hdb_graph_nodes WHERE source_ref LIKE 'code_symbol:%'"),
+            count("SELECT COUNT(*) FROM _hdb_code_symbols"),
+        ) {
+            (Some(nodes), Some(symbols)) => nodes == symbols,
+            _ => false,
+        }
+    }
+
     /// Project every `_hdb_code_symbols` row into `_hdb_graph_nodes`
     /// so the universal-graph layer sees every code symbol as a node.
     /// Idempotent. Creates the graph tables on first call.
+    ///
+    /// Incremental: only nodes that differ are written, nodes of symbols that
+    /// no longer exist are deleted with their edges (see
+    /// `graph_rag::project_code_symbols`). Always runs the full diff.
     #[cfg(feature = "graph-rag")]
     pub fn graph_rag_project_symbols(&self) -> Result<graph_rag::GraphRagStats> {
         // Spec P1.4: projection writes the `_hdb_graph_*` tables.

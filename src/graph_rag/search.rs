@@ -4,7 +4,7 @@
 //! feature follow-up (phase 3.1) once the shared embedder story lands
 //! across the whole track.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 
 use crate::{EmbeddedDatabase, Error, Result, Value};
 
@@ -56,6 +56,30 @@ pub struct GraphRagHit {
     pub hop_distance: u32,
 }
 
+static SEARCH_STATEMENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Number of SQL statements the graph search / WITH CONTEXT expansion has
+/// issued in this process (monotonic). The benchmark harness takes the delta
+/// around one search to report statements per search.
+pub fn search_statement_count() -> u64 {
+    SEARCH_STATEMENTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+thread_local! {
+    static THREAD_SEARCH_STATEMENTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The same count for statements issued on the calling thread only, so a
+/// caller can measure its own search while others run in parallel.
+pub fn search_statement_count_this_thread() -> u64 {
+    THREAD_SEARCH_STATEMENTS.with(std::cell::Cell::get)
+}
+
+pub(crate) fn count_search_statement() {
+    SEARCH_STATEMENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    THREAD_SEARCH_STATEMENTS.with(|count| count.set(count.get() + 1));
+}
+
 /// Run a seed → expand → return pass. See `GraphRagOptions` for knobs.
 ///
 /// Storage-level filtering: seed WHERE predicates and edge-kind
@@ -83,6 +107,7 @@ pub fn graph_rag_search(db: &EmbeddedDatabase, opts: &GraphRagOptions) -> Result
         }
         seed_sql.push(')');
     }
+    count_search_statement();
     let rows = db.query(&seed_sql, &[])?;
 
     let mut seeds: Vec<GraphRagHit> = Vec::new();
@@ -109,40 +134,22 @@ pub fn graph_rag_search(db: &EmbeddedDatabase, opts: &GraphRagOptions) -> Result
         return Ok(seeds);
     }
 
-    // 2. BFS expansion.
+    // 2. Expansion, one frontier per hop (see `expand_hops`).
     let mut visited: HashMap<i64, GraphRagHit> = HashMap::new();
-    let mut queue: VecDeque<(i64, u32)> = VecDeque::new();
     for s in &seeds {
         visited.insert(s.node_id, s.clone());
-        queue.push_back((s.node_id, 0));
     }
-    while let Some((nid, depth)) = queue.pop_front() {
-        if depth >= opts.hops {
-            continue;
-        }
-        if visited.len() >= opts.limit {
-            break;
-        }
-        let neighbours = fetch_neighbours(db, nid, opts.direction, &opts.edge_kinds)?;
-        for n in neighbours {
-            if visited.len() >= opts.limit {
-                break;
-            }
-            if visited.contains_key(&n.node_id) {
-                continue;
-            }
-            let hit = GraphRagHit {
-                node_id: n.node_id,
-                node_kind: n.node_kind.clone(),
-                title: n.title.clone(),
-                text: n.text.clone(),
-                source_ref: n.source_ref.clone(),
-                hop_distance: depth + 1,
-            };
-            visited.insert(n.node_id, hit);
-            queue.push_back((n.node_id, depth + 1));
-        }
-    }
+    let seed_ids: Vec<i64> = seeds.iter().map(|s| s.node_id).collect();
+    expand_hops(
+        db,
+        &mut visited,
+        seed_ids,
+        opts.hops,
+        opts.direction,
+        &opts.edge_kinds,
+        opts.limit,
+        None,
+    )?;
 
     let mut out: Vec<GraphRagHit> = visited.into_values().collect();
     // Deterministic order: hop_distance ascending, then node_id.
@@ -155,74 +162,160 @@ pub fn graph_rag_search(db: &EmbeddedDatabase, opts: &GraphRagOptions) -> Result
     Ok(out)
 }
 
-#[derive(Debug, Clone)]
-struct Neighbour {
-    node_id: i64,
-    node_kind: String,
-    title: Option<String>,
-    text: Option<String>,
-    source_ref: Option<String>,
-}
+const IN_BATCH: usize = 1000;
 
-fn fetch_neighbours(
+/// One hop of edges for a whole frontier: `(source, peer)` pairs with `source`
+/// in `ids` and `peer != source`. `Out` is `from_node IN (..)`, `In` is
+/// `to_node IN (..)`, `Both` runs both statements and unions them. Every
+/// statement is single-table with an `IN` list (index-served with the
+/// `_hdb_graph_edges(from_node / to_node)` indexes), ids are chunked at 1000.
+/// Pairs come back in no particular order and may repeat.
+pub(crate) fn expand_frontier(
     db: &EmbeddedDatabase,
-    seed: i64,
+    ids: &[i64],
     direction: Direction,
-    kinds: &[String],
-) -> Result<Vec<Neighbour>> {
-    // Build kind filter SQL fragment. Non-empty `kinds` pushes down
-    // through FilteredScan bloom + zone maps.
-    let kind_filter = if kinds.is_empty() {
+    edge_kinds: &[String],
+) -> Result<Vec<(i64, i64)>> {
+    let kind_filter = if edge_kinds.is_empty() {
         String::new()
     } else {
-        let list = kinds.iter().map(|k| sql_text(k)).collect::<Vec<_>>().join(",");
-        format!(" AND e.edge_kind IN ({list})")
+        let list = edge_kinds.iter().map(|k| sql_text(k)).collect::<Vec<_>>().join(",");
+        format!(" AND edge_kind IN ({list})")
     };
-
-    let where_direction = match direction {
-        Direction::Out => format!("e.from_node = {seed}"),
-        Direction::In => format!("e.to_node = {seed}"),
-        Direction::Both => format!("(e.from_node = {seed} OR e.to_node = {seed})"),
-    };
-
-    let sql = format!(
-        "SELECT DISTINCT \
-           CASE WHEN e.from_node = {seed} THEN e.to_node ELSE e.from_node END AS peer \
-         FROM _hdb_graph_edges e \
-         WHERE {where_direction}{kind_filter}"
-    );
-    let rows = db.query(&sql, &[])?;
-    let mut ids = Vec::with_capacity(rows.len());
-    let mut seen: HashSet<i64> = HashSet::new();
-    for row in rows {
-        if let Some(id) = as_int(row.values.first()) {
-            if id != seed && seen.insert(id) {
-                ids.push(id);
+    let mut pairs: Vec<(i64, i64)> = Vec::new();
+    for batch in ids.chunks(IN_BATCH) {
+        let csv = batch.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+        if matches!(direction, Direction::Out | Direction::Both) {
+            count_search_statement();
+            for row in db.query(
+                &format!("SELECT from_node, to_node FROM _hdb_graph_edges WHERE from_node IN ({csv}){kind_filter}"),
+                &[],
+            )? {
+                if let (Some(src), Some(peer)) = (as_int(row.values.first()), as_int(row.values.get(1))) {
+                    if src != peer {
+                        pairs.push((src, peer));
+                    }
+                }
+            }
+        }
+        if matches!(direction, Direction::In | Direction::Both) {
+            count_search_statement();
+            for row in db.query(
+                &format!("SELECT to_node, from_node FROM _hdb_graph_edges WHERE to_node IN ({csv}){kind_filter}"),
+                &[],
+            )? {
+                if let (Some(src), Some(peer)) = (as_int(row.values.first()), as_int(row.values.get(1))) {
+                    if src != peer {
+                        pairs.push((src, peer));
+                    }
+                }
             }
         }
     }
-    if ids.is_empty() {
-        return Ok(Vec::new());
-    }
-    let id_list = ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
-    let nodes_rows = db.query(
-        &format!(
-            "SELECT node_id, node_kind, title, text, source_ref \
-             FROM _hdb_graph_nodes WHERE node_id IN ({id_list})"
-        ),
-        &[],
-    )?;
-    let mut out = Vec::with_capacity(nodes_rows.len());
-    for row in nodes_rows {
-        out.push(Neighbour {
-            node_id: as_int(row.values.first()).unwrap_or(0),
-            node_kind: as_string(row.values.get(1)).unwrap_or_default(),
-            title: as_string(row.values.get(2)),
-            text: as_string(row.values.get(3)),
-            source_ref: as_string(row.values.get(4)),
-        });
+    Ok(pairs)
+}
+
+/// Nodes by primary key, one `IN` statement per 1000 ids. Missing ids are
+/// simply absent from the result. `hop_distance` is 0; the caller sets it.
+pub(crate) fn load_nodes(db: &EmbeddedDatabase, ids: &[i64]) -> Result<HashMap<i64, GraphRagHit>> {
+    let mut out = HashMap::with_capacity(ids.len());
+    for batch in ids.chunks(IN_BATCH) {
+        let csv = batch.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+        count_search_statement();
+        for row in db.query(
+            &format!(
+                "SELECT node_id, node_kind, title, text, source_ref FROM _hdb_graph_nodes WHERE node_id IN ({csv})"
+            ),
+            &[],
+        )? {
+            let Some(node_id) = as_int(row.values.first()) else {
+                continue;
+            };
+            out.insert(
+                node_id,
+                GraphRagHit {
+                    node_id,
+                    node_kind: as_string(row.values.get(1)).unwrap_or_default(),
+                    title: as_string(row.values.get(2)),
+                    text: as_string(row.values.get(3)),
+                    source_ref: as_string(row.values.get(4)),
+                    hop_distance: 0,
+                },
+            );
+        }
     }
     Ok(out)
+}
+
+/// Breadth-first expansion of `visited` (already holding the seeds at hop 0)
+/// by one frontier per hop: three statements per hop at most (edges out, edges
+/// in, nodes by key) instead of two per visited node.
+///
+/// Rules, shared by `graph_rag_search` and `WITH CONTEXT`:
+/// - a node's hop distance is the hop at which it was FIRST reached;
+/// - within a hop, sources are taken in ascending node id and each source's
+///   peers in ascending node id; a peer already visited (or already a
+///   candidate of this hop) is skipped; `expand_limit`, when given, caps the
+///   NEW peers one source contributes;
+/// - the hop's candidates are loaded, those without a node row are dropped, and
+///   the hop is cut at the room left under `limit` keeping the LOWEST node ids
+///   (ties under a limit are therefore broken by node id, not by the order in
+///   which the database happened to return edges);
+/// - expansion stops after `hops` hops or when `limit` nodes are visited.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn expand_hops(
+    db: &EmbeddedDatabase,
+    visited: &mut HashMap<i64, GraphRagHit>,
+    mut frontier: Vec<i64>,
+    hops: u32,
+    direction: Direction,
+    edge_kinds: &[String],
+    limit: usize,
+    expand_limit: Option<usize>,
+) -> Result<()> {
+    for depth in 0..hops {
+        if frontier.is_empty() || visited.len() >= limit {
+            break;
+        }
+        frontier.sort_unstable();
+        frontier.dedup();
+        let pairs = expand_frontier(db, &frontier, direction, edge_kinds)?;
+        let mut by_source: std::collections::BTreeMap<i64, std::collections::BTreeSet<i64>> =
+            std::collections::BTreeMap::new();
+        for (src, peer) in pairs {
+            by_source.entry(src).or_default().insert(peer);
+        }
+        let mut candidates: HashSet<i64> = HashSet::new();
+        for peers in by_source.values() {
+            let mut taken = 0usize;
+            for peer in peers {
+                if expand_limit.is_some_and(|cap| taken >= cap) {
+                    break;
+                }
+                if visited.contains_key(peer) || !candidates.insert(*peer) {
+                    continue;
+                }
+                taken += 1;
+            }
+        }
+        if candidates.is_empty() {
+            break;
+        }
+        let ids: Vec<i64> = candidates.into_iter().collect();
+        let mut loaded = load_nodes(db, &ids)?;
+        let mut found: Vec<i64> = loaded.keys().copied().collect();
+        found.sort_unstable();
+        found.truncate(limit.saturating_sub(visited.len()));
+        frontier = Vec::with_capacity(found.len());
+        for id in found {
+            if let Some(mut hit) = loaded.remove(&id) {
+                hit.hop_distance = depth + 1;
+                visited.insert(id, hit);
+                frontier.push(id);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn sql_text(s: &str) -> String {

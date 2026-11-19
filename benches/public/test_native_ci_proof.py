@@ -262,5 +262,33 @@ class NativeProofFixtures(unittest.TestCase):
             proof.validate_results(self.root, expected, raw, baseline)
 
 
+class CodeGraphBenchLines(unittest.TestCase):
+    """The `files/s` rate shape printed by examples/code_graph_bench.rs."""
+
+    def test_parse_accepts_files_per_second(self):
+        spec = importlib.util.spec_from_file_location("bench_tools_fixture", Path(__file__).with_name("bench_tools.py"))
+        tools = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(tools)
+        got = tools.parse_lines([
+            "code_graph.cold_index_300   812.5 files/s\n",
+            "code_graph.reindex_1_file_300   21.40 txn/s\n",
+            "code_graph.lsp_definition_p95   9000.0 lookups/s\n",
+            "CODE_GRAPH_BENCH_JSON {}\n",
+        ])
+        self.assertEqual(got["code_graph.cold_index_300"]["ops_per_sec"], 812.5)
+        self.assertEqual(got["code_graph.cold_index_300"]["unit"], "files/s")
+        self.assertEqual(got["code_graph.reindex_1_file_300"]["ops_per_sec"], 21.4)
+        self.assertEqual(got["code_graph.lsp_definition_p95"]["ops_per_sec"], 9000.0)
+        self.assertEqual(len(got), 3)
+
+    def test_best_of_runs_wins(self):
+        spec = importlib.util.spec_from_file_location("bench_tools_fixture2", Path(__file__).with_name("bench_tools.py"))
+        tools = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(tools)
+        got = tools.parse_lines(["x.y   10.0 files/s\n", "x.y   30.0 files/s\n", "x.y   20.0 files/s\n"])
+        self.assertEqual(got["x.y"]["ops_per_sec"], 30.0)
+        self.assertEqual(got["x.y"]["runs_seen"], 3)
+
+
 if __name__ == "__main__":
     unittest.main()

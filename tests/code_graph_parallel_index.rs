@@ -373,3 +373,48 @@ fn small_corpus_no_regression_under_parallelism() {
     assert_eq!(stats.files_parsed, 1);
     assert!(stats.symbols_written >= 1);
 }
+
+/// v09.4: the phase timers split the serial write phase; they must not
+/// exceed it and must account for most of it (the rest is begin/commit).
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+fn stats_phase_timers_sum_to_write_elapsed() {
+    let db = EmbeddedDatabase::new_in_memory().unwrap();
+    populate_corpus(&db);
+    // Several copies so the write phase is long enough to measure.
+    for round in 0..40 {
+        for (path, lang, content) in FIXTURE_FILES {
+            db.execute_params_returning(
+                "INSERT INTO src VALUES ($1, $2, $3)",
+                &[
+                    Value::String(format!("r{round}/{path}")),
+                    Value::String((*lang).into()),
+                    Value::String((*content).into()),
+                ],
+            )
+            .unwrap();
+        }
+    }
+    let stats = db.code_index(CodeIndexOptions::for_table("src")).unwrap();
+    assert!(stats.files_parsed > 100);
+    let sum = stats.cleanup_ms
+        + stats.files_upsert_ms
+        + stats.symbols_insert_ms
+        + stats.refs_insert_ms
+        + stats.cross_resolve_ms;
+    assert!(
+        sum <= stats.write_elapsed_ms + 5,
+        "phases {sum} ms exceed the write phase {} ms",
+        stats.write_elapsed_ms
+    );
+    assert!(
+        stats.write_elapsed_ms <= sum * 2 + 100,
+        "phases {sum} ms explain too little of the write phase {} ms",
+        stats.write_elapsed_ms
+    );
+    assert!(stats.symbols_insert_ms > 0 || stats.refs_insert_ms > 0);
+    // A second, unchanged run does no write work at all.
+    let noop = db.code_index(CodeIndexOptions::for_table("src")).unwrap();
+    assert_eq!(noop.files_parsed, 0);
+    assert_eq!(noop.symbols_insert_ms + noop.refs_insert_ms + noop.cleanup_ms, 0);
+}

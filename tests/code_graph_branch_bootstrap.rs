@@ -53,3 +53,26 @@ fn unsupported_branch_index_still_aborts_until_rollback() -> Result<()> {
     }
     Ok(())
 }
+
+/// v09.3: the graph-rag tables gain their read indexes on main only; on a
+/// branch `ensure_tables` must not issue the refused CREATE INDEX, which would
+/// abort the caller's transaction.
+#[cfg(feature = "graph-rag")]
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+fn graph_tables_on_branch_do_not_issue_create_index() -> Result<()> {
+    let mut config = Config::default();
+    config.storage.memory_only = true;
+    config.storage.path = None;
+    config.session.lock_timeout_ms = 100;
+    let db = EmbeddedDatabase::with_config(config)?;
+    db.create_branch("g_child")?;
+    db.switch_branch("g_child")?;
+    db.begin()?;
+    heliosdb_nano::graph_rag::ensure_tables(&db)?;
+    // The transaction was not aborted by a refused index statement.
+    assert_eq!(db.query("SELECT node_id FROM _hdb_graph_nodes", &[])?.len(), 0);
+    db.commit()?;
+    db.switch_branch("main")?;
+    Ok(())
+}

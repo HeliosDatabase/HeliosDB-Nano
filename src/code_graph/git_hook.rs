@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 
 use crate::{EmbeddedDatabase, Error, Result, Value};
 
-use super::storage::{code_index, CodeIndexOptions};
+use super::storage::CodeIndexOptions;
 
 /// Run the hook. `stdin` is line-delimited paths relative to
 /// `repo_root`. Returns the resulting `CodeIndexStats`.
@@ -54,6 +54,9 @@ pub fn run(
 
     ensure_source_table(&db, source_table)?;
 
+    // Paths whose source row this run upserted or deleted: the targeted run
+    // reads and hashes only these, not the whole source table.
+    let mut changed: Vec<String> = Vec::new();
     for p in paths {
         let abs = if PathBuf::from(p).is_absolute() {
             PathBuf::from(p)
@@ -66,6 +69,7 @@ pub fn run(
                 &format!("DELETE FROM \"{source_table}\" WHERE path = $1"),
                 &[Value::String(p.clone())],
             )?;
+            changed.push(p.clone());
             continue;
         }
         let Some(lang) = lang_from_path(&abs) else {
@@ -92,10 +96,16 @@ pub fn run(
                 Value::Int8(bytes),
             ],
         )?;
+        changed.push(p.clone());
     }
 
-    // Content-hash gate in code_index will skip unchanged files.
-    code_index(&db, CodeIndexOptions::for_table(source_table))
+    // Targeted run: only the changed paths are read and hashed (the content
+    // hash still skips a path whose content did not change). Going through
+    // `EmbeddedDatabase::code_index` also keeps the graph projection in sync
+    // when graph-rag is compiled in.
+    let mut opts = CodeIndexOptions::for_table(source_table);
+    opts.only_paths = Some(changed);
+    db.code_index(opts)
 }
 
 fn ensure_source_table(db: &EmbeddedDatabase, source_table: &str) -> Result<()> {
@@ -138,12 +148,13 @@ mod tests {
         let stats = run(&data, &repo, "src", &["a.rs".into(), "b.rs".into()]).unwrap();
         assert_eq!(stats.files_parsed, 2);
 
-        // Modify one, hook reports only that one. code_index scans
-        // the full src table, so b.rs shows up as files_unchanged.
+        // Modify one: the targeted run reads and hashes only the listed
+        // path, so the untouched b.rs is not even seen.
         std::fs::write(repo.join("a.rs"), "pub fn a2() {}\n").unwrap();
         let stats2 = run(&data, &repo, "src", &["a.rs".into()]).unwrap();
+        assert_eq!(stats2.files_seen, 1);
         assert_eq!(stats2.files_parsed, 1);
-        assert_eq!(stats2.files_unchanged, 1);
+        assert_eq!(stats2.files_unchanged, 0);
     }
 
     #[test]
@@ -168,5 +179,35 @@ mod tests {
             },
             0
         );
+        // The index holds nothing of the deleted file: no file row, no symbol.
+        let count = |sql: &str| match &db.query(sql, &[]).unwrap()[0].values[0] {
+            Value::Int4(n) => *n as i64,
+            Value::Int8(n) => *n,
+            _ => -1,
+        };
+        assert_eq!(count("SELECT COUNT(*) FROM _hdb_code_files"), 0);
+        assert_eq!(count("SELECT COUNT(*) FROM _hdb_code_symbols"), 0);
+    }
+
+    /// The hook goes through `EmbeddedDatabase::code_index`, so with graph-rag
+    /// compiled in the graph is projected (the hook used to call the storage
+    /// indexer directly and never did).
+    #[cfg(feature = "graph-rag")]
+    #[test]
+    fn hook_projects_when_graph_rag_enabled() {
+        let tmp = tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("a.rs"), "pub fn a() {}\n").unwrap();
+        run(&data, &repo, "src", &["a.rs".into()]).unwrap();
+        let db = EmbeddedDatabase::new(&data).unwrap();
+        let rows = db
+            .query(
+                "SELECT COUNT(*) FROM _hdb_graph_nodes WHERE source_ref LIKE 'code_symbol:%'",
+                &[],
+            )
+            .unwrap();
+        assert!(matches!(&rows[0].values[0], Value::Int8(n) if *n >= 1));
     }
 }

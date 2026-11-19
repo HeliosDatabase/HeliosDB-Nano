@@ -30,6 +30,7 @@ scripts' output — never hand-edited. Honesty rules baked in:
 | `run_durable_writes.sh` | The Durable Writes Gauntlet: write workloads at honest durability tiers — Nano `durable_commit=true` vs SQLite `synchronous=FULL` (Tier 1), Nano disk default vs SQLite WAL/NORMAL (Tier 2) — plus Nano multi-session durable commit scaling (`run_durable_commit_bench`). |
 | `run_concurrency.sh` | Multi-threaded embedded benches: hot-row lookups at 1/4/16 threads (`run_cache_concurrency_bench`), per-session transaction cycles (`run_session_txn_bench`, R0.1), and write-write conflict detection with zero-lost-update assertion (`run_conflict_bench`, R0.2). |
 | `ci_perf_smoke.sh` | The CI perf gate (used by `.github/workflows/perf-gate.yml`): TPS suite at N=1000/M=200 + the in-txn FK bulk-insert shape, best-of-3, checked against `ci_baseline.json`. |
+| `examples/code_graph_bench.rs` | The code-graph harness (not a script; `cargo run --profile perf --features code-graph,graph-rag,mcp-endpoint --example code_graph_bench -- --files 300 --mode memory\|disk --samples 200 [--dir D] [--parallelism N] [--chunk-size N]`): deterministic generated Rust corpus (fixed seed), cold index with the phase split (`triage/cleanup/files_upsert/symbols_insert/refs_insert/cross_resolve/projection` ms), no-op re-index, re-index after editing 1 and 10 files and after deleting 1, reopen + first query (disk), p50/p95/p99 of the LSP calls and of graph search, the same through `mcp::rpc::handle_rpc_with_db` (uncached and cached), rows per table, data-dir bytes, VmHWM, correctness counters (deleted file still resolvable, graph nodes without a symbol, refs with a non-unresolved resolution and NULL `to_symbol`, statements per graph search) and cross-checks. Prints `label   <rate> files/s` lines for `bench_tools.py` and one `CODE_GRAPH_BENCH_JSON {...}` line. |
 | `regen_ci_baseline.sh` | Regenerates `ci_baseline.json` from a fresh run on the current machine (rates pre-scaled down, default 0.5x). |
 | `release_bench.sh` | A release against an earlier one, in one command: `release_bench.sh v4.41.1` clones that revision, builds both sides with the release profile and runs `pg35_run.py` and `wire_pk_ab.sh` as A/Bs in alternating order. Writes `RESULTS.md` with the checksum of every binary measured. |
 | `pg35_run.py` | The strict `pg35` suite (`tests/pg35_benchmark.rs`): 35 SQL categories, embedded Nano against a real PostgreSQL 18.4, 300 timed iterations each with result checks. Builds the harness, writes the build receipt, profile and reference preflight it requires, runs it and tabulates the receipts. One or more source trees; needs the PostgreSQL reference on `127.0.0.1:25433` (the script's header has the `docker run` line) but no `psql`. |
@@ -54,7 +55,9 @@ pushes to `main` that touch engine code. Design:
 - **Workloads:** the 11-workload mem TPS suite at N=1000/M=200, plus
   `run_fk_bulk_insert_bench` (2000 FK-bearing INSERTs inside one transaction —
   the exact shape of the v3.28.0 338x FK regression that shipped ~2 weeks
-  undetected). Total runtime is seconds once the build cache is warm.
+  undetected), plus the code-graph harness on a 300-file generated corpus
+  (cold index and 1-file re-index on a populated store; the job's build now
+  includes the `code-graph` tree-sitter grammars). Total runtime is seconds once the build cache is warm.
 - **Noise handling:** each workload's score is the best of 3 runs; the
   baseline was generated on a workstation and pre-scaled by 0.5x; the gate
   fails only when measured < baseline / 2.5. Net effect: a workload must be

@@ -29,5 +29,8 @@ pub use ingest::{
 };
 pub use linker::{link_exact_qualified, link_vector_similar, LinkerStats, SymbolEmbedding, TextEmbedding};
 pub use schema::{ensure_tables, project_code_symbols, GraphRagStats};
-pub use search::{graph_rag_search, Direction, GraphRagHit, GraphRagOptions};
+pub use search::{
+    graph_rag_search, search_statement_count, search_statement_count_this_thread, Direction, GraphRagHit,
+    GraphRagOptions,
+};
 pub use with_context::{detect_with_context, graph_rag_expand_with_context, WithContextOptions};

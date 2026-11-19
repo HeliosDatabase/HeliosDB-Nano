@@ -68,6 +68,9 @@ new_results_dir() {
 #   - run_tps_suite, mem, N=1000 M=200 (all 11 workloads)
 #   - run_fk_bulk_insert_bench, parents=1000 children=2000 in one txn
 #     (the v3.28.0 338x FK regression shape)
+#   - examples/code_graph_bench.rs, 300 generated files, memory: cold index
+#     and 1-file re-index on a populated store (needs --features code-graph,
+#     i.e. the tree-sitter grammars, in the gate job's build)
 run_ci_gate_workloads() {
     local dir="$1" reps="${2:-3}"
     : > "$dir/ci_raw.txt"
@@ -89,6 +92,11 @@ run_ci_gate_workloads() {
             HELIOS_FK_CHILDREN=2000 \
             cargo test --quiet --profile perf --test tps_workloads run_fk_bulk_insert_bench \
             -- --nocapture --test-threads=1) 2>&1 | tee -a "$dir/ci_raw.txt"
+        echo "--- gate rep $rep/$reps: code graph, cold index + 1-file re-index (300 files) ---"
+        (cd "$ROOT" && cargo run --quiet --profile perf \
+            --features code-graph,graph-rag,mcp-endpoint --example code_graph_bench \
+            -- --files 300 --mode memory --samples 20 --skip-equiv) 2>&1 \
+            | grep -v '^CODE_GRAPH_BENCH_JSON' | tee -a "$dir/ci_raw.txt"
     done
     python3 "$TOOLS" parse "$dir/ci_raw.txt" > "$dir/ci_measured.json"
 }

@@ -97,7 +97,7 @@ git diff-tree --no-commit-id --name-only -r HEAD \
       --source-table src
 chmod +x .git/hooks/post-commit
 ```
-Each commit prints `CodeIndexStats { files_seen, files_parsed, files_unchanged, files_skipped, symbols_written, refs_written }`.
+Each commit prints `CodeIndexStats { files_seen, files_parsed, files_unchanged, files_skipped, files_removed, symbols_written, refs_written, ... }` plus phase timers (`triage_ms`, `cleanup_ms`, `files_upsert_ms`, `symbols_insert_ms`, `refs_insert_ms`, `cross_resolve_ms`, `projection_ms`). The hook runs a targeted re-index (`CodeIndexOptions::only_paths`): only the paths it names are read and hashed, a deleted file's symbols, references and file row are removed, and the graph is projected when `graph-rag` is compiled in.
 
 ### Recipe 4: Force-reparse (rebuild from scratch)
 ```bash
@@ -116,15 +116,17 @@ Use this when adding a new grammar (existing files need re-parsing) or after upg
 ### Recipe 5: Inspect via SQL
 ```sql
 -- top-10 most-referenced symbols in the project
-SELECT s.name, COUNT(r.id) AS refs
+SELECT s.name, COUNT(r.edge_id) AS refs
   FROM _hdb_code_symbols s
-  JOIN _hdb_code_symbol_refs r ON r.to_symbol = s.id
+  JOIN _hdb_code_symbol_refs r ON r.to_symbol = s.node_id
  GROUP BY s.name
  ORDER BY refs DESC LIMIT 10;
 
--- find every symbol called `parse` in Rust
-SELECT * FROM _hdb_code_symbols
- WHERE name = 'parse' AND lang = 'rust';
+-- find every symbol called `parse` in Rust (language lives on the file row;
+-- `name` is index-served, the join to files is on the small matching set)
+SELECT s.*, f.path FROM _hdb_code_symbols s
+  JOIN _hdb_code_files f ON f.node_id = s.file_id
+ WHERE s.name = 'parse' AND f.lang = 'rust';
 ```
 
 ### Recipe 6: Branch-scoped queries (FR-3 `ON BRANCH '<n>'`)
@@ -137,8 +139,10 @@ The branch guard restores the previous active branch on Drop, so any later queri
 ## Pitfalls
 - **`heliosdb-nano code-graph hook` is opt-in** — it's only present if the binary was built with `--features code-graph`. If users see "unknown subcommand", reinstall.
 - **Languages**: Phase-1 ships Rust, Python, TypeScript, Go, Markdown, SQL. Adding a language requires registering its tree-sitter grammar via `register_grammar`.
+- **Re-index cost follows the change, not the corpus**: a changed file is cleaned by key (ids read through the indexes, deletes by primary key, once per chunk); a file that left the source table is removed (`files_removed`); `only_paths: Some(vec![..])` skips reading the rest of the source table. Cross-file references are bound while they are inserted (name map built once); only a small tail of UPDATEs remains (`tail_statements`). A run that has to parse more than 5000 files and has no `chunk_size` is chunked by 2000 files (one transaction per chunk; a rerun resumes).
 - **Large repos**: first full index can take minutes. Subsequent commits are fast (Merkle-hashed file diffing skips unchanged files — `files_unchanged` in the stats).
-- **`bulk_insert_tuples` direct-write path**: ingest writes via the in-process bulk path, not via `INSERT … VALUES`. Don't try to ingest from outside the same OS process while the indexer is running.
+- **Ingest runs inside the indexer's transaction**: rows are written with multi-row parameterised `INSERT … RETURNING` batches that join the chunk's transaction (a failed chunk rolls back). Only one process can own the data directory, so run `code_index` from the process that owns it.
+- **Indexes**: `_hdb_code_symbols(name, file_id)`, `_hdb_code_files(path)` and the refs `file_id` / `from_symbol` / `to_symbol` indexes serve reads (definition, outline, call hierarchy) on the main branch; a column that only has `REFERENCES` is scanned on read. UPDATE/DELETE pick rows by primary key or scan, never through a secondary index. A store created by an older build gains the new indexes at its next `code_index`.
 - **FK in transaction (v3.21.x bug, fixed in v3.22.1)**: cascading deletes inside a transaction once raised phantom FK violations. Pin to `>=3.22.1` for the per-file delete-stale path.
 - **Cross-process `INSERT … ON CONFLICT (path) DO UPDATE`** is still racy. The hook subcommand and SDK both run in-process, so this only matters if you wrap your own multi-process ingester.
 

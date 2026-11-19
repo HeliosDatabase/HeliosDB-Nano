@@ -352,7 +352,9 @@ fn in_process_tools() -> Vec<ToolDescriptor> {
 /// Wrapped in a server-side LRU cache for read-only tools (see
 /// `super::result_cache`) — repeated identical calls inside an
 /// agentic-coding session return the cached `ToolOutcome` without
-/// re-running the handler. Cache invalidates on any mutating tool call
+/// re-running the handler. A DB-backed entry is valid only while the engine's
+/// result-cache epoch is unchanged (any write to that database drops it); the
+/// cache also invalidates on mutating in-process tool calls
 /// (`super::result_cache::writes`) and on TTL expiry.
 ///
 /// The cache is keyed by the DATABASE as well as by the tool and its
@@ -367,15 +369,21 @@ pub fn call_tool(db: Option<&EmbeddedDatabase>, name: &str, args: JsonValue) -> 
     // database at all, which gets its own scope.
     let database = db.map(|d| d.storage.instance_id());
 
+    // The engine's write signal, read BEFORE the lookup and the handler. A hit
+    // needs the same epoch now; a publish needs it unchanged after the handler.
+    let epoch_before = db.map(|d| d.result_cache_epoch());
+
     // Cache-hit short-circuit. Read-only tools only.
-    if let Some(cached) = result_cache::try_get(database, name, &args) {
+    if let Some(cached) = result_cache::try_get(database, epoch_before, name, &args) {
         return cached;
     }
 
     let outcome = call_tool_inner(db, name, args.clone());
 
-    // Populate cache (no-op for non-read-only tools or error outcomes).
-    result_cache::insert(database, name, &args, &outcome);
+    // Populate cache (no-op for non-read-only tools, error outcomes, or when
+    // the database was written while the handler ran).
+    let epoch_now = db.map(|d| d.result_cache_epoch());
+    result_cache::insert(database, epoch_before, epoch_now, name, &args, &outcome);
 
     // Bump generation on writes — invalidates everything cached so far.
     if !outcome.is_error && result_cache::writes(name) {

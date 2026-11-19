@@ -456,6 +456,10 @@ required-features = ["code-graph"]
 name = "code_graph_inspect"
 required-features = ["code-graph"]
 
+[[example]]
+name = "code_graph_bench"
+required-features = ["code-graph", "graph-rag", "mcp-endpoint"]
+
 [profile.bench]
 inherits = "release"
 

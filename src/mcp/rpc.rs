@@ -134,6 +134,10 @@ pub(crate) fn info_result() -> JsonValue {
             cache.hits as f64 / total as f64
         }
     };
+    let per_tool: serde_json::Map<String, JsonValue> = super::result_cache::per_tool_stats()
+        .into_iter()
+        .map(|(k, h, m)| (k, json!({ "hits": h, "misses": m })))
+        .collect();
     json!({
         "serverInfo": {
             "name": "heliosdb-nano",
@@ -157,6 +161,8 @@ pub(crate) fn info_result() -> JsonValue {
             "hits":       cache.hits,
             "misses":     cache.misses,
             "evictions":  cache.evictions,
+            "stale_drops": cache.stale_drops,
+            "per_tool":   per_tool,
             "hit_rate":   cache_hit_rate,
         },
     })

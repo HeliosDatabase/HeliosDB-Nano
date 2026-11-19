@@ -14,8 +14,6 @@
 
 use crate::{EmbeddedDatabase, Error, Result, Value};
 
-use super::storage;
-
 /// Disambiguation hints for `lsp_definition`. All fields optional;
 /// callers supply what they know.
 #[derive(Debug, Default, Clone)]
@@ -164,50 +162,107 @@ pub fn lsp_call_hierarchy(
     direction: CallDirection,
     depth: u32,
 ) -> Result<Vec<CallHierarchyRow>> {
-    // Manual BFS for phase 1 — phase 2 wraps as a recursive CTE so
-    // callers can run it from pure SQL.
+    // Manual BFS — phase 2 wraps as a recursive CTE so callers can run it
+    // from pure SQL.
+    //
+    // Each level is three single-table statements instead of one three-way
+    // join: every join in the engine is a hash join that scans the
+    // unfiltered side, so the joined form read the whole symbols table per
+    // level (hundreds of ms at 200k symbols) while the same predicates on
+    // one table are index-served (sub-ms):
+    //   1. refs by `to_symbol IN (..)` / `from_symbol IN (..)` and kind,
+    //   2. the new symbols by primary key,
+    //   3. their file paths by primary key (cached across levels).
+    // Within a level, rows come in the order the refs scan returned them,
+    // first sighting wins.
+    const IN_CHUNK: usize = 1000;
     let mut out = Vec::new();
     let mut frontier: Vec<i64> = vec![symbol_id];
     let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
     seen.insert(symbol_id);
+    let mut paths: std::collections::HashMap<i64, String> = std::collections::HashMap::new();
     for d in 1..=depth {
         if frontier.is_empty() {
             break;
         }
-        let ids_csv = frontier.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
-        let sql = match direction {
-            CallDirection::Incoming => format!(
-                "SELECT r.from_symbol, s.qualified, f.path, s.line_start \
-                 FROM _hdb_code_symbol_refs r \
-                 JOIN _hdb_code_symbols s ON s.node_id = r.from_symbol \
-                 JOIN _hdb_code_files   f ON f.node_id = s.file_id \
-                 WHERE r.to_symbol IN ({ids_csv}) AND r.kind = 'CALLS'"
-            ),
-            CallDirection::Outgoing => format!(
-                "SELECT r.to_symbol, s.qualified, f.path, s.line_start \
-                 FROM _hdb_code_symbol_refs r \
-                 JOIN _hdb_code_symbols s ON s.node_id = r.to_symbol \
-                 JOIN _hdb_code_files   f ON f.node_id = s.file_id \
-                 WHERE r.from_symbol IN ({ids_csv}) \
-                       AND r.kind = 'CALLS' \
-                       AND r.to_symbol IS NOT NULL"
-            ),
-        };
-        let rows = db.query(&sql, &[])?;
+        // 1. neighbours of the frontier, in scan order, deduplicated.
+        let mut candidates: Vec<i64> = Vec::new();
+        let mut candidate_set: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        for chunk in frontier.chunks(IN_CHUNK) {
+            let ids_csv = chunk.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+            let sql = match direction {
+                CallDirection::Incoming => format!(
+                    "SELECT from_symbol FROM _hdb_code_symbol_refs \
+                     WHERE to_symbol IN ({ids_csv}) AND kind = 'CALLS'"
+                ),
+                CallDirection::Outgoing => format!(
+                    "SELECT to_symbol FROM _hdb_code_symbol_refs \
+                     WHERE from_symbol IN ({ids_csv}) AND kind = 'CALLS' AND to_symbol IS NOT NULL"
+                ),
+            };
+            for row in db.query(&sql, &[])? {
+                let id = int_at(&row, 0)?;
+                if !seen.contains(&id) && candidate_set.insert(id) {
+                    candidates.push(id);
+                }
+            }
+        }
+        // 2. the symbols behind them, by primary key.
+        let mut info: std::collections::HashMap<i64, (String, i64, i32)> = std::collections::HashMap::new();
+        for chunk in candidates.chunks(IN_CHUNK) {
+            let ids_csv = chunk.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+            let rows = db.query(
+                &format!("SELECT node_id, qualified, file_id, line_start FROM _hdb_code_symbols WHERE node_id IN ({ids_csv})"),
+                &[],
+            )?;
+            for row in rows {
+                info.insert(
+                    int_at(&row, 0)?,
+                    (
+                        str_at(&row, 1).unwrap_or_default(),
+                        int_at(&row, 2)?,
+                        int_at(&row, 3).map(|x| x as i32).unwrap_or(0),
+                    ),
+                );
+            }
+        }
+        // 3. their files, by primary key, once per file across levels.
+        let mut missing_files: Vec<i64> = info
+            .values()
+            .map(|(_, f, _)| *f)
+            .filter(|f| !paths.contains_key(f))
+            .collect();
+        missing_files.sort_unstable();
+        missing_files.dedup();
+        for chunk in missing_files.chunks(IN_CHUNK) {
+            let ids_csv = chunk.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+            let rows = db.query(
+                &format!("SELECT node_id, path FROM _hdb_code_files WHERE node_id IN ({ids_csv})"),
+                &[],
+            )?;
+            for row in rows {
+                paths.insert(int_at(&row, 0)?, str_at(&row, 1).unwrap_or_default());
+            }
+        }
         let mut next_frontier: Vec<i64> = Vec::new();
-        for row in rows {
-            let next_id = int_at(&row, 0)?;
-            if !seen.insert(next_id) {
+        for id in candidates {
+            let Some((qualified, file_id, line)) = info.get(&id) else {
+                continue;
+            };
+            let Some(path) = paths.get(file_id) else {
+                continue;
+            };
+            if !seen.insert(id) {
                 continue;
             }
             out.push(CallHierarchyRow {
                 depth: d as i32,
-                symbol_id: next_id,
-                qualified: str_at(&row, 1).unwrap_or_default(),
-                path: str_at(&row, 2).unwrap_or_default(),
-                line: int_at(&row, 3).map(|x| x as i32).unwrap_or(0),
+                symbol_id: id,
+                qualified: qualified.clone(),
+                path: path.clone(),
+                line: *line,
             });
-            next_frontier.push(next_id);
+            next_frontier.push(id);
         }
         frontier = next_frontier;
     }
@@ -231,9 +286,6 @@ pub fn lsp_hover(db: &EmbeddedDatabase, symbol_id: i64) -> Result<Option<HoverRo
             ai_summary: None,
         }));
     }
-    // File-level sanity so callers can distinguish "unknown id" from
-    // "known id with no signature".
-    let _ = storage::file_id_for_symbol(db, symbol_id)?;
     Ok(None)
 }
 

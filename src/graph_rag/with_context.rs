@@ -21,7 +21,7 @@
 //! [`graph_rag_expand_with_context`] to run the seed query and
 //! expand.
 
-use super::search::{graph_rag_search, Direction, GraphRagHit, GraphRagOptions};
+use super::search::{expand_hops, graph_rag_search, load_nodes, Direction, GraphRagHit, GraphRagOptions};
 use crate::{EmbeddedDatabase, Error, Result, Value};
 
 /// Parsed form of `WITH CONTEXT (...)`. Pure data — detached from
@@ -264,54 +264,37 @@ pub fn graph_rag_expand_with_context(
         return Ok(Vec::new());
     }
 
-    // 2. Hand off to the graph_rag_search engine. We pass an empty
-    //    seed_text and a dummy match so the BFS path walks the
-    //    pre-selected seeds directly; `graph_rag_search` currently
-    //    requires a seed_text, so run a BFS manually over the seed
-    //    set here.
+    // 2. Expand the pre-selected seeds one frontier per hop (the shared
+    //    `search::expand_hops`): seeds are loaded with ONE primary-key IN
+    //    statement (a seed id with no node row is skipped); the first `limit`
+    //    seeds in query order are kept.
     let direction = opts.direction.unwrap_or(Direction::Both);
     let limit = opts.limit.unwrap_or(50);
-    use std::collections::{HashMap, HashSet, VecDeque};
+    use std::collections::{HashMap, HashSet};
+    let mut seen_seed: HashSet<i64> = HashSet::new();
+    seed_ids.retain(|id| seen_seed.insert(*id));
+    let mut loaded = load_nodes(db, &seed_ids)?;
     let mut visited: HashMap<i64, GraphRagHit> = HashMap::new();
-    let mut queue: VecDeque<(i64, u32)> = VecDeque::new();
-    for &id in &seed_ids {
-        queue.push_back((id, 0));
-        if let Some(hit) = load_hit(db, id)? {
-            visited.insert(id, hit);
-        }
+    let mut frontier: Vec<i64> = Vec::new();
+    for id in &seed_ids {
         if visited.len() >= limit {
             break;
         }
-    }
-    while let Some((nid, depth)) = queue.pop_front() {
-        if depth >= opts.hops {
-            continue;
-        }
-        if visited.len() >= limit {
-            break;
-        }
-        let peers = fetch_peers(db, nid, direction, &opts.edges)?;
-        let mut expanded = 0usize;
-        for peer in peers {
-            if let Some(expand_cap) = opts.expand_limit {
-                if expanded >= expand_cap {
-                    break;
-                }
-            }
-            if visited.contains_key(&peer) {
-                continue;
-            }
-            if let Some(mut hit) = load_hit(db, peer)? {
-                hit.hop_distance = depth + 1;
-                visited.insert(peer, hit);
-                queue.push_back((peer, depth + 1));
-                expanded += 1;
-            }
-            if visited.len() >= limit {
-                break;
-            }
+        if let Some(hit) = loaded.remove(id) {
+            visited.insert(*id, hit);
+            frontier.push(*id);
         }
     }
+    expand_hops(
+        db,
+        &mut visited,
+        frontier,
+        opts.hops,
+        direction,
+        &opts.edges,
+        limit,
+        opts.expand_limit,
+    )?;
     let mut out: Vec<GraphRagHit> = visited.into_values().collect();
     out.sort_by(|a, b| {
         a.hop_distance
@@ -325,82 +308,7 @@ pub fn graph_rag_expand_with_context(
     // recorded option so consumers can inspect it via the
     // `HitTransport` shape when ExpandOperator ships.
     let _ = &opts.rerank_by;
-    let _ = HashSet::<i64>::new(); // silence `unused` when feature combinations shift
     Ok(out)
-}
-
-fn load_hit(db: &EmbeddedDatabase, node_id: i64) -> Result<Option<GraphRagHit>> {
-    let rows = db.query(
-        &format!(
-            "SELECT node_id, node_kind, title, text, source_ref \
-             FROM _hdb_graph_nodes WHERE node_id = {node_id}"
-        ),
-        &[],
-    )?;
-    let Some(row) = rows.first() else {
-        return Ok(None);
-    };
-    Ok(Some(GraphRagHit {
-        node_id: match row.values.first() {
-            Some(Value::Int4(n)) => *n as i64,
-            Some(Value::Int8(n)) => *n,
-            _ => return Ok(None),
-        },
-        node_kind: match row.values.get(1) {
-            Some(Value::String(s)) => s.clone(),
-            _ => String::new(),
-        },
-        title: match row.values.get(2) {
-            Some(Value::String(s)) => Some(s.clone()),
-            _ => None,
-        },
-        text: match row.values.get(3) {
-            Some(Value::String(s)) => Some(s.clone()),
-            _ => None,
-        },
-        source_ref: match row.values.get(4) {
-            Some(Value::String(s)) => Some(s.clone()),
-            _ => None,
-        },
-        hop_distance: 0,
-    }))
-}
-
-fn fetch_peers(db: &EmbeddedDatabase, seed: i64, direction: Direction, kinds: &[String]) -> Result<Vec<i64>> {
-    let kind_filter = if kinds.is_empty() {
-        String::new()
-    } else {
-        let list = kinds
-            .iter()
-            .map(|k| format!("'{}'", k.replace('\'', "''")))
-            .collect::<Vec<_>>()
-            .join(",");
-        format!(" AND e.edge_kind IN ({list})")
-    };
-    let where_direction = match direction {
-        Direction::Out => format!("e.from_node = {seed}"),
-        Direction::In => format!("e.to_node = {seed}"),
-        Direction::Both => format!("(e.from_node = {seed} OR e.to_node = {seed})"),
-    };
-    let sql = format!(
-        "SELECT DISTINCT \
-           CASE WHEN e.from_node = {seed} THEN e.to_node ELSE e.from_node END AS peer \
-         FROM _hdb_graph_edges e \
-         WHERE {where_direction}{kind_filter}"
-    );
-    let rows = db.query(&sql, &[])?;
-    let mut ids = Vec::with_capacity(rows.len());
-    for row in rows {
-        let id = match row.values.first() {
-            Some(Value::Int4(n)) => *n as i64,
-            Some(Value::Int8(n)) => *n,
-            _ => continue,
-        };
-        if id != seed {
-            ids.push(id);
-        }
-    }
-    Ok(ids)
 }
 
 /// Silence the unused `graph_rag_search` re-export when `WITH CONTEXT`

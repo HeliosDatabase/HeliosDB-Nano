@@ -3,7 +3,9 @@
 A single-command install of HeliosDB-Nano + the code-graph indexer
 + the MCP endpoint into a hidden git-ignored directory inside any
 git repo. Validated end-to-end during the FR-1 pilot on Nano's own
-`src/` tree (cold-index 128 s, warm re-index 12 ms).
+`src/` tree. For current numbers run the harness
+(`examples/code_graph_bench.rs`, see `benches/public/README.md`); published
+results for pinned public corpora will replace this sentence.
 
 ## Prerequisites
 

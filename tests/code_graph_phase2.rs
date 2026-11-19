@@ -374,3 +374,262 @@ fn force_reparse_against_populated_kb() -> Result<()> {
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// v09.3: index-eligible shapes for definition, outline and call hierarchy
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+mod v09_3 {
+    use super::*;
+    use heliosdb_nano::code_graph::CallDirection;
+    #[cfg(feature = "mcp-endpoint")]
+    use heliosdb_nano::mcp::call_tool;
+    use std::collections::{BTreeSet, HashMap, HashSet};
+
+    fn id(v: &Value) -> i64 {
+        match v {
+            Value::Int4(n) => i64::from(*n),
+            Value::Int8(n) => *n,
+            other => panic!("not an integer: {other:?}"),
+        }
+    }
+
+    /// A small corpus: a call chain across three files, a cycle, a shared
+    /// name defined in two files, and a leaf that nothing calls.
+    fn corpus(db: &EmbeddedDatabase) -> Result<()> {
+        insert(
+            db,
+            "a.py",
+            "python",
+            "def alpha():\n    return beta()\n\ndef beta():\n    return gamma()\n\ndef shared():\n    return 1\n",
+        )?;
+        insert(
+            db,
+            "b.py",
+            "python",
+            "def gamma():\n    return delta() + alpha()\n\ndef delta():\n    return epsilon()\n\ndef shared():\n    return 2\n",
+        )?;
+        insert(
+            db,
+            "c.py",
+            "python",
+            "def epsilon():\n    return zeta()\n\ndef zeta():\n    return 0\n\ndef lonely():\n    return 3\n",
+        )?;
+        db.code_index(CodeIndexOptions::for_table("src"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn definition_by_name_with_kind_and_path_hints_unchanged() -> Result<()> {
+        let db = setup()?;
+        corpus(&db)?;
+        let all = db.lsp_definition("shared", &DefinitionHint::default())?;
+        assert_eq!(all.len(), 2);
+        let by_path = db.lsp_definition(
+            "shared",
+            &DefinitionHint {
+                hint_file: Some("b.py".into()),
+                hint_kind: None,
+            },
+        )?;
+        assert_eq!(by_path.len(), 1);
+        assert_eq!(by_path[0].path, "b.py");
+        let by_kind = db.lsp_definition(
+            "shared",
+            &DefinitionHint {
+                hint_file: Some("a.py".into()),
+                hint_kind: Some("function".into()),
+            },
+        )?;
+        assert_eq!(by_kind.len(), 1);
+        assert_eq!(by_kind[0].path, "a.py");
+        assert!(db
+            .lsp_definition("no_such_symbol", &DefinitionHint::default())?
+            .is_empty());
+        // The name and path indexes exist and are what the planner is offered.
+        let names: BTreeSet<String> = db
+            .query("SELECT indexname FROM pg_indexes", &[])?
+            .iter()
+            .filter_map(|r| match r.values.first() {
+                Some(Value::String(s)) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        for want in ["idx_hdb_code_symbols_name", "idx_hdb_code_files_path"] {
+            assert!(names.contains(want), "missing {want}: {names:?}");
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "mcp-endpoint")]
+    #[test]
+    fn document_symbols_same_rows_two_step() -> Result<()> {
+        let db = setup()?;
+        corpus(&db)?;
+        let call = |args: serde_json::Value| call_tool(Some(&db), "helios_lsp_document_symbols", args);
+        let out = call(serde_json::json!({ "path": "b.py" }));
+        assert!(!out.is_error, "{:?}", out.payload);
+        let got: Vec<(String, i64)> = out.payload["symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| {
+                (
+                    s["name"].as_str().unwrap().to_string(),
+                    s["line_start"].as_i64().unwrap(),
+                )
+            })
+            .collect();
+        // Reference: the raw tables, joined in Rust, ordered (line_start, node_id).
+        let files: HashMap<i64, String> = db
+            .query("SELECT node_id, path FROM _hdb_code_files", &[])?
+            .iter()
+            .map(|r| {
+                (
+                    id(&r.values[0]),
+                    match &r.values[1] {
+                        Value::String(s) => s.clone(),
+                        _ => String::new(),
+                    },
+                )
+            })
+            .collect();
+        let mut reference: Vec<(i64, i64, String)> = db
+            .query("SELECT node_id, file_id, name, line_start FROM _hdb_code_symbols", &[])?
+            .iter()
+            .filter(|r| files.get(&id(&r.values[1])).map(String::as_str) == Some("b.py"))
+            .map(|r| {
+                (
+                    id(&r.values[3]),
+                    id(&r.values[0]),
+                    match &r.values[2] {
+                        Value::String(s) => s.clone(),
+                        _ => String::new(),
+                    },
+                )
+            })
+            .collect();
+        reference.sort();
+        let want: Vec<(String, i64)> = reference.into_iter().map(|(l, _, n)| (n, l)).collect();
+        assert_eq!(got, want);
+        assert!(got.len() >= 3);
+        // Kind filter and unknown path.
+        let only_fn = call(serde_json::json!({ "path": "b.py", "kinds": ["function"] }));
+        assert_eq!(only_fn.payload["symbols"].as_array().unwrap().len(), got.len());
+        let none = call(serde_json::json!({ "path": "b.py", "kinds": ["struct"] }));
+        assert!(none.payload["symbols"].as_array().unwrap().is_empty());
+        let unknown = call(serde_json::json!({ "path": "nope.py" }));
+        assert!(!unknown.is_error);
+        assert!(unknown.payload["symbols"].as_array().unwrap().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn call_hierarchy_in_out_depth3_equals_reference() -> Result<()> {
+        let db = setup()?;
+        corpus(&db)?;
+        // Reference BFS over the raw tables.
+        let refs: Vec<(i64, Option<i64>)> = db
+            .query(
+                "SELECT from_symbol, to_symbol FROM _hdb_code_symbol_refs WHERE kind = 'CALLS'",
+                &[],
+            )?
+            .iter()
+            .map(|r| {
+                (
+                    id(&r.values[0]),
+                    match &r.values[1] {
+                        Value::Null => None,
+                        v => Some(id(v)),
+                    },
+                )
+            })
+            .collect();
+        assert!(!refs.is_empty());
+        let symbols: Vec<i64> = db
+            .query("SELECT node_id FROM _hdb_code_symbols", &[])?
+            .iter()
+            .map(|r| id(&r.values[0]))
+            .collect();
+        for dir in [CallDirection::Incoming, CallDirection::Outgoing] {
+            for &start in &symbols {
+                let mut seen: HashSet<i64> = HashSet::from([start]);
+                let mut frontier = vec![start];
+                let mut expected: Vec<(i32, BTreeSet<i64>)> = Vec::new();
+                for d in 1..=3 {
+                    let mut level = BTreeSet::new();
+                    for &(f, t) in &refs {
+                        let (src, dst) = match dir {
+                            CallDirection::Incoming => (t, Some(f)),
+                            CallDirection::Outgoing => (Some(f), t),
+                        };
+                        if let (Some(src), Some(dst)) = (src, dst) {
+                            if frontier.contains(&src) && !seen.contains(&dst) {
+                                level.insert(dst);
+                            }
+                        }
+                    }
+                    seen.extend(level.iter().copied());
+                    frontier = level.iter().copied().collect();
+                    if !level.is_empty() {
+                        expected.push((d, level));
+                    }
+                }
+                let got = db.lsp_call_hierarchy(start, dir, 3)?;
+                let mut by_depth: HashMap<i32, BTreeSet<i64>> = HashMap::new();
+                for row in &got {
+                    assert!(!row.path.is_empty() && !row.qualified.is_empty());
+                    assert!(
+                        by_depth.entry(row.depth).or_default().insert(row.symbol_id),
+                        "duplicate row"
+                    );
+                }
+                let got_levels: Vec<(i32, BTreeSet<i64>)> = {
+                    let mut v: Vec<_> = by_depth.into_iter().collect();
+                    v.sort_by_key(|(d, _)| *d);
+                    v
+                };
+                assert_eq!(got_levels, expected, "start={start} dir={dir:?}");
+            }
+        }
+        Ok(())
+    }
+
+    /// A store bootstrapped by an older build (no name / path index) gains the
+    /// indexes at the next `code_index`, and index-served lookups return the
+    /// rows a scan does.
+    #[test]
+    fn old_store_gains_indexes_and_lookups_match_a_scan() -> Result<()> {
+        let db = setup()?;
+        corpus(&db)?;
+        db.execute("DROP INDEX idx_hdb_code_symbols_name")?;
+        db.execute("DROP INDEX idx_hdb_code_files_path")?;
+        let scan: BTreeSet<i64> = db
+            .query("SELECT node_id, name FROM _hdb_code_symbols", &[])?
+            .iter()
+            .filter(|r| matches!(&r.values[1], Value::String(n) if n == "shared"))
+            .map(|r| id(&r.values[0]))
+            .collect();
+        insert(&db, "d.py", "python", "def shared():\n    return 4\n")?;
+        db.code_index(CodeIndexOptions::for_table("src"))?;
+        let names: BTreeSet<String> = db
+            .query("SELECT indexname FROM pg_indexes", &[])?
+            .iter()
+            .filter_map(|r| match r.values.first() {
+                Some(Value::String(s)) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(names.contains("idx_hdb_code_symbols_name"), "{names:?}");
+        assert!(names.contains("idx_hdb_code_files_path"), "{names:?}");
+        let served: BTreeSet<i64> = db
+            .lsp_definition("shared", &DefinitionHint::default())?
+            .iter()
+            .map(|d| d.symbol_id)
+            .collect();
+        assert!(served.is_superset(&scan));
+        assert_eq!(served.len(), scan.len() + 1);
+        Ok(())
+    }
+}

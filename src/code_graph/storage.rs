@@ -126,6 +126,15 @@ pub struct CodeIndexOptions {
     /// trees + symbol buffers in RAM at once is fine. `Some(n)` caps
     /// peak memory at `n × avg_parsed_file_bytes` instead of
     /// `corpus_size × …`. Recommended for corpora ≥ 10 K files.
+    ///
+    /// With `None`, a run that has to parse more than
+    /// [`DEFAULT_CHUNK_THRESHOLD`] files is split into chunks of
+    /// [`DEFAULT_CHUNK_FILES`] anyway: one chunk is one transaction, so a
+    /// single-chunk cold index of a very large corpus is one huge write group
+    /// (bounded by the engine's single-transaction size limit) and a failure
+    /// throws all of it away. A chunked run commits chunk by chunk; after a
+    /// failure a rerun skips the committed files (their stored hash matches) and
+    /// indexes the rest. Pass `Some(usize::MAX)` to force one chunk.
     pub chunk_size: Option<usize>,
     /// Skip the corpus-wide unresolved-reference rebinding pass.
     /// This leaves in-file references intact and keeps unresolved
@@ -136,6 +145,16 @@ pub struct CodeIndexOptions {
     /// are still indexed, but call/import/reference graph edges are
     /// omitted for fast first-pass KB builds.
     pub skip_symbol_refs: bool,
+    /// Targeted run: read, hash and index only these source paths (a git hook
+    /// or an agent edit that knows what it changed). A listed path with no
+    /// source row but a stored file row is removed from the index; unlisted
+    /// files are left alone, and the source table is not scanned (an empty
+    /// list does nothing). `None` (default) = every row of the source table,
+    /// and files that left the table are removed.
+    ///
+    /// Adding this field to a struct literal of `CodeIndexOptions` is a
+    /// source break for code that does not use `..CodeIndexOptions::for_table(t)`.
+    pub only_paths: Option<Vec<String>>,
 }
 
 impl CodeIndexOptions {
@@ -150,6 +169,7 @@ impl CodeIndexOptions {
             chunk_size: None,
             skip_cross_file_resolve: false,
             skip_symbol_refs: false,
+            only_paths: None,
         }
     }
 
@@ -195,6 +215,40 @@ pub struct CodeIndexStats {
     /// caller opted into bounded-memory mode via
     /// `CodeIndexOptions::chunk_size`.
     pub chunks_processed: u32,
+    /// Source files that were present in `_hdb_code_files` but no longer in
+    /// the source table, and whose symbols, references and file row were
+    /// removed by this run.
+    pub files_removed: u64,
+    /// Phase timers (milliseconds). `triage_ms` covers reading the source
+    /// table and the stored hashes and classifying every file; the next five
+    /// are the serial write phase split by statement family and add up to
+    /// (almost all of) `write_elapsed_ms`; `projection_ms` is the graph-rag
+    /// projection run by `EmbeddedDatabase::code_index` after the indexer.
+    pub triage_ms: u64,
+    pub cleanup_ms: u64,
+    pub files_upsert_ms: u64,
+    pub symbols_insert_ms: u64,
+    pub refs_insert_ms: u64,
+    pub cross_resolve_ms: u64,
+    pub projection_ms: u64,
+    /// Set when the graph-rag projection failed after the code tables were
+    /// committed; the index itself succeeded.
+    pub projection_error: Option<String>,
+    /// UPDATE statements the tail resolution pass issued (refs whose target
+    /// name was defined by a later chunk or an older run, and relabels of
+    /// names that gained a second definition during the run).
+    pub tail_statements: u64,
+}
+
+/// Sub-millisecond accumulators for the phase timers of one run; converted to
+/// `CodeIndexStats` milliseconds once, so truncation does not eat the sum.
+#[derive(Default)]
+struct PhaseTimers {
+    cleanup: std::time::Duration,
+    files_upsert: std::time::Duration,
+    symbols_insert: std::time::Duration,
+    refs_insert: std::time::Duration,
+    cross_resolve: std::time::Duration,
 }
 
 /// Tracks whether `CREATE EXTENSION hdb_code` has been executed in the
@@ -328,12 +382,25 @@ pub fn code_index_with_embedder(
     opts: CodeIndexOptions,
     embedder: Box<dyn Embedder>,
 ) -> Result<CodeIndexStats> {
+    // One indexer per database at a time: the keyed cleanup reads ids before
+    // the chunk's transaction opens, and a second concurrent call would see
+    // this one's transaction through the process-global slot.
+    let indexer_mutex = indexer_lock(db.storage.instance_id());
+    let _indexer_held = indexer_mutex.lock().unwrap_or_else(|e| e.into_inner());
+
     bootstrap_tables(db)?;
     mark_extension_installed();
 
-    let files = fetch_source_files(db, &opts.source_table)?;
-    let mut existing_sha = fetch_file_sha_map(db)?;
+    let triage_started = std::time::Instant::now();
+    let only: Option<&[String]> = opts.only_paths.as_deref();
+    // A targeted run with nothing to look at does no table scan at all.
+    if only.is_some_and(<[String]>::is_empty) {
+        return Ok(CodeIndexStats::default());
+    }
+    let files = fetch_source_files(db, &opts.source_table, only)?;
+    let mut stored = fetch_stored_files(db, &opts.source_table, only)?;
     let mut stats = CodeIndexStats::default();
+    let mut timers = PhaseTimers::default();
     let mut lang_set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
     // -------- Tier 1.3: TRUNCATE fast path for force_reparse --------
@@ -353,7 +420,7 @@ pub fn code_index_with_embedder(
     // a cold KB — every INSERT is fresh, no DELETE-then-INSERT
     // churn. Skipped when the tables are already empty (cold KB)
     // and when force_reparse is false (incremental).
-    let truncated = opts.force_reparse && !existing_sha.is_empty();
+    let truncated = opts.force_reparse && only.is_none() && !stored.is_empty();
     if truncated {
         // Order matters for FK semantics in case anyone added FKs
         // later: refs → symbols → ast_nodes → files.
@@ -369,7 +436,7 @@ pub fn code_index_with_embedder(
             // the error and keep going.
             let _ = db.execute(&format!("TRUNCATE {tbl}"));
         }
-        existing_sha.clear();
+        stored.clear();
         tracing::debug!("force_reparse + populated KB: truncated _hdb_code_* tables");
     }
 
@@ -383,8 +450,32 @@ pub fn code_index_with_embedder(
     // files_unchanged exactly the same way the serial implementation
     // did. Languages_seen is also accumulated here so the stats
     // remain identical even when no files reach the parse phase.
+    // Files of this source table that left the source: stored but no longer
+    // present. Computed from the source rows of ANY language (a row whose
+    // language has no extractor is skipped, not removed).
+    let present: std::collections::HashSet<&str> = files.iter().map(|f| f.path.as_str()).collect();
+    let mut removed_ids: Vec<i64> = stored
+        .iter()
+        .filter(|(path, _)| !present.contains(path.as_str()))
+        .map(|(_, f)| f.id)
+        .collect();
+    removed_ids.sort_unstable();
+    drop(present);
+    // Hash on the dedicated pool when there is enough to hash; a handful of
+    // files (a hook, an agent edit) stays serial and builds no pool.
+    let workers = opts.resolved_parallelism();
+    let mut pool: Option<rayon::ThreadPool> = None;
+    let shas: Vec<String> = if files.len() >= PARALLEL_HASH_MIN && workers > 1 {
+        use rayon::prelude::*;
+        let built = build_index_pool(workers)?;
+        let shas = built.install(|| files.par_iter().map(|f| sha256_hex(&f.content)).collect());
+        pool = Some(built);
+        shas
+    } else {
+        files.iter().map(|f| sha256_hex(&f.content)).collect()
+    };
     let mut to_parse: Vec<(SourceFile, String, ParseExtractPair)> = Vec::new();
-    for file in files.into_iter() {
+    for (file, sha) in files.into_iter().zip(shas) {
         stats.files_seen += 1;
         let resolution = match resolve_parser_and_extractor(&file.lang) {
             Some(r) => r,
@@ -394,8 +485,7 @@ pub fn code_index_with_embedder(
             }
         };
         lang_set.insert(file.lang.to_ascii_lowercase());
-        let sha = sha256_hex(&file.content);
-        let unchanged = existing_sha.get(&file.path).map(|s| s == &sha).unwrap_or(false);
+        let unchanged = stored.get(&file.path).map(|f| f.sha == sha).unwrap_or(false);
         if unchanged && !opts.force_reparse {
             stats.files_unchanged += 1;
             continue;
@@ -403,7 +493,24 @@ pub fn code_index_with_embedder(
         to_parse.push((file, sha, resolution));
     }
 
-    let touched = !to_parse.is_empty();
+    let mut touched = !to_parse.is_empty();
+    // Files whose symbols go away (re-parsed or removed) must not be binding
+    // targets of this run.
+    let bind_at_insert = !opts.skip_cross_file_resolve && !opts.skip_symbol_refs;
+    let mut names = if bind_at_insert && (!to_parse.is_empty() || !removed_ids.is_empty()) {
+        let mut excluded: std::collections::HashSet<i64> = removed_ids.iter().copied().collect();
+        for (file, _, _) in &to_parse {
+            if let Some(sf) = stored.get(&file.path) {
+                excluded.insert(sf.id);
+            }
+        }
+        Some(NameMap::load(db, &excluded)?)
+    } else {
+        None
+    };
+    let mut tail = TailState::default();
+    let older_refs_possible = !stored.is_empty();
+    stats.triage_ms = triage_started.elapsed().as_millis() as u64;
 
     // -------- Pipeline construction --------
     //
@@ -418,10 +525,12 @@ pub fn code_index_with_embedder(
     // it, then move to the next chunk. Default `None` keeps the
     // single-chunk all-in-one path that's fastest for small/medium
     // corpora where memory isn't a concern.
-    let workers = opts.resolved_parallelism();
     stats.parse_workers = workers as u32;
 
-    let chunks: Vec<Vec<(SourceFile, String, ParseExtractPair)>> = match opts.chunk_size {
+    let effective_chunk = opts
+        .chunk_size
+        .or_else(|| (to_parse.len() > DEFAULT_CHUNK_THRESHOLD).then_some(DEFAULT_CHUNK_FILES));
+    let chunks: Vec<Vec<(SourceFile, String, ParseExtractPair)>> = match effective_chunk {
         None => {
             if to_parse.is_empty() {
                 Vec::new()
@@ -447,13 +556,10 @@ pub fn code_index_with_embedder(
     let pool = if chunks.is_empty() {
         None
     } else {
-        Some(
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(workers)
-                .thread_name(|i| format!("hdb-code-index-{i}"))
-                .build()
-                .map_err(|e| Error::query_execution(format!("failed to build code-index thread pool ({e})")))?,
-        )
+        match pool {
+            Some(p) => Some(p),
+            None => Some(build_index_pool(workers)?),
+        }
     };
 
     // -------- Tier 1.1 prelude: detect outer-txn vs self-managed --------
@@ -483,6 +589,43 @@ pub fn code_index_with_embedder(
     // refused; a chunk on a branch is one atomic transaction again, reading
     // its own branch writes through the branch view.
     let manage_txn = !db.in_transaction();
+    // Keyed cleanup (ids read with autocommit reads that the secondary indexes
+    // serve, then primary-key deletes) needs the indexes (main only) and its
+    // own transaction. A caller-owned transaction or a branch keeps the
+    // per-file path.
+    let keyed = manage_txn && db.current_branch() == "main";
+
+    // Files that left the source table: removed before any chunk, in their own
+    // transaction (idempotent, and independent of the chunks' atomicity).
+    if !removed_ids.is_empty() {
+        let started = std::time::Instant::now();
+        // Ids are read BEFORE the transaction opens (index-served autocommit
+        // reads); inside it the removal only deletes by primary key.
+        let removal_plan = if keyed {
+            Some(plan_cleanup(db, &removed_ids)?)
+        } else {
+            None
+        };
+        if manage_txn {
+            db.begin()?;
+        }
+        let removal = remove_files(db, &removed_ids, removal_plan.as_ref());
+        if manage_txn {
+            match removal {
+                Ok(()) => db.commit()?,
+                Err(e) => {
+                    let _ = db.rollback();
+                    return Err(e);
+                }
+            }
+        } else {
+            removal?;
+        }
+        stats.files_removed = removed_ids.len() as u64;
+        touched = true;
+        timers.cleanup += started.elapsed();
+        stats.write_elapsed_ms += started.elapsed().as_millis() as u64;
+    }
 
     // Tier 1.3 correctness guard: `skip_delete_stale` (set when we
     // truncated up front) tells `write_one_parsed` to skip the
@@ -496,6 +639,7 @@ pub fn code_index_with_embedder(
 
     // -------- Per-chunk: parallel parse → transactional drain --------
     for chunk in chunks {
+        let chunk_paths: Vec<String> = chunk.iter().map(|(f, _, _)| f.path.clone()).collect();
         let parse_started = std::time::Instant::now();
         let parsed: Vec<Result<ParsedFile>> = if let Some(pool) = &pool {
             use rayon::prelude::*;
@@ -513,6 +657,22 @@ pub fn code_index_with_embedder(
         // input order so output is deterministic regardless of worker
         // scheduling.
         let write_started = std::time::Instant::now();
+        // Ids of the chunk's changed existing files, then what they own.
+        let plan = if keyed {
+            let started = std::time::Instant::now();
+            let mut seen_ids = std::collections::HashSet::new();
+            let ids: Vec<i64> = chunk_paths
+                .iter()
+                .filter(|path| !processed_paths.contains(path.as_str()))
+                .filter_map(|path| stored.get(path).map(|f| f.id))
+                .filter(|id| seen_ids.insert(*id))
+                .collect();
+            let plan = plan_cleanup(db, &ids)?;
+            timers.cleanup += started.elapsed();
+            Some(plan)
+        } else {
+            None
+        };
         if manage_txn {
             db.begin()?;
         }
@@ -524,6 +684,10 @@ pub fn code_index_with_embedder(
             parsed,
             truncated,
             &mut processed_paths,
+            &mut timers,
+            &stored,
+            plan.as_ref(),
+            names.as_mut().map(|n| (n, &mut tail)),
         );
         if manage_txn {
             match chunk_result {
@@ -548,26 +712,27 @@ pub fn code_index_with_embedder(
     // operation, not a parse one.
     if touched && !opts.skip_cross_file_resolve {
         let cross_started = std::time::Instant::now();
-        if manage_txn {
-            db.begin()?;
-        }
-        let cross_result = cross_file_resolve(db, &mut stats);
-        if manage_txn {
-            match cross_result {
-                Ok(()) => db.commit()?,
-                Err(e) => {
-                    let _ = db.rollback();
-                    return Err(e);
-                }
+        match names.as_ref() {
+            // The refs of this run were bound while they were inserted; only a
+            // small tail is left (see `tail_resolve`).
+            Some(names) => tail_resolve(db, names, &tail, older_refs_possible, manage_txn, &mut stats)?,
+            // `skip_symbol_refs`: nothing was inserted, but older unbound refs
+            // may now find a target: the full pass.
+            None => {
+                resolve_in_own_txn(db, manage_txn, |db| resolve_cross_file_references(db).map(|_| ()))?;
             }
-        } else {
-            cross_result?;
         }
+        timers.cross_resolve += cross_started.elapsed();
         stats.write_elapsed_ms += cross_started.elapsed().as_millis() as u64;
     } else if touched {
         tracing::debug!("code_index: skipped cross-file reference resolve");
     }
 
+    stats.cleanup_ms = timers.cleanup.as_millis() as u64;
+    stats.files_upsert_ms = timers.files_upsert.as_millis() as u64;
+    stats.symbols_insert_ms = timers.symbols_insert.as_millis() as u64;
+    stats.refs_insert_ms = timers.refs_insert.as_millis() as u64;
+    stats.cross_resolve_ms = timers.cross_resolve.as_millis() as u64;
     Ok(stats)
 }
 
@@ -600,6 +765,10 @@ fn drain_chunk(
     parsed: Vec<Result<ParsedFile>>,
     truncated_this_call: bool,
     processed_paths: &mut std::collections::HashSet<String>,
+    timers: &mut PhaseTimers,
+    stored: &HashMap<String, StoredFile>,
+    plan: Option<&CleanupPlan>,
+    mut binder: Option<(&mut NameMap, &mut TailState)>,
 ) -> Result<()> {
     // Step 1 — short-circuit any worker-side parse errors. (Same
     // behaviour as the prior implementation; '?' propagation halts
@@ -615,14 +784,80 @@ fn drain_chunk(
     // Output is a vector of (file_id, parsed_file) preserving input
     // order so cross-file batching below can map back unambiguously.
     let mut prepared: Vec<(i64, ParsedFile)> = Vec::with_capacity(parsed.len());
-    for p in parsed {
-        let first_time = processed_paths.insert(p.file.path.clone());
-        let skip_delete_stale = truncated_this_call && first_time;
-        let file_id = upsert_file(db, &opts.source_table, &p.file, &p.sha)?;
-        if !skip_delete_stale {
-            delete_stale_symbols_and_refs(db, file_id)?;
+    if let Some(plan) = plan {
+        // Keyed path: one set-based cleanup for the chunk, then the file rows
+        // by key (UPDATE by node_id for files already stored, one multi-row
+        // INSERT for new ones). No per-file SELECT, none for new files.
+        let started = std::time::Instant::now();
+        apply_cleanup(db, plan)?;
+        timers.cleanup += started.elapsed();
+
+        let started = std::time::Instant::now();
+        let mut slots: Vec<Option<i64>> = vec![None; parsed.len()];
+        let mut new_idx: Vec<usize> = Vec::new();
+        let mut dup_idx: Vec<usize> = Vec::new();
+        for (i, p) in parsed.iter().enumerate() {
+            if !processed_paths.insert(p.file.path.clone()) {
+                dup_idx.push(i);
+                continue;
+            }
+            match stored.get(&p.file.path) {
+                Some(sf) => {
+                    db.execute_params(
+                        "UPDATE _hdb_code_files SET lang = $1, sha256 = $2 WHERE node_id = $3",
+                        &[
+                            Value::String(p.file.lang.clone()),
+                            Value::String(p.sha.clone()),
+                            Value::Int8(sf.id),
+                        ],
+                    )?;
+                    slots[i] = Some(sf.id);
+                }
+                None => new_idx.push(i),
+            }
         }
-        prepared.push((file_id, p));
+        if !new_idx.is_empty() {
+            let list: Vec<(&SourceFile, &str)> = new_idx
+                .iter()
+                .filter_map(|&i| parsed.get(i).map(|p| (&p.file, p.sha.as_str())))
+                .collect();
+            let ids = insert_new_files(db, &opts.source_table, &list)?;
+            for (k, &i) in new_idx.iter().enumerate() {
+                slots[i] = ids.get(k).copied();
+            }
+        }
+        timers.files_upsert += started.elapsed();
+        // A path that occurs twice in the source table (no primary key on it):
+        // the later occurrence takes the per-file path.
+        for &i in &dup_idx {
+            if let Some(p) = parsed.get(i) {
+                let started = std::time::Instant::now();
+                let id = upsert_file(db, &opts.source_table, &p.file, &p.sha)?;
+                timers.files_upsert += started.elapsed();
+                let started = std::time::Instant::now();
+                delete_stale_symbols_and_refs(db, id)?;
+                timers.cleanup += started.elapsed();
+                slots[i] = Some(id);
+            }
+        }
+        for (p, slot) in parsed.into_iter().zip(slots) {
+            let id = slot.ok_or_else(|| Error::storage("code-graph file row was not assigned a key"))?;
+            prepared.push((id, p));
+        }
+    } else {
+        for p in parsed {
+            let first_time = processed_paths.insert(p.file.path.clone());
+            let skip_delete_stale = truncated_this_call && first_time;
+            let started = std::time::Instant::now();
+            let file_id = upsert_file(db, &opts.source_table, &p.file, &p.sha)?;
+            timers.files_upsert += started.elapsed();
+            if !skip_delete_stale {
+                let started = std::time::Instant::now();
+                delete_stale_symbols_and_refs(db, file_id)?;
+                timers.cleanup += started.elapsed();
+            }
+            prepared.push((file_id, p));
+        }
     }
 
     // Step 3 — flatten ALL symbols across files. Track per-file
@@ -640,11 +875,18 @@ fn drain_chunk(
         sym_owner_file_ids.extend(std::iter::repeat(*file_id).take(p.symbols.len()));
     }
 
+    let started = std::time::Instant::now();
     let symbol_ids: Vec<i64> = if all_symbols.is_empty() {
         Vec::new()
     } else {
         bulk_insert_symbols_batched(db, embedder, stats, &sym_owner_file_ids, &all_symbols)?
     };
+    timers.symbols_insert += started.elapsed();
+    if let Some((names, _)) = binder.as_mut() {
+        for (sym, id) in all_symbols.iter().zip(symbol_ids.iter()) {
+            names.add(&sym.name, *id);
+        }
+    }
 
     // Step 4 — flatten ALL refs across files. For each file slice
     // its symbol_ids out of the flat result; convert per-file
@@ -656,7 +898,15 @@ fn drain_chunk(
         prepared.iter().map(|(_, p)| p.resolved.len()).sum()
     };
     if total_refs > 0 {
-        let written = bulk_insert_refs_batched(db, &prepared, &symbol_ids, &sym_ranges)?;
+        let started = std::time::Instant::now();
+        let written = bulk_insert_refs_batched(
+            db,
+            &prepared,
+            &symbol_ids,
+            &sym_ranges,
+            binder.as_mut().map(|(n, t)| (&**n, &mut **t)),
+        )?;
+        timers.refs_insert += started.elapsed();
         stats.refs_written += written;
     }
 
@@ -897,6 +1147,7 @@ fn bulk_insert_refs_batched(
     prepared: &[(i64, ParsedFile)],
     symbol_ids: &[i64],
     sym_ranges: &[(usize, usize)],
+    mut binder: Option<(&NameMap, &mut TailState)>,
 ) -> Result<u64> {
     let schema = db.storage.catalog().get_table_schema("_hdb_code_symbol_refs")?;
     let n_cols = schema.columns.len();
@@ -909,6 +1160,7 @@ fn bulk_insert_refs_batched(
 
     let total: usize = prepared.iter().map(|(_, p)| p.resolved.len()).sum();
     let mut tuples: Vec<Tuple> = Vec::with_capacity(total);
+    let mut tails: Vec<RefTail> = Vec::new();
     for (i, (file_id, p)) in prepared.iter().enumerate() {
         let (start, count) = sym_ranges[i];
         let file_symbol_ids = &symbol_ids[start..start + count];
@@ -919,18 +1171,46 @@ fn bulk_insert_refs_batched(
                     r.from_idx, file_id
                 ))
             })?;
-            let to_val = match r.to_idx {
+            let mut to_val = match r.to_idx {
                 Some(idx) => file_symbol_ids
                     .get(idx)
                     .map(|id| Value::Int8(*id))
                     .unwrap_or(Value::Null),
                 None => Value::Null,
             };
-            let res = match r.resolution {
+            let mut res = match r.resolution {
                 Resolution::Exact => "exact",
                 Resolution::Heuristic => "heuristic",
                 Resolution::Unresolved => "unresolved",
             };
+            let mut tail = RefTail::None;
+            if let (Some((names, _)), true) = (binder.as_ref(), r.to_idx.is_none()) {
+                // A cross-file reference: bind it to the corpus definition now.
+                // Same rule as the old UPDATE pass: the lowest node_id wins and
+                // the label is exact only for a name with one definition.
+                // A ref an import rebound (`exact`/`heuristic` with no target
+                // id) gets the same binding, and keeps `exact` only when the
+                // import was unique and the name has one definition.
+                let bare = last_segment(&r.to_name);
+                let exact_ok = matches!(r.resolution, Resolution::Unresolved | Resolution::Exact);
+                match names.first.get(bare) {
+                    Some((id, count)) => {
+                        to_val = Value::Int8(*id);
+                        let exact = *count == 1 && exact_ok;
+                        res = if exact { "exact" } else { "heuristic" };
+                        if *count == 1 {
+                            tail = RefTail::BoundExact { bare: bare.to_string() };
+                        }
+                    }
+                    None => {
+                        tail = RefTail::Unbound {
+                            bare: bare.to_string(),
+                            exact_ok,
+                        };
+                    }
+                }
+            }
+            tails.push(tail);
             let mut values: Vec<Value> = Vec::with_capacity(n_cols);
             values.push(Value::Null); // edge_id — auto-fill
             values.push(Value::Int8(*file_id));
@@ -948,76 +1228,18 @@ fn bulk_insert_refs_batched(
     }
     let written = tuples.len() as u64;
     if !tuples.is_empty() {
-        insert_graph_rows(db, "_hdb_code_symbol_refs", &schema, tuples)?;
+        let edge_ids = insert_graph_rows(db, "_hdb_code_symbol_refs", &schema, tuples)?;
+        if let Some((_, state)) = binder.as_mut() {
+            for (edge_id, tail) in edge_ids.into_iter().zip(tails) {
+                match tail {
+                    RefTail::None => {}
+                    RefTail::Unbound { bare, exact_ok } => state.unbound.push((edge_id, bare, exact_ok)),
+                    RefTail::BoundExact { bare } => state.bound_exact.entry(bare).or_default().push(edge_id),
+                }
+            }
+        }
     }
     Ok(written)
-}
-
-/// Drain one parsed file into the `_hdb_code_*` tables. Caller wraps
-/// in a transaction (Tier 1.1).
-///
-/// `skip_delete_stale` short-circuits the
-/// SELECT-existing-symbols / UPDATE-inbound-refs / DELETE-symbols /
-/// DELETE-refs preamble. Set when the indexer just truncated the
-/// `_hdb_code_*` tables (force_reparse fast path) — the SELECT would
-/// always return empty and the DELETEs would be no-ops, so skipping
-/// them saves O(files) wasted SQL parses + RocksDB round-trips on
-/// large corpora.
-fn write_one_parsed(
-    db: &EmbeddedDatabase,
-    opts: &CodeIndexOptions,
-    embedder: &dyn Embedder,
-    stats: &mut CodeIndexStats,
-    parsed: ParsedFile,
-    skip_delete_stale: bool,
-) -> Result<()> {
-    let ParsedFile {
-        file,
-        sha,
-        symbols,
-        resolved,
-    } = parsed;
-
-    // Upsert the file row, get back the file_id. This also writes
-    // the new sha256 so the next run can short-circuit.
-    let file_id = upsert_file(db, &opts.source_table, &file, &sha)?;
-
-    if !skip_delete_stale {
-        // Null inbound cross-file refs pointing at this file's old
-        // symbols — the cross-file resolver at the end of the run
-        // rebinds them. Uses a literal IN list (SELECT-then-UPDATE)
-        // since `UPDATE … IN (SELECT …)` isn't wired in the DML path.
-        let sym_rows = db.query(
-            &format!("SELECT node_id FROM _hdb_code_symbols WHERE file_id = {file_id}"),
-            &[],
-        )?;
-        let stale_ids: Vec<i64> = sym_rows
-            .iter()
-            .filter_map(|r| match r.values.first() {
-                Some(Value::Int4(n)) => Some(*n as i64),
-                Some(Value::Int8(n)) => Some(*n),
-                _ => None,
-            })
-            .collect();
-        if !stale_ids.is_empty() {
-            let csv = stale_ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
-            db.execute(&format!(
-                "UPDATE _hdb_code_symbol_refs \
-                    SET to_symbol = NULL, resolution = 'unresolved' \
-                  WHERE to_symbol IN ({csv})"
-            ))?;
-        }
-        db.execute(&format!("DELETE FROM _hdb_code_symbol_refs WHERE file_id = {file_id}"))?;
-        db.execute(&format!("DELETE FROM _hdb_code_symbols WHERE file_id = {file_id}"))?;
-    }
-
-    let symbol_ids = insert_symbols(db, file_id, &symbols, embedder, stats)?;
-    let refs_written = insert_refs(db, file_id, &symbol_ids, &resolved)?;
-
-    stats.files_parsed += 1;
-    stats.symbols_written += symbols.len() as u64;
-    stats.refs_written += refs_written;
-    Ok(())
 }
 
 /// Per-file output of the parallel parse + extract phase. Holds only
@@ -1120,89 +1342,521 @@ fn ensure_body_vec_column(db: &EmbeddedDatabase, dim: usize) -> Result<()> {
     Ok(())
 }
 
-fn fetch_file_sha_map(db: &EmbeddedDatabase) -> Result<HashMap<String, String>> {
+/// A `_hdb_code_files` row of one source table: its key and stored hash.
+struct StoredFile {
+    id: i64,
+    sha: String,
+}
+
+/// The stored files of ONE source table, by path. (Two source tables may
+/// hold the same path; the hash of one must not stand for the other.)
+fn fetch_stored_files(
+    db: &EmbeddedDatabase,
+    source_table: &str,
+    only: Option<&[String]>,
+) -> Result<HashMap<String, StoredFile>> {
     // Probe first — _hdb_code_files may not exist on the very first call.
     let probe = db.query("SELECT 1 FROM _hdb_code_files LIMIT 1", &[]);
     if probe.is_err() {
         return Ok(HashMap::new());
     }
-    let rows = db.query("SELECT path, sha256 FROM _hdb_code_files", &[])?;
+    let mut rows = Vec::new();
+    match only {
+        None => {
+            rows = db.query_params(
+                "SELECT node_id, path, sha256 FROM _hdb_code_files WHERE source_table = $1",
+                &[Value::String(source_table.to_string())],
+            )?
+        }
+        Some(paths) => {
+            for batch in paths.chunks(KEY_BATCH) {
+                let marks = (2..=batch.len() + 1)
+                    .map(|i| format!("${i}"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let mut params = vec![Value::String(source_table.to_string())];
+                params.extend(batch.iter().map(|p| Value::String(p.clone())));
+                rows.extend(db.query_params(
+                    &format!(
+                        "SELECT node_id, path, sha256 FROM _hdb_code_files WHERE source_table = $1 AND path IN ({marks})"
+                    ),
+                    &params,
+                )?);
+            }
+        }
+    }
     let mut out = HashMap::with_capacity(rows.len());
     for row in rows {
-        let path = match row.values.first() {
+        let id = match row.values.first() {
+            Some(Value::Int4(n)) => i64::from(*n),
+            Some(Value::Int8(n)) => *n,
+            _ => continue,
+        };
+        let path = match row.values.get(1) {
             Some(Value::String(s)) => s.clone(),
             _ => continue,
         };
-        let sha = match row.values.get(1) {
+        let sha = match row.values.get(2) {
             Some(Value::String(s)) => s.clone(),
-            _ => continue,
+            _ => String::new(),
         };
-        out.insert(path, sha);
+        out.insert(path, StoredFile { id, sha });
     }
     Ok(out)
 }
 
-fn cross_file_resolve(db: &EmbeddedDatabase, stats: &mut CodeIndexStats) -> Result<()> {
-    // Build a corpus map name→(node_id, count) in one scan.
-    let rows = db.query(
-        "SELECT name, node_id FROM _hdb_code_symbols ORDER BY name, node_id",
-        &[],
-    )?;
-    let mut first: std::collections::HashMap<String, (i64, u32)> = std::collections::HashMap::new();
-    for row in rows {
-        let name = match row.values.first() {
-            Some(Value::String(s)) => s.clone(),
-            _ => continue,
-        };
-        let id = match row.values.get(1) {
-            Some(Value::Int4(n)) => *n as i64,
-            Some(Value::Int8(n)) => *n,
-            _ => continue,
-        };
-        let entry = first.entry(name).or_insert((id, 0));
-        entry.1 += 1;
+/// Process-local indexer lock per database. The keyed cleanup reads ids
+/// before the chunk's transaction opens, so two `code_index` calls on one
+/// database must not interleave (and the engine's transaction slot is
+/// process-global, so a second call would otherwise see the first one's
+/// transaction as the caller's).
+fn indexer_lock(instance_id: u64) -> std::sync::Arc<std::sync::Mutex<()>> {
+    use once_cell::sync::Lazy;
+    use std::sync::{Arc, Mutex};
+    static LOCKS: Lazy<Mutex<HashMap<u64, Arc<Mutex<()>>>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+    let mut map = LOCKS.lock().unwrap_or_else(|e| e.into_inner());
+    Arc::clone(map.entry(instance_id).or_insert_with(|| Arc::new(Mutex::new(()))))
+}
+
+const KEY_BATCH: usize = 1000;
+
+/// A run that parses more files than this and has no explicit `chunk_size`
+/// is chunked by [`DEFAULT_CHUNK_FILES`] (see `CodeIndexOptions::chunk_size`).
+pub const DEFAULT_CHUNK_THRESHOLD: usize = 5000;
+/// Files per chunk of a defaulted chunked run.
+pub const DEFAULT_CHUNK_FILES: usize = 2000;
+
+/// Corpus-wide `name -> (lowest node_id, number of definitions)`, the table
+/// the cross-file pass used to rebuild with a scan. Loaded once per call
+/// (without the symbols of files about to be re-parsed or removed) and
+/// extended by every chunk's new symbols, so cross-file references can be
+/// bound while they are inserted instead of by UPDATEs afterwards.
+#[derive(Default)]
+struct NameMap {
+    first: HashMap<String, (i64, u32)>,
+    /// Names that went from one definition to two or more during this run:
+    /// refs labelled `exact` for them need relabelling in the tail.
+    crossed: std::collections::HashSet<String>,
+    added: bool,
+}
+
+impl NameMap {
+    fn add(&mut self, name: &str, id: i64) {
+        self.added = true;
+        match self.first.get_mut(name) {
+            Some(entry) => {
+                entry.0 = entry.0.min(id);
+                entry.1 += 1;
+                if entry.1 == 2 {
+                    self.crossed.insert(name.to_string());
+                }
+            }
+            None => {
+                self.first.insert(name.to_string(), (id, 1));
+            }
+        }
     }
 
-    let unresolved = db.query(
-        "SELECT edge_id, to_name FROM _hdb_code_symbol_refs WHERE resolution = 'unresolved'",
+    fn load(db: &EmbeddedDatabase, excluded_files: &std::collections::HashSet<i64>) -> Result<Self> {
+        let mut map = NameMap::default();
+        for row in db.query("SELECT name, node_id, file_id FROM _hdb_code_symbols", &[])? {
+            let mut values = row.values.into_iter();
+            let name = match values.next() {
+                Some(Value::String(s)) => s,
+                _ => continue,
+            };
+            let id = match value_i64(values.next().as_ref()) {
+                Some(id) => id,
+                None => continue,
+            };
+            if let Some(file_id) = value_i64(values.next().as_ref()) {
+                if excluded_files.contains(&file_id) {
+                    continue;
+                }
+            }
+            map.add(&name, id);
+        }
+        // Loading is not a run-time addition: nothing "crossed" yet.
+        map.crossed.clear();
+        map.added = false;
+        Ok(map)
+    }
+}
+
+/// Refs this run inserted whose target may still change.
+#[derive(Default)]
+struct TailState {
+    /// `(edge_id, bare name, exact_ok)`: inserted with NULL `to_symbol` because
+    /// the name had no definition yet. `exact_ok` = it may be labelled `exact`
+    /// when the name turns out to have one definition (a plain unresolved ref,
+    /// or one an import rebound with a unique import).
+    unbound: Vec<(i64, String, bool)>,
+    /// Refs bound to a name that had exactly one definition when inserted.
+    bound_exact: HashMap<String, Vec<i64>>,
+}
+
+/// How a to-be-inserted ref relates to the tail.
+enum RefTail {
+    None,
+    Unbound { bare: String, exact_ok: bool },
+    BoundExact { bare: String },
+}
+
+/// Files at or above this count are hashed on the parse pool.
+const PARALLEL_HASH_MIN: usize = 64;
+
+fn build_index_pool(workers: usize) -> Result<rayon::ThreadPool> {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(workers)
+        .thread_name(|i| format!("hdb-code-index-{i}"))
+        .build()
+        .map_err(|e| Error::query_execution(format!("failed to build code-index thread pool ({e})")))
+}
+
+fn int_list(ids: &[i64]) -> String {
+    ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",")
+}
+
+fn value_i64(v: Option<&Value>) -> Option<i64> {
+    match v {
+        Some(Value::Int4(n)) => Some(i64::from(*n)),
+        Some(Value::Int8(n)) => Some(*n),
+        _ => None,
+    }
+}
+
+/// What a set of files owns, collected with autocommit reads (index-served:
+/// `file_id IN` and `to_symbol IN` on single tables) BEFORE the chunk's
+/// transaction opens, so the transaction itself only deletes by primary key.
+#[derive(Default)]
+struct CleanupPlan {
+    /// `_hdb_code_symbol_refs.edge_id` of refs that occur in the files.
+    ref_ids: Vec<i64>,
+    /// `_hdb_code_symbols.node_id` of the files' symbols.
+    symbol_ids: Vec<i64>,
+    /// Refs of OTHER files that point at those symbols (to be unresolved).
+    inbound_ids: Vec<i64>,
+}
+
+fn plan_cleanup(db: &EmbeddedDatabase, file_ids: &[i64]) -> Result<CleanupPlan> {
+    let mut plan = CleanupPlan::default();
+    for batch in file_ids.chunks(KEY_BATCH) {
+        let csv = int_list(batch);
+        for row in db.query(
+            &format!("SELECT node_id FROM _hdb_code_symbols WHERE file_id IN ({csv})"),
+            &[],
+        )? {
+            if let Some(id) = value_i64(row.values.first()) {
+                plan.symbol_ids.push(id);
+            }
+        }
+        for row in db.query(
+            &format!("SELECT edge_id FROM _hdb_code_symbol_refs WHERE file_id IN ({csv})"),
+            &[],
+        )? {
+            if let Some(id) = value_i64(row.values.first()) {
+                plan.ref_ids.push(id);
+            }
+        }
+    }
+    let deleting: std::collections::HashSet<i64> = plan.ref_ids.iter().copied().collect();
+    for batch in plan.symbol_ids.chunks(KEY_BATCH) {
+        let csv = int_list(batch);
+        for row in db.query(
+            &format!("SELECT edge_id FROM _hdb_code_symbol_refs WHERE to_symbol IN ({csv})"),
+            &[],
+        )? {
+            if let Some(id) = value_i64(row.values.first()) {
+                if !deleting.contains(&id) {
+                    plan.inbound_ids.push(id);
+                }
+            }
+        }
+    }
+    Ok(plan)
+}
+
+/// Apply a plan inside the chunk transaction: unresolve inbound refs, then
+/// delete the files' refs and symbols, all by primary key.
+fn apply_cleanup(db: &EmbeddedDatabase, plan: &CleanupPlan) -> Result<()> {
+    for batch in plan.inbound_ids.chunks(KEY_BATCH) {
+        db.execute(&format!(
+            "UPDATE _hdb_code_symbol_refs SET to_symbol = NULL, resolution = 'unresolved' \
+             WHERE edge_id IN ({})",
+            int_list(batch)
+        ))?;
+    }
+    for batch in plan.ref_ids.chunks(KEY_BATCH) {
+        db.execute(&format!(
+            "DELETE FROM _hdb_code_symbol_refs WHERE edge_id IN ({})",
+            int_list(batch)
+        ))?;
+    }
+    for batch in plan.symbol_ids.chunks(KEY_BATCH) {
+        db.execute(&format!(
+            "DELETE FROM _hdb_code_symbols WHERE node_id IN ({})",
+            int_list(batch)
+        ))?;
+    }
+    Ok(())
+}
+
+/// Insert `_hdb_code_files` rows for new files in multi-row batches and
+/// return their ids in input order.
+fn insert_new_files(db: &EmbeddedDatabase, source_table: &str, files: &[(&SourceFile, &str)]) -> Result<Vec<i64>> {
+    use std::fmt::Write as _;
+    let mut ids = Vec::with_capacity(files.len());
+    for batch in files.chunks(200) {
+        let mut sql = String::from("INSERT INTO _hdb_code_files (source_table, path, lang, sha256) VALUES ");
+        let mut params: Vec<Value> = Vec::with_capacity(batch.len() * 4);
+        for (i, (file, sha)) in batch.iter().enumerate() {
+            if i != 0 {
+                sql.push_str(", ");
+            }
+            let base = params.len();
+            write!(sql, "(${}, ${}, ${}, ${})", base + 1, base + 2, base + 3, base + 4)
+                .map_err(|e| Error::storage(format!("code-graph SQL construction: {e}")))?;
+            params.push(Value::String(source_table.to_string()));
+            params.push(Value::String(file.path.clone()));
+            params.push(Value::String(file.lang.clone()));
+            params.push(Value::String((*sha).to_string()));
+        }
+        sql.push_str(" RETURNING node_id");
+        let (affected, returned) = db.execute_params_returning(&sql, &params)?;
+        if usize::try_from(affected).ok() != Some(batch.len()) || returned.len() != batch.len() {
+            return Err(Error::storage(
+                "code-graph file INSERT returned a different number of rows",
+            ));
+        }
+        for row in returned {
+            ids.push(
+                value_i64(row.values.first())
+                    .ok_or_else(|| Error::storage("code-graph file INSERT returned an invalid key"))?,
+            );
+        }
+    }
+    Ok(ids)
+}
+
+/// Remove files that left the source table: their refs and symbols (keyed),
+/// refs of other files that pointed at them (unresolved), the file rows.
+fn remove_files(db: &EmbeddedDatabase, file_ids: &[i64], plan: Option<&CleanupPlan>) -> Result<()> {
+    if file_ids.is_empty() {
+        return Ok(());
+    }
+    if let Some(plan) = plan {
+        apply_cleanup(db, plan)?;
+    } else {
+        for id in file_ids {
+            delete_stale_symbols_and_refs(db, *id)?;
+        }
+    }
+    for batch in file_ids.chunks(KEY_BATCH) {
+        db.execute(&format!(
+            "DELETE FROM _hdb_code_files WHERE node_id IN ({})",
+            int_list(batch)
+        ))?;
+    }
+    Ok(())
+}
+
+/// UPDATEs per transaction in the tail pass of a run that owns its transaction.
+const TAIL_COMMIT_EVERY: u64 = 200;
+
+/// Run `f` inside its own transaction when the indexer owns the transaction.
+fn resolve_in_own_txn(
+    db: &EmbeddedDatabase,
+    manage_txn: bool,
+    f: impl FnOnce(&EmbeddedDatabase) -> Result<()>,
+) -> Result<()> {
+    if manage_txn {
+        db.begin()?;
+    }
+    let result = f(db);
+    if manage_txn {
+        match result {
+            Ok(()) => db.commit()?,
+            Err(e) => {
+                let _ = db.rollback();
+                return Err(e);
+            }
+        }
+        Ok(())
+    } else {
+        result
+    }
+}
+
+/// The corpus-wide pass: bind every ref with no target (`to_symbol IS NULL`)
+/// whose last name segment is defined somewhere. For skip-then-resolve
+/// workflows (`skip_cross_file_resolve`, or `skip_symbol_refs` runs); a normal
+/// run binds while inserting and only runs the small tail. Returns the number
+/// of refs bound. Label rule: the lowest `node_id` wins, `exact` for a name with
+/// one definition (and, for a ref an import rebound, only if it was `exact`),
+/// `heuristic` otherwise.
+pub fn resolve_cross_file_references(db: &EmbeddedDatabase) -> Result<u64> {
+    let names = NameMap::load(db, &std::collections::HashSet::new())?;
+    let unbound = db.query(
+        "SELECT edge_id, to_name, resolution FROM _hdb_code_symbol_refs WHERE to_symbol IS NULL",
         &[],
     )?;
-    let mut updates: std::collections::HashMap<(i64, &'static str), Vec<i64>> = std::collections::HashMap::new();
-    for row in unresolved {
-        let edge_id = match row.values.first() {
-            Some(Value::Int4(n)) => *n as i64,
-            Some(Value::Int8(n)) => *n,
-            _ => continue,
+    let mut updates: HashMap<(i64, &'static str), Vec<i64>> = HashMap::new();
+    for row in unbound {
+        let mut v = row.values.into_iter();
+        let Some(edge_id) = value_i64(v.next().as_ref()) else {
+            continue;
         };
-        let to_name = match row.values.get(1) {
-            Some(Value::String(s)) => s.clone(),
-            _ => continue,
+        let Some(Value::String(to_name)) = v.next() else {
+            continue;
         };
-        let bare = last_segment(&to_name);
-        if let Some((id, count)) = first.get(bare) {
-            let res = if *count == 1 { "exact" } else { "heuristic" };
-            updates.entry((*id, res)).or_default().push(edge_id);
+        let resolution = match v.next() {
+            Some(Value::String(s)) => s,
+            _ => String::new(),
+        };
+        if let Some((id, count)) = names.first.get(last_segment(&to_name)) {
+            let exact_ok = resolution != "heuristic";
+            let label = if *count == 1 && exact_ok { "exact" } else { "heuristic" };
+            updates.entry((*id, label)).or_default().push(edge_id);
         }
     }
-    let mut rebound = 0u64;
-    const UPDATE_BATCH: usize = 1_000;
-    for ((id, res), edge_ids) in updates {
-        for chunk in edge_ids.chunks(UPDATE_BATCH) {
-            let csv = chunk
-                .iter()
-                .map(|edge_id| edge_id.to_string())
-                .collect::<Vec<_>>()
-                .join(",");
+    let mut bound = 0u64;
+    let mut keys: Vec<_> = updates.keys().copied().collect();
+    keys.sort_unstable();
+    for key in keys {
+        let Some(edge_ids) = updates.get(&key) else { continue };
+        for batch in edge_ids.chunks(KEY_BATCH) {
             db.execute(&format!(
-                "UPDATE _hdb_code_symbol_refs \
-                   SET to_symbol = {id}, resolution = '{res}' \
-                 WHERE edge_id IN ({csv})"
+                "UPDATE _hdb_code_symbol_refs SET to_symbol = {}, resolution = '{}' WHERE edge_id IN ({})",
+                key.0,
+                key.1,
+                int_list(batch)
             ))?;
-            rebound += chunk.len() as u64;
+            bound += batch.len() as u64;
         }
     }
-    let _ = rebound;
-    let _ = stats;
+    Ok(bound)
+}
+
+/// What is left after binding at insert: refs whose target name a later chunk
+/// (or an older run) defined, and relabels of names that gained a second
+/// definition during the run. In-memory lists for this run's refs; one
+/// autocommit read of older unbound refs, only when this run added symbols
+/// and the store held files before it. UPDATEs are grouped (target, label)
+/// by 1000 edge ids and committed every [`TAIL_COMMIT_EVERY`] statements.
+fn tail_resolve(
+    db: &EmbeddedDatabase,
+    names: &NameMap,
+    tail: &TailState,
+    older_refs_possible: bool,
+    manage_txn: bool,
+    stats: &mut CodeIndexStats,
+) -> Result<()> {
+    let mut updates: HashMap<(i64, &'static str), Vec<i64>> = HashMap::new();
+    let mut this_run: std::collections::HashSet<i64> = std::collections::HashSet::with_capacity(tail.unbound.len());
+    for (edge_id, bare, exact_ok) in &tail.unbound {
+        this_run.insert(*edge_id);
+        if let Some((id, count)) = names.first.get(bare.as_str()) {
+            let label = if *count == 1 && *exact_ok { "exact" } else { "heuristic" };
+            updates.entry((*id, label)).or_default().push(*edge_id);
+        }
+    }
+    if names.added && older_refs_possible {
+        for row in db.query(
+            "SELECT edge_id, to_name, resolution FROM _hdb_code_symbol_refs WHERE to_symbol IS NULL",
+            &[],
+        )? {
+            let mut v = row.values.into_iter();
+            let Some(edge_id) = value_i64(v.next().as_ref()) else {
+                continue;
+            };
+            if this_run.contains(&edge_id) {
+                continue;
+            }
+            let Some(Value::String(to_name)) = v.next() else {
+                continue;
+            };
+            let resolution = match v.next() {
+                Some(Value::String(s)) => s,
+                _ => String::new(),
+            };
+            if let Some((id, count)) = names.first.get(last_segment(&to_name)) {
+                let exact_ok = resolution != "heuristic";
+                let label = if *count == 1 && exact_ok { "exact" } else { "heuristic" };
+                updates.entry((*id, label)).or_default().push(edge_id);
+            }
+        }
+    }
+    let mut relabel: Vec<i64> = Vec::new();
+    let mut crossed: Vec<&String> = names.crossed.iter().collect();
+    crossed.sort();
+    for name in crossed {
+        if let Some(ids) = tail.bound_exact.get(name.as_str()) {
+            relabel.extend(ids.iter().copied());
+        }
+    }
+    if updates.is_empty() && relabel.is_empty() {
+        return Ok(());
+    }
+
+    let mut statements = 0u64;
+    let mut in_txn = false;
+    let run = |statements: &mut u64, in_txn: &mut bool, sql: String| -> Result<()> {
+        if manage_txn && !*in_txn {
+            db.begin()?;
+            *in_txn = true;
+        }
+        db.execute(&sql)?;
+        *statements += 1;
+        if manage_txn && *statements % TAIL_COMMIT_EVERY == 0 {
+            db.commit()?;
+            *in_txn = false;
+        }
+        Ok(())
+    };
+    let result = (|| -> Result<()> {
+        let mut keys: Vec<_> = updates.keys().copied().collect();
+        keys.sort_unstable();
+        for key in keys {
+            let Some(edge_ids) = updates.get(&key) else { continue };
+            for batch in edge_ids.chunks(KEY_BATCH) {
+                run(
+                    &mut statements,
+                    &mut in_txn,
+                    format!(
+                        "UPDATE _hdb_code_symbol_refs SET to_symbol = {}, resolution = '{}' WHERE edge_id IN ({})",
+                        key.0,
+                        key.1,
+                        int_list(batch)
+                    ),
+                )?;
+            }
+        }
+        for batch in relabel.chunks(KEY_BATCH) {
+            run(
+                &mut statements,
+                &mut in_txn,
+                format!(
+                    "UPDATE _hdb_code_symbol_refs SET resolution = 'heuristic' WHERE edge_id IN ({})",
+                    int_list(batch)
+                ),
+            )?;
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            if manage_txn && in_txn {
+                db.commit()?;
+            }
+        }
+        Err(e) => {
+            if manage_txn && in_txn {
+                let _ = db.rollback();
+            }
+            return Err(e);
+        }
+    }
+    stats.tail_statements = statements;
     Ok(())
 }
 
@@ -1270,13 +1924,16 @@ fn bootstrap_tables(db: &EmbeddedDatabase) -> Result<()> {
            )"#,
     )?;
 
-    // Tier 2 perf indexes (added v3.21.1+). Without these, the
-    // per-file delete-stale path (`DELETE FROM … WHERE file_id = X`)
-    // does a full table scan — a 35-second slow query for a 181-row
-    // delete on a ~115 K-row refs table was observed in the field.
-    // file_id-indexed deletes drop that to single-millisecond range
-    // and are also the load-bearing index for the cross-file
-    // resolver's UPDATE-by-file_id path. Idempotent.
+    // Secondary indexes. They serve READS and foreign-key probes: a column
+    // that only has REFERENCES is scanned on read, so `file_id = X`,
+    // `to_symbol IN (..)` and the like need these. They do NOT make
+    // `DELETE ... WHERE file_id = X` select its rows through the index:
+    // UPDATE/DELETE row selection uses the primary key or a scan, so the
+    // indexer reads ids first (index-served) and deletes by primary key.
+    // `name` serves lsp_definition, `path` serves document symbols and the
+    // definition path hint (UNIQUE(source_table, path) is composite and
+    // cannot serve a `path = ..` probe). Idempotent; a store created by an
+    // older build gains them (with a backfill) at the next call.
     // Secondary CREATE INDEX is deliberately unsupported on a branch.
     // These four nonunique indexes are main-only performance aids; branch
     // PK/FK semantics come from the table definitions above. Issuing this
@@ -1291,6 +1948,8 @@ fn bootstrap_tables(db: &EmbeddedDatabase) -> Result<()> {
     db.execute(
         "CREATE INDEX IF NOT EXISTS idx_hdb_code_symbol_refs_from_symbol ON _hdb_code_symbol_refs(from_symbol)",
     )?;
+    db.execute("CREATE INDEX IF NOT EXISTS idx_hdb_code_symbols_name ON _hdb_code_symbols(name)")?;
+    db.execute("CREATE INDEX IF NOT EXISTS idx_hdb_code_files_path ON _hdb_code_files(path)")?;
     Ok(())
 }
 
@@ -1306,34 +1965,51 @@ struct SourceFile {
     sha256: Option<String>,
 }
 
-fn fetch_source_files(db: &EmbeddedDatabase, source_table: &str) -> Result<Vec<SourceFile>> {
-    // NB: we intentionally take the whole corpus into memory in phase
-    // 1 — Nano's pilot is thousands of files, not millions. Phase 2's
-    // trigger-based incremental reparse eliminates this batch.
-    let rows = db.query(
-        &format!(r#"SELECT "path", "lang", "content" FROM "{source_table}""#),
-        &[],
-    )?;
-    let mut out = Vec::with_capacity(rows.len());
-    for row in rows {
-        let path = match row.values.first() {
-            Some(Value::String(s)) => s.clone(),
-            _ => continue,
-        };
-        let lang = match row.values.get(1) {
-            Some(Value::String(s)) => s.clone(),
-            _ => String::new(),
-        };
-        let content = match row.values.get(2) {
-            Some(Value::String(s)) => s.clone(),
-            _ => String::new(),
-        };
-        out.push(SourceFile {
-            path,
-            lang,
-            content,
-            sha256: None,
-        });
+fn fetch_source_files(db: &EmbeddedDatabase, source_table: &str, only: Option<&[String]>) -> Result<Vec<SourceFile>> {
+    // NB: a full run takes the whole corpus into memory (the pilot is thousands
+    // of files, not millions). A targeted run reads only the listed paths: a
+    // text primary-key IN list is index-served, so the cost follows the list.
+    let mut out = Vec::new();
+    let mut push_rows = |rows: Vec<Tuple>| {
+        out.reserve(rows.len());
+        for row in rows {
+            // Move the strings out of the row instead of cloning them.
+            let mut values = row.values.into_iter();
+            let path = match values.next() {
+                Some(Value::String(s)) => s,
+                _ => continue,
+            };
+            let lang = match values.next() {
+                Some(Value::String(s)) => s,
+                _ => String::new(),
+            };
+            let content = match values.next() {
+                Some(Value::String(s)) => s,
+                _ => String::new(),
+            };
+            out.push(SourceFile {
+                path,
+                lang,
+                content,
+                sha256: None,
+            });
+        }
+    };
+    match only {
+        None => push_rows(db.query(
+            &format!(r#"SELECT "path", "lang", "content" FROM "{source_table}""#),
+            &[],
+        )?),
+        Some(paths) => {
+            for batch in paths.chunks(KEY_BATCH) {
+                let marks = (1..=batch.len()).map(|i| format!("${i}")).collect::<Vec<_>>().join(",");
+                let params: Vec<Value> = batch.iter().map(|p| Value::String(p.clone())).collect();
+                push_rows(db.query_params(
+                    &format!(r#"SELECT "path", "lang", "content" FROM "{source_table}" WHERE "path" IN ({marks})"#),
+                    &params,
+                )?);
+            }
+        }
     }
     Ok(out)
 }
@@ -1387,158 +2063,6 @@ fn upsert_file(db: &EmbeddedDatabase, source_table: &str, file: &SourceFile, sha
     Err(Error::query_execution("RETURNING file_id yielded no rows"))
 }
 
-fn insert_symbols(
-    db: &EmbeddedDatabase,
-    file_id: i64,
-    symbols: &[Symbol],
-    embedder: &dyn Embedder,
-    stats: &mut CodeIndexStats,
-) -> Result<Vec<i64>> {
-    if symbols.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    // Compute embeddings up-front. NoopEmbedder returns None for
-    // everything → vectors stays empty → no schema change.
-    let mut vectors: Vec<Option<Vec<f32>>> = Vec::with_capacity(symbols.len());
-    for sym in symbols {
-        let v = if !sym.signature.is_empty() {
-            embedder.embed(&sym.signature)?
-        } else {
-            None
-        };
-        if v.is_some() {
-            stats.embed_calls += 1;
-        }
-        vectors.push(v);
-    }
-
-    let any_vec = vectors.iter().any(Option::is_some);
-    if any_vec {
-        let dim = vectors.iter().find_map(|v| v.as_ref().map(|v| v.len())).unwrap_or(0);
-        if dim == 0 {
-            return Err(Error::query_execution("embedder returned a zero-length vector"));
-        }
-        ensure_body_vec_column(db, dim)?;
-        for v in &vectors {
-            if let Some(vec) = v {
-                if vec.len() != dim {
-                    return Err(Error::query_execution(format!(
-                        "embedder dimension mismatch: expected {dim}, got {}",
-                        vec.len()
-                    )));
-                }
-            }
-        }
-    }
-
-    // Build rows in the declared column order, then let the SQL INSERT
-    // join this operation's transaction. Direct bulk writes cannot be
-    // paired with the earlier transaction-owned stale-row DELETEs.
-    let schema = db.storage.catalog().get_table_schema("_hdb_code_symbols")?;
-    let n_cols = schema.columns.len();
-    let expected_min_cols = if any_vec { 13 } else { 12 };
-    if n_cols < expected_min_cols {
-        return Err(Error::query_execution(format!(
-            "_hdb_code_symbols schema has {} cols, fast path expects ≥ {}",
-            n_cols, expected_min_cols
-        )));
-    }
-
-    let mut tuples: Vec<Tuple> = Vec::with_capacity(symbols.len());
-    for (idx, sym) in symbols.iter().enumerate() {
-        let mut values: Vec<Value> = Vec::with_capacity(n_cols);
-        // Column order matches the CREATE TABLE in bootstrap_tables:
-        //   node_id, file_id, name, qualified, kind, signature,
-        //   visibility, line_start, line_end, byte_start, byte_end,
-        //   parent_id, [body_vec]
-        values.push(Value::Null); // node_id — generated by the SQL INSERT
-        values.push(Value::Int8(file_id));
-        values.push(Value::String(sym.name.clone()));
-        values.push(Value::String(sym.qualified.clone()));
-        values.push(Value::String(sym.kind.as_str().to_string()));
-        values.push(Value::String(sym.signature.clone()));
-        values.push(Value::String(sym.visibility.as_str().to_string()));
-        values.push(Value::Int4(sym.line_start as i32));
-        values.push(Value::Int4(sym.line_end as i32));
-        values.push(Value::Int4(sym.byte_start as i32));
-        values.push(Value::Int4(sym.byte_end as i32));
-        values.push(Value::Null); // parent_id — phase-1 leaves this null
-        if any_vec && n_cols >= 13 {
-            let v = vectors
-                .get(idx)
-                .and_then(|v| v.clone())
-                .map(Value::Vector)
-                .unwrap_or(Value::Null);
-            values.push(v);
-        }
-        // Pad with Value::Null if the schema has more columns than
-        // we know about (forward-compat).
-        while values.len() < n_cols {
-            values.push(Value::Null);
-        }
-        tuples.push(Tuple::new(values));
-    }
-    insert_graph_rows(db, "_hdb_code_symbols", &schema, tuples)
-}
-
-fn insert_refs(
-    db: &EmbeddedDatabase,
-    file_id: i64,
-    symbol_ids: &[i64],
-    resolved: &[super::resolver::ResolvedRef],
-) -> Result<u64> {
-    if resolved.is_empty() {
-        return Ok(0);
-    }
-
-    // Same transaction-owned insertion as insert_symbols.
-    let schema = db.storage.catalog().get_table_schema("_hdb_code_symbol_refs")?;
-    let n_cols = schema.columns.len();
-    if n_cols < 8 {
-        return Err(Error::query_execution(format!(
-            "_hdb_code_symbol_refs schema has {} cols, fast path expects ≥ 8",
-            n_cols
-        )));
-    }
-
-    let mut tuples: Vec<Tuple> = Vec::with_capacity(resolved.len());
-    for r in resolved {
-        let from_id = symbol_ids
-            .get(r.from_idx)
-            .copied()
-            .ok_or_else(|| Error::query_execution(format!("resolver produced invalid from_idx {}", r.from_idx)))?;
-        let to_val = match r.to_idx {
-            Some(idx) => symbol_ids.get(idx).map(|id| Value::Int8(*id)).unwrap_or(Value::Null),
-            None => Value::Null,
-        };
-        let res = match r.resolution {
-            Resolution::Exact => "exact",
-            Resolution::Heuristic => "heuristic",
-            Resolution::Unresolved => "unresolved",
-        };
-        // Column order from bootstrap_tables:
-        //   edge_id, file_id, from_symbol, to_symbol, to_name, kind,
-        //   line, resolution
-        let mut values: Vec<Value> = Vec::with_capacity(n_cols);
-        values.push(Value::Null); // edge_id — auto-fill
-        values.push(Value::Int8(file_id));
-        values.push(Value::Int8(from_id));
-        values.push(to_val);
-        values.push(Value::String(r.to_name.clone()));
-        values.push(Value::String(r.kind_str.to_string()));
-        values.push(Value::Int4(r.line as i32));
-        values.push(Value::String(res.to_string()));
-        while values.len() < n_cols {
-            values.push(Value::Null);
-        }
-        tuples.push(Tuple::new(values));
-    }
-    let written = tuples.len() as u64;
-    insert_graph_rows(db, "_hdb_code_symbol_refs", &schema, tuples)?;
-    Ok(written)
-}
-
 fn sql_text(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
@@ -1552,18 +2076,6 @@ pub(super) fn file_path_by_id(db: &EmbeddedDatabase, file_id: i64) -> Result<Opt
     )?;
     Ok(rows.first().and_then(|r| match r.values.first() {
         Some(Value::String(s)) => Some(s.clone()),
-        _ => None,
-    }))
-}
-
-pub(super) fn file_id_for_symbol(db: &EmbeddedDatabase, symbol_id: i64) -> Result<Option<i64>> {
-    let rows = db.query(
-        &format!("SELECT file_id FROM _hdb_code_symbols WHERE node_id = {symbol_id}"),
-        &[],
-    )?;
-    Ok(rows.first().and_then(|r| r.values.first()).and_then(|v| match v {
-        Value::Int4(n) => Some(*n as i64),
-        Value::Int8(n) => Some(*n),
         _ => None,
     }))
 }

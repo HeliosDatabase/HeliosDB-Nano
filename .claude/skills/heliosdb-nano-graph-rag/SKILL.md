@@ -129,6 +129,8 @@ let hits = db.graph_rag_search(
 Or `heliosdb_graph_path` for shortest-path between two nodes.
 
 ## Pitfalls
+- **The projection is a diff.** `db.code_index(..)` and `graph_rag_project_symbols()` insert missing symbol nodes, update only the nodes whose kind/title/text changed, and delete the nodes of symbols that no longer exist together with their edges (linker `MENTIONS` edges into them included; counted in `GraphRagStats`). A re-index that parsed and removed nothing skips the projection when the graph already holds one code node per symbol. A projection failure after the index committed is reported in `CodeIndexStats.projection_error`, not as an `Err`. `DocChunk`/email/issue nodes are never touched.
+- **Search expands one frontier per hop** (at most `3 × hops + 1` statements). Hop distance is the hop of first reach; under `limit`/`EXPAND_LIMIT` ties within a hop go to the lowest node id.
 - **`graph-rag` implies `code-graph`** — you cannot enable just one. The code-symbol projection is the primary node population strategy.
 - **Embeddings can be external**. If you don't compile `--features code-embed`, you must populate `embedding` columns yourself (call any embedding API from your app and `INSERT INTO _hdb_graph_nodes (…, embedding) VALUES (…)`).
 - **First-pass ingestion is heavy**. PDF/Office/audio extractors use external libraries and can take minutes for large corpora. Run ingestion as a one-off or background job, not on the request path.

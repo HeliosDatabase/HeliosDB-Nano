@@ -72,6 +72,17 @@ for d in defs {
 All are plain user tables — queryable, joinable, and branch-aware like
 any other Nano table.
 
+On the main branch the tables carry these secondary indexes (created
+IF NOT EXISTS, so a store made by an older build gains them at its next
+`code_index`): `_hdb_code_symbols(file_id)` and `(name)`,
+`_hdb_code_files(path)`, and `_hdb_code_symbol_refs(file_id)`,
+`(to_symbol)`, `(from_symbol)`. The graph-rag tables add
+`_hdb_graph_edges(from_node)` and `(to_node)` and
+`_hdb_graph_nodes(source_ref)`. They serve reads and foreign-key
+probes; a column that only has `REFERENCES` is scanned on read, and
+UPDATE/DELETE choose rows by primary key or a scan, not by a secondary
+index. Branches do not get secondary indexes.
+
 ## Public API
 
 ```rust
@@ -116,6 +127,39 @@ Every `lsp_*` query pushes its WHERE predicate through the regular
 in `src/storage/predicate_pushdown.rs` kicks in for free. A typical
 `lsp_definition('foo')` is an Eq-pushdown on a single column — cheap
 even on a multi-million-symbol corpus.
+
+## Re-index, resolution and chunking
+
+- **Keyed cleanup.** A changed file's rows are removed by key: the indexer reads
+  the file's symbol and reference ids and the references that point at its
+  symbols (index-served `IN` reads, before the chunk's transaction opens), then
+  inside the chunk's transaction unresolves the inbound references and deletes by
+  primary key, once per chunk. A file that left the source table is removed the
+  same way (`CodeIndexStats::files_removed`); its inbound references become
+  `unresolved`. New files cost no cleanup statements. One `code_index` runs per
+  database at a time.
+- **Targeted runs.** `CodeIndexOptions::only_paths = Some(paths)` reads and
+  hashes only those source rows (the git hook uses it); a listed path with no
+  source row is removed from the index; an empty list does nothing.
+- **Cross-file references** are bound while they are inserted: the corpus name
+  map (lowest `node_id` per name, count of definitions) is loaded once, minus the
+  symbols of files being re-parsed or removed, and extended by each chunk. The
+  label is `exact` for a name with one definition and `heuristic` otherwise. A
+  reference an import rebound (`use a::b::helper;` then `helper()`) is bound to
+  the definition of the last path segment and keeps `exact` only if the import was
+  unique and the name has one definition. What cannot be known at insert time —
+  a name defined by a later chunk or an older run, a name that gained a second
+  definition during the run — is fixed by a small tail of grouped UPDATEs
+  (`CodeIndexStats::tail_statements`). `resolve_cross_file_references` is the full
+  pass for `skip_cross_file_resolve` workflows.
+- **Chunking.** A run that parses more than 5000 files and sets no `chunk_size`
+  is chunked by 2000 files. Each chunk is one transaction: after a failure the
+  committed chunks stay, their files are skipped on the next run (stored hash
+  matches) and the rest is indexed.
+- **Graph projection** (`graph-rag`) is a diff: missing nodes are inserted,
+  changed nodes updated, nodes of vanished symbols deleted with their edges, and
+  a run that parsed and removed nothing skips it when the graph already has one
+  code node per symbol.
 
 ## What's out of scope (phase 1)
 
