@@ -27,6 +27,14 @@ changes.
 Reports from users of earlier releases (GitHub numbers) and defects found while the work after
 4.42.0 was being prepared. Each has a test file.
 
+- **A PL/pgSQL procedure took the `ELSE` branch of every `IF`, never entered a `WHILE`, and stored
+  the text of an expression instead of its value.** The interpreter now evaluates expressions (with
+  the routine's variables bound as parameters, so both statement families agree): `IF` / `ELSIF` /
+  `ELSE`, `CASE`, `WHILE`, `LOOP` with `EXIT` / `CONTINUE` and labels, numeric `FOR` and `FOR` over a
+  query run as written, an assignment stores the value cast to the declared type, `PERFORM` runs its
+  query, and `SET` inside a body is a statement. A non-boolean condition is an error, not false.
+  `[procedural] max_loop_iterations` (default 0, unlimited) caps one loop; recursion stays bounded
+  by `udf_max_call_depth`. Test file: `tests/plpgsql_core_semantics.rs`.
 - **Branch listings and helper endpoints stop giving false answers.** `SHOW BRANCHES`,
   `pg_database_branches()` and `pg_branch_stats()` printed `created_at` — a logical counter — as a
   1970 date; a new branch now records its wall-clock creation time and the listings show it (NULL
