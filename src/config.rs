@@ -86,6 +86,12 @@ pub struct Config {
     /// any `[section]` tables.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<ProfileConfig>,
+    /// Refuse a config file that carries unknown keys, unknown sections or
+    /// keys that have no effect, instead of warning about them (v03.4). Opt-in;
+    /// `start --strict-config` asks for the same. A top-level scalar, so it
+    /// must come before the first `[section]` in the file.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub strict_config: bool,
     /// Storage configuration
     #[serde(default)]
     pub storage: StorageConfig,
@@ -142,10 +148,15 @@ pub struct Config {
     pub api: ApiConfig,
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
             profile: None,
+            strict_config: false,
             storage: StorageConfig::default(),
             encryption: EncryptionConfig::default(),
             server: ServerConfig::default(),
@@ -166,6 +177,133 @@ impl Default for Config {
             api: ApiConfig::default(),
         }
     }
+}
+
+/// What a config file's author most likely got wrong, found while loading it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigWarningKind {
+    /// A top-level `[section]` nothing reads.
+    UnknownSection,
+    /// A key inside a known section that nothing reads.
+    UnknownKey,
+    /// A key that parses but that no code acts on (see [`INERT_KEYS`]).
+    NoEffect,
+}
+
+/// One finding of [`Config::load_report`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ConfigWarning {
+    pub kind: ConfigWarningKind,
+    /// Dotted path of the key or section, e.g. `authentication.passwrod`.
+    pub path: String,
+    /// The full sentence logged for it.
+    pub message: String,
+}
+
+/// Top-level sections of the configuration file.
+const KNOWN_SECTIONS: &[&str] = &[
+    "profile",
+    "storage",
+    "encryption",
+    "server",
+    "replication",
+    "performance",
+    "audit",
+    "optimizer",
+    "authentication",
+    "compression",
+    "materialized_views",
+    "vector",
+    "sync",
+    "session",
+    "locks",
+    "dump",
+    "resource_quotas",
+    "api",
+];
+
+/// Keys that the configuration file accepts and that no code acts on, with
+/// the reason. A file that sets one gets a warning naming it; a file that
+/// does not gets nothing. This table is the one place to shrink when a key
+/// is wired.
+pub const INERT_KEYS: &[(&str, &str)] = &[
+    ("server.oracle_port", "there is no Oracle TNS listener"),
+    (
+        "server.tls_enabled",
+        "the PostgreSQL listener takes --tls-cert/--tls-key; the key is read only as the fallback for the replication port",
+    ),
+    (
+        "server.tls_cert_path",
+        "the PostgreSQL listener takes --tls-cert; the key is read only as the fallback for the replication port",
+    ),
+    (
+        "server.tls_key_path",
+        "the PostgreSQL listener takes --tls-key; the key is read only as the fallback for the replication port",
+    ),
+    ("server.tls_post_quantum", "the --tls-post-quantum flag is authoritative"),
+    ("server.mysql_tls_enabled", "the MySQL listener takes --mysql-tls-cert/--mysql-tls-key"),
+    ("server.mysql_tls_cert_path", "the MySQL listener takes --mysql-tls-cert"),
+    ("server.mysql_tls_key_path", "the MySQL listener takes --mysql-tls-key"),
+    ("server.mysql_tls_post_quantum", "the --mysql-tls-post-quantum flag is authoritative"),
+    ("performance.worker_threads", "nothing reads it"),
+    ("performance.query_timeout_secs", "nothing reads it"),
+    ("performance.simd_enabled", "nothing reads it"),
+    ("performance.parallel_query", "nothing reads it"),
+    ("optimizer.enabled", "the optimizer builds its own defaults and does not read this section"),
+    ("optimizer.enable_seqscan", "the optimizer builds its own defaults and does not read this section"),
+    ("optimizer.enable_indexscan", "the optimizer builds its own defaults and does not read this section"),
+    ("optimizer.enable_hashjoin", "the optimizer builds its own defaults and does not read this section"),
+    ("optimizer.enable_mergejoin", "the optimizer builds its own defaults and does not read this section"),
+    ("optimizer.enable_nestloop", "the optimizer builds its own defaults and does not read this section"),
+    ("optimizer.seq_page_cost", "the optimizer builds its own defaults and does not read this section"),
+    ("optimizer.random_page_cost", "the optimizer builds its own defaults and does not read this section"),
+    ("optimizer.cpu_tuple_cost", "the optimizer builds its own defaults and does not read this section"),
+    ("optimizer.cpu_index_tuple_cost", "the optimizer builds its own defaults and does not read this section"),
+    ("authentication.enabled", "`start` takes the method from --auth; this section is not read"),
+    ("authentication.method", "`start` takes the method from --auth; this section is not read"),
+    ("authentication.jwt_secret", "JWT authentication is not served by `start`"),
+    ("authentication.jwt_expiration_secs", "JWT authentication is not served by `start`"),
+    ("authentication.password_hash_algorithm", "nothing reads it"),
+    ("authentication.users_file", "file-based authentication is not served by `start`"),
+    ("sync.enabled", "the sync protocol is built only with the sync-experimental feature"),
+    ("sync.node_id", "the sync protocol is built only with the sync-experimental feature"),
+    ("sync.server_url", "the sync protocol is built only with the sync-experimental feature"),
+    ("sync.client_id", "the sync protocol is built only with the sync-experimental feature"),
+    ("sync.sync_interval_secs", "the sync protocol is built only with the sync-experimental feature"),
+    ("sync.change_log_enabled", "the sync protocol is built only with the sync-experimental feature"),
+];
+
+/// The known key nearest to `key` (edit distance of at most 2), if any is
+/// that close.
+fn nearest_key<'a>(key: &str, known: impl Iterator<Item = &'a str>) -> Option<&'a str> {
+    known
+        .map(|candidate| (edit_distance(key, candidate), candidate))
+        .filter(|(distance, _)| *distance <= 2)
+        .min_by_key(|(distance, _)| *distance)
+        .map(|(_, candidate)| candidate)
+}
+
+/// Levenshtein distance over chars; the inputs are short key names.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut diagonal = row.first().copied().unwrap_or(0);
+        if let Some(first) = row.first_mut() {
+            *first = i + 1;
+        }
+        for (j, cb) in b.iter().enumerate() {
+            let above = row.get(j + 1).copied().unwrap_or(0);
+            let left = row.get(j).copied().unwrap_or(0);
+            let cost = usize::from(ca != *cb);
+            if let Some(cell) = row.get_mut(j + 1) {
+                *cell = (above + 1).min(left + 1).min(diagonal + cost);
+            }
+            diagonal = above;
+        }
+    }
+    row.last().copied().unwrap_or(0)
 }
 
 impl Config {
@@ -198,18 +336,63 @@ impl Config {
     ///
     /// i.e. the profile only fills in bundled fields the file did not set
     /// explicitly — an explicit `[storage]` key in the file always wins.
+    ///
+    /// Unknown sections, unknown keys and keys that have no effect are logged
+    /// once each as warnings; the load fails instead when the file says
+    /// `strict_config = true`. See [`Config::load_report`] for the same
+    /// findings as data.
     pub fn from_toml_str(content: &str) -> crate::Result<Self> {
-        let mut config: Config =
-            toml::from_str(content).map_err(|e| crate::Error::config(format!("Failed to parse config: {}", e)))?;
+        Self::from_toml_str_with(content, false)
+    }
 
-        // Re-parse as a raw TOML document. Two consumers: the profile-precedence
-        // check below, and the unknown-section warning. Hoisted out of the
-        // `if let Some(profile)` so the warning runs for every config file, not
-        // only profile-bearing ones.
+    /// [`Config::from_toml_str`] with strict mode forced on by the caller
+    /// (`start --strict-config`): any warning becomes a load error.
+    pub fn from_toml_str_with(content: &str, strict: bool) -> crate::Result<Self> {
+        let (config, warnings) = Self::load_report(content)?;
+        if (strict || config.strict_config) && !warnings.is_empty() {
+            return Err(crate::Error::config(format!(
+                "strict config: the file has {} problem(s) and strict mode refuses it:\n{}",
+                warnings.len(),
+                warnings
+                    .iter()
+                    .map(|w| format!("  - {}", w.message))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )));
+        }
+        for warning in &warnings {
+            tracing::warn!("{}", warning.message);
+        }
+        Ok(config)
+    }
+
+    /// [`Config::from_file`] with strict mode forced on by the caller.
+    pub fn from_file_with(path: impl AsRef<std::path::Path>, strict: bool) -> crate::Result<Self> {
+        let content = std::fs::read_to_string(path)?;
+        Self::from_toml_str_with(&content, strict)
+    }
+
+    /// Parse a TOML string and report what the loader found wrong with it,
+    /// as data: nothing is logged here.
+    ///
+    /// A hard problem (bad syntax, a wrong type, a key in a
+    /// `deny_unknown_fields` section) is an `Err`. Everything softer is a
+    /// [`ConfigWarning`]: a section or key nothing reads (probably a typo),
+    /// and a key that parses but that no code acts on ([`INERT_KEYS`]).
+    pub fn load_report(content: &str) -> crate::Result<(Self, Vec<ConfigWarning>)> {
+        let mut ignored: Vec<String> = Vec::new();
+        let mut config: Config = serde_ignored::deserialize(toml::Deserializer::new(content), |path| {
+            ignored.push(path.to_string());
+        })
+        .map_err(|e| crate::Error::config(format!("Failed to parse config: {}", e)))?;
+
+        // Re-parse as a raw TOML document. Consumers: the profile-precedence
+        // check below, and the warnings.
         let raw: toml::Value =
             toml::from_str(content).map_err(|e| crate::Error::config(format!("Failed to parse config: {}", e)))?;
 
-        Self::warn_unknown_sections(&raw);
+        let mut warnings = Self::unknown_key_warnings(&ignored);
+        warnings.extend(Self::inert_key_warnings(&raw));
 
         // `#[serde(skip)]` gives this `false` after deserialization regardless, so
         // derive it from the raw document: only it can say whether the operator
@@ -228,68 +411,82 @@ impl Config {
         config.session.validate_lock_timeout()?;
         // Spec R5.2: and this one at load, not at the first volatile ADD COLUMN.
         config.storage.validate()?;
-        Ok(config)
+        Ok((config, warnings))
     }
 
-    /// Warn about top-level sections this build does not recognise.
-    ///
-    /// serde ignores unknown fields by default and nothing here sets
-    /// `deny_unknown_fields`, so a misspelled or obsolete section is silently
-    /// discarded. That is how a user came to run a database they believed was
-    /// authenticated: they wrote `[auth] method = "md5"`, the real section is
-    /// `[authentication]`, and NOTHING said otherwise — while `[storage]` from the
-    /// same file applied correctly, making the file look honoured.
-    ///
-    /// Warn rather than hard-fail: rejecting outright would stop existing configs
-    /// from booting over a stray key, and a config that refuses to start is its own
-    /// outage. A warning that names the likely intended section is enough to make
-    /// the failure visible, which was the entire problem.
-    ///
-    /// NOTE this catches TOP-LEVEL sections only. An unknown KEY inside a known
-    /// section (`[authentication] passwrod = ...`) is still silent; closing that
-    /// needs per-section allowlists or `serde_ignored`, and is tracked separately.
-    fn warn_unknown_sections(raw: &toml::Value) {
-        const KNOWN: &[&str] = &[
-            "profile",
-            "storage",
-            "encryption",
-            "server",
-            "replication",
-            "performance",
-            "audit",
-            "optimizer",
-            "authentication",
-            "compression",
-            "materialized_views",
-            "vector",
-            "sync",
-            "session",
-            "locks",
-            "dump",
-            "resource_quotas",
-            "api",
-        ];
-
-        let Some(table) = raw.as_table() else { return };
-        for key in table.keys() {
-            if KNOWN.contains(&key.as_str()) {
+    /// Unknown paths the deserializer skipped, as warnings. A one-segment path
+    /// is a section; a longer one is a key inside a known section, with the
+    /// nearest known sibling suggested when one is close.
+    fn unknown_key_warnings(ignored: &[String]) -> Vec<ConfigWarning> {
+        let defaults = toml::Value::try_from(Config::default()).ok();
+        let mut warnings = Vec::new();
+        for path in ignored {
+            let segments: Vec<&str> = path.split('.').collect();
+            if let [section] = segments.as_slice() {
+                warnings.push(Self::unknown_section_warning(section));
                 continue;
             }
-            // Cheap nearest-match: prefix relation in either direction covers the
-            // realistic confusions (auth/authentication, vec/vector, perf/performance).
-            let suggestion = KNOWN
-                .iter()
-                .find(|k| k.starts_with(key.as_str()) || key.as_str().starts_with(*k));
-            match suggestion {
-                Some(k) => tracing::warn!(
-                    "config: unknown section [{key}] is IGNORED — did you mean [{k}]? \
-                     Settings under [{key}] have no effect."
-                ),
-                None => {
-                    tracing::warn!("config: unknown section [{key}] is IGNORED — settings under it have no effect.")
-                }
+            let Some((key, parents)) = segments.split_last() else {
+                continue;
+            };
+            // Siblings the default configuration serializes at the same level.
+            let mut level = defaults.as_ref();
+            for parent in parents {
+                level = level.and_then(|value| value.get(*parent));
             }
+            let suggestion = level
+                .and_then(toml::Value::as_table)
+                .and_then(|table| nearest_key(key, table.keys().map(String::as_str)));
+            let hint = match suggestion {
+                Some(near) => format!(" — did you mean `{near}`?"),
+                None => String::new(),
+            };
+            warnings.push(ConfigWarning {
+                kind: ConfigWarningKind::UnknownKey,
+                path: path.clone(),
+                message: format!("config: unknown key `{path}` is IGNORED{hint} It has no effect."),
+            });
         }
+        warnings
+    }
+
+    fn unknown_section_warning(key: &str) -> ConfigWarning {
+        // Cheap nearest-match: prefix relation in either direction covers the
+        // realistic confusions (auth/authentication, vec/vector, perf/performance).
+        let suggestion = KNOWN_SECTIONS
+            .iter()
+            .find(|k| k.starts_with(key) || key.starts_with(*k));
+        let message = match suggestion {
+            Some(k) => format!(
+                "config: unknown section [{key}] is IGNORED — did you mean [{k}]? \
+                 Settings under [{key}] have no effect."
+            ),
+            None => format!("config: unknown section [{key}] is IGNORED — settings under it have no effect."),
+        };
+        ConfigWarning {
+            kind: ConfigWarningKind::UnknownSection,
+            path: key.to_string(),
+            message,
+        }
+    }
+
+    /// Keys the file sets that [`INERT_KEYS`] says no code acts on.
+    fn inert_key_warnings(raw: &toml::Value) -> Vec<ConfigWarning> {
+        INERT_KEYS
+            .iter()
+            .filter(|(path, _)| {
+                let mut value = Some(raw);
+                for segment in path.split('.') {
+                    value = value.and_then(|v| v.get(segment));
+                }
+                value.is_some()
+            })
+            .map(|(path, reason)| ConfigWarning {
+                kind: ConfigWarningKind::NoEffect,
+                path: (*path).to_string(),
+                message: format!("config: `{path}` has no effect: {reason}"),
+            })
+            .collect()
     }
 
     /// Default configuration with a named profile bundle applied.
@@ -1689,10 +1886,13 @@ pub enum WalSyncModeConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CompressionType {
     /// No compression
+    #[serde(alias = "none")]
     None,
     /// Zstandard compression (recommended)
+    #[serde(alias = "zstd")]
     Zstd,
     /// LZ4 compression (faster, lower ratio)
+    #[serde(alias = "lz4")]
     Lz4,
 }
 
@@ -2288,7 +2488,10 @@ impl Default for OptimizerConfig {
 }
 
 /// Authentication configuration (v2.1)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` is written by hand below: `jwt_secret` must not appear in a debug
+/// print (`config check` prints the configuration through it).
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AuthenticationConfig {
     /// Enable authentication
@@ -2954,6 +3157,20 @@ fn redacted_opt(value: &Option<String>) -> Option<&'static str> {
     value.as_ref().map(|_| REDACTED)
 }
 
+impl std::fmt::Debug for AuthenticationConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthenticationConfig")
+            .field("enabled", &self.enabled)
+            .field("method", &self.method)
+            .field("jwt_secret", &redacted_opt(&self.jwt_secret))
+            .field("jwt_expiration_secs", &self.jwt_expiration_secs)
+            .field("password_hash_algorithm", &self.password_hash_algorithm)
+            .field("users_file", &self.users_file)
+            .field("legacy_acl_noop", &self.legacy_acl_noop)
+            .finish()
+    }
+}
+
 impl std::fmt::Debug for ApiConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ApiConfig")
@@ -3027,9 +3244,123 @@ fn generate_random_secret() -> String {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::many_single_char_names
+)]
 mod tests {
     use super::*;
+
+    // ------------------------------------------------------------------
+    // v03.4: unknown keys, keys with no effect, strict mode
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn an_unknown_key_in_a_known_section_is_reported_and_strict_refuses_it() {
+        let (config, warnings) = Config::load_report("[authentication]\npasswrod = \"x\"\n").unwrap();
+        assert!(!config.strict_config);
+        assert_eq!(warnings.len(), 1, "{warnings:#?}");
+        assert_eq!(warnings[0].kind, ConfigWarningKind::UnknownKey);
+        assert_eq!(warnings[0].path, "authentication.passwrod");
+        // a near miss names the sibling
+        let (_, near) = Config::load_report("[server]\nmax_connection = 5\n").unwrap();
+        assert!(near[0].message.contains("max_connections"), "{near:#?}");
+
+        let strict_file = "strict_config = true\n[authentication]\npasswrod = \"x\"\n";
+        let error = Config::from_toml_str(strict_file).unwrap_err().to_string();
+        assert!(error.contains("authentication.passwrod"), "{error}");
+        let error = Config::from_toml_str_with("[authentication]\npasswrod = \"x\"\n", true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("authentication.passwrod"), "{error}");
+        // warn-only by default
+        assert!(Config::from_toml_str("[authentication]\npasswrod = \"x\"\n").is_ok());
+    }
+
+    #[test]
+    fn an_unknown_section_is_reported_with_its_nearest_section() {
+        let (_, warnings) = Config::load_report("[auth]\nmethod = \"md5\"\n").unwrap();
+        assert_eq!(warnings.len(), 1, "{warnings:#?}");
+        assert_eq!(warnings[0].kind, ConfigWarningKind::UnknownSection);
+        assert!(warnings[0].message.contains("[authentication]"), "{warnings:#?}");
+    }
+
+    #[test]
+    fn a_key_with_no_effect_is_reported_with_its_reason_only_when_the_file_sets_it() {
+        let (_, none) = Config::load_report("[optimizer]\n").unwrap();
+        assert!(none.is_empty(), "{none:#?}");
+        let (_, warnings) = Config::load_report("[optimizer]\nenable_hashjoin = false\n").unwrap();
+        assert_eq!(warnings.len(), 1, "{warnings:#?}");
+        assert_eq!(warnings[0].kind, ConfigWarningKind::NoEffect);
+        assert_eq!(warnings[0].path, "optimizer.enable_hashjoin");
+        assert!(
+            warnings[0].message.contains("does not read this section"),
+            "{warnings:#?}"
+        );
+        // live keys never warn
+        let (_, live) = Config::load_report("[server]\nport = 5433\nlisten_addr = \"127.0.0.1\"\n").unwrap();
+        assert!(live.is_empty(), "{live:#?}");
+        // strict mode refuses an inert key
+        assert!(Config::from_toml_str_with("[optimizer]\nenable_hashjoin = false\n", true).is_err());
+    }
+
+    #[test]
+    fn every_inert_key_names_a_real_field() {
+        // A table entry that no longer names a field would warn about nothing
+        // and rot silently: set each key and see the loader accept it as known.
+        for (path, reason) in INERT_KEYS {
+            assert!(!reason.is_empty());
+            let (section, key) = path.split_once('.').unwrap();
+            let value = match key {
+                k if k.ends_with("_secs") || k.ends_with("_threads") || k.ends_with("_port") => "1",
+                k if k.contains("cost") => "1.0",
+                k if k.ends_with("_path") || k.ends_with("_file") || k == "jwt_secret" || k.ends_with("_url") => {
+                    "\"x\""
+                }
+                "method" => "\"trust\"",
+                "password_hash_algorithm" => "\"argon2\"",
+                "node_id" | "client_id" => "\"x\"",
+                _ => "true",
+            };
+            let (_, warnings) = Config::load_report(&format!("[{section}]\n{key} = {value}\n")).unwrap();
+            assert_eq!(warnings.len(), 1, "{path}: {warnings:#?}");
+            assert_eq!(
+                warnings[0].kind,
+                ConfigWarningKind::NoEffect,
+                "{path} is not a known key"
+            );
+        }
+    }
+
+    #[test]
+    fn the_server_skill_sample_loads_strictly() {
+        let skill = include_str!("../.claude/skills/heliosdb-nano-server/SKILL.md");
+        let from = skill.find("## TOML configuration sections").unwrap();
+        let block = skill[from..]
+            .split("```toml\n")
+            .nth(1)
+            .unwrap()
+            .split("```")
+            .next()
+            .unwrap();
+        Config::from_toml_str_with(block, true).unwrap();
+    }
+
+    #[test]
+    fn a_removed_replication_key_is_still_a_hard_error() {
+        assert!(Config::load_report("[replication]\nobserver_hosts = ['o:1']").is_err());
+    }
+
+    #[test]
+    fn authentication_debug_redacts_the_jwt_secret() {
+        let config = Config::from_toml_str("[authentication]\njwt_secret = \"TOP-SECRET-VALUE\"\n").unwrap();
+        let printed = format!("{:?} {:#?}", config.authentication, config);
+        assert!(!printed.contains("TOP-SECRET-VALUE"), "{printed}");
+        assert!(printed.contains("jwt_secret"));
+    }
 
     #[test]
     fn replication_defaults_preserve_standalone_startup() {
@@ -3495,6 +3826,10 @@ redirect_uri = "http://localhost:8080/auth/v1/callback"
         let content = include_str!("../config.example.toml");
         let config = Config::from_toml_str(content).expect("config.example.toml must parse");
         config.validate().expect("config.example.toml must validate");
+        // ...with nothing the loader would warn about, strictly.
+        let (_, warnings) = Config::load_report(content).expect("config.example.toml must load");
+        assert!(warnings.is_empty(), "config.example.toml warns: {warnings:#?}");
+        Config::from_toml_str_with(content, true).expect("config.example.toml must load strictly");
         // The example documents the safe profile semantics explicitly.
         assert_eq!(config.storage.wal_sync_mode, WalSyncModeConfig::Sync);
     }

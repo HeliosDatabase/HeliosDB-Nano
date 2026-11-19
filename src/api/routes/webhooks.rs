@@ -5,12 +5,24 @@
 //!
 //! ## Endpoints
 //!
-//! - `POST /api/webhooks/github` - GitHub webhook
-//! - `POST /api/webhooks/gitlab` - GitLab webhook
-//! - `POST /api/webhooks/generic` - Provider-agnostic webhook
+//! - `POST /v1/webhooks/github` - GitHub webhook
+//! - `POST /v1/webhooks/gitlab` - GitLab webhook
+//! - `POST /v1/webhooks/generic` - Provider-agnostic webhook
+//!
+//! ## Authentication
+//!
+//! The secrets come from the environment once, when the router is built
+//! (`HELIOS_GITHUB_WEBHOOK_SECRET`, `HELIOS_GITLAB_WEBHOOK_TOKEN`,
+//! `HELIOS_WEBHOOK_SECRET`; an empty value counts as unset). When a provider's
+//! secret is set, a request without a valid signature or token is refused with
+//! 401 before anything is parsed or any branch is touched. With no secret set
+//! the endpoint accepts unsigned requests (as before) and says so in the log
+//! once; the outer HTTP policy still applies.
+
+use std::sync::Arc;
 
 use axum::{
-    extract::{Json, State},
+    extract::{Extension, Json, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::post,
@@ -20,7 +32,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::server::AppState;
 use crate::git_integration::webhooks::{
-    GitProvider, StorageWebhookHandler, WebhookConfig, WebhookEvent, WebhookEventType, WebhookHandler, WebhookResult,
+    ct_eq_secret, GitProvider, StorageWebhookHandler, WebhookConfig, WebhookEvent, WebhookEventType, WebhookHandler,
+    WebhookResult,
 };
 
 /// Webhook response
@@ -61,13 +74,29 @@ impl WebhookError {
     }
 }
 
-/// Create webhook routes
+/// Create webhook routes. The secrets are read from the environment here,
+/// once, not on every request.
 pub fn routes() -> Router<AppState> {
+    routes_with_config(WebhookConfig::from_env())
+}
+
+/// Create webhook routes with an explicit configuration.
+pub fn routes_with_config(config: WebhookConfig) -> Router<AppState> {
+    for (name, secret, variable) in [
+        ("github", &config.github_secret, "HELIOS_GITHUB_WEBHOOK_SECRET"),
+        ("gitlab", &config.gitlab_token, "HELIOS_GITLAB_WEBHOOK_TOKEN"),
+        ("generic", &config.generic_secret, "HELIOS_WEBHOOK_SECRET"),
+    ] {
+        if secret.is_none() {
+            tracing::warn!("webhook endpoint /v1/webhooks/{name} accepts unsigned requests: {variable} is not set");
+        }
+    }
     Router::new()
         .route("/github", post(handle_github_webhook))
         .route("/gitlab", post(handle_gitlab_webhook))
         .route("/generic", post(handle_generic_webhook))
         .route("/health", axum::routing::get(health_check))
+        .layer(Extension(Arc::new(config)))
 }
 
 /// Health check for webhook endpoints
@@ -82,9 +111,14 @@ async fn health_check() -> impl IntoResponse {
 ///
 /// Expects:
 /// - Header `X-GitHub-Event`: Event type (e.g., "pull_request")
-/// - Header `X-Hub-Signature-256`: HMAC signature (optional, for validation)
+/// - Header `X-Hub-Signature-256`: HMAC signature (required when a secret is configured)
 /// - Body: JSON payload
-async fn handle_github_webhook(State(state): State<AppState>, headers: HeaderMap, body: String) -> impl IntoResponse {
+async fn handle_github_webhook(
+    State(state): State<AppState>,
+    Extension(config): Extension<Arc<WebhookConfig>>,
+    headers: HeaderMap,
+    body: String,
+) -> impl IntoResponse {
     // Get event type header
     let event_type = match headers.get("X-GitHub-Event") {
         Some(v) => v.to_str().unwrap_or("unknown"),
@@ -97,12 +131,18 @@ async fn handle_github_webhook(State(state): State<AppState>, headers: HeaderMap
         }
     };
 
-    // Get webhook config from state (if available)
-    let config = get_webhook_config(&state);
-    let handler = WebhookHandler::new(config);
+    let handler = WebhookHandler::new((*config).clone());
 
-    // Validate signature if configured
-    if let Some(signature) = headers.get("X-Hub-Signature-256") {
+    // With a secret configured the signature is mandatory: a missing header
+    // is refused, not skipped.
+    if config.github_secret.is_some() {
+        let Some(signature) = headers.get("X-Hub-Signature-256") else {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(WebhookError::new("Missing webhook signature", "MISSING_SIGNATURE")),
+            )
+                .into_response();
+        };
         let sig_str = signature.to_str().unwrap_or("");
         match handler.validate_github_signature(body.as_bytes(), sig_str) {
             Ok(false) => {
@@ -142,7 +182,7 @@ async fn handle_github_webhook(State(state): State<AppState>, headers: HeaderMap
     };
 
     // Handle the event - prefer storage-aware handler if available
-    let result = handle_event_with_storage(&state, &event);
+    let result = handle_event_with_storage(&state, &config, &event);
     match result {
         Ok(result) => {
             let status = if result.success {
@@ -164,15 +204,25 @@ async fn handle_github_webhook(State(state): State<AppState>, headers: HeaderMap
 ///
 /// Expects:
 /// - Header `X-Gitlab-Event`: Event type
-/// - Header `X-Gitlab-Token`: Secret token (optional, for validation)
+/// - Header `X-Gitlab-Token`: Secret token (required when a token is configured)
 /// - Body: JSON payload
-async fn handle_gitlab_webhook(State(state): State<AppState>, headers: HeaderMap, body: String) -> impl IntoResponse {
-    // Get webhook config from state
-    let config = get_webhook_config(&state);
-    let handler = WebhookHandler::new(config);
+async fn handle_gitlab_webhook(
+    State(state): State<AppState>,
+    Extension(config): Extension<Arc<WebhookConfig>>,
+    headers: HeaderMap,
+    body: String,
+) -> impl IntoResponse {
+    let handler = WebhookHandler::new((*config).clone());
 
-    // Validate token if provided
-    if let Some(token) = headers.get("X-Gitlab-Token") {
+    // With a token configured it is mandatory: a missing header is refused.
+    if config.gitlab_token.is_some() {
+        let Some(token) = headers.get("X-Gitlab-Token") else {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(WebhookError::new("Missing GitLab token", "MISSING_TOKEN")),
+            )
+                .into_response();
+        };
         let token_str = token.to_str().unwrap_or("");
         match handler.validate_gitlab_token(token_str) {
             Ok(false) => {
@@ -212,7 +262,7 @@ async fn handle_gitlab_webhook(State(state): State<AppState>, headers: HeaderMap
     };
 
     // Handle the event - prefer storage-aware handler if available
-    let result = handle_event_with_storage(&state, &event);
+    let result = handle_event_with_storage(&state, &config, &event);
     match result {
         Ok(result) => {
             let status = if result.success {
@@ -264,24 +314,26 @@ fn default_provider() -> String {
 /// This allows integration with any CI/CD system or custom tooling.
 async fn handle_generic_webhook(
     State(state): State<AppState>,
+    Extension(config): Extension<Arc<WebhookConfig>>,
     headers: HeaderMap,
     Json(payload): Json<GenericWebhookPayload>,
 ) -> impl IntoResponse {
-    // Get webhook config from state
-    let config = get_webhook_config(&state);
-
-    // Validate secret if provided in Authorization header
-    if let Some(auth) = headers.get("Authorization") {
-        if let Some(ref secret) = config.generic_secret {
-            let auth_str = auth.to_str().unwrap_or("");
-            let expected = format!("Bearer {}", secret);
-            if auth_str != expected {
-                return (
-                    StatusCode::UNAUTHORIZED,
-                    Json(WebhookError::new("Invalid authorization", "INVALID_AUTH")),
-                )
-                    .into_response();
-            }
+    // With a secret configured `Authorization: Bearer <secret>` is mandatory.
+    if let Some(ref secret) = config.generic_secret {
+        let Some(auth) = headers.get("Authorization") else {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(WebhookError::new("Missing authorization", "MISSING_AUTH")),
+            )
+                .into_response();
+        };
+        let presented = auth.to_str().unwrap_or("").strip_prefix("Bearer ");
+        if !presented.is_some_and(|token| ct_eq_secret(token, secret)) {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(WebhookError::new("Invalid authorization", "INVALID_AUTH")),
+            )
+                .into_response();
         }
     }
 
@@ -333,7 +385,7 @@ async fn handle_generic_webhook(
     };
 
     // Handle the event - prefer storage-aware handler if available
-    let result = handle_event_with_storage(&state, &event);
+    let result = handle_event_with_storage(&state, &config, &event);
     match result {
         Ok(result) => {
             let status = if result.success {
@@ -356,8 +408,12 @@ async fn handle_generic_webhook(
 /// If the database has branching enabled, uses StorageWebhookHandler
 /// to actually create/merge/drop branches. Otherwise falls back to
 /// the basic WebhookHandler that just logs events.
-fn handle_event_with_storage(state: &AppState, event: &WebhookEvent) -> Result<WebhookResult, crate::Error> {
-    let config = get_webhook_config(state);
+fn handle_event_with_storage(
+    state: &AppState,
+    config: &WebhookConfig,
+    event: &WebhookEvent,
+) -> Result<WebhookResult, crate::Error> {
+    let config = config.clone();
 
     // Try to use storage-aware handler if branching is enabled
     if let Some(branch_manager) = state.db.storage.branch_manager() {
@@ -370,22 +426,6 @@ fn handle_event_with_storage(state: &AppState, event: &WebhookEvent) -> Result<W
         // Fall back to basic handler (just logging)
         let basic_handler = WebhookHandler::new(config);
         basic_handler.handle(event)
-    }
-}
-
-/// Get webhook configuration from app state
-///
-/// Reads webhook secrets from environment variables:
-/// - HELIOS_GITHUB_WEBHOOK_SECRET: GitHub webhook signature secret
-/// - HELIOS_GITLAB_WEBHOOK_TOKEN: GitLab webhook token
-/// - HELIOS_WEBHOOK_SECRET: Generic webhook secret
-fn get_webhook_config(_state: &AppState) -> WebhookConfig {
-    WebhookConfig {
-        github_secret: std::env::var("HELIOS_GITHUB_WEBHOOK_SECRET").ok(),
-        gitlab_token: std::env::var("HELIOS_GITLAB_WEBHOOK_TOKEN").ok(),
-        generic_secret: std::env::var("HELIOS_WEBHOOK_SECRET").ok(),
-        allowed_ips: Vec::new(),
-        rate_limit: 60, // requests per minute
     }
 }
 

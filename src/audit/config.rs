@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 /// Audit logging configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AuditConfig {
     /// Enable audit logging
     pub enabled: bool,

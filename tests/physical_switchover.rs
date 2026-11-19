@@ -855,7 +855,16 @@ struct StopDaemon(PathBuf);
 impl Drop for StopDaemon {
     fn drop(&mut self) {
         if self.0.exists() {
-            let _ = cli(&["stop".to_string(), "--pid-file".to_string(), text(&self.0)]);
+            // `stop` now waits for the shutdown; bound the teardown, and kill a
+            // daemon that outlasts it (a demotion can run for minutes).
+            let _ = cli(&[
+                "stop".to_string(),
+                "--pid-file".to_string(),
+                text(&self.0),
+                "--timeout".to_string(),
+                "20".to_string(),
+                "--force".to_string(),
+            ]);
         }
     }
 }

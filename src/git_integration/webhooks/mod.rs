@@ -219,6 +219,40 @@ pub struct WebhookConfig {
     pub rate_limit: u32,
 }
 
+impl WebhookConfig {
+    /// The secrets as the environment names them. An empty value is unset: an
+    /// empty HMAC key would otherwise be accepted as a secret.
+    pub fn from_env() -> Self {
+        Self::from_values(
+            std::env::var("HELIOS_GITHUB_WEBHOOK_SECRET").ok(),
+            std::env::var("HELIOS_GITLAB_WEBHOOK_TOKEN").ok(),
+            std::env::var("HELIOS_WEBHOOK_SECRET").ok(),
+        )
+    }
+
+    /// Build from raw values; empty strings count as unset.
+    pub fn from_values(github: Option<String>, gitlab: Option<String>, generic: Option<String>) -> Self {
+        let non_empty = |value: Option<String>| value.filter(|v| !v.is_empty());
+        Self {
+            github_secret: non_empty(github),
+            gitlab_token: non_empty(gitlab),
+            generic_secret: non_empty(generic),
+            ..Self::default()
+        }
+    }
+}
+
+/// Compare two secrets without leaking, through timing, how much of them
+/// matches or how long they are: both sides are hashed with SHA-256 first, so
+/// the comparison always runs over two 32-byte digests.
+pub fn ct_eq_secret(a: &str, b: &str) -> bool {
+    use sha2::{Digest, Sha256};
+    use subtle::ConstantTimeEq;
+    let left = Sha256::digest(a.as_bytes());
+    let right = Sha256::digest(b.as_bytes());
+    left.as_slice().ct_eq(right.as_slice()).into()
+}
+
 impl Default for WebhookConfig {
     fn default() -> Self {
         Self {
@@ -409,7 +443,7 @@ impl WebhookHandler {
         let Some(ref expected) = self.config.gitlab_token else {
             return Ok(true);
         };
-        Ok(token == expected)
+        Ok(ct_eq_secret(token, expected))
     }
 
     /// Handle a webhook event

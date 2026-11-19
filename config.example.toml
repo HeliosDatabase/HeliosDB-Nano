@@ -3,6 +3,15 @@
 # This is a comprehensive example configuration file showing all available
 # options for HeliosDB Nano. Copy this file to config.toml and customize
 # as needed for your deployment.
+#
+# How the loader reports a file: a section or key nothing reads (a typo) and a
+# key that parses but that no code acts on are each logged as a WARNING that
+# names them; the server still starts. Set `strict_config = true` (top-level,
+# before any [section]) or pass `start --strict-config` to make any such
+# warning refuse the start. `heliosdb-nano config check --config FILE` runs the
+# same check without starting a server. This example loads with no warnings.
+#
+# strict_config = false
 
 # ============================================================================
 # PROFILE (top-level key — must appear before any [section])
@@ -325,15 +334,19 @@ Environment = "HELIOSDB_ENCRYPTION_KEY"
 # SERVER CONFIGURATION
 # ============================================================================
 [server]
-# Listen address (use "0.0.0.0" to accept connections from any IP)
+# Listen address (use "0.0.0.0" to accept connections from any IP). `start`
+# uses this when --listen is not given (the flag wins; the default is
+# 127.0.0.1). A non-loopback address is refused under trust authentication
+# unless --allow-insecure-trust is passed.
 listen_addr = "127.0.0.1"
 
-# PostgreSQL protocol port
+# PostgreSQL protocol port. `start` uses this when --port is not given (the
+# flag wins; the default is 5432).
 port = 5432
 
-# Oracle TNS protocol port. Currently unused/reserved: no Oracle listener is
-# started by `heliosdb-nano start`, and this value is never read at startup.
-oracle_port = 1521
+# Oracle TNS protocol port. NO EFFECT: no Oracle listener is started by
+# `heliosdb-nano start`, and this value is never read.
+# oracle_port = 1521
 
 # Maximum concurrent connections PER LISTENER (the PostgreSQL TCP, MySQL TCP
 # and MySQL Unix-socket listeners each get their own limit of this size).
@@ -413,38 +426,31 @@ copy_max_buffered_rows = 10000000
 # disable (unbounded — not recommended on memory-constrained hosts).
 copy_max_record_bytes = 1073741824
 
-# Enable TLS/SSL
-tls_enabled = false
-
-# TLS certificate path (required if tls_enabled = true)
+# TLS/SSL for the PostgreSQL listener is set with the `start` flags --tls-cert
+# and --tls-key. The three keys below have NO EFFECT on that listener (they
+# are read only as the fallback certificate pair of the replication port), so
+# `config check` reports them when a file sets them.
+# tls_enabled = false
 # tls_cert_path = "/path/to/cert.pem"
-
-# TLS private key path (required if tls_enabled = true)
 # tls_key_path = "/path/to/key.pem"
 
 # Offer the X25519MLKEM768 hybrid post-quantum key-exchange group
 # (draft-ietf-tls-ecdhe-mlkem — the same "quantum-ready TLS" group AWS,
 # MySQL 26.7 and CockroachDB already ship) alongside classical groups on the
 # PostgreSQL TLS listener. A classical-only client still connects fine — this
-# only adds an option, never removes one. Only meaningful with tls_enabled.
-tls_post_quantum = true
+# only adds an option, never removes one. NO EFFECT as a key: the
+# --tls-post-quantum flag is authoritative (default true).
+# tls_post_quantum = true
 
 # Enable TLS/SSL for the MySQL wire-protocol listener. Unlike PostgreSQL,
 # TLS is OFFERED (via the CLIENT_SSL capability bit), not required —
 # plaintext MySQL clients still connect. Mirrors tls_enabled/tls_cert_path/
-# tls_key_path above; the CLI flags (--mysql-tls-cert / --mysql-tls-key /
-# --mysql-tls-post-quantum) are authoritative.
-mysql_tls_enabled = false
-
-# MySQL TLS certificate path (required if mysql_tls_enabled = true)
+# tls_key_path above. NO EFFECT as keys: only the CLI flags (--mysql-tls-cert /
+# --mysql-tls-key / --mysql-tls-post-quantum) configure the MySQL listener.
+# mysql_tls_enabled = false
 # mysql_tls_cert_path = "/path/to/cert.pem"
-
-# MySQL TLS private key path (required if mysql_tls_enabled = true)
 # mysql_tls_key_path = "/path/to/key.pem"
-
-# Offer the X25519MLKEM768 hybrid post-quantum key-exchange group on the
-# MySQL TLS listener, mirroring tls_post_quantum above.
-mysql_tls_post_quantum = true
+# mysql_tls_post_quantum = true
 
 # ============================================================================
 # REPLICATION CONFIGURATION (physical standbys, one port: NPHYS003)
@@ -630,18 +636,11 @@ logical_wal_retention_entries = 0
 # PERFORMANCE CONFIGURATION
 # ============================================================================
 [performance]
-# Number of worker threads (default: number of CPU cores)
-# Set to 0 to use all available cores
-worker_threads = 0
-
-# Query timeout in seconds (legacy setting, use storage.query_timeout_ms instead)
-query_timeout_secs = 300
-
-# Enable SIMD optimizations for vector operations
-simd_enabled = true
-
-# Enable parallel query execution
-parallel_query = true
+# NO EFFECT (nothing reads them; `config check` reports them when set):
+# worker_threads = 0        # worker threads
+# query_timeout_secs = 300  # use storage.query_timeout_ms instead
+# simd_enabled = true
+# parallel_query = true
 
 # INSERT … SELECT inside a transaction stages its rows through the transactional
 # insert path in chunks of this many rows (so ROLLBACK removes them). Bounds the
@@ -746,49 +745,33 @@ capture_custom_fields = false
 # ============================================================================
 # OPTIMIZER CONFIGURATION (v2.1)
 # ============================================================================
-[optimizer]
-# Enable query optimizer
-enabled = true
-
-# Enable/disable specific scan and join methods
-enable_seqscan = true
-enable_indexscan = true
-enable_hashjoin = true
-enable_mergejoin = true
-enable_nestloop = true
-
-# Cost model parameters (PostgreSQL-compatible)
-# Adjust these to tune optimizer behavior for your workload
-seq_page_cost = 1.0          # Cost of sequential page fetch
-random_page_cost = 4.0       # Cost of random page fetch (SSD: 1.1, HDD: 4.0)
-cpu_tuple_cost = 0.01        # Cost of processing one tuple
-cpu_index_tuple_cost = 0.005 # Cost of processing one index tuple
+# NO EFFECT: the optimizer builds its own defaults and does not read this
+# section; `config check` reports every key below when a file sets it.
+# [optimizer]
+# enabled = true
+# enable_seqscan = true
+# enable_indexscan = true
+# enable_hashjoin = true
+# enable_mergejoin = true
+# enable_nestloop = true
+# seq_page_cost = 1.0
+# random_page_cost = 4.0
+# cpu_tuple_cost = 0.01
+# cpu_index_tuple_cost = 0.005
 
 # ============================================================================
 # AUTHENTICATION CONFIGURATION (v2.1)
 # ============================================================================
 [authentication]
-# Enable authentication
-enabled = false
-
-# Authentication method:
-# - "trust": No authentication (dev mode only!)
-# - "password": Password-based authentication
-# - "jwt": JWT token authentication
-# - "ldap": LDAP authentication
-method = "trust"
-
-# JWT configuration (only used if method = "jwt")
-# jwt_secret = "your-secret-key-here-change-in-production"
-jwt_expiration_secs = 86400  # 24 hours
-
-# Password hash algorithm:
-# - "argon2": Argon2 (recommended, most secure)
-# - "bcrypt": BCrypt (good balance)
-# - "pbkdf2": PBKDF2 (widely supported)
-password_hash_algorithm = "argon2"
-
-# Users file path (for file-based authentication)
+# `heliosdb-nano start` takes its authentication method ONLY from the --auth
+# flag (trust, password, md5, scram-sha-256; a password from --password-file or
+# HELIOSDB_PASSWORD_FILE). The keys below parse but NO CODE READS THEM, so
+# `config check` reports them when a file sets them:
+# enabled = false
+# method = "trust"
+# jwt_secret = "..."
+# jwt_expiration_secs = 86400
+# password_hash_algorithm = "argon2"
 # users_file = "/etc/heliosdb/users.json"
 
 # ----------------------------------------------------------------------------
@@ -973,8 +956,6 @@ pq_bits = 8
 # wal_enabled = false
 # [server]
 # listen_addr = "127.0.0.1"
-# [authentication]
-# method = "trust"
 
 # --- Production Configuration ---
 # Uncomment and modify for production:
@@ -983,25 +964,15 @@ pq_bits = 8
 # query_timeout_ms = 30000
 # [server]
 # listen_addr = "0.0.0.0"
-# tls_enabled = true
-# tls_cert_path = "/etc/heliosdb/ssl/cert.pem"
-# tls_key_path = "/etc/heliosdb/ssl/key.pem"
-# [authentication]
-# enabled = true
-# method = "jwt"
-# jwt_secret = "CHANGE-THIS-SECRET-IN-PRODUCTION"
+# # also pass on the command line: --auth scram-sha-256 --password-file ...
+# # and --tls-cert/--tls-key (none of those are read from this file)
 # [encryption]
 # enabled = true
 # [audit]
 # enabled = true
-# log_path = "/var/log/heliosdb/audit.log"
 
 # --- High-Performance Configuration (SSD) ---
 # Uncomment for SSD-optimized settings:
-# [optimizer]
-# random_page_cost = 1.1  # SSDs have low random access cost
-# [performance]
-# worker_threads = 0      # Use all cores
 # [storage]
 # cache_size = 2147483648 # 2GB cache
 

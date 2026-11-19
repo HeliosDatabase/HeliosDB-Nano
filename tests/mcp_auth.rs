@@ -152,6 +152,23 @@ async fn bearer_token_wrong_value_returns_401() {
 }
 
 #[test]
+fn bearer_token_check_rejects_a_prefix_and_a_longer_token() {
+    let auth = McpAuth::BearerToken(Arc::from("td8-secret"));
+    let scope = heliosdb_nano::mcp::auth::Scope::Read;
+    assert!(auth.check(Some("Bearer td8-secret"), scope).is_ok());
+    for presented in [
+        "Bearer td8-secre",
+        "Bearer td8-secrets",
+        "Bearer ",
+        "td8-secret",
+        "Bearer td8-secreT",
+    ] {
+        assert!(auth.check(Some(presented), scope).is_err(), "{presented}");
+    }
+    assert!(auth.check(None, scope).is_err());
+}
+
+#[test]
 fn bind_safety_loopback_with_disabled_ok() {
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
     assert!(bind_safety_check(addr, &McpAuth::Disabled).is_ok());

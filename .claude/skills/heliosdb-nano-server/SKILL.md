@@ -20,8 +20,9 @@ allowed-tools: Bash(heliosdb-nano *), Bash(psql *), Bash(systemctl *), Read
 |------|---------|-----------|
 | start (foreground) | CLI | `heliosdb-nano start --data-dir ./mydata` |
 | start (daemon) | CLI | `heliosdb-nano start --data-dir ./mydata --daemon --pid-file ./heliosdb.pid` |
-| stop | CLI | `heliosdb-nano stop --pid-file ./heliosdb.pid` |
-| status | CLI | `heliosdb-nano status --pid-file ./heliosdb.pid` |
+| stop | CLI | `heliosdb-nano stop --pid-file ./heliosdb.pid [--data-dir DIR] [--timeout 330] [--no-wait] [--force] [--json]` (waits for the shutdown; signals only a verified server; exit 0 stopped, 1 failed or still shutting down, 3 not running, 4 stale PID file; a container needs a stop grace period above 300 s) |
+| status | CLI | `heliosdb-nano status --pid-file ./heliosdb.pid [--data-dir DIR] [--json]` (exit 0 running, 3 not running, 4 stale PID file) |
+| check a config file | CLI | `heliosdb-nano config check --config nano.toml [--strict] [--json]` (exit 0 clean, 1 does not load or validate, 2 warnings under `--strict`; secrets redacted; `start --strict-config` refuses the same warnings) |
 | TLS | CLI | `--tls-cert ./certs/srv.crt --tls-key ./certs/srv.key` |
 | auth | CLI | `--auth scram-sha-256 --password 'admin-secret'` |
 | HA primary | CLI | `--replication-role primary --replication-port 5433 --replication-token-file ./replication.token --sync-mode semi-sync` |
@@ -51,7 +52,7 @@ allowed-tools: Bash(heliosdb-nano *), Bash(psql *), Bash(systemctl *), Read
 `config.example.toml` (in repo root) is the template. Key sections used in this skill:
 
 ```toml
-[server]
+[server]                     # --listen / --port win over these two keys
 listen_addr     = "127.0.0.1"
 port            = 5432
 max_connections = 200
@@ -63,25 +64,17 @@ wal_enabled           = true
 compression           = "zstd"
 
 [encryption]
-key_source = "file"          # or "env"
-cipher     = "aes-256-gcm"
-zke_mode   = false           # zero-knowledge encryption
-
-[performance]
-cache_size_mb     = 512
-wal_buffer_size   = 65536
+enabled = false              # key source and algorithm: see config.example.toml
 
 [session]
 timeout_secs            = 3600
 max_sessions_per_user   = 50
 
 [locks]
-deadlock_detection_enabled = true
 timeout_ms                 = 5000
 
 [audit]
 enabled    = true
-log_path   = "./logs/audit.jsonl"
 
 [replication]                # HA replication (docs/guides/physical-standby.md)
 role                = "primary"   # standalone | primary | standby
@@ -333,14 +326,18 @@ After=network.target
 
 [Service]
 User=heliosdb
+# Foreground unit: systemd supervises the server itself (no --daemon, no
+# PIDFile). The password comes from a file, never from the command line.
 ExecStart=/usr/local/bin/heliosdb-nano start \
     --data-dir /var/lib/heliosdb \
     --port 5432 \
     --listen 0.0.0.0 \
-    --auth scram-sha-256 --password ${HELIOSDB_ADMIN_PASSWORD} \
-    --daemon --pid-file /var/run/heliosdb.pid
-ExecStop=/usr/local/bin/heliosdb-nano stop --pid-file /var/run/heliosdb.pid
-PIDFile=/var/run/heliosdb.pid
+    --auth scram-sha-256 --password-file /etc/heliosdb/admin.password
+# SIGTERM is the clean shutdown. A switchover demotion may take up to 300 s and
+# a --dump-on-shutdown write as long as the data needs: do not let systemd's
+# default 90 s stop timeout kill it.
+KillSignal=SIGTERM
+TimeoutStopSec=330
 Restart=on-failure
 
 [Install]

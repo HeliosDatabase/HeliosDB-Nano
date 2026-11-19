@@ -102,7 +102,7 @@ impl McpAuth {
                 let token = header_value
                     .and_then(|v| v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")))
                     .ok_or(AuthError::MissingToken)?;
-                if token == expected.as_ref() {
+                if crate::git_integration::webhooks::ct_eq_secret(token, expected.as_ref()) {
                     Ok(None)
                 } else {
                     Err(AuthError::InvalidToken(Error::config(

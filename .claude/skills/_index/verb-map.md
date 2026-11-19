@@ -13,8 +13,9 @@ Source of truth: `src/main.rs`, `src/repl/commands.rs`, `src/lib.rs`, `src/mcp/t
 | Subcommand | Purpose | Skill |
 |------------|---------|-------|
 | `start` | Launch server (PG/MySQL wires + HTTP health) | `heliosdb-nano-server` |
-| `stop` | Graceful shutdown via PID file | `heliosdb-nano-server` |
-| `status [--pid-file f] [--data-dir d]` | Check daemon status; with `--data-dir` (spec P5.1) also the directory's replication role, epoch, and a fence or interrupted promotion it carries (read-only, the node may run) | `heliosdb-nano-server` |
+| `stop [--pid-file f] [--data-dir d] [--timeout SECS] [--no-wait] [--force] [--json]` | Signal a verified server and wait for its clean shutdown (default 330 s; left alone after the timeout unless `--force`); exit 0 stopped, 1 failed/still shutting down, 3 not running, 4 stale PID file | `heliosdb-nano-server` |
+| `config check [--config f] [--strict] [--json]` | Validate a config file without starting a server: unknown sections and keys, keys no code reads, validation errors; prints the configuration with secrets redacted; exit 0 / 1 error / 2 warnings under `--strict` | `heliosdb-nano-server` |
+| `status [--pid-file f] [--data-dir d] [--json]` | Check daemon status (exit 0 running, 3 not running, 4 stale PID file); with `--data-dir` (spec P5.1) also the directory's replication role, epoch, and a fence or interrupted promotion it carries (read-only, the node may run) | `heliosdb-nano-server` |
 | `init` | Create empty data directory | `heliosdb-nano-install` |
 | `repl` | Interactive shell (embedded mode) | `heliosdb-nano-connect` |
 | `dump` | Backup to file (zstd/gzip/brotli/none) | `heliosdb-nano-backup` |

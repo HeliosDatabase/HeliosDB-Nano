@@ -503,6 +503,88 @@ fn daemon_readiness_timeout(role: &str, replication_startup_secs: u64) -> std::t
     })
 }
 
+/// Where a resolved `start` setting came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ValueSource {
+    Flag,
+    ConfigFile,
+    Default,
+}
+
+impl ValueSource {
+    fn label(self, flag: &str) -> String {
+        match self {
+            ValueSource::Flag => flag.to_string(),
+            ValueSource::ConfigFile => "config file".to_string(),
+            ValueSource::Default => "default".to_string(),
+        }
+    }
+}
+
+/// The sources of the resolved listen address and port, for the banner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ListenSources {
+    listen: ValueSource,
+    port: ValueSource,
+}
+
+/// `start`'s PostgreSQL listen address and port after precedence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ListenChoice {
+    listen: String,
+    port: u16,
+    listen_source: ValueSource,
+    port_source: ValueSource,
+}
+
+impl ListenChoice {
+    fn sources(&self) -> ListenSources {
+        ListenSources {
+            listen: self.listen_source,
+            port: self.port_source,
+        }
+    }
+}
+
+const DEFAULT_PG_PORT: u16 = 5432;
+const DEFAULT_LISTEN_ADDRESS: &str = "127.0.0.1";
+
+/// Resolve `--listen` / `--port` > `[server] listen_addr` / `port` > the
+/// defaults. A key counts as set only when the file WRITES it: a parsed
+/// struct cannot tell a written default from an absent key, so the raw
+/// document is asked.
+fn resolve_listen(
+    cli_listen: Option<String>,
+    cli_port: Option<u16>,
+    file: Option<&Config>,
+    file_doc: Option<&toml::Value>,
+) -> ListenChoice {
+    let file_sets = |key: &str| {
+        file_doc
+            .and_then(|doc| doc.get("server"))
+            .and_then(|server| server.get(key))
+            .is_some()
+    };
+    let (listen, listen_source) = match (cli_listen, file) {
+        (Some(value), _) => (value, ValueSource::Flag),
+        (None, Some(config)) if file_sets("listen_addr") => {
+            (config.server.listen_addr.clone(), ValueSource::ConfigFile)
+        }
+        (None, _) => (DEFAULT_LISTEN_ADDRESS.to_string(), ValueSource::Default),
+    };
+    let (port, port_source) = match (cli_port, file) {
+        (Some(value), _) => (value, ValueSource::Flag),
+        (None, Some(config)) if file_sets("port") => (config.server.port, ValueSource::ConfigFile),
+        (None, _) => (DEFAULT_PG_PORT, ValueSource::Default),
+    };
+    ListenChoice {
+        listen,
+        port,
+        listen_source,
+        port_source,
+    }
+}
+
 /// Literal addresses only, with explicit port taking precedence over socket suffix.
 fn parse_listen_address(value: &str, explicit_port: Option<u16>, default_port: u16) -> Result<std::net::SocketAddr> {
     use std::net::{IpAddr, SocketAddr};
@@ -1186,6 +1268,27 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+enum ConfigCommand {
+    /// Load and validate a config file; print what the loader found and the
+    /// configuration it parsed, secrets redacted
+    ///
+    /// Exit status: 0 clean (or only warnings), 1 the file does not load or
+    /// does not validate, 2 warnings under --strict.
+    Check {
+        /// Config file (default: the built-in defaults)
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+        /// Treat any warning (unknown section or key, key with no effect) as
+        /// a failure: exit 2
+        #[arg(long)]
+        strict: bool,
+        /// Print one JSON object: ok, file, errors, warnings, effective
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum Commands {
     /// Install/follow a closed physical receiver; never exposes SQL or serving readiness.
@@ -1243,17 +1346,26 @@ enum Commands {
         #[arg(short, long)]
         memory: bool,
 
-        /// Port to listen on
-        #[arg(short, long, default_value = "5432")]
-        port: u16,
+        /// Port to listen on. Precedence: this flag, then `[server] port` in
+        /// --config, then 5432. (No clap default: an absent flag must be
+        /// distinguishable from an explicit one.)
+        #[arg(short, long)]
+        port: Option<u16>,
 
-        /// Listen address
-        #[arg(long, default_value = "127.0.0.1")]
-        listen: String,
+        /// Listen address. Precedence: this flag, then `[server] listen_addr`
+        /// in --config, then 127.0.0.1.
+        #[arg(long)]
+        listen: Option<String>,
 
         /// Config file
         #[arg(short, long)]
         config: Option<PathBuf>,
+
+        /// Refuse a config file with unknown keys, unknown sections or keys
+        /// that have no effect, instead of warning (same as `strict_config =
+        /// true` in the file).
+        #[arg(long)]
+        strict_config: bool,
 
         /// Run server in background (daemon mode)
         #[arg(long)]
@@ -1532,18 +1644,54 @@ enum Commands {
         max_connections_warn_percent: Option<u8>,
     },
 
-    /// Stop a running server
+    /// Stop a running server: signal it, then wait for its clean shutdown
+    ///
+    /// Only a process verified to be the server is signalled; a PID file
+    /// naming anything else is reported and removed. A server that is still
+    /// shutting down when --timeout ends is left alone unless --force.
+    /// Exit status: 0 stopped, 1 failed or still shutting down, 3 not
+    /// running, 4 stale PID file (nothing was signalled).
     Stop {
         /// PID file location
         #[arg(long, default_value = "./heliosdb.pid")]
         pid_file: PathBuf,
+        /// The server's data directory. Names the process holding its LOCK,
+        /// which verifies the PID and stands in for a missing PID file.
+        #[arg(short, long, value_name = "DIR")]
+        data_dir: Option<PathBuf>,
+        /// Seconds to wait for the shutdown to finish. The default exceeds
+        /// the 300 s a switchover demotion may take on SIGTERM.
+        #[arg(long, value_name = "SECS", default_value_t = 330)]
+        timeout: u64,
+        /// Send SIGTERM and return without waiting.
+        #[arg(long)]
+        no_wait: bool,
+        /// After --timeout, send SIGKILL. A demotion or a shutdown dump cut
+        /// short this way must be finished with `recover`.
+        #[arg(long)]
+        force: bool,
+        /// Print the outcome as one JSON object.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Inspect configuration files without starting a server
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
     },
 
     /// Check server status
+    ///
+    /// Exit status: 0 running, 3 not running, 4 stale PID file (it names a
+    /// process that is not the server).
     Status {
         /// PID file location
         #[arg(long, default_value = "./heliosdb.pid")]
         pid_file: PathBuf,
+        /// Print the status as one JSON object.
+        #[arg(long)]
+        json: bool,
         /// Spec P5.1: also report the data directory's replication identity —
         /// its role, dataset history and epoch, and a fence or an interrupted
         /// promotion it carries (read-only; the node may be running).
@@ -1737,6 +1885,7 @@ async fn run(cli: Cli) -> Result<()> {
             port,
             listen,
             config,
+            strict_config,
             daemon,
             pid_file,
             dump_on_shutdown,
@@ -1850,10 +1999,29 @@ async fn run(cli: Cli) -> Result<()> {
 
             let resolved_data_dir = data_dir.unwrap_or_else(|| PathBuf::from("./heliosdb-data"));
 
+            // The config file is read ONCE, here, and handed down to
+            // `start_server`: every load warning prints once, and the
+            // listen address, port and replication settings are resolved from
+            // the same document.
+            let (file_config, file_doc) = match &config {
+                Some(path) => {
+                    let content = std::fs::read_to_string(path)?;
+                    let doc: toml::Value =
+                        toml::from_str(&content).map_err(|e| Error::config(format!("Failed to parse config: {e}")))?;
+                    (Some(Config::from_toml_str_with(&content, strict_config)?), Some(doc))
+                }
+                None => (None, None),
+            };
+            // Listen address and port: explicit flag > `[server]` key > default.
+            // Resolved values (not the raw flags) are forwarded to the daemon
+            // child and written into `db_config.server`.
+            let listen_choice = resolve_listen(listen, port, file_config.as_ref(), file_doc.as_ref());
+            let (port, listen) = (listen_choice.port, listen_choice.listen.clone());
+
             // Resolve replication once: explicit CLI values > TOML > defaults.
             // Forward the resolved values through daemon re-exec as well.
-            let mut replication = if let Some(path) = &config {
-                Config::from_file(path.clone())?.replication
+            let mut replication = if let Some(file) = &file_config {
+                file.replication.clone()
             } else {
                 heliosdb_nano::config::ReplicationConfig::default()
             };
@@ -2052,6 +2220,7 @@ async fn run(cli: Cli) -> Result<()> {
                     resolved_data_dir,
                     port,
                     listen,
+                    listen_choice.sources(),
                     config,
                     memory,
                     dump_on_shutdown,
@@ -2079,7 +2248,9 @@ async fn run(cli: Cli) -> Result<()> {
                     resolved_data_dir,
                     port,
                     listen,
+                    listen_choice.sources(),
                     config,
+                    file_config,
                     memory,
                     dump_on_shutdown,
                     tls_cert,
@@ -2121,11 +2292,41 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Promote(args) => run_promote(args).await,
         Commands::Standby(args) => run_standby_command(args).await,
         Commands::Archive(args) => run_archive_command(args),
-        Commands::Stop { ref pid_file } => stop_server(pid_file),
-        Commands::Status {
+        Commands::Stop {
             ref pid_file,
             ref data_dir,
-        } => check_server_status(pid_file, data_dir.as_deref()),
+            timeout,
+            no_wait,
+            force,
+            json,
+        } => {
+            let code = stop_server(&StopOptions {
+                pid_file: pid_file.clone(),
+                data_dir: data_dir.clone(),
+                timeout: std::time::Duration::from_secs(timeout),
+                no_wait,
+                force,
+                json,
+            })?;
+            exit_with(code);
+            Ok(())
+        }
+        Commands::Status {
+            ref pid_file,
+            json,
+            ref data_dir,
+        } => {
+            let code = check_server_status(pid_file, data_dir.as_deref(), json)?;
+            exit_with(code);
+            Ok(())
+        }
+        Commands::Config { ref command } => match command {
+            ConfigCommand::Check { config, strict, json } => {
+                let code = run_config_check(config.as_deref(), *strict, *json);
+                exit_with(code);
+                Ok(())
+            }
+        },
         Commands::Init { ref data_dir } => init_database(data_dir),
         Commands::Repl {
             data_dir,
@@ -2285,7 +2486,9 @@ async fn start_server(
     data_dir: PathBuf,
     port: u16,
     listen: String,
+    listen_sources: ListenSources,
     config_path: Option<PathBuf>,
+    file_config: Option<Config>,
     memory_mode: bool,
     dump_on_shutdown: bool,
     tls_cert: Option<PathBuf>,
@@ -2377,9 +2580,9 @@ async fn start_server(
     println!();
 
     // Load config
-    let mut db_config = if let Some(ref path) = config_path {
+    let mut db_config = if let (Some(path), Some(file)) = (config_path.as_ref(), file_config) {
         println!("[1/4] Loading configuration from {}...", path.display());
-        Config::from_file(path.clone())?
+        file
     } else {
         println!("[1/4] Using default configuration...");
         Config::default()
@@ -2428,6 +2631,10 @@ async fn start_server(
         promote_without_fence: db_config.replication.promote_without_fence.clone(),
         promote_fence_timeout: db_config.replication.promote_fence_timeout.clone(),
     };
+
+    // `storage.config()` must agree with the socket that was bound.
+    db_config.server.listen_addr = listen.clone();
+    db_config.server.port = port;
 
     // CLI flags win over the config file for storage location/mode.
     if memory_mode {
@@ -2612,9 +2819,8 @@ async fn start_server(
     }
 
     // Configure PostgreSQL server
-    let pg_addr: SocketAddr = format!("{listen}:{port}")
-        .parse()
-        .map_err(|e| Error::config(format!("Invalid listen address: {e}")))?;
+    // A bare IPv4 or IPv6 literal (`::1`, `[::1]`) or IP:port; the port is explicit.
+    let pg_addr: SocketAddr = parse_listen_address(&listen, Some(port), 5432)?;
 
     // Bind PostgreSQL before the database opens and before HA starts: an
     // occupied port — or an overlapping replication endpoint — fails here,
@@ -2796,7 +3002,11 @@ async fn start_server(
     }
 
     println!("[3/4] Configuring server...");
-    println!("      - Listen address: {pg_addr}");
+    println!(
+        "      - Listen address: {pg_addr} (listen: {}, port: {})",
+        listen_sources.listen.label("--listen"),
+        listen_sources.port.label("--port")
+    );
     if let Some(addr) = http_addr {
         println!("      - HTTP address: {addr}");
     }
@@ -3955,6 +4165,7 @@ async fn start_server_daemon(
     data_dir: PathBuf,
     port: u16,
     listen: String,
+    listen_sources: ListenSources,
     config_path: Option<PathBuf>,
     memory: bool,
     dump_on_shutdown: bool,
@@ -3980,27 +4191,22 @@ async fn start_server_daemon(
     #[cfg(unix)]
     use std::process::{Command, Stdio};
 
-    // Check if server is already running — the stale-PID probe shells out to kill(1), unix-only.
+    // Check if server is already running. A PID file naming a process that is
+    // not the server (a reused PID, a crashed daemon) is replaced, not trusted.
     #[cfg(unix)]
-    if pid_file.exists() {
-        if let Ok(pid_str) = std::fs::read_to_string(&pid_file) {
-            if let Ok(pid) = pid_str.trim().parse::<i32>() {
-                // Check if process is running
-                #[cfg(unix)]
-                {
-                    if Command::new("kill")
-                        .args(["-0", &pid.to_string()])
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::null())
-                        .status()
-                        .map(|s| s.success())
-                        .unwrap_or(false)
-                    {
-                        return Err(Error::io(format!(
-                            "Server is already running (PID: {pid}). Use 'heliosdb-nano stop' to stop it."
-                        )));
-                    }
-                }
+    if let Ok(Some(pid)) = read_pid_file(&pid_file) {
+        let directory = (!memory).then_some(data_dir.as_path());
+        match verify_server_pid(pid, directory) {
+            PidVerdict::Server => {
+                return Err(Error::io(format!(
+                    "Server is already running (PID: {pid}). Use 'heliosdb-nano stop' to stop it."
+                )));
+            }
+            PidVerdict::NotRunning | PidVerdict::Unrelated => {
+                println!(
+                    "Replacing stale PID file {} (process {pid} is not a running HeliosDB server).",
+                    pid_file.display()
+                );
             }
         }
     }
@@ -4222,7 +4428,11 @@ async fn start_server_daemon(
         println!();
         println!("  Status:         RUNNING");
         println!("  PID:            {pid}");
-        println!("  Address:        {listen}:{port}");
+        println!(
+            "  Address:        {listen}:{port} (listen: {}, port: {})",
+            listen_sources.listen.label("--listen"),
+            listen_sources.port.label("--port")
+        );
         println!("  Data directory: {}", data_dir.display());
         println!("  PID file:       {}", pid_file.display());
         println!();
@@ -4250,85 +4460,414 @@ async fn start_server_daemon(
     }
 }
 
-fn stop_server(pid_file: &PathBuf) -> Result<()> {
-    if !pid_file.exists() {
-        return Err(Error::io(format!(
-            "PID file not found: {}. Server may not be running.",
-            pid_file.display()
-        )));
+/// Exit with `code` unless it is 0 (the process is ending anyway; this keeps a
+/// distinct status for scripts).
+fn exit_with(code: i32) {
+    if code != 0 {
+        std::process::exit(code);
     }
+}
 
-    let pid_str = std::fs::read_to_string(pid_file).map_err(|e| Error::io(format!("Failed to read PID file: {e}")))?;
+/// `stop` exit codes. Chosen on purpose, not copied from pg_ctl (where 4 means
+/// "data directory not accessible"): scripts can tell "nothing to stop" from
+/// "a PID file that points elsewhere" from "stop failed".
+const EXIT_NOT_RUNNING: i32 = 3;
+const EXIT_STALE_PID_FILE: i32 = 4;
 
-    let pid = pid_str
-        .trim()
-        .parse::<i32>()
-        .map_err(|e| Error::io(format!("Invalid PID in file: {e}")))?;
+/// What a PID names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PidVerdict {
+    /// The HeliosDB server (it holds the data directory's LOCK, or is named
+    /// like the binary when there is no directory to ask).
+    Server,
+    /// No such process.
+    NotRunning,
+    /// A live process that is not the server: the PID was reused.
+    Unrelated,
+}
 
-    println!("Stopping HeliosDB server (PID: {pid})...");
-
+/// The process holding RocksDB's `LOCK` of `data_dir` (a running node), asked
+/// with `F_GETLK`, which takes nothing: it never disturbs a lock this process
+/// takes later.
+fn lock_holder_pid(data_dir: &std::path::Path) -> Option<i32> {
     #[cfg(unix)]
     {
-        use std::process::{Command, Stdio};
+        use std::os::unix::io::AsRawFd;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(data_dir.join("LOCK"))
+            .ok()?;
+        // SAFETY: an all-zero `flock` is a valid value of the plain C struct.
+        let mut probe: libc::flock = unsafe { std::mem::zeroed() };
+        probe.l_type = libc::F_WRLCK as libc::c_short;
+        probe.l_whence = libc::SEEK_SET as libc::c_short;
+        // SAFETY: fcntl(2) F_GETLK on a descriptor this function owns, with a
+        // pointer to a live, initialized `flock` it only writes into.
+        let answered = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETLK, &mut probe) };
+        (answered == 0 && probe.l_type != libc::F_UNLCK as libc::c_short).then_some(probe.l_pid)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = data_dir;
+        None
+    }
+}
 
-        // Send SIGTERM to gracefully stop the server
-        let status = Command::new("kill")
-            .args(["-TERM", &pid.to_string()])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map_err(|e| Error::io(format!("Failed to send signal: {e}")))?;
+/// Is a process with this PID alive (a zombie is not)?
+#[cfg(unix)]
+fn process_alive(pid: i32) -> bool {
+    // SAFETY: signal 0 only probes for existence.
+    let probe = unsafe { libc::kill(pid, 0) };
+    if probe != 0 {
+        return std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+    }
+    // /proc/<pid>/stat: `pid (comm) S ...`; the state follows the last ')'.
+    let zombie = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| {
+            stat.rsplit_once(')')
+                .map(|(_, rest)| rest.trim_start().starts_with('Z'))
+        })
+        .unwrap_or(false);
+    !zombie
+}
 
-        if status.success() {
-            // Wait a bit for graceful shutdown
-            std::thread::sleep(std::time::Duration::from_secs(2));
+/// The short name of a process (`/proc/<pid>/comm`, or `ps` where there is no
+/// /proc).
+#[cfg(unix)]
+fn process_name(pid: i32) -> Option<String> {
+    if let Ok(name) = std::fs::read_to_string(format!("/proc/{pid}/comm")) {
+        return Some(name.trim().to_string());
+    }
+    let output = std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "comm="])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let base = text.rsplit('/').next().unwrap_or("").to_string();
+    (!base.is_empty()).then_some(base)
+}
 
-            // Check if process is still running
-            let still_running = Command::new("kill")
-                .args(["-0", &pid.to_string()])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
-
-            if still_running {
-                println!("Server did not stop gracefully, sending SIGKILL...");
-                Command::new("kill")
-                    .args(["-KILL", &pid.to_string()])
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status()
-                    .ok();
-            }
-
-            // Remove PID file
-            std::fs::remove_file(pid_file).map_err(|e| Error::io(format!("Failed to remove PID file: {e}")))?;
-
-            println!("Server stopped successfully");
-            Ok(())
-        } else {
-            Err(Error::io(format!(
-                "Failed to stop server. Process {pid} may not exist."
-            )))
+/// Is `pid` the HeliosDB server? With a data directory the process holding
+/// its LOCK is the answer; with none, or when the directory is not locked
+/// (a memory server), the process must be named like the binary. The
+/// executable path is deliberately not compared: after an upgrade replaces
+/// the binary first it reads "(deleted)".
+fn verify_server_pid(pid: i32, data_dir: Option<&std::path::Path>) -> PidVerdict {
+    #[cfg(unix)]
+    {
+        if pid <= 1 || !process_alive(pid) {
+            return PidVerdict::NotRunning;
         }
+        if let Some(holder) = data_dir.and_then(lock_holder_pid) {
+            return if holder == pid {
+                PidVerdict::Server
+            } else {
+                PidVerdict::Unrelated
+            };
+        }
+        match process_name(pid) {
+            Some(name) if name.starts_with("heliosdb") => PidVerdict::Server,
+            _ => PidVerdict::Unrelated,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (pid, data_dir);
+        PidVerdict::NotRunning
+    }
+}
+
+/// Read a PID file: `Ok(None)` when it does not exist.
+fn read_pid_file(pid_file: &std::path::Path) -> Result<Option<i32>> {
+    if !pid_file.exists() {
+        return Ok(None);
+    }
+    let text = std::fs::read_to_string(pid_file).map_err(|e| Error::io(format!("Failed to read PID file: {e}")))?;
+    let pid = text
+        .trim()
+        .parse::<i32>()
+        .map_err(|e| Error::io(format!("Invalid PID in {}: {e}", pid_file.display())))?;
+    Ok(Some(pid))
+}
+
+struct StopOptions {
+    pid_file: PathBuf,
+    data_dir: Option<PathBuf>,
+    timeout: std::time::Duration,
+    no_wait: bool,
+    force: bool,
+    json: bool,
+}
+
+/// `stop`: returns the exit status. Signals only a verified server, waits for
+/// it to finish its own shutdown (which can run for minutes: a switchover
+/// demotion, a `--dump-on-shutdown` write) and never kills it unless `--force`
+/// and the timeout say so.
+fn stop_server(options: &StopOptions) -> Result<i32> {
+    #[cfg(unix)]
+    {
+        let report = |code: i32, state: &str, pid: Option<i32>, text: &str| {
+            if options.json {
+                println!(
+                    "{}",
+                    serde_json::json!({ "state": state, "pid": pid, "pid_file": options.pid_file, "message": text })
+                );
+            } else if code == 0 {
+                println!("{text}");
+            } else {
+                eprintln!("{text}");
+            }
+            code
+        };
+
+        // Which process: the PID file's, else the one holding the directory's LOCK.
+        let from_file = read_pid_file(&options.pid_file)?;
+        let pid = match (from_file, options.data_dir.as_deref().and_then(lock_holder_pid)) {
+            (Some(pid), _) => pid,
+            (None, Some(holder)) => holder,
+            (None, None) => {
+                return Ok(report(
+                    EXIT_NOT_RUNNING,
+                    "not_running",
+                    None,
+                    &format!(
+                        "Server is not running (no PID file at {}{}).",
+                        options.pid_file.display(),
+                        if options.data_dir.is_some() {
+                            " and the data directory is not locked"
+                        } else {
+                            ""
+                        }
+                    ),
+                ));
+            }
+        };
+
+        match verify_server_pid(pid, options.data_dir.as_deref()) {
+            PidVerdict::NotRunning => {
+                let _ = std::fs::remove_file(&options.pid_file);
+                return Ok(report(
+                    EXIT_NOT_RUNNING,
+                    "not_running",
+                    Some(pid),
+                    &format!("Server is not running: process {pid} no longer exists (stale PID file removed)."),
+                ));
+            }
+            PidVerdict::Unrelated => {
+                let _ = std::fs::remove_file(&options.pid_file);
+                return Ok(report(
+                    EXIT_STALE_PID_FILE,
+                    "stale",
+                    Some(pid),
+                    &format!(
+                        "PID file {} names process {pid}, which is not the HeliosDB server (the PID was reused). \
+                         Nothing was signalled; the stale PID file was removed.",
+                        options.pid_file.display()
+                    ),
+                ));
+            }
+            PidVerdict::Server => {}
+        }
+
+        if !options.json {
+            println!("Stopping HeliosDB server (PID: {pid})...");
+        }
+        // SAFETY: SIGTERM to a PID that was just verified to be the server.
+        if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Ok(report(
+                    1,
+                    "failed",
+                    Some(pid),
+                    &format!("Failed to signal process {pid}: {error}"),
+                ));
+            }
+        }
+        if options.no_wait {
+            return Ok(report(
+                0,
+                "signalled",
+                Some(pid),
+                &format!("SIGTERM sent to {pid}; not waiting (--no-wait)."),
+            ));
+        }
+
+        let started = std::time::Instant::now();
+        let mut next_progress = std::time::Duration::from_secs(10);
+        while process_alive(pid) {
+            if started.elapsed() >= options.timeout {
+                if !options.force {
+                    return Ok(report(
+                        1,
+                        "still_shutting_down",
+                        Some(pid),
+                        &format!(
+                            "Server (PID {pid}) is still shutting down after {}s (a switchover demotion or a \
+                             shutdown dump may be running). It was left alone; run `stop` again to keep waiting, \
+                             or use --force to kill it.",
+                            options.timeout.as_secs()
+                        ),
+                    ));
+                }
+                eprintln!(
+                    "WARNING: killing server {pid} after {}s (--force): a switchover demotion or a shutdown dump \
+                     cut short must be finished with `heliosdb-nano recover`.",
+                    options.timeout.as_secs()
+                );
+                // SAFETY: SIGKILL to the verified server that ignored the timeout.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+                let kill_started = std::time::Instant::now();
+                while process_alive(pid) && kill_started.elapsed() < std::time::Duration::from_secs(10) {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                break;
+            }
+            if !options.json && started.elapsed() >= next_progress {
+                println!("  still shutting down ({}s)...", started.elapsed().as_secs());
+                next_progress += std::time::Duration::from_secs(10);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        if process_alive(pid) {
+            return Ok(report(1, "failed", Some(pid), &format!("Process {pid} did not exit.")));
+        }
+        let _ = std::fs::remove_file(&options.pid_file);
+        Ok(report(0, "stopped", Some(pid), "Server stopped successfully"))
     }
 
     #[cfg(not(unix))]
     {
+        let _ = options;
         Err(Error::io("Server management is only supported on Unix systems"))
     }
 }
 
 /// `heliosdb-nano status`: the process (`--pid-file`), and with `--data-dir`
 /// the directory's replication identity (spec P5.1: its epoch, and a fence
-/// or an interrupted promotion it carries).
-fn check_server_status(pid_file: &PathBuf, data_dir: Option<&std::path::Path>) -> Result<()> {
-    check_process_status(pid_file)?;
-    if let Some(dir) = data_dir {
-        print_replication_identity(dir);
+/// or an interrupted promotion it carries). Returns the exit status: 0
+/// running, 3 not running, 4 stale PID file.
+fn check_server_status(pid_file: &PathBuf, data_dir: Option<&std::path::Path>, json: bool) -> Result<i32> {
+    let (code, state, pid) = process_status(pid_file, data_dir)?;
+    if json {
+        let started = pid.filter(|_| code == 0).and_then(process_start_time);
+        let mut object = serde_json::json!({
+            "state": state,
+            "running": code == 0,
+            "pid": pid,
+            "pid_file": pid_file,
+            "started": started,
+        });
+        if let (Some(dir), Some(map)) = (data_dir, object.as_object_mut()) {
+            let identity = replication_identity_json(dir);
+            map.insert("role".into(), identity["role"].clone());
+            map.insert("epoch".into(), identity["epoch"].clone());
+            map.insert("fence".into(), identity["fence"].clone());
+        }
+        println!("{object}");
+    } else {
+        match (state, pid) {
+            ("running", Some(pid)) => {
+                println!("Status: RUNNING");
+                println!("  PID: {pid}");
+                println!("  PID file: {}", pid_file.display());
+                if let Some(start) = process_start_time(pid) {
+                    println!("  Started: {start}");
+                }
+            }
+            ("stale", Some(pid)) => {
+                println!("Status: NOT RUNNING");
+                println!(
+                    "  PID file {} names process {pid}, which is not the HeliosDB server",
+                    pid_file.display()
+                );
+                println!("  Remove the stale PID file (`heliosdb-nano stop` does it)");
+            }
+            (_, Some(pid)) => {
+                println!("Status: NOT RUNNING");
+                println!("  PID file exists but process {pid} is not running");
+                println!("  You may need to remove stale PID file: {}", pid_file.display());
+            }
+            _ => {
+                println!("Status: NOT RUNNING");
+                println!("PID file not found: {}", pid_file.display());
+            }
+        }
+        if let Some(dir) = data_dir {
+            print_replication_identity(dir);
+        }
     }
-    Ok(())
+    Ok(code)
+}
+
+/// `(exit status, state, pid)` of the server a PID file (or, failing that,
+/// the data directory's LOCK) names.
+fn process_status(
+    pid_file: &std::path::Path,
+    data_dir: Option<&std::path::Path>,
+) -> Result<(i32, &'static str, Option<i32>)> {
+    let pid = match (read_pid_file(pid_file)?, data_dir.and_then(lock_holder_pid)) {
+        (Some(pid), _) | (None, Some(pid)) => pid,
+        (None, None) => return Ok((EXIT_NOT_RUNNING, "not_running", None)),
+    };
+    Ok(match verify_server_pid(pid, data_dir) {
+        PidVerdict::Server => (0, "running", Some(pid)),
+        PidVerdict::NotRunning => (EXIT_NOT_RUNNING, "not_running", Some(pid)),
+        PidVerdict::Unrelated => (EXIT_STALE_PID_FILE, "stale", Some(pid)),
+    })
+}
+
+/// When the process started, as `ps` prints it.
+fn process_start_time(pid: i32) -> Option<String> {
+    let output = std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "lstart="])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (output.status.success() && !text.is_empty()).then_some(text)
+}
+
+/// `status --json --data-dir`: role, epoch and fence of the directory.
+/// `null` for each when `ha-tier1` is not compiled in.
+fn replication_identity_json(dir: &std::path::Path) -> serde_json::Value {
+    #[cfg(not(feature = "ha-tier1"))]
+    {
+        let _ = dir;
+        serde_json::json!({ "role": null, "epoch": null, "fence": null })
+    }
+    #[cfg(feature = "ha-tier1")]
+    {
+        use heliosdb_nano::replication::checkpoint_transfer::PHYSICAL_MARKER_FILE;
+        use heliosdb_nano::replication::epoch::{epoch_of, read_directory_epoch};
+        use heliosdb_nano::replication::fence::{read_fenced_record, FENCED_FILE};
+        use heliosdb_nano::replication::history::PRIMARY_HISTORY_FILE;
+        use heliosdb_nano::replication::promote::PROMOTION_FILE;
+        let carries = |name: &str| std::fs::symlink_metadata(dir.join(name)).is_ok();
+        let role = if carries(FENCED_FILE) {
+            "fenced primary"
+        } else if carries(PROMOTION_FILE) {
+            "standby being promoted (interrupted)"
+        } else if carries(PHYSICAL_MARKER_FILE) {
+            "physical standby"
+        } else if carries(PRIMARY_HISTORY_FILE) {
+            "primary"
+        } else {
+            "standalone"
+        };
+        let epoch = read_directory_epoch(dir).ok().map(|record| epoch_of(record.as_ref()));
+        let fence = match read_fenced_record(dir) {
+            Ok(Some(record)) => serde_json::json!({
+                "fenced_at": record.fenced_at,
+                "fenced_by_epoch": record.fenced_by_epoch,
+                "by_node": record.by_node.to_string(),
+                "final_sequence": record.final_sequence,
+            }),
+            _ => serde_json::Value::Null,
+        };
+        serde_json::json!({ "role": role, "epoch": epoch, "fence": fence })
+    }
 }
 
 /// Spec P5.1 §1: what `status --data-dir` says about a directory's
@@ -4412,64 +4951,97 @@ fn print_replication_identity(dir: &std::path::Path) {
     }
 }
 
-fn check_process_status(pid_file: &PathBuf) -> Result<()> {
-    if !pid_file.exists() {
-        println!("Status: NOT RUNNING");
-        println!("PID file not found: {}", pid_file.display());
-        return Ok(());
-    }
-
-    let pid_str = std::fs::read_to_string(pid_file).map_err(|e| Error::io(format!("Failed to read PID file: {e}")))?;
-
-    let pid = pid_str
-        .trim()
-        .parse::<i32>()
-        .map_err(|e| Error::io(format!("Invalid PID in file: {e}")))?;
-
-    #[cfg(unix)]
-    {
-        use std::process::{Command, Stdio};
-
-        // Check if process is running
-        let is_running = Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-
-        if is_running {
-            println!("Status: RUNNING");
-            println!("  PID: {pid}");
-            println!("  PID file: {}", pid_file.display());
-
-            // Try to get process info
-            if let Ok(output) = Command::new("ps")
-                .args(["-p", &pid.to_string(), "-o", "lstart="])
-                .output()
-            {
-                if output.status.success() {
-                    let start_time = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                    if !start_time.is_empty() {
-                        println!("  Started: {start_time}");
-                    }
-                }
+/// `config check`: load and validate a config file without starting
+/// anything. Returns the exit status: 0 clean (or warnings only), 1 the file
+/// does not load or validate, 2 warnings under `--strict`.
+fn run_config_check(path: Option<&std::path::Path>, strict: bool, json: bool) -> i32 {
+    use heliosdb_nano::config::ConfigWarningKind;
+    let mut errors: Vec<String> = Vec::new();
+    let mut warnings = Vec::new();
+    let mut effective = None;
+    let loaded = match path {
+        Some(path) => std::fs::read_to_string(path)
+            .map_err(|e| format!("cannot read {}: {e}", path.display()))
+            .and_then(|content| Config::load_report(&content).map_err(|e| e.to_string())),
+        None => Ok((Config::default(), Vec::new())),
+    };
+    match loaded {
+        Ok((config, found)) => {
+            warnings = found;
+            if let Err(error) = config.validate() {
+                errors.push(error.to_string());
             }
-        } else {
-            println!("Status: NOT RUNNING");
-            println!("  PID file exists but process {pid} is not running");
-            println!("  You may need to remove stale PID file: {}", pid_file.display());
+            effective = Some(config);
+        }
+        Err(error) => errors.push(error),
+    }
+    let code = if !errors.is_empty() {
+        1
+    } else if strict && !warnings.is_empty() {
+        2
+    } else {
+        0
+    };
+    // `Debug` of the configuration redacts every secret (`ApiConfig`,
+    // `AuthenticationConfig`, `ReplicationConfig`); `Serialize` does not, so
+    // it is never used here.
+    let effective_text = effective.as_ref().map(|config| format!("{config:#?}"));
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ok": code == 0,
+                "file": path,
+                "strict": strict,
+                "errors": errors,
+                "warnings": warnings,
+                "effective": effective_text,
+            })
+        );
+        return code;
+    }
+    match path {
+        Some(path) => println!("config file: {}", path.display()),
+        None => println!("config file: (none given; the built-in defaults)"),
+    }
+    for error in &errors {
+        eprintln!("error: {error}");
+    }
+    for (kind, title) in [
+        (ConfigWarningKind::UnknownSection, "unknown sections (ignored)"),
+        (ConfigWarningKind::UnknownKey, "unknown keys (ignored)"),
+        (
+            ConfigWarningKind::NoEffect,
+            "keys that have no effect (the server never reads them)",
+        ),
+    ] {
+        let of_kind: Vec<_> = warnings.iter().filter(|w| w.kind == kind).collect();
+        if !of_kind.is_empty() {
+            println!("{title}:");
+            for warning in of_kind {
+                println!("  {}", warning.message);
+            }
         }
     }
-
-    #[cfg(not(unix))]
-    {
-        println!("Status: UNKNOWN (platform not supported)");
-        println!("  PID: {}", pid);
+    if errors.is_empty() {
+        println!(
+            "result: {}",
+            if warnings.is_empty() {
+                "OK".to_string()
+            } else if strict {
+                format!("{} warning(s), refused by --strict", warnings.len())
+            } else {
+                format!("OK with {} warning(s)", warnings.len())
+            }
+        );
+        if let Some(text) = effective_text {
+            println!("effective configuration (secrets redacted):");
+            println!("{text}");
+        }
+    } else {
+        println!("result: FAILED");
     }
-
-    Ok(())
+    code
 }
 
 // ========== HA Helper Functions ==========
@@ -11745,32 +12317,12 @@ async fn run_promote(args: PromoteArgs) -> Result<()> {
 /// process takes later — and names the process holding it.
 #[cfg(feature = "ha-tier1")]
 fn refuse_running_node(data_dir: &std::path::Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::io::AsRawFd;
-        let lock = data_dir.join("LOCK");
-        let Ok(file) = std::fs::OpenOptions::new().read(true).write(true).open(&lock) else {
-            return Ok(());
-        };
-        // SAFETY: an all-zero `flock` is a valid value of the plain C struct.
-        let mut probe: libc::flock = unsafe { std::mem::zeroed() };
-        probe.l_type = libc::F_WRLCK as libc::c_short;
-        probe.l_whence = libc::SEEK_SET as libc::c_short;
-        // SAFETY: fcntl(2) F_GETLK on a descriptor this function owns, with a
-        // pointer to a live, initialized `flock` it only writes into.
-        let answered = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETLK, &mut probe) };
-        if answered == 0 && probe.l_type != libc::F_UNLCK as libc::c_short {
-            return Err(Error::config(format!(
-                "recover refused: {} is in use by a running node (process {} holds its LOCK); stop it first: recover \
-                 works on a stopped standby",
-                data_dir.display(),
-                probe.l_pid
-            )));
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = data_dir;
+    if let Some(holder) = lock_holder_pid(data_dir) {
+        return Err(Error::config(format!(
+            "recover refused: {} is in use by a running node (process {holder} holds its LOCK); stop it first: recover \
+             works on a stopped standby",
+            data_dir.display()
+        )));
     }
     Ok(())
 }
@@ -12794,5 +13346,97 @@ mod physical_cli_tests {
         std::fs::remove_file(hard).unwrap();
         std::fs::write(&path, [9u8; 31]).unwrap();
         assert!(heliosdb_nano::replication::read_replication_token(&path).is_err());
+    }
+}
+
+/// v03.1: `start`'s listen address and port come from the flag, else the
+/// config file, else the defaults; and the flags that have a config twin carry
+/// no clap default (an absent flag must not look like an explicit one).
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::many_single_char_names
+)]
+mod listen_resolution_tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    fn file(text: &str) -> (Config, toml::Value) {
+        (Config::from_toml_str(text).unwrap(), toml::from_str(text).unwrap())
+    }
+
+    #[test]
+    fn start_memory_parses_with_no_port_and_no_listen() {
+        let cli = Cli::try_parse_from(["nano", "start", "--memory"]).unwrap();
+        let Commands::Start { port, listen, .. } = cli.command else {
+            panic!("expected start");
+        };
+        assert_eq!(port, None);
+        assert_eq!(listen, None);
+    }
+
+    #[test]
+    fn start_flags_with_a_config_twin_have_no_default_value() {
+        let command = Cli::command();
+        let start = command.find_subcommand("start").unwrap();
+        for name in ["port", "listen"] {
+            let argument = start.get_arguments().find(|a| a.get_id() == name).unwrap();
+            assert!(
+                argument.get_default_values().is_empty(),
+                "--{name} has a clap default, so an absent flag cannot be told from an explicit one"
+            );
+        }
+    }
+
+    #[test]
+    fn defaults_apply_with_neither_flag_nor_file() {
+        let choice = resolve_listen(None, None, None, None);
+        assert_eq!(choice.listen, "127.0.0.1");
+        assert_eq!(choice.port, 5432);
+        assert_eq!(choice.listen_source, ValueSource::Default);
+        assert_eq!(choice.port_source, ValueSource::Default);
+        // a file that sets neither key changes nothing
+        let (config, doc) = file("[server]\nmax_connections = 7\n");
+        let choice = resolve_listen(None, None, Some(&config), Some(&doc));
+        assert_eq!((choice.listen.as_str(), choice.port), ("127.0.0.1", 5432));
+        assert_eq!(choice.port_source, ValueSource::Default);
+    }
+
+    #[test]
+    fn the_file_applies_without_a_flag_and_the_flag_wins_with_one() {
+        let (config, doc) = file("[server]\nlisten_addr = \"::1\"\nport = 6000\n");
+        let choice = resolve_listen(None, None, Some(&config), Some(&doc));
+        assert_eq!((choice.listen.as_str(), choice.port), ("::1", 6000));
+        assert_eq!(choice.listen_source, ValueSource::ConfigFile);
+        assert_eq!(choice.port_source, ValueSource::ConfigFile);
+
+        let choice = resolve_listen(Some("127.0.0.2".into()), Some(6001), Some(&config), Some(&doc));
+        assert_eq!((choice.listen.as_str(), choice.port), ("127.0.0.2", 6001));
+        assert_eq!(choice.listen_source, ValueSource::Flag);
+        assert_eq!(choice.port_source, ValueSource::Flag);
+
+        // an explicit flag equal to the old default still beats the file
+        let choice = resolve_listen(None, Some(5432), Some(&config), Some(&doc));
+        assert_eq!(choice.port, 5432);
+        assert_eq!(choice.port_source, ValueSource::Flag);
+
+        // a file that WRITES the default is "config file", not "default"
+        let (config, doc) = file("[server]\nport = 5432\n");
+        assert_eq!(
+            resolve_listen(None, None, Some(&config), Some(&doc)).port_source,
+            ValueSource::ConfigFile
+        );
+    }
+
+    #[test]
+    fn ipv6_literals_bind_through_parse_listen_address() {
+        for literal in ["::1", "[::1]"] {
+            let address = parse_listen_address(literal, Some(5433), 5432).unwrap();
+            assert_eq!(address.port(), 5433);
+            assert!(address.is_ipv6());
+        }
     }
 }
