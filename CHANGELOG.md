@@ -27,6 +27,17 @@ changes.
 Reports from users of earlier releases (GitHub numbers) and defects found while the work after
 4.42.0 was being prepared. Each has a test file.
 
+- **A branch can expire.** `CREATE BRANCH b FROM main WITH (expires_in = '2h', label = 'agent-42')`
+  used to answer "Unknown branch option". The branch now records when it expires and a label; an
+  expired branch refuses new statements, and it is dropped at the next open or branch operation
+  (one with a live child branch is kept and reported). `pg_database_branches()` shows `expires_at`
+  and `label`. Test file: `tests/branch_expiry.rs`.
+- **`heliosdb-nano dump --format sql --dialect postgres` writes a script PostgreSQL loads.** Tables,
+  keys, foreign keys, CHECKs, indexes, sequences, views and rows, loaded by `psql` with zero errors
+  and the same query results (checked against PostgreSQL 18.4). `--tables`, `--schema-only` and
+  `--data-only` select what is written. `docs/guides/leaving-nano.md` describes moving a database
+  off Nano. Test files: `tests/dump_cli_sql.rs`, `tests/dump_to_postgres.rs` (needs a PostgreSQL,
+  ignored by default).
 - **A PL/pgSQL procedure took the `ELSE` branch of every `IF`, never entered a `WHILE`, and stored
   the text of an expression instead of its value.** The interpreter now evaluates expressions (with
   the routine's variables bound as parameters, so both statement families agree): `IF` / `ELSIF` /
