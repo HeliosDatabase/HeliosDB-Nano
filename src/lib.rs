@@ -12009,6 +12009,15 @@ impl EmbeddedDatabase {
                 selection,
                 returning,
             } => {
+                // v05.6 / GH#32: read policies apply to subqueries in WHERE too.
+                let rls_where;
+                let selection = match self.rls_dml_where(selection.as_ref())? {
+                    Some(guarded) => {
+                        rls_where = Some(guarded);
+                        &rls_where
+                    }
+                    None => selection,
+                };
                 let catalog = self.storage.catalog();
                 let schema = catalog.get_table_schema(table_name)?;
                 // Stamp source_table_name so qualified predicates
@@ -12575,6 +12584,15 @@ impl EmbeddedDatabase {
                 selection,
                 returning,
             } => {
+                // v05.6 / GH#32: read policies apply to subqueries in WHERE too.
+                let rls_where;
+                let selection = match self.rls_dml_where(selection.as_ref())? {
+                    Some(guarded) => {
+                        rls_where = Some(guarded);
+                        &rls_where
+                    }
+                    None => selection,
+                };
                 let catalog = self.storage.catalog();
                 let schema = catalog.get_table_schema(table_name)?;
                 // RLS (ROADMAP_V5 §1.1): resolved + parsed once per statement, before
@@ -23765,6 +23783,15 @@ impl EmbeddedDatabase {
                 selection,
                 returning,
             } => {
+                // v05.6 / GH#32: read policies apply to subqueries in WHERE too.
+                let rls_where;
+                let selection = match self.rls_dml_where(selection.as_ref())? {
+                    Some(guarded) => {
+                        rls_where = Some(guarded);
+                        &rls_where
+                    }
+                    None => selection,
+                };
                 let catalog = self.storage.catalog();
                 let schema = catalog.get_table_schema(table_name)?;
                 let table_constraints = catalog.load_table_constraints(table_name)?;
@@ -24131,6 +24158,15 @@ impl EmbeddedDatabase {
                 selection,
                 returning,
             } => {
+                // v05.6 / GH#32: read policies apply to subqueries in WHERE too.
+                let rls_where;
+                let selection = match self.rls_dml_where(selection.as_ref())? {
+                    Some(guarded) => {
+                        rls_where = Some(guarded);
+                        &rls_where
+                    }
+                    None => selection,
+                };
                 let catalog = self.storage.catalog();
                 let schema = catalog.get_table_schema(table_name)?;
                 let eval_schema = schema.clone().with_source_table_name(table_name);
@@ -33808,6 +33844,19 @@ impl EmbeddedDatabase {
         walk(expr, &mut |plan| {
             Self::bind_outer_refs_in_subquery(plan, &probe, outer_schema, outer_table) != *plan
         })
+    }
+
+    /// v05.6: an UPDATE / DELETE predicate with a subquery, with the read
+    /// policies applied to every subquery's plan, as a SELECT gets them.
+    /// `None` when there is nothing to change (no subquery or no tenant
+    /// context), so the common path keeps the planned predicate.
+    fn rls_dml_where(&self, selection: Option<&sql::LogicalExpr>) -> Result<Option<sql::LogicalExpr>> {
+        match selection {
+            Some(expr) if self.has_effective_tenant_context() && sql::Executor::expr_contains_subquery(expr) => {
+                Ok(Some(self.apply_rls_to_expr(expr.clone())?))
+            }
+            _ => Ok(None),
+        }
     }
 
     /// GH#32: prepare an UPDATE / DELETE predicate that holds a subquery.
