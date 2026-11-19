@@ -15108,3 +15108,100 @@ async fn wire_call_plpgsql_if_takes_the_selected_branch_on_both_protocols() {
     assert_eq!(rows[1].values[0], crate::Value::Int4(5));
     assert_eq!(rows[1].values[1], crate::Value::String("positive".into()));
 }
+
+/// Run one statement through Parse / Bind / Execute with text parameters.
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+async fn extended_run(
+    handler: &mut PgConnectionHandler<DuplexStream>,
+    client: &mut DuplexStream,
+    sql: &str,
+    params: &[&str],
+) -> Vec<u8> {
+    handler
+        .handle_parse_extended("x".into(), sql.into(), vec![])
+        .await
+        .expect("parse");
+    let values: Vec<Option<Vec<u8>>> = params.iter().map(|p| Some(p.as_bytes().to_vec())).collect();
+    handler
+        .handle_bind_extended("xp".into(), "x".into(), vec![0; values.len()], values, vec![])
+        .await
+        .expect("bind");
+    handler.handle_execute_extended("xp".into(), 0).await.expect("execute");
+    drain(client).await
+}
+
+/// v06.1: a bound `UPDATE … WHERE id = $1` inside BEGIN, after an INSERT of
+/// that id, changes the staged row (UPDATE 1), also while another connection
+/// holds a transaction open.
+#[tokio::test]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+async fn bound_pk_update_in_a_transaction_finds_the_staged_row() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    db.execute("CREATE TABLE w (id INT PRIMARY KEY, v INT)")
+        .expect("create");
+    db.execute("INSERT INTO w VALUES (1, 0)").expect("seed");
+    let (mut other, mut other_client) = test_handler(Arc::clone(&db));
+    let (mut handler, mut client) = test_handler(Arc::clone(&db));
+    for (round, hold_other) in [false, true].into_iter().enumerate() {
+        if hold_other {
+            extended_run(&mut other, &mut other_client, "BEGIN", &[]).await;
+            extended_run(&mut other, &mut other_client, "SELECT v FROM w WHERE id = 1", &[]).await;
+        }
+        let id = (10 + round).to_string();
+        extended_run(&mut handler, &mut client, "BEGIN", &[]).await;
+        extended_run(&mut handler, &mut client, "INSERT INTO w VALUES ($1, 0)", &[&id]).await;
+        let out = extended_run(&mut handler, &mut client, "UPDATE w SET v = 7 WHERE id = $1", &[&id]).await;
+        assert!(
+            command_tags(&out).iter().any(|t| t == "UPDATE 1"),
+            "{:?}",
+            command_tags(&out)
+        );
+        let out = extended_run(&mut handler, &mut client, "UPDATE w SET v = 8 WHERE id = $1", &["1"]).await;
+        assert!(
+            command_tags(&out).iter().any(|t| t == "UPDATE 1"),
+            "{:?}",
+            command_tags(&out)
+        );
+        extended_run(&mut handler, &mut client, "COMMIT", &[]).await;
+        if hold_other {
+            extended_run(&mut other, &mut other_client, "COMMIT", &[]).await;
+        }
+    }
+    let rows = db.query("SELECT id, v FROM w ORDER BY id", &[]).expect("rows");
+    assert_eq!(rows.len(), 3);
+}
+
+/// v05.8: `AS OF TIMESTAMP $1` is described as timestamptz (1184).
+#[tokio::test]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+async fn as_of_timestamp_parameter_is_described_as_timestamptz() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    db.execute("CREATE TABLE h (id INT PRIMARY KEY, v INT)")
+        .expect("create");
+    let (mut handler, mut client) = test_handler(db);
+    handler
+        .handle_parse_extended(
+            "d".into(),
+            "SELECT v FROM h AS OF TIMESTAMP $1 WHERE id = $2".into(),
+            vec![],
+        )
+        .await
+        .expect("parse");
+    handler
+        .handle_describe_extended(super::messages::DescribeTarget::Statement, "d".into())
+        .await
+        .expect("describe");
+    let bytes = drain(&mut client).await;
+    let (_, payload) = parse_messages(&bytes)
+        .into_iter()
+        .find(|(kind, _)| *kind == b't')
+        .expect("ParameterDescription");
+    let count = i16::from_be_bytes([payload[0], payload[1]]) as usize;
+    let oids: Vec<i32> = (0..count)
+        .map(|i| {
+            let at = 2 + i * 4;
+            i32::from_be_bytes([payload[at], payload[at + 1], payload[at + 2], payload[at + 3]])
+        })
+        .collect();
+    assert_eq!(oids, vec![1184, 23]);
+}

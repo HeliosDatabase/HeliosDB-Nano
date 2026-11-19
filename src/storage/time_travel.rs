@@ -1160,6 +1160,9 @@ impl SnapshotManager {
                     "VERSIONS BETWEEN cannot be resolved to a single timestamp. Use scan_versions_between instead.",
                 ))
             }
+            AsOfClause::TimestampExpr(_) => Err(Error::query_execution(
+                "AS OF TIMESTAMP <expression> must be evaluated before it is resolved",
+            )),
             AsOfClause::Commit(sha) => {
                 // AS OF COMMIT queries are handled by the CommitTracker in git_integration
                 // The executor should handle this variant separately
@@ -1325,6 +1328,9 @@ impl SnapshotManager {
             AsOfClause::Scn(scn) => self.resolve_scn(*scn),
             AsOfClause::VersionsBetween { .. } => Err(Error::query_execution(
                 "Cannot resolve VersionsBetween to a single timestamp",
+            )),
+            AsOfClause::TimestampExpr(_) => Err(Error::query_execution(
+                "AS OF TIMESTAMP <expression> must be evaluated before it is resolved",
             )),
             AsOfClause::Commit(sha) => {
                 // AS OF COMMIT queries should be handled by git_integration::CommitTracker

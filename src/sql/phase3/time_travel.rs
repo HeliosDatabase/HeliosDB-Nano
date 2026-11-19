@@ -23,6 +23,14 @@ impl TimeTravelParser {
             return Ok(AsOfClause::Now);
         }
 
+        // AS OF TIMESTAMP <expression> is planned by the caller
+        // (`Self::timestamp_expression`); here it is refused by name.
+        if Self::timestamp_expression(clause_str).is_some() {
+            return Err(Error::query_execution(
+                "AS OF TIMESTAMP <expression> is only accepted after a table in a query",
+            ));
+        }
+
         // Parse TIMESTAMP '2025-11-15 06:00:00'
         if trimmed.starts_with("TIMESTAMP") {
             let ts_str = clause_str
@@ -69,6 +77,45 @@ impl TimeTravelParser {
             "Invalid AS OF clause: {}. Expected NOW, TIMESTAMP, TRANSACTION, or SCN",
             clause_str
         )))
+    }
+
+    /// The expression text of `TIMESTAMP <expression>` when the operand is not
+    /// a single string literal (`now()`, `now() - interval '5 minutes'`,
+    /// `CURRENT_TIMESTAMP`, `$1`); `None` for the literal form and for
+    /// anything that is not a TIMESTAMP operand.
+    pub fn timestamp_expression(operand: &str) -> Option<&str> {
+        let toks = tokenize(operand);
+        let first = toks.first()?;
+        if !is_kw(operand, Some(first), "TIMESTAMP") {
+            return None;
+        }
+        let rest = toks.get(1..)?;
+        let start = rest.first()?.start;
+        if rest.len() == 1 && rest.first().is_some_and(|t| t.kind == Tk::Str) {
+            return None;
+        }
+        operand.get(start..).map(str::trim).filter(|s| !s.is_empty())
+    }
+
+    /// The 1-based indexes of the parameters that are a whole `AS OF
+    /// TIMESTAMP $n` anchor: the wire describes them as `timestamptz`.
+    pub fn as_of_parameter_indexes(sql: &str) -> Vec<usize> {
+        Self::scan(sql)
+            .iter()
+            .filter(|clause| !clause.is_versions)
+            .filter_map(|clause| Self::timestamp_expression(&clause.operand))
+            .filter_map(|text| text.strip_prefix('$').and_then(|n| n.trim().parse::<usize>().ok()))
+            .filter(|n| *n > 0)
+            .collect()
+    }
+
+    /// Whether `sql` names history with an expression anchor (`AS OF
+    /// TIMESTAMP now()`): its answer changes with the clock, so it is never
+    /// served from the result cache.
+    pub fn has_expression_anchor(sql: &str) -> bool {
+        Self::scan(sql)
+            .iter()
+            .any(|clause| !clause.is_versions && Self::timestamp_expression(&clause.operand).is_some())
     }
 
     /// Check if a query contains a real time-travel clause
@@ -481,7 +528,32 @@ fn point_len(sql: &str, toks: &[Token], i: usize) -> Option<usize> {
     let next = toks.get(i + 1);
     if w.eq_ignore_ascii_case("NOW") {
         Some(1)
-    } else if w.eq_ignore_ascii_case("TIMESTAMP") || w.eq_ignore_ascii_case("COMMIT") {
+    } else if w.eq_ignore_ascii_case("TIMESTAMP") {
+        // `TIMESTAMP 'literal'`, or `TIMESTAMP <expression>` running to the
+        // first terminator at nesting depth 0.
+        // The literal form, also when an alias follows it (`t AS OF TIMESTAMP
+        // '..' a JOIN ..`): only an operator after the literal makes it an
+        // expression (`'..' - interval '1 hour'`, `'..'::timestamptz`).
+        let after = toks.get(i + 2);
+        let operator_follows = after.is_some_and(|t| t.kind == Tk::Punct) && !is_point_terminator(sql, toks, i + 2);
+        if next.is_some_and(|n| n.kind == Tk::Str) && !operator_follows {
+            return Some(2);
+        }
+        let mut depth = 0usize;
+        let mut j = i + 1;
+        while depth > 0 || !is_point_terminator(sql, toks, j) {
+            let Some(t) = toks.get(j) else { break };
+            if t.kind == Tk::Punct {
+                match sql.get(t.start..t.end) {
+                    Some("(") => depth += 1,
+                    Some(")") => depth = depth.saturating_sub(1),
+                    _ => {}
+                }
+            }
+            j += 1;
+        }
+        Some(j - i)
+    } else if w.eq_ignore_ascii_case("COMMIT") {
         Some(if next.is_some_and(|n| n.kind == Tk::Str) { 2 } else { 1 })
     } else if w.eq_ignore_ascii_case("TRANSACTION") || w.eq_ignore_ascii_case("SCN") {
         let num = next.is_some_and(|n| {
@@ -493,6 +565,49 @@ fn point_len(sql: &str, toks: &[Token], i: usize) -> Option<usize> {
         Some(if num { 2 } else { 1 })
     } else {
         None
+    }
+}
+
+/// Words that end a `TIMESTAMP <expression>` operand at nesting depth 0.
+const POINT_TERMINATORS: &[&str] = &[
+    "WHERE",
+    "JOIN",
+    "INNER",
+    "LEFT",
+    "RIGHT",
+    "FULL",
+    "CROSS",
+    "NATURAL",
+    "ON",
+    "USING",
+    "GROUP",
+    "ORDER",
+    "LIMIT",
+    "OFFSET",
+    "HAVING",
+    "UNION",
+    "INTERSECT",
+    "EXCEPT",
+    "WINDOW",
+    "FETCH",
+    "FOR",
+    "RETURNING",
+    "AND",
+    "AS",
+    "SET",
+    "VALUES",
+];
+
+/// Whether token `i` ends a time point: the end of the text, `,`, `;`, `)`
+/// or one of [`POINT_TERMINATORS`].
+fn is_point_terminator(sql: &str, toks: &[Token], i: usize) -> bool {
+    let Some(t) = toks.get(i) else {
+        return true;
+    };
+    match t.kind {
+        Tk::Punct => matches!(sql.get(t.start..t.end), Some("," | ";" | ")")),
+        Tk::Word => POINT_TERMINATORS.iter().any(|k| is_kw(sql, Some(t), k)),
+        _ => false,
     }
 }
 
@@ -582,6 +697,26 @@ fn scan_tokens(sql: &str, toks: &[Token]) -> Vec<TimeTravelClause> {
 )]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timestamp_operand_is_an_expression_up_to_its_terminator() {
+        let c = TimeTravelParser::scan("SELECT v FROM t AS OF TIMESTAMP now() - interval '5 minutes' WHERE id = 1");
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].operand, "TIMESTAMP now() - interval '5 minutes'");
+        assert_eq!(
+            TimeTravelParser::timestamp_expression(&c[0].operand),
+            Some("now() - interval '5 minutes'")
+        );
+        let c = TimeTravelParser::scan(
+            "SELECT a.id FROM acc AS OF TIMESTAMP '2025-01-01 00:00:00' a JOIN n ON a.id = n.id",
+        );
+        assert_eq!(c[0].operand, "TIMESTAMP '2025-01-01 00:00:00'");
+        assert_eq!(TimeTravelParser::timestamp_expression(&c[0].operand), None);
+        assert_eq!(
+            TimeTravelParser::as_of_parameter_indexes("SELECT v FROM t AS OF TIMESTAMP $2 WHERE id = $1"),
+            vec![2]
+        );
+    }
 
     #[test]
     fn test_parse_as_of_now() {

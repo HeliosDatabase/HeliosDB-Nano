@@ -4713,7 +4713,29 @@ impl<'a> Planner<'a> {
                 end: Box::new(end),
             }));
         }
+        if let Some(text) = TimeTravelParser::timestamp_expression(&clause.operand) {
+            return Ok(Some(super::logical_plan::AsOfClause::TimestampExpr(Box::new(
+                self.as_of_timestamp_expression(text)?,
+            ))));
+        }
         Ok(Some(TimeTravelParser::parse_as_of_clause(&clause.operand)?))
+    }
+
+    /// Plan the expression of `AS OF TIMESTAMP <expression>`: parsed as the
+    /// one item of a select list, planned with no columns in scope.
+    fn as_of_timestamp_expression(&self, text: &str) -> Result<LogicalExpr> {
+        let invalid = || Error::query_execution(format!("Invalid AS OF TIMESTAMP expression: {text}"));
+        let statement = super::Parser::new().parse_one(&format!("SELECT {text}"))?;
+        let Statement::Query(query) = statement else {
+            return Err(invalid());
+        };
+        let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+            return Err(invalid());
+        };
+        match select.projection.as_slice() {
+            [SelectItem::UnnamedExpr(expr)] if select.from.is_empty() => self.expr_to_logical(expr),
+            _ => Err(invalid()),
+        }
     }
 
     /// Convert SELECT items to expressions and aliases
@@ -8012,6 +8034,23 @@ impl<'a> Planner<'a> {
                     table_name,
                     constraint_name: name.as_ref().map(Self::normalize_ident),
                     expression: self.expr_to_logical(&expr)?,
+                })
+            }
+            // v05.10: `ADD [CONSTRAINT n] PRIMARY KEY (cols)` over existing
+            // columns (pg_dump's spelling); the executor validates the rows
+            // and builds the key's index.
+            AlterTableOperation::AddConstraint(sqlparser::ast::TableConstraint::PrimaryKey {
+                name, columns, ..
+            }) => {
+                if columns.is_empty() {
+                    return Err(Error::query_execution(
+                        "ALTER TABLE … ADD PRIMARY KEY requires at least one column",
+                    ));
+                }
+                Ok(LogicalPlan::AlterTableAddPrimaryKey {
+                    table_name,
+                    constraint_name: name.as_ref().map(Self::normalize_ident),
+                    columns: columns.iter().map(Self::normalize_ident).collect(),
                 })
             }
             AlterTableOperation::AddConstraint(sqlparser::ast::TableConstraint::Unique { name, columns, .. }) => {

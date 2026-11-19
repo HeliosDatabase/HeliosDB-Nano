@@ -156,6 +156,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
         } else {
             param_types.clone()
         };
+        // v05.8: a parameter that is the whole `AS OF TIMESTAMP $n` anchor is
+        // a timestamptz (the clause is stripped before sqlparser sees it, so
+        // the inference above cannot type it).
+        let mut inferred_param_types = inferred_param_types;
+        for n in crate::sql::TimeTravelParser::as_of_parameter_indexes(&query) {
+            let declared = param_types.get(n - 1).copied().unwrap_or(0);
+            if let Some(slot) = inferred_param_types.get_mut(n - 1) {
+                if declared == 0 {
+                    *slot = 1184;
+                }
+            }
+        }
 
         // Derive result schema from query plan (gracefully handle failures).
         // If planning fails (e.g., table doesn't exist, unknown function), we

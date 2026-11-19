@@ -408,6 +408,10 @@ impl ScopeStack {
         if self.levels.is_empty() {
             return EntryLookup::Unscoped;
         }
+        // Pass 1: an entry's own name (alias, or bare table name when it has
+        // no alias), innermost to outermost. An outer level's own name wins
+        // over an inner level's LENIENT real-table name, so `acct.grp` inside
+        // `(SELECT .. FROM acct AS a ..)` under `FROM acct` names the outer row.
         for (level, scope) in self.levels.iter().enumerate().rev() {
             let own: Vec<usize> = scope
                 .entries
@@ -426,6 +430,10 @@ impl ScopeStack {
                 }
                 _ => return EntryLookup::Duplicate,
             }
+        }
+        // Pass 2: only when no level owns the name, the lenient real-table
+        // names, innermost to outermost.
+        for (level, scope) in self.levels.iter().enumerate().rev() {
             let lenient: Vec<usize> = scope
                 .entries
                 .iter()
@@ -658,6 +666,57 @@ mod tests {
         );
         stack.record(base(Some("a"), "u", &["id"]));
         assert_eq!(stack.resolve(Some("a"), "id", &[]), Resolution::DuplicateAlias);
+    }
+
+    #[test]
+    fn outer_own_name_wins_over_inner_lenient_name() {
+        let mut stack = ScopeStack::default();
+        stack.push();
+        stack.record(base(None, "acct", &["id", "grp"]));
+        stack.push();
+        stack.record(base(Some("a"), "acct", &["id", "grp"]));
+        assert_eq!(
+            stack.resolve(Some("acct"), "grp", &[]),
+            Resolution::Resolved {
+                qualifier: Some("acct".to_string())
+            },
+            "acct names the outer row, not the inner alias a"
+        );
+        assert_eq!(
+            stack.resolve(Some("a"), "grp", &[]),
+            Resolution::Resolved {
+                qualifier: Some("a".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn lenient_name_still_resolves_when_no_outer_candidate() {
+        let mut stack = ScopeStack::default();
+        stack.push();
+        stack.record(base(None, "other", &["id"]));
+        stack.push();
+        stack.record(base(Some("a"), "acct", &["id", "grp"]));
+        assert_eq!(
+            stack.resolve(Some("acct"), "grp", &[]),
+            Resolution::Resolved {
+                qualifier: Some("a".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn two_aliased_entries_sharing_a_real_name_stay_missing() {
+        let mut stack = ScopeStack::default();
+        stack.push();
+        stack.record(base(Some("o"), "other", &["id"]));
+        stack.push();
+        stack.record(base(Some("a"), "acct", &["id"]));
+        stack.record(base(Some("b"), "acct", &["id"]));
+        assert_eq!(
+            stack.resolve(Some("acct"), "id", &[]),
+            Resolution::MissingFromClauseEntry
+        );
     }
 
     #[test]

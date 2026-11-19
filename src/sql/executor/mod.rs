@@ -143,7 +143,7 @@ impl PhysicalOperator for DualScanOperator {
 ///
 /// * `src/lib.rs` `fast_string_literal_value` — text-family fast SELECT
 /// * `src/lib.rs` `fast_parse_pk_probe_value` — text-family fast PK probe
-/// * `src/lib.rs` `try_extract_pk_value` — text-family UPDATE/DELETE point lookup
+/// * `src/lib.rs` `pk_write_candidates` — UPDATE/DELETE primary-key candidates
 /// * `src/sql/executor/mod.rs` `pk_in_list_value` — `pk IN (…)` pushdown
 /// * `src/storage/engine.rs` `coerce_pk_value` — `get_row_by_pk`
 /// * `src/sql/executor/scan.rs` — the READ path: `equality_lookup_from_sides`,
@@ -2373,29 +2373,67 @@ impl<'a> Executor<'a> {
         }
     }
 
-    /// Base-table schema of a (single-table) subquery plan, used to decide whether a
-    /// column reference is satisfied by the subquery's own table (inner) or is FREE
-    /// (a correlated outer reference).
-    fn base_scan_schema(plan: &LogicalPlan) -> Option<std::sync::Arc<Schema>> {
+    /// The subquery's base relation: its schema and the name it is VISIBLE
+    /// by in its `FROM` (the alias, else the table name).
+    fn base_scan_rel(plan: &LogicalPlan) -> Option<(std::sync::Arc<Schema>, String)> {
         match plan {
-            LogicalPlan::Scan { schema, .. } | LogicalPlan::FilteredScan { schema, .. } => Some(schema.clone()),
+            LogicalPlan::Scan {
+                schema,
+                alias,
+                table_name,
+                ..
+            }
+            | LogicalPlan::FilteredScan {
+                schema,
+                alias,
+                table_name,
+                ..
+            } => Some((schema.clone(), alias.clone().unwrap_or_else(|| table_name.clone()))),
             LogicalPlan::Filter { input, .. }
             | LogicalPlan::Project { input, .. }
             | LogicalPlan::Aggregate { input, .. }
             | LogicalPlan::Sort { input, .. }
-            | LogicalPlan::Limit { input, .. } => Self::base_scan_schema(input),
+            | LogicalPlan::Limit { input, .. } => Self::base_scan_rel(input),
             _ => None,
         }
     }
 
-    /// A column ref is a FREE outer reference if the subquery's own base table does
-    /// not provide it but `outer` does.
-    fn col_is_free_outer(table: &Option<String>, name: &str, inner: Option<&Schema>, outer: &Schema) -> bool {
-        let in_inner = inner.is_some_and(|s| s.get_qualified_column_index(table.as_deref(), name).is_some());
-        !in_inner && outer.get_qualified_column_index(table.as_deref(), name).is_some()
+    /// Does the subquery's own relation provide `table.name`? Decided by the
+    /// VISIBLE name first: a qualifier equal to the inner relation's visible
+    /// name (or its bare table key) is inner; a qualifier the OUTER schema
+    /// exposes as a visible name is outer, even when it is the inner table's
+    /// real name (`(SELECT .. FROM acct AS a WHERE a.grp = acct.grp) .. FROM
+    /// acct`). Only then today's lookup, which also accepts the real name of an
+    /// aliased inner column (single-level leniency, unscoped plans).
+    fn inner_provides(table: &Option<String>, name: &str, inner: Option<(&Schema, &str)>, outer: &Schema) -> bool {
+        let Some((schema, visible)) = inner else {
+            return false;
+        };
+        if let Some(q) = table.as_deref() {
+            let bare = visible.rsplit('.').next().unwrap_or(visible);
+            if q == visible || q == bare {
+                return schema.get_column_index(name).is_some()
+                    || schema.get_qualified_column_index(Some(q), name).is_some();
+            }
+            if outer
+                .columns
+                .iter()
+                .any(|c| c.name == name && c.source_table.as_deref() == Some(q))
+            {
+                return false;
+            }
+        }
+        schema.get_qualified_column_index(table.as_deref(), name).is_some()
     }
 
-    fn expr_has_free_outer_ref(expr: &crate::sql::LogicalExpr, inner: Option<&Schema>, outer: &Schema) -> bool {
+    /// A column ref is a FREE outer reference if the subquery's own base table does
+    /// not provide it but `outer` does.
+    fn col_is_free_outer(table: &Option<String>, name: &str, inner: Option<(&Schema, &str)>, outer: &Schema) -> bool {
+        !Self::inner_provides(table, name, inner, outer)
+            && outer.get_qualified_column_index(table.as_deref(), name).is_some()
+    }
+
+    fn expr_has_free_outer_ref(expr: &crate::sql::LogicalExpr, inner: Option<(&Schema, &str)>, outer: &Schema) -> bool {
         use crate::sql::LogicalExpr as E;
         match expr {
             E::Column { table, name } => Self::col_is_free_outer(table, name, inner, outer),
@@ -2440,11 +2478,16 @@ impl<'a> Executor<'a> {
             LogicalPlan::FilteredScan {
                 schema,
                 predicate: Some(p),
+                alias,
+                table_name,
                 ..
-            } => Self::expr_has_free_outer_ref(p, Some(schema), outer),
+            } => {
+                let visible = alias.as_deref().unwrap_or(table_name);
+                Self::expr_has_free_outer_ref(p, Some((schema, visible)), outer)
+            }
             LogicalPlan::Filter { input, predicate } => {
-                let inner = Self::base_scan_schema(input);
-                Self::expr_has_free_outer_ref(predicate, inner.as_deref(), outer)
+                let inner = Self::base_scan_rel(input);
+                Self::expr_has_free_outer_ref(predicate, inner.as_ref().map(|(s, v)| (&**s, v.as_str())), outer)
                     || Self::plan_has_free_outer_ref(input, outer)
             }
             LogicalPlan::Project { input, .. }
@@ -2497,11 +2540,16 @@ impl<'a> Executor<'a> {
     }
 
     /// Bind a subquery's FREE outer column refs to the outer row's values (in place).
-    fn bind_expr_to_outer(expr: &mut crate::sql::LogicalExpr, inner: Option<&Schema>, outer: &Schema, row: &Tuple) {
+    fn bind_expr_to_outer(
+        expr: &mut crate::sql::LogicalExpr,
+        inner: Option<(&Schema, &str)>,
+        outer: &Schema,
+        row: &Tuple,
+    ) {
         use crate::sql::LogicalExpr as E;
         match expr {
             E::Column { table, name } => {
-                if inner.is_some_and(|s| s.get_qualified_column_index(table.as_deref(), name).is_some()) {
+                if Self::inner_provides(table, name, inner, outer) {
                     return; // inner column — leave for the subquery to resolve
                 }
                 if let Some(idx) = outer.get_qualified_column_index(table.as_deref(), name) {
@@ -2563,15 +2611,22 @@ impl<'a> Executor<'a> {
 
     fn bind_plan_mut(plan: &mut LogicalPlan, outer: &Schema, row: &Tuple) {
         match plan {
-            LogicalPlan::FilteredScan { schema, predicate, .. } => {
+            LogicalPlan::FilteredScan {
+                schema,
+                predicate,
+                alias,
+                table_name,
+                ..
+            } => {
                 let inner = schema.clone();
+                let visible = alias.clone().unwrap_or_else(|| table_name.clone());
                 if let Some(p) = predicate {
-                    Self::bind_expr_to_outer(p, Some(&inner), outer, row);
+                    Self::bind_expr_to_outer(p, Some((&inner, &visible)), outer, row);
                 }
             }
             LogicalPlan::Filter { input, predicate } => {
-                let inner = Self::base_scan_schema(input);
-                Self::bind_expr_to_outer(predicate, inner.as_deref(), outer, row);
+                let inner = Self::base_scan_rel(input);
+                Self::bind_expr_to_outer(predicate, inner.as_ref().map(|(s, v)| (&**s, v.as_str())), outer, row);
                 Self::bind_plan_mut(input, outer, row);
             }
             LogicalPlan::Project { input, .. }
@@ -5873,21 +5928,22 @@ fn insert_relation_spellings(name: &str, relations: &mut std::collections::HashS
 fn collect_plan_relations(plan: &crate::sql::LogicalPlan, relations: &mut std::collections::HashSet<String>) {
     use crate::sql::LogicalPlan;
     match plan {
-        LogicalPlan::Scan { table_name, alias, .. } => {
-            insert_relation_spellings(table_name, relations);
-            if let Some(alias) = alias {
-                insert_relation_spellings(alias, relations);
-            }
-        }
+        // An aliased scan is visible by its alias only: its real name names an
+        // outer relation when one exists (the planner rewrites a lenient
+        // real-name reference to the alias when none does).
+        LogicalPlan::Scan { table_name, alias, .. } => match alias {
+            Some(alias) => insert_relation_spellings(alias, relations),
+            None => insert_relation_spellings(table_name, relations),
+        },
         LogicalPlan::FilteredScan {
             table_name,
             alias,
             predicate,
             ..
         } => {
-            insert_relation_spellings(table_name, relations);
-            if let Some(alias) = alias {
-                insert_relation_spellings(alias, relations);
+            match alias {
+                Some(alias) => insert_relation_spellings(alias, relations),
+                None => insert_relation_spellings(table_name, relations),
             }
             // Symmetric with `collect_plan_qualifiers`, which reads this
             // predicate: a subquery pushed into a scan brings its own scope.

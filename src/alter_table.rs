@@ -922,6 +922,9 @@ impl EmbeddedDatabase {
                 })?;
             resolved.push(found.name.clone());
         }
+        if resolved.iter().all(|n| st.base.columns.iter().any(|c| &c.name == n)) {
+            return self.alter_add_primary_key_on_existing_columns(st, constraint_name, resolved);
+        }
         let existing_pk = st
             .schema
             .columns
@@ -972,6 +975,109 @@ impl EmbeddedDatabase {
                 .unwrap_or_default(),
             st.table,
             resolved.join(", ")
+        );
+        Ok(())
+    }
+
+    /// v05.10: `ADD [CONSTRAINT name] PRIMARY KEY (cols)` over columns the table
+    /// had when the statement began. Refused when the table has a key already
+    /// (42P16) or this transaction staged rows of it (0A000). Every row is
+    /// validated first: a NULL in a key column is 23502, a duplicate key 23505,
+    /// with nothing written and no index left. The rows keep their row ids: the
+    /// key's index maps each key to the row id the row is stored under, as it
+    /// does for a key declared in CREATE TABLE. The columns become NOT NULL and
+    /// carry the `primary_key` flag, which is what reopen rebuilds the index from.
+    fn alter_add_primary_key_on_existing_columns<'e>(
+        &'e self,
+        st: &mut AlterStatement<'e>,
+        constraint_name: &Option<String>,
+        resolved: Vec<String>,
+    ) -> Result<()> {
+        let catalog = self.storage.catalog();
+        let recorded_pk = st
+            .constraints_mut(&catalog)?
+            .unique_constraints
+            .iter()
+            .any(|uc| uc.is_primary_key);
+        if st.schema.columns.iter().any(|c| c.primary_key) || recorded_pk {
+            return Err(Error::query_execution(format!(
+                "multiple primary keys for table \"{}\" are not allowed",
+                st.table
+            )));
+        }
+        for (i, name) in resolved.iter().enumerate() {
+            if resolved.iter().skip(i + 1).any(|other| other == name) {
+                return Err(Error::query_execution(format!(
+                    "column \"{}\" appears twice in primary key constraint",
+                    name
+                )));
+            }
+        }
+        if st.own_rows {
+            return Err(Error::ddl_over_staged_rows("ALTER TABLE … ADD PRIMARY KEY", &st.table));
+        }
+        let rows = self.alter_current_rows(st)?;
+        let positions: Vec<usize> = resolved
+            .iter()
+            .filter_map(|n| st.schema.columns.iter().position(|c| &c.name == n))
+            .collect();
+        for row in &rows {
+            for (position, name) in positions.iter().zip(&resolved) {
+                if matches!(row.values.get(*position), None | Some(Value::Null)) {
+                    return Err(Error::ConstraintViolation(format!(
+                        "column \"{}\" of relation \"{}\" contains null values: the primary key {}",
+                        name,
+                        st.table,
+                        crate::error::NOT_NULL_VIOLATION_MARKER
+                    )));
+                }
+            }
+        }
+        let art = self.storage.art_indexes();
+        let index_name = art.create_pk_index(&st.table, &resolved).map_err(|e| {
+            Error::query_execution(format!(
+                "could not create the index enforcing PRIMARY KEY on {}({}): {}",
+                st.table,
+                resolved.join(", "),
+                e
+            ))
+        })?;
+        {
+            let dropped = std::sync::Arc::clone(art);
+            let unwritten = index_name.clone();
+            st.ddl.on_abort(move || {
+                let _ = dropped.drop_index(&unwritten);
+            });
+        }
+        st.created_indexes.push(index_name.clone());
+        for column in st.schema.columns.iter_mut() {
+            if resolved.contains(&column.name) {
+                column.primary_key = true;
+                column.nullable = false;
+            }
+        }
+        if let Err(e) = art.backfill_unique_index(&index_name, &st.schema, &rows) {
+            let _ = art.drop_index(&index_name);
+            st.created_indexes.retain(|n| n != &index_name);
+            return Err(Error::constraint_violation(format!(
+                "could not create primary key{} on relation \"{}\": {}",
+                constraint_name
+                    .as_ref()
+                    .map(|n| format!(" \"{}\"", n))
+                    .unwrap_or_default(),
+                st.table,
+                e
+            )));
+        }
+        tracing::info!(
+            "Adding PRIMARY KEY{} on existing columns {}({}) over {} row(s)",
+            constraint_name
+                .as_ref()
+                .map(|n| format!(" '{}'", n))
+                .unwrap_or_default(),
+            st.table,
+            resolved.join(", "),
+            rows.len()
         );
         Ok(())
     }

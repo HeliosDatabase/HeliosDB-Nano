@@ -257,6 +257,158 @@ pub struct WriteGate {
     /// The store seals its values (encryption at rest): this gate cannot read
     /// a constraint record out of a batch ([`OwnerDelta`]).
     constraint_records_sealed: AtomicBool,
+    /// Writes of main's index-definition records (`meta:index:{name}`), and
+    /// the table each names ([`IndexDefinitionWrites`]).
+    index_definition_writes: IndexDefinitionWrites,
+}
+
+/// The prefix of main's index-definition records (`meta:index:{name}`).
+const INDEX_DEFINITION_PREFIX: &[u8] = b"meta:index:";
+
+/// Whether a key, or a deleted range, touches the index-definition records.
+fn touches_index_definitions(key: &[u8], range_end: Option<&[u8]>) -> bool {
+    match range_end {
+        None => key.starts_with(INDEX_DEFINITION_PREFIX),
+        Some(end) => key < b"meta:index;".as_slice() && end > INDEX_DEFINITION_PREFIX,
+    }
+}
+
+/// Which index-definition records name which table, as [`ConstraintWrites`]
+/// keeps the foreign-key owners: seeded by a walk of every record
+/// ([`WriteGate::remember_index_definition_tables`]), then followed through
+/// every write of a record (a put names its table, or none when it does not
+/// decode; a delete removes the name), and given up whenever a write cannot be
+/// followed exactly (sealed values, a range delete, an unwalkable batch, a
+/// failed write, another such write in flight). A `DROP TABLE` reads only its
+/// own table's records by name instead of every table's
+/// (`Catalog::table_index_definitions`).
+#[derive(Debug, Default)]
+struct IndexDefinitionWrites {
+    started: AtomicU64,
+    finished: AtomicU64,
+    tables: parking_lot::Mutex<Option<IndexDefinitionTables>>,
+}
+
+/// Index name -> the table its record names, and the reverse.
+#[derive(Debug, Default)]
+struct IndexDefinitionTables {
+    by_name: std::collections::HashMap<String, String>,
+    by_table: std::collections::HashMap<String, std::collections::BTreeSet<String>>,
+}
+
+impl IndexDefinitionTables {
+    fn set(&mut self, name: &str, table: Option<&str>) {
+        if let Some(previous) = self.by_name.remove(name) {
+            if let Some(names) = self.by_table.get_mut(&previous) {
+                names.remove(name);
+                if names.is_empty() {
+                    self.by_table.remove(&previous);
+                }
+            }
+        }
+        if let Some(table) = table {
+            self.by_name.insert(name.to_string(), table.to_string());
+            self.by_table
+                .entry(table.to_string())
+                .or_default()
+                .insert(name.to_string());
+        }
+    }
+}
+
+/// What one write does to [`IndexDefinitionTables`].
+#[derive(Debug)]
+enum IndexDefinitionDelta {
+    /// Each record put or deleted: its index name, and the table it names
+    /// afterwards (`None`: deleted, or a record that does not decode, which a
+    /// walk steps over too).
+    Known(Vec<(String, Option<String>)>),
+    Unknown,
+}
+
+impl IndexDefinitionDelta {
+    fn entry(key: &[u8], value: Option<&[u8]>, sealed: bool) -> Option<(String, Option<String>)> {
+        let name = std::str::from_utf8(key.strip_prefix(INDEX_DEFINITION_PREFIX)?).ok()?;
+        match value {
+            None => Some((name.to_string(), None)),
+            Some(_) if sealed => None,
+            Some(value) => Some((
+                name.to_string(),
+                super::catalog::Catalog::decode_persisted_index_definition(name, value)
+                    .map(|definition| definition.table_name),
+            )),
+        }
+    }
+
+    fn note(delta: &mut Option<Self>, operation: super::layout_epochs::BatchKey<'_>, sealed: bool) {
+        use super::layout_epochs::BatchKey;
+        let (key, value, readable) = match operation {
+            BatchKey::Put(key, value) => (key, Some(value), true),
+            BatchKey::Delete(key) => (key, None, true),
+            BatchKey::Merge(key) => (key, None, false),
+            BatchKey::Range(start, end) => {
+                if touches_index_definitions(start, Some(end)) {
+                    *delta = Some(Self::Unknown);
+                }
+                return;
+            }
+        };
+        if !touches_index_definitions(key, None) {
+            return;
+        }
+        let entry = if readable {
+            Self::entry(key, value, sealed)
+        } else {
+            None
+        };
+        match (delta.as_mut(), entry) {
+            (Some(Self::Unknown), _) => {}
+            (Some(Self::Known(entries)), Some(entry)) => entries.push(entry),
+            (None, Some(entry)) => *delta = Some(Self::Known(vec![entry])),
+            (_, None) => *delta = Some(Self::Unknown),
+        }
+    }
+}
+
+/// One write of [`IndexDefinitionWrites`]; dropped without [`Self::finish`]
+/// it ends as a write that could not be followed.
+struct IndexDefinitionWrite<'g> {
+    writes: &'g IndexDefinitionWrites,
+    delta: IndexDefinitionDelta,
+}
+
+impl<'g> IndexDefinitionWrite<'g> {
+    fn begin(writes: &'g IndexDefinitionWrites, delta: IndexDefinitionDelta) -> Self {
+        let mut tables = writes.tables.lock();
+        let started = writes.started.fetch_add(1, Ordering::SeqCst) + 1;
+        if matches!(delta, IndexDefinitionDelta::Unknown) || started != writes.finished.load(Ordering::SeqCst) + 1 {
+            *tables = None;
+        }
+        drop(tables);
+        Self { writes, delta }
+    }
+
+    fn finish(mut self, applied: bool) {
+        if !applied {
+            self.delta = IndexDefinitionDelta::Unknown;
+        }
+    }
+}
+
+impl Drop for IndexDefinitionWrite<'_> {
+    fn drop(&mut self) {
+        let mut tables = self.writes.tables.lock();
+        match (&self.delta, tables.as_mut()) {
+            (IndexDefinitionDelta::Known(entries), Some(map)) => {
+                for (name, table) in entries {
+                    map.set(name, table.as_deref());
+                }
+            }
+            (IndexDefinitionDelta::Unknown, _) => *tables = None,
+            (IndexDefinitionDelta::Known(_), None) => {}
+        }
+        self.writes.finished.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 /// The prefix of main's constraint records (`table_constraints:{table}`).
@@ -686,6 +838,7 @@ impl WriteGate {
             delta_ids_installed: AtomicBool::new(false),
             delta_floor_locks: std::array::from_fn(|_| parking_lot::Mutex::new(())),
             constraint_writes: ConstraintWrites::default(),
+            index_definition_writes: IndexDefinitionWrites::default(),
             constraint_records_sealed: AtomicBool::new(false),
         })
     }
@@ -724,6 +877,43 @@ impl WriteGate {
         let mut slot = self.constraint_writes.owners.lock();
         if self.constraint_write_stamp() == Some(stamp) {
             *slot = Some(owners.into_iter().collect());
+        }
+    }
+
+    /// The count of writes of index-definition records, when none is in flight
+    /// and this gate sees every key it writes; `None` otherwise (as
+    /// [`Self::constraint_write_stamp`]).
+    pub(crate) fn index_definition_write_stamp(&self) -> Option<u64> {
+        self.layout.get()?;
+        let finished = self.index_definition_writes.finished.load(Ordering::SeqCst);
+        let started = self.index_definition_writes.started.load(Ordering::SeqCst);
+        (started == finished).then_some(started)
+    }
+
+    /// The names of the index-definition records that name `table`, when the
+    /// map is current ([`IndexDefinitionWrites`]).
+    pub(crate) fn index_definitions_of_table(&self, table: &str) -> Option<Vec<String>> {
+        let tables = self.index_definition_writes.tables.lock();
+        self.index_definition_write_stamp()?;
+        tables.as_ref().map(|map| {
+            map.by_table
+                .get(table)
+                .map(|names| names.iter().cloned().collect())
+                .unwrap_or_default()
+        })
+    }
+
+    /// Seed the map with `(index, table)` pairs listed by a walk of every
+    /// index-definition record that began under `stamp`, unless such a write
+    /// has started since.
+    pub(crate) fn remember_index_definition_tables(&self, stamp: u64, pairs: Vec<(String, String)>) {
+        let mut slot = self.index_definition_writes.tables.lock();
+        if self.index_definition_write_stamp() == Some(stamp) {
+            let mut map = IndexDefinitionTables::default();
+            for (name, table) in pairs {
+                map.set(&name, Some(&table));
+            }
+            *slot = Some(map);
         }
     }
 
@@ -903,19 +1093,25 @@ impl WriteGate {
         &self,
         db: &DB,
         batch: &WriteBatch,
-    ) -> Result<(LayoutChange, DeltaFloors, Option<OwnerDelta>)> {
+    ) -> Result<(
+        LayoutChange,
+        DeltaFloors,
+        Option<OwnerDelta>,
+        Option<IndexDefinitionDelta>,
+    )> {
         use super::layout_epochs::BatchKey;
         let wiring = self.layout.get();
         let delta_ids = self.delta_ids_installed.load(Ordering::Acquire);
         let mut floors = DeltaFloors::default();
         if wiring.is_none() && !delta_ids {
             // No wiring: no stamp is ever given (`constraint_write_stamp`).
-            return Ok((LayoutChange::none(), floors, None));
+            return Ok((LayoutChange::none(), floors, None, None));
         }
         let mut tables: Vec<String> = Vec::new();
         let mut branches = Vec::new();
         let mut branch_wide = false;
         let mut constraints: Option<OwnerDelta> = None;
+        let mut index_definitions: Option<IndexDefinitionDelta> = None;
         let sealed = self.constraint_records_sealed.load(Ordering::SeqCst);
         let mut inspected = Ok(());
         // One borrowed key pass, shared with the layout detector already on the
@@ -925,6 +1121,7 @@ impl WriteGate {
                 inspected = floors.inspect(db, operation);
             }
             OwnerDelta::note(&mut constraints, operation, sealed);
+            IndexDefinitionDelta::note(&mut index_definitions, operation, sealed);
             if let Some(wiring) = wiring {
                 if let BatchKey::Range(start, end) = operation {
                     branch_wide |= super::layout_epochs::branch_catalog_range(start, end);
@@ -947,6 +1144,7 @@ impl WriteGate {
             }
             // Unknown keys: counted as a constraint write that cannot be followed.
             constraints = Some(OwnerDelta::Unknown);
+            index_definitions = Some(IndexDefinitionDelta::Unknown);
             tables.clear();
             branches.clear();
             let mut collector = LayoutKeyCollector(Vec::new());
@@ -969,7 +1167,7 @@ impl WriteGate {
             }
             _ => LayoutChange::none(),
         };
-        Ok((change, floors, constraints))
+        Ok((change, floors, constraints, index_definitions))
     }
 
     /// Spec R5.6: [`Self::begin_batch_change`] for one key.
@@ -1350,8 +1548,10 @@ impl WriteGate {
         if !batch.is_empty() {
             super::layout_epochs::at_durable_effect()?;
         }
-        let (change, floors, constraints) = self.begin_batch_change(db, &batch)?;
+        let (change, floors, constraints, index_definitions) = self.begin_batch_change(db, &batch)?;
         let constraint_write = constraints.map(|delta| ConstraintWrite::begin(&self.constraint_writes, delta));
+        let index_definition_write =
+            index_definitions.map(|delta| IndexDefinitionWrite::begin(&self.index_definition_writes, delta));
         let applied = if self.freeze_active.load(Ordering::SeqCst) {
             self.write_frozen(db, batch, opts, slot, floors, attempt)
         } else {
@@ -1361,6 +1561,9 @@ impl WriteGate {
         };
         if let Some(constraint_write) = constraint_write {
             constraint_write.finish(applied.is_ok());
+        }
+        if let Some(index_definition_write) = index_definition_write {
+            index_definition_write.finish(applied.is_ok());
         }
         self.end_layout_change(change);
         applied
@@ -1394,6 +1597,14 @@ impl WriteGate {
         // Ends when this function returns, after RocksDB has.
         let _constraint_write = touches_constraint_records(key, None)
             .then(|| ConstraintWrite::begin(&self.constraint_writes, OwnerDelta::Unknown));
+        let index_definition_write = touches_index_definitions(key, None).then(|| {
+            let sealed = self.constraint_records_sealed.load(Ordering::SeqCst);
+            let delta = IndexDefinitionDelta::entry(key, Some(value), sealed)
+                .map_or(IndexDefinitionDelta::Unknown, |entry| {
+                    IndexDefinitionDelta::Known(vec![entry])
+                });
+            IndexDefinitionWrite::begin(&self.index_definition_writes, delta)
+        });
         let applied = if self.freeze_active.load(Ordering::SeqCst) {
             let mut batch = WriteBatch::default();
             batch.put(key, value);
@@ -1428,6 +1639,9 @@ impl WriteGate {
             drop(slot);
             applied
         };
+        if let Some(index_definition_write) = index_definition_write {
+            index_definition_write.finish(applied.is_ok());
+        }
         self.end_layout_change(change);
         applied
     }
@@ -1455,6 +1669,12 @@ impl WriteGate {
         // Ends when this function returns, after RocksDB has.
         let _constraint_write = touches_constraint_records(key, None)
             .then(|| ConstraintWrite::begin(&self.constraint_writes, OwnerDelta::Unknown));
+        let index_definition_write = touches_index_definitions(key, None).then(|| {
+            let delta = IndexDefinitionDelta::entry(key, None, false).map_or(IndexDefinitionDelta::Unknown, |entry| {
+                IndexDefinitionDelta::Known(vec![entry])
+            });
+            IndexDefinitionWrite::begin(&self.index_definition_writes, delta)
+        });
         let applied = if self.freeze_active.load(Ordering::SeqCst) {
             let mut batch = WriteBatch::default();
             batch.delete(key);
@@ -1471,6 +1691,9 @@ impl WriteGate {
             drop(slot);
             applied
         };
+        if let Some(index_definition_write) = index_definition_write {
+            index_definition_write.finish(applied.is_ok());
+        }
         self.end_layout_change(change);
         applied
     }

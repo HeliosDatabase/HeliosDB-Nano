@@ -5496,6 +5496,9 @@ impl EmbeddedDatabase {
 
     fn query_is_non_deterministic(sql: &str) -> bool {
         Self::contains_any_ascii_case_insensitive(sql, &Self::NON_DETERMINISTIC_MARKERS)
+            // `AS OF TIMESTAMP CURRENT_TIMESTAMP - interval '1 hour'` names a
+            // different past at every call.
+            || sql::TimeTravelParser::has_expression_anchor(sql)
     }
 
     /// Whether `haystack` contains any of `needles`, ignoring ASCII case, in one
@@ -12096,26 +12099,16 @@ impl EmbeddedDatabase {
                 };
                 let assignments = rls_assignments.as_ref().unwrap_or(assignments);
 
-                // Try PK point lookup optimization: if WHERE is `pk_col = literal`,
-                // fetch only the matching row instead of scanning the entire table.
-                // Skip optimization on non-main branches: branch-inherited rows are stored
-                // under the main prefix (data:) but PK lookup uses branch prefix (bdata:).
+                // Primary-key candidates (v06.1): `pk_write_candidates` answers a
+                // sole-PK conjunct (`pk = v`, `pk IN (...)`, inside an AND tree)
+                // with the committed rows it names, values coerced to the key's
+                // type (GH#15); everything it cannot answer exactly — including
+                // a NUMERIC probe that misses — declines to the scan. Branches
+                // take the branch view.
                 //
-                // GH#15: `try_extract_pk_value` returns `Some` only when the literal was
-                // coerced to the PK column's exact type, so the probe key is byte-identical
-                // to the one INSERT stored and a miss really does mean "no such row"
-                // (`None => vec![]` below). Anything it cannot type — including a literal
-                // that is not representable in the column's type — comes back `None` and
-                // takes the scan branch, where the predicate is evaluated per row exactly
-                // as SELECT does it.
-                //
-                // GH#41 CORRECTION: "a miss really does mean `no such row`" held
-                // only for rows this transaction did not stage itself. A row
-                // INSERTed earlier in the SAME transaction is not in `data:` at
-                // all, so the probe missed and `None => vec![]` silently dropped
-                // the statement. The `merge_txn_writes` gate below is what makes
-                // the sentence above true again: the point lookup now runs only
-                // when this transaction has staged nothing for the table.
+                // GH#41: the candidates are committed state only. A row this
+                // transaction staged is merged in below whenever it wrote the
+                // table, exactly as for the scan.
                 let on_branch = self.storage.is_branch_active();
                 // GH#41 (sprinter 27bf8d819c52): READ-YOUR-OWN-WRITES ON THE
                 // WRITE PATH. Both row sources below read committed state only —
@@ -12158,14 +12151,12 @@ impl EmbeddedDatabase {
                 // in `write_set` or `insert_log`, which makes both the merge and
                 // the point-lookup decline provably free when nothing is staged.
                 //
-                // WHY THE POINT LOOKUP MUST DECLINE RATHER THAN MERGE. Merging
-                // into the `vec![]` a missed point lookup produces still cannot
-                // find a staged row: the probe reads the ART index and
-                // materialises from `data:`, and the staged row is in neither.
-                // The decline is safe in the cardinality sense the census
-                // documents — a staged write can only ADD or REMOVE keys for
-                // this table, and either way the scan below is the correct
-                // answer.
+                // WHY CANDIDATES + MERGE IS CORRECT. `merge_with_write_set_shaped`
+                // adds EVERY staged image of this table (its INSERTs, key-moving
+                // UPDATEs, tombstones), not only the candidates' row ids, so a
+                // row the index probe cannot see (staged, not in `data:`) still
+                // reaches `row_matches`, and a staged tombstone removes a
+                // committed candidate. The cost is O(staged keys of the table).
                 //
                 // BRANCHES ARE UNCHANGED. `merge_with_write_set` keys off
                 // `data:{table}:`, while a branch write is staged under
@@ -12187,7 +12178,7 @@ impl EmbeddedDatabase {
                 let row_epoch = self.row_epoch_for(branch_view.as_ref(), table_name);
                 let tuples = if let Some(view) = &branch_view {
                     view.scan(Some(txn), table_name, &schema)?
-                } else if let Some(candidates) = self.pk_in_write_candidates(table_name, &schema, dml_selection, &[])? {
+                } else if let Some(candidates) = self.pk_write_candidates(table_name, &schema, dml_selection, &[])? {
                     if merge_txn_writes {
                         txn.merge_with_write_set_shaped(
                             table_name,
@@ -12205,17 +12196,6 @@ impl EmbeddedDatabase {
                         base_tuples,
                         &self.storage.row_shape(table_name, width)?,
                     )?
-                } else if let Some(pk_value) = Self::try_extract_pk_value(dml_selection, &schema) {
-                    // Spec R5.4 (review F1): the row as stored, not the row cache's
-                    // copy — `lock_row_for_change` trusts what it is handed while the
-                    // epoch has not moved.
-                    match self
-                        .storage
-                        .get_row_by_typed_pk_for_write_with_schema(table_name, &pk_value, &schema)?
-                    {
-                        Some(tuple) => vec![tuple],
-                        None => vec![],
-                    }
                 } else {
                     self.storage.scan_table_branch_aware(table_name)?
                 };
@@ -12645,22 +12625,9 @@ impl EmbeddedDatabase {
                 let trigger_event = sql::logical_plan::TriggerEvent::Delete;
                 let has_triggers = self.trigger_registry.has_triggers_for_table(table_name);
 
-                // Try PK point lookup optimization for DELETE WHERE pk_col = literal
-                // Skip optimization on non-main branches: branch-inherited rows are stored
-                // under the main prefix (data:) but PK lookup uses branch prefix (bdata:),
-                // so inherited rows would not be found.
-                //
-                // GH#15: identical shape to the UPDATE arm above, and identical contract —
-                // `try_extract_pk_value` yields a probe key already coerced to the PK
-                // column's type, so `None => vec![]` only ever means "genuinely absent";
-                // an uncoercible literal declines the point lookup and falls back to the
-                // scan branch. `DELETE … RETURNING` by PK reaches exactly this code.
-                //
-                // GH#41 CORRECTION: same as the UPDATE arm — `None => vec![]`
-                // meant "genuinely absent" only for rows this transaction had
-                // not staged itself; the `merge_txn_writes` gate below restores
-                // that contract by standing the point lookup down whenever it
-                // has.
+                // Primary-key candidates exactly as in the UPDATE arm above
+                // (`pk_write_candidates`, merged with the transaction's staged
+                // rows). `DELETE … RETURNING` by PK reaches exactly this code.
                 let on_branch = self.storage.is_branch_active();
                 // GH#41 (sprinter 27bf8d819c52): identical shape and identical
                 // reasoning to the UPDATE arm above — read that comment, which
@@ -12679,7 +12646,7 @@ impl EmbeddedDatabase {
                 let tuples = if let Some(view) = &branch_view {
                     view.scan(Some(txn), table_name, &schema_arc)?
                 } else if let Some(candidates) =
-                    self.pk_in_write_candidates(table_name, &schema_arc, dml_selection, &[])?
+                    self.pk_write_candidates(table_name, &schema_arc, dml_selection, &[])?
                 {
                     if merge_txn_writes {
                         txn.merge_with_write_set_shaped(
@@ -12698,16 +12665,6 @@ impl EmbeddedDatabase {
                         base_tuples,
                         &self.storage.row_shape(table_name, width)?,
                     )?
-                } else if let Some(pk_value) = Self::try_extract_pk_value(dml_selection, &schema_arc) {
-                    // Spec R5.4 (review F1): storage, not the row cache (see the
-                    // UPDATE arm).
-                    match self
-                        .storage
-                        .get_row_by_typed_pk_for_write_with_schema(table_name, &pk_value, &schema_arc)?
-                    {
-                        Some(tuple) => vec![tuple],
-                        None => vec![],
-                    }
                 } else {
                     self.storage.scan_table_branch_aware(table_name)?
                 };
@@ -17032,6 +16989,11 @@ impl EmbeddedDatabase {
         data_type: &DataType,
         params: &'a [Value],
     ) -> Option<Result<std::borrow::Cow<'a, Value>>> {
+        // A NUMERIC key's encoding is scale-sensitive (`6` vs a stored `6.00`):
+        // a probe miss is not proof of absence, so the planner decides.
+        if matches!(data_type, DataType::Numeric) {
+            return None;
+        }
         if let sql::LogicalExpr::Parameter { index } = expr {
             if *index == 0 {
                 return Some(Err(Error::query_execution(
@@ -17639,6 +17601,26 @@ impl EmbeddedDatabase {
     fn validate_add_primary_key_preconditions(&self, table_name: &str, columns: &[String]) -> Result<()> {
         let catalog = self.storage.catalog();
         let schema = catalog.get_table_schema(table_name)?;
+        // v05.10: a key over columns the table already has (`ALTER TABLE t ADD
+        // [CONSTRAINT n] PRIMARY KEY (cols)`, what pg_dump emits) is validated
+        // over the rows by the executor (23502 / 23505); here only a key the
+        // table already has is refused.
+        let on_existing_columns = columns
+            .iter()
+            .all(|n| schema.columns.iter().any(|c| c.name.eq_ignore_ascii_case(n)));
+        if on_existing_columns {
+            let recorded_pk = catalog
+                .load_table_constraints(table_name)
+                .map(|c| c.unique_constraints.iter().any(|uc| uc.is_primary_key))
+                .unwrap_or(false);
+            if schema.columns.iter().any(|c| c.primary_key) || recorded_pk {
+                return Err(Error::query_execution(format!(
+                    "multiple primary keys for table \"{}\" are not allowed",
+                    table_name
+                )));
+            }
+            return Ok(());
+        }
         let existing_pk: Vec<&str> = schema
             .columns
             .iter()
@@ -21222,6 +21204,11 @@ impl EmbeddedDatabase {
     /// straight into an EMPTY RESULT (`Ok(None)` → `Ok(vec![])` /
     /// `Some(Ok(0))`), which is the read-path twin of GH#15.
     fn fast_parse_pk_probe_value(token: &str, pk_type: &DataType) -> Option<Value> {
+        // NUMERIC: a probe miss is not proof of absence (scale-sensitive key
+        // encoding); the planner path compares by value.
+        if matches!(pk_type, DataType::Numeric) {
+            return None;
+        }
         let (value, rest) = Self::fast_parse_one_value(token, pk_type)?;
         if !rest.trim().is_empty() {
             return None;
@@ -23978,7 +23965,7 @@ impl EmbeddedDatabase {
                 let row_epoch = self.row_epoch_for(branch_view.as_ref(), table_name);
                 let base_tuples = match &branch_view {
                     Some(view) => view.scan(active_txn, table_name, &schema)?,
-                    None => match self.pk_in_write_candidates(table_name, &schema, dml_selection, params)? {
+                    None => match self.pk_write_candidates(table_name, &schema, dml_selection, params)? {
                         Some(candidates) => candidates,
                         None => self.storage.scan_table_branch_aware(table_name)?,
                     },
@@ -24312,7 +24299,7 @@ impl EmbeddedDatabase {
                 let row_epoch = self.row_epoch_for(branch_view.as_ref(), table_name);
                 let base_tuples = match &branch_view {
                     Some(view) => view.scan(active_txn, table_name, &schema)?,
-                    None => match self.pk_in_write_candidates(table_name, &schema, dml_selection, params)? {
+                    None => match self.pk_write_candidates(table_name, &schema, dml_selection, params)? {
                         Some(candidates) => candidates,
                         None => self.storage.scan_table_branch_aware(table_name)?,
                     },
@@ -34253,120 +34240,110 @@ impl EmbeddedDatabase {
         }
     }
 
-    /// Extract the PK point-lookup probe key from a simple WHERE clause like
-    /// `pk_col = literal` or `literal = pk_col`.
-    ///
-    /// `None` means "do NOT take the point lookup" — the caller must scan and
-    /// evaluate the predicate per row. It is returned when the predicate is not
-    /// a simple PK equality, when there is no sole PK column, and (GH#15) when
-    /// the literal has no valid ART encoding for the PK column's type.
-    ///
-    /// `Some(value)` is always already coerced to the PK column's type, because
-    /// the ART key encoding is byte-exact per `Value` variant: the parser hands
-    /// us `Value::String("<uuid>")` (36 UTF-8 bytes) for a quoted literal while
-    /// INSERT stored `Value::Uuid` (16 raw bytes), so an uncoerced probe can
-    /// never match. That miss used to be reported as "no such row", which is
-    /// how `UPDATE … WHERE id = '<uuid>'` silently became `UPDATE 0` while
-    /// `SELECT` with the same predicate returned the row.
-    fn try_extract_pk_value(selection: Option<&sql::LogicalExpr>, schema: &Schema) -> Option<Value> {
-        let predicate = selection?;
-        // BUG F: this single-value `get_row_by_pk` optimization (used by the
-        // UPDATE and DELETE executor arms) is only valid for a SOLE primary-key
-        // column. A composite PRIMARY KEY marks every member `primary_key =
-        // true`; matching a prefix predicate against the first one and probing
-        // the grouped composite index with a single value never matches,
-        // silently affecting 0 rows. Decline for composite PKs so the caller
-        // falls back to a full scan + filter (which evaluates the predicate
-        // per row and correctly matches every prefix row).
-        if !schema.has_single_column_pk() {
-            return None;
-        }
-        let pk_col = schema.columns.iter().find(|c| c.primary_key)?;
-
-        let literal = if let sql::LogicalExpr::BinaryExpr {
-            left,
-            op: sql::BinaryOperator::Eq,
-            right,
-        } = predicate
-        {
-            match (left.as_ref(), right.as_ref()) {
-                (sql::LogicalExpr::Column { name, .. }, sql::LogicalExpr::Literal(val)) if name == &pk_col.name => {
-                    val.clone()
-                }
-                (sql::LogicalExpr::Literal(val), sql::LogicalExpr::Column { name, .. }) if name == &pk_col.name => {
-                    val.clone()
-                }
-                _ => return None,
+    /// The probe values of the first usable primary-key conjunct of `predicate`
+    /// (walking an AND tree): `pk = v` / `v = pk` as a one-element list, or a
+    /// non-negated `pk IN (v, ...)`. A value is a literal or a bound parameter;
+    /// `None` when no conjunct is usable or a value is NULL, an expression or
+    /// a NOT IN (the scan keeps those).
+    fn pk_conjunct_values(
+        predicate: &sql::LogicalExpr,
+        pk_name: &str,
+        table_name: &str,
+        params: &[Value],
+    ) -> Option<Vec<Value>> {
+        let is_pk = |expr: &sql::LogicalExpr| match expr {
+            sql::LogicalExpr::Column { table, name } => {
+                name == pk_name && table.as_deref().is_none_or(|qualifier| qualifier == table_name)
             }
-        } else {
-            return None;
+            _ => false,
         };
-
-        // GH#15: THE one coercion rule, shared with the read path's index probe
-        // and with the `IN`-list count pushdown. `None` = this literal cannot be
-        // encoded as a key for this column, so the point lookup would be a
-        // guaranteed miss; declining sends the caller to a scan, which is the
-        // only thing that keeps UPDATE/DELETE matching exactly what SELECT does.
-        sql::executor::coerce_literal_to_column_type(literal, &pk_col.data_type)
+        let bound = |expr: &sql::LogicalExpr| -> Option<Value> {
+            let value = match expr {
+                sql::LogicalExpr::Literal(value) => value.clone(),
+                sql::LogicalExpr::Parameter { index } => index.checked_sub(1).and_then(|p| params.get(p))?.clone(),
+                _ => return None,
+            };
+            (!matches!(value, Value::Null)).then_some(value)
+        };
+        match predicate {
+            sql::LogicalExpr::BinaryExpr {
+                left,
+                op: sql::BinaryOperator::And,
+                right,
+            } => Self::pk_conjunct_values(left, pk_name, table_name, params)
+                .or_else(|| Self::pk_conjunct_values(right, pk_name, table_name, params)),
+            sql::LogicalExpr::BinaryExpr {
+                left,
+                op: sql::BinaryOperator::Eq,
+                right,
+            } => {
+                if is_pk(left) {
+                    bound(right).map(|v| vec![v])
+                } else if is_pk(right) {
+                    bound(left).map(|v| vec![v])
+                } else {
+                    None
+                }
+            }
+            sql::LogicalExpr::InList {
+                expr,
+                list,
+                negated: false,
+            } if is_pk(expr) && !list.is_empty() => list.iter().map(bound).collect(),
+            _ => None,
+        }
     }
 
-    /// A committed candidate superset for a sole, bound integer-PK IN predicate.
-    /// The caller MUST merge its complete staged rows before filtering: an index
-    /// miss cannot exclude this owner's INSERT, PK change, raw put or tombstone.
-    /// All normal predicate/row-lock/constraint/outcome logic remains downstream.
-    fn pk_in_write_candidates(
+    /// A committed candidate superset for an UPDATE/DELETE whose WHERE carries
+    /// a sole-primary-key conjunct (`pk = v`, `pk IN (...)`, either inside an
+    /// AND tree; literal or bound). The caller MUST merge its complete staged
+    /// rows before filtering when the transaction wrote the table: an index
+    /// miss cannot exclude this owner's INSERT, PK change, raw put or
+    /// tombstone. The full predicate still runs on every candidate downstream,
+    /// with the row-lock/constraint/outcome logic.
+    ///
+    /// `Ok(None)` = take the scan: no usable conjunct, composite/no PK, branch,
+    /// no primary registry, not a plain table, a value that cannot be coerced
+    /// to the key type (GH#15), and a NUMERIC probe that MISSES (`6` against a
+    /// stored `6.00` encodes differently; the scan compares by value, which is
+    /// what SELECT does).
+    fn pk_write_candidates(
         &self,
         table_name: &str,
         schema: &Schema,
         selection: Option<&sql::LogicalExpr>,
         params: &[Value],
     ) -> Result<Option<Vec<Tuple>>> {
-        let Some(
-            predicate @ sql::LogicalExpr::InList {
-                expr,
-                list,
-                negated: false,
-            },
-        ) = selection
-        else {
+        let Some(predicate) = selection else {
             return Ok(None);
         };
-        // No ordinary non-IN mutation pays schema/index probes or allocations.
-        // Keep expressions/casts/NULL/NOT IN and noninteger encoding ambiguity
-        // on the existing scan. The resolver's BIGSERIAL is Int8.
-        if list.is_empty()
-            || !list.iter().all(|item| match item {
-                sql::LogicalExpr::Literal(Value::Int2(_) | Value::Int4(_) | Value::Int8(_)) => true,
-                sql::LogicalExpr::Parameter { index } => index
-                    .checked_sub(1)
-                    .and_then(|position| params.get(position))
-                    .is_some_and(|value| matches!(value, Value::Int2(_) | Value::Int4(_) | Value::Int8(_))),
-                _ => false,
-            })
-            || !schema.has_single_column_pk()
-            || self.storage.is_branch_active()
+        // Cheap shape test first: no ordinary mutation pays registry probes.
+        if !matches!(
+            predicate,
+            sql::LogicalExpr::BinaryExpr {
+                op: sql::BinaryOperator::Eq | sql::BinaryOperator::And,
+                ..
+            } | sql::LogicalExpr::InList { negated: false, .. }
+        ) || !schema.has_single_column_pk()
         {
-            return Ok(None);
-        }
-        let sql::LogicalExpr::Column { table, name } = expr.as_ref() else {
-            return Ok(None);
-        };
-        if table.as_deref().is_some_and(|qualifier| qualifier != table_name) {
             return Ok(None);
         }
         let Some(column) = schema.columns.iter().find(|column| column.primary_key) else {
             return Ok(None);
         };
-        if name != &column.name || !matches!(column.data_type, DataType::Int2 | DataType::Int4 | DataType::Int8) {
-            return Ok(None);
-        }
-        let Some((_index, values)) =
-            sql::executor::scan::indexed_in_list_lookup(&self.storage, table_name, schema, predicate, params)
-        else {
+        let Some(raw) = Self::pk_conjunct_values(predicate, &column.name, table_name, params) else {
             return Ok(None);
         };
+        let mut values = Vec::with_capacity(raw.len());
+        for value in raw {
+            match sql::executor::coerce_literal_to_column_type(value, &column.data_type) {
+                Some(Value::Null) | None => return Ok(None),
+                Some(value) => values.push(value),
+            }
+        }
         // Missing/retired primary registry is not an authoritative empty row set.
-        if self.storage.art_indexes().pk_index_len(table_name).is_none()
+        if self.storage.is_branch_active()
+            || self.storage.art_indexes().pk_index_len(table_name).is_none()
             || self.storage.cached_table_kind(table_name)? != storage::TableKind::Table
         {
             return Ok(None);
@@ -34377,16 +34354,22 @@ impl EmbeddedDatabase {
             // Current storage, not the row cache or an old read snapshot. This
             // getter retains foreign removed-key holds and misdirected-claim
             // reconciliation; a native/shape/availability error propagates.
-            if let Some(tuple) = self
+            match self
                 .storage
                 .get_row_by_typed_pk_for_write_with_schema(table_name, &value, schema)?
             {
-                let row_id = tuple
-                    .row_id
-                    .ok_or_else(|| Error::storage("PK-IN write candidate has no stored row identity"))?;
-                if seen.insert(row_id) {
-                    candidates.push(tuple);
+                Some(tuple) => {
+                    let row_id = tuple
+                        .row_id
+                        .ok_or_else(|| Error::storage("PK write candidate has no stored row identity"))?;
+                    if seen.insert(row_id) {
+                        candidates.push(tuple);
+                    }
                 }
+                // The key encoding of NUMERIC is scale-sensitive: a miss is
+                // not proof of absence, so the scan decides.
+                None if matches!(value, Value::Numeric(_)) => return Ok(None),
+                None => {}
             }
         }
         Ok(Some(candidates))
@@ -48511,6 +48494,10 @@ mod direct_cache_publication_tests;
 #[cfg(test)]
 #[path = "fk_owner_list_tests.rs"]
 mod fk_owner_list_tests;
+
+#[cfg(test)]
+#[path = "index_definition_map_tests.rs"]
+mod index_definition_map_tests;
 
 #[cfg(test)]
 mod non_deterministic_marker_tests {

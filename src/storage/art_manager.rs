@@ -3362,7 +3362,7 @@ impl ArtIndexManager {
                 .cloned()
                 .ok_or_else(|| ArtIndexError::IndexNotFound(name.to_string()))?
         };
-        if entry.index_type != ArtIndexType::Unique {
+        if !matches!(entry.index_type, ArtIndexType::Unique | ArtIndexType::PrimaryKey) {
             return Err(ArtIndexError::Internal(format!(
                 "Index '{}' is not a unique index",
                 name

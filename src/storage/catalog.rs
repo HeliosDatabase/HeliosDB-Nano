@@ -7976,8 +7976,35 @@ impl<'a> Catalog<'a> {
     /// `Catalog::drop_table`, so a standby runs this same teardown. Per-index
     /// records would double-log and could race the replayed
     /// `WalOperation::CreateIndex` — the hazard the trigger teardown documents.
+    ///
+    /// Reads only `table_name`'s records, by name, while the write gate's map
+    /// of which record names which table is current
+    /// (`StorageEngine::index_definitions_of_table`); otherwise it walks every
+    /// record once and leaves the map for the next statement.
     fn table_index_definitions(&self, table_name: &str) -> Result<Vec<(String, PersistedIndexDefinition)>> {
+        if let Some(names) = self.storage.index_definitions_of_table(table_name) {
+            let mut definitions = Vec::with_capacity(names.len());
+            for name in names {
+                let Some(value) = self.storage.get(&Self::index_metadata_key(&name))? else {
+                    continue;
+                };
+                if let Some(definition) = Self::decode_persisted_index_definition(&name, &value) {
+                    if definition.table_name == table_name {
+                        definitions.push((name, definition));
+                    }
+                }
+            }
+            return Ok(definitions);
+        }
+        let stamp = self.storage.write_gate().index_definition_write_stamp();
         let mut definitions = self.list_index_definitions()?;
+        if let Some(stamp) = stamp {
+            let pairs = definitions
+                .iter()
+                .map(|(name, definition)| (name.clone(), definition.table_name.clone()))
+                .collect();
+            self.storage.remember_index_definition_tables(stamp, pairs);
+        }
         definitions.retain(|(_, definition)| definition.table_name == table_name);
         Ok(definitions)
     }

@@ -294,6 +294,39 @@ fn transaction_for_scan<'a>(
     }
 }
 
+/// `AS OF TIMESTAMP <expression>` evaluated once, with the statement's
+/// parameters, to the literal form the snapshot lookup resolves (and refuses
+/// below the GC horizon, or before the first snapshot, exactly as a literal).
+/// Every other clause is returned as it is.
+fn evaluate_as_of_anchor(
+    executor: &Executor<'_>,
+    clause: &crate::sql::logical_plan::AsOfClause,
+) -> Result<crate::sql::logical_plan::AsOfClause> {
+    use crate::sql::logical_plan::AsOfClause;
+    let AsOfClause::TimestampExpr(expr) = clause else {
+        return Ok(clause.clone());
+    };
+    let evaluator = crate::sql::Evaluator::with_parameters(
+        std::sync::Arc::new(Schema::new(Vec::new())),
+        executor.parameters().to_vec(),
+    );
+    let value = evaluator.evaluate(expr, &crate::Tuple::new(Vec::new()))?;
+    let text = match value {
+        crate::Value::Timestamp(ts) => ts.to_rfc3339(),
+        crate::Value::String(text) => text,
+        crate::Value::Null => {
+            return Err(crate::Error::query_execution("AS OF TIMESTAMP expression is NULL"));
+        }
+        other => {
+            return Err(crate::Error::query_execution(format!(
+                "AS OF TIMESTAMP expression must be a timestamp, got {}",
+                other.data_type()
+            )));
+        }
+    };
+    Ok(AsOfClause::Timestamp(text))
+}
+
 pub(crate) fn storage_predicates_are_sql_safe(schema: &Schema, predicates: &[AnalyzedPredicate]) -> bool {
     predicates.iter().all(|predicate| {
         let Some(column) = schema.columns.get(predicate.column_index) else {
@@ -2315,6 +2348,7 @@ pub(super) fn handle_scan(executor: &Executor, plan: &LogicalPlan) -> Result<Box
                 // direct current-`data:` read for tables unchanged since it).
                 txn_base_tuples(storage, txn, &actual_table_name, table_name, &schema, as_of.is_none())?
             } else if let Some(as_of_clause) = as_of {
+                let as_of_clause = &evaluate_as_of_anchor(executor, as_of_clause)?;
                 // P0#1: AS OF / historical queries require version history.
                 // With time_travel_enabled=false the commit path writes no
                 // versions, so honoring AS OF would silently return current
@@ -2792,6 +2826,7 @@ pub(super) fn handle_filtered_scan(executor: &Executor, plan: &LogicalPlan) -> R
                     )
                 }
             } else if let Some(as_of_clause) = as_of {
+                let as_of_clause = &evaluate_as_of_anchor(executor, as_of_clause)?;
                 // P0#1: AS OF requires version history (see above).
                 if !storage.time_travel_enabled() {
                     return Err(crate::Error::query_execution(

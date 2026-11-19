@@ -3410,6 +3410,18 @@ impl StorageEngine {
         self.gate.remember_foreign_key_owners(stamp, owners);
     }
 
+    /// The names of the index-definition records that name `table`, when the
+    /// write gate's map of them is current (`WriteGate::index_definitions_of_table`).
+    pub(crate) fn index_definitions_of_table(&self, table: &str) -> Option<Vec<String>> {
+        self.gate.index_definitions_of_table(table)
+    }
+
+    /// Keep `(index, table)` pairs listed by a walk of every index-definition
+    /// record that began under `stamp`, unless such a write has started since.
+    pub(crate) fn remember_index_definition_tables(&self, stamp: u64, pairs: Vec<(String, String)>) {
+        self.gate.remember_index_definition_tables(stamp, pairs);
+    }
+
     /// The gate every raw write of this engine — and of every component built
     /// around its RocksDB handle — goes through.
     pub fn write_gate(&self) -> &Arc<WriteGate> {

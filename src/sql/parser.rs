@@ -2939,8 +2939,8 @@ impl Parser {
     /// families' `Delete` arms treat a missing selection as "every row matches"
     /// (`} else { true }`), and no DELETE path branches on `selection.is_none()`
     /// — the only two selection-keyed optimizations are
-    /// `EmbeddedDatabase::try_extract_pk_value`, which needs a
-    /// `pk_col = <literal>` equality and therefore declines for `None` and for
+    /// `EmbeddedDatabase::pk_write_candidates`, which needs a
+    /// primary-key conjunct and therefore declines for `None` and for
     /// `TRUE` alike (both fall to the same `scan_table_branch_aware`), and the
     /// text fast path `EmbeddedDatabase::prepare_fast_delete`, which declines on
     /// any `RETURNING` before it ever looks at the predicate. Filling the alias

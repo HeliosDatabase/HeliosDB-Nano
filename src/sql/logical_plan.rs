@@ -2321,6 +2321,11 @@ pub enum AsOfClause {
         /// End timestamp (inclusive)
         end: Box<AsOfClause>,
     },
+    /// AS OF TIMESTAMP <expression>: `now() - interval '5 minutes'`,
+    /// `CURRENT_TIMESTAMP`, a bound parameter. Evaluated once per statement,
+    /// with its parameters, by the scan that reads history. Appended LAST:
+    /// plans are bincode-encoded by variant position.
+    TimestampExpr(Box<LogicalExpr>),
 }
 
 /// Index creation options

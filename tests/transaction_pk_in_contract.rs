@@ -409,3 +409,160 @@ fn raii_owner_keeps_staged_pk_in_updates_until_its_own_settlement() -> Result<()
     }
     Ok(())
 }
+
+/// v06.1: `pk = v` and `pk = v AND other` use the key on every route; the rows
+/// they change are the ones a forced scan (`pk + 0 = v`) would change.
+fn key_cases() -> Vec<(&'static str, Value, Value, &'static str)> {
+    // (column type, stored key literal as a Value for params, new staged key, text literal of stored key)
+    vec![
+        ("INT", Value::Int4(5), Value::Int4(50), "5"),
+        ("BIGINT", Value::Int8(5), Value::Int8(50), "5"),
+        ("TEXT", Value::String("k5".into()), Value::String("k50".into()), "'k5'"),
+        (
+            "UUID",
+            Value::String("00000000-0000-0000-0000-000000000005".into()),
+            Value::String("00000000-0000-0000-0000-000000000050".into()),
+            "'00000000-0000-0000-0000-000000000005'",
+        ),
+        ("NUMERIC(10,2)", Value::Int4(5), Value::Int4(50), "5"),
+    ]
+}
+
+fn literal(value: &Value) -> String {
+    match value {
+        Value::String(s) => format!("'{s}'"),
+        Value::Int4(n) => n.to_string(),
+        Value::Int8(n) => n.to_string(),
+        other => format!("{other:?}"),
+    }
+}
+
+fn sum_v(db: &EmbeddedDatabase) -> Result<Vec<Vec<i64>>> {
+    ints(db.query("SELECT COUNT(*), COALESCE(SUM(v), 0) FROM k", &[])?)
+}
+
+#[test]
+fn pk_equality_and_conjunct_in_a_transaction_after_staged_writes() -> Result<()> {
+    for (ty, stored, staged, stored_text) in key_cases() {
+        for family in [Family::Text, Family::Params] {
+            for commit in [false, true] {
+                let db = EmbeddedDatabase::new_in_memory()?;
+                db.execute(&format!("CREATE TABLE k (id {ty} PRIMARY KEY, v INT)"))?;
+                db.execute(&format!("INSERT INTO k VALUES ({stored_text}, 1)"))?;
+                db.begin()?;
+                // A staged INSERT, then writes by key: the staged row and the
+                // committed row are both found.
+                db.execute(&format!("INSERT INTO k VALUES ({}, 2)", literal(&staged)))?;
+                let (n, _) = family.write(
+                    &db,
+                    &format!("UPDATE k SET v = v + 10 WHERE id = {}", literal(&staged)),
+                    "UPDATE k SET v = v + 10 WHERE id = $1",
+                    std::slice::from_ref(&staged),
+                )?;
+                assert_eq!(n, 1, "{ty} {family:?} staged key");
+                let (n, _) = family.write(
+                    &db,
+                    &format!("UPDATE k SET v = v + 100 WHERE id = {stored_text} AND v = 1"),
+                    "UPDATE k SET v = v + 100 WHERE id = $1 AND v = $2",
+                    &[stored.clone(), Value::Int4(1)],
+                )?;
+                assert_eq!(n, 1, "{ty} {family:?} committed key AND");
+                // The extra conjunct still runs on the candidate.
+                let (n, _) = family.write(
+                    &db,
+                    &format!("UPDATE k SET v = 0 WHERE v = 1 AND id = {stored_text}"),
+                    "UPDATE k SET v = 0 WHERE v = $2 AND id = $1",
+                    &[stored.clone(), Value::Int4(1)],
+                )?;
+                assert_eq!(n, 0, "{ty} {family:?} false conjunct");
+                assert_eq!(sum_v(&db)?, vec![vec![2, 113]], "{ty} {family:?}");
+                // Key-moving UPDATE: the old key is gone, the new key is found.
+                db.execute(&format!(
+                    "UPDATE k SET id = {} WHERE id = {stored_text}",
+                    match ty {
+                        "TEXT" => "'k7'".to_string(),
+                        "UUID" => "'00000000-0000-0000-0000-000000000007'".to_string(),
+                        _ => "7".to_string(),
+                    }
+                ))?;
+                let (n, _) = family.write(
+                    &db,
+                    &format!("DELETE FROM k WHERE id = {stored_text}"),
+                    "DELETE FROM k WHERE id = $1",
+                    std::slice::from_ref(&stored),
+                )?;
+                assert_eq!(n, 0, "{ty} {family:?} old key after move");
+                db.execute("SAVEPOINT s")?;
+                let (n, _) = family.write(
+                    &db,
+                    &format!("DELETE FROM k WHERE id = {}", literal(&staged)),
+                    "DELETE FROM k WHERE id = $1",
+                    std::slice::from_ref(&staged),
+                )?;
+                assert_eq!(n, 1, "{ty} {family:?} staged delete");
+                db.execute("ROLLBACK TO SAVEPOINT s")?;
+                assert_eq!(sum_v(&db)?, vec![vec![2, 113]], "{ty} {family:?} after savepoint");
+                if commit {
+                    db.commit()?;
+                    assert_eq!(sum_v(&db)?, vec![vec![2, 113]]);
+                } else {
+                    db.rollback()?;
+                    assert_eq!(sum_v(&db)?, vec![vec![1, 1]]);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn numeric_key_scale_variants_match_like_select() -> Result<()> {
+    for family in [Family::Text, Family::Params] {
+        for in_txn in [false, true] {
+            let db = EmbeddedDatabase::new_in_memory()?;
+            db.execute("CREATE TABLE n (id NUMERIC(10,2) PRIMARY KEY, v INT)")?;
+            db.execute("INSERT INTO n VALUES (6.00, 1), (7.50, 1)")?;
+            assert_eq!(db.query("SELECT v FROM n WHERE id = 6", &[])?.len(), 1);
+            if in_txn {
+                db.begin()?;
+            }
+            let (n, _) = family.write(
+                &db,
+                "UPDATE n SET v = 2 WHERE id = 6",
+                "UPDATE n SET v = $1 WHERE id = $2",
+                &[Value::Int4(2), Value::Int4(6)],
+            )?;
+            assert_eq!(n, 1, "UPDATE {family:?} in_txn={in_txn}");
+            let (n, _) = family.write(
+                &db,
+                "DELETE FROM n WHERE id = 7.5",
+                "DELETE FROM n WHERE id = $1",
+                &[Value::Numeric("7.5".into())],
+            )?;
+            assert_eq!(n, 1, "DELETE {family:?} in_txn={in_txn}");
+            if in_txn {
+                db.commit()?;
+            }
+            assert_eq!(ints(db.query("SELECT v FROM n", &[])?)?, vec![vec![2]]);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn sql_prepare_execute_of_a_pk_update_changes_the_row() -> Result<()> {
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute("CREATE TABLE p (id INT PRIMARY KEY, e INT)")?;
+    db.execute("INSERT INTO p VALUES (1, 0), (2, 0)")?;
+    db.execute("PREPARE pu AS UPDATE p SET e = $1 WHERE id = $2")?;
+    assert_eq!(db.execute("EXECUTE pu(5, 2)")?, 1);
+    db.begin()?;
+    db.execute("INSERT INTO p VALUES (3, 0)")?;
+    assert_eq!(db.execute("EXECUTE pu(6, 3)")?, 1);
+    db.commit()?;
+    assert_eq!(
+        ints(db.query("SELECT id, e FROM p ORDER BY id", &[])?)?,
+        vec![vec![1, 0], vec![2, 5], vec![3, 6]]
+    );
+    Ok(())
+}
