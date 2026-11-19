@@ -3959,6 +3959,10 @@ impl Parser {
             return Err(Error::query_execution("DROP BRANCH requires a branch name"));
         }
 
+        // v10.1: nothing may follow the name but `;` and comments. `DROP BRANCH
+        // b4 PLEASE` used to drop b4.
+        Self::refuse_branch_statement_tail("DROP BRANCH", remaining.get(name_end..).unwrap_or(""))?;
+
         Ok((branch_name, if_exists))
     }
 
@@ -4012,21 +4016,70 @@ impl Parser {
             return Err(Error::query_execution("MERGE BRANCH requires target branch name"));
         }
 
-        // Find WITH clause (optional)
-        let with_options = if let Some(with_pos) = upper_remaining.find("WITH") {
-            let after_with = remaining[with_pos + 4..].trim_start();
-            let with_end = after_with.find(';').unwrap_or(after_with.len());
-            let opts = after_with[..with_end].trim().to_string();
-            if opts.is_empty() {
-                None
-            } else {
-                Some(opts)
+        // v10.1: after the target only `WITH <options>`, `;` and comments.
+        // This used to search the rest of the statement for the substring
+        // WITH and ignore everything else, so `MERGE BRANCH dev INTO main
+        // CHECK` and `... DRY RUN` performed the real merge.
+        let tail = Self::skip_branch_blanks(after_into.get(target_end..).unwrap_or(""));
+        let with_options = match tail.get(..4) {
+            Some(word)
+                if word.eq_ignore_ascii_case("WITH")
+                    && tail.get(4..).unwrap_or("").chars().next().is_none_or(|c| c.is_whitespace() || c == '(') =>
+            {
+                let options = Self::skip_branch_blanks(tail.get(4..).unwrap_or(""));
+                let end = if options.starts_with('(') {
+                    Self::find_matching_paren(options)
+                        .map(|close| close + 1)
+                        .ok_or_else(|| Error::sql_parse("MERGE BRANCH: unmatched parenthesis in WITH"))?
+                } else {
+                    // A bare `a = b` list runs to the end, less a `;`.
+                    let trimmed = options.trim_end();
+                    trimmed.strip_suffix(';').unwrap_or(trimmed).len()
+                };
+                let list = options.get(..end).unwrap_or("").trim();
+                if list.is_empty() {
+                    return Err(Error::sql_parse("MERGE BRANCH: WITH requires options"));
+                }
+                Self::refuse_branch_statement_tail("MERGE BRANCH", options.get(end..).unwrap_or(""))?;
+                Some(list.to_string())
             }
-        } else {
-            None
+            _ => {
+                Self::refuse_branch_statement_tail("MERGE BRANCH", tail)?;
+                None
+            }
         };
+        let _ = upper_remaining;
 
         Ok((source, target, with_options))
+    }
+
+    /// Skip whitespace and `--` / `/* */` comments.
+    fn skip_branch_blanks(mut text: &str) -> &str {
+        loop {
+            text = text.trim_start();
+            if let Some(comment) = text.strip_prefix("--") {
+                text = comment.find('\n').map_or("", |end| &comment[end..]);
+            } else if let Some(comment) = text.strip_prefix("/*") {
+                text = comment.find("*/").map_or("", |end| &comment[end + 2..]);
+            } else {
+                return text;
+            }
+        }
+    }
+
+    /// v10.1: a branch statement's tail may hold only an optional `;` and
+    /// comments; anything else is a 42601 syntax error, raised before the
+    /// statement changes anything.
+    fn refuse_branch_statement_tail(statement: &str, tail: &str) -> Result<()> {
+        let rest = Self::skip_branch_blanks(tail);
+        let rest = Self::skip_branch_blanks(rest.strip_prefix(';').unwrap_or(rest));
+        if rest.is_empty() {
+            return Ok(());
+        }
+        let word: String = rest.chars().take_while(|c| !c.is_whitespace()).take(40).collect();
+        Err(Error::sql_parse(format!(
+            "{statement}: syntax error at or near \"{word}\": unexpected words after the statement"
+        )))
     }
 
     /// Parse USE BRANCH statement

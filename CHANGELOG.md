@@ -27,6 +27,14 @@ changes.
 Reports from users of earlier releases (GitHub numbers) and defects found while the work after
 4.42.0 was being prepared. Each has a test file.
 
+- **Branch statements refuse words and options they do not understand.** `MERGE BRANCH dev INTO
+  main CHECK` and `... DRY RUN` performed the real merge, `DROP BRANCH b4 PLEASE` dropped b4, a WITH
+  pair without a value (`WITH (bogus)`, `WITH (replication_factor)`) was skipped silently, a quoted
+  value containing `=` was skipped, and `delete_branch_after = yes` merged and kept the branch. Now
+  anything after the target of MERGE BRANCH other than `WITH (...)`, anything after the name of
+  DROP BRANCH, a malformed option pair and a non-boolean value (true/false, on/off, 1/0) fail with
+  SQLSTATE 42601 before anything changes; a quoted value may contain `=` and `,`. A trailing `;`
+  and comments are still accepted. Test file: `tests/branch_statement_strictness.rs`.
 - **A dump now restores the whole schema: sequences, SERIAL and IDENTITY columns, ordinary, UNIQUE
   and expression indexes, the HNSW operator class, and views.** Neither the SQL nor the binary
   dump carried them: the dump's index list reported vector indexes only, and nothing wrote

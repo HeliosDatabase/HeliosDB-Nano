@@ -104,18 +104,8 @@ impl BranchingParser {
         let mut options = Vec::new();
         let options_str = Self::strip_option_parens(options_str);
 
-        // Simple parsing - split by comma and parse key=value pairs
-        for pair in options_str.split(',') {
-            let parts: Vec<&str> = pair.split('=').map(|s| s.trim()).collect();
-            if parts.len() != 2 {
-                continue;
-            }
-
-            let key = parts.first().map(|s| s.to_lowercase()).unwrap_or_default();
-            let value = parts
-                .get(1)
-                .map(|s| s.trim_matches('\'').trim_matches('"'))
-                .unwrap_or_default();
+        for (key, value) in Self::split_option_pairs("CREATE BRANCH", options_str)? {
+            let value = value.as_str();
 
             match key.as_str() {
                 "replication_factor" => {
@@ -184,22 +174,102 @@ impl BranchingParser {
             .trim()
     }
 
+    /// v10.1: split a WITH option list into `(key, value)` pairs.
+    ///
+    /// Quote-aware: `,` and `=` inside `'…'` or `"…"` belong to the value, so
+    /// `region = 'a=b'` is one pair. A pair that is not exactly one key, one
+    /// `=` and one value is a 42601 syntax error — `WITH (bogus)` and
+    /// `WITH (replication_factor)` used to be skipped silently.
+    fn split_option_pairs(statement: &str, list: &str) -> Result<Vec<(String, String)>> {
+        let malformed = |pair: &str| {
+            Error::sql_parse(format!(
+                "{statement}: malformed option \"{}\": expected name = value",
+                pair.trim()
+            ))
+        };
+        let mut pieces: Vec<String> = Vec::new();
+        let mut current = String::new();
+        let mut quote: Option<char> = None;
+        for c in list.chars() {
+            match quote {
+                Some(q) => {
+                    if c == q {
+                        quote = None;
+                    }
+                    current.push(c);
+                }
+                None if c == '\'' || c == '"' => {
+                    quote = Some(c);
+                    current.push(c);
+                }
+                None if c == ',' => pieces.push(std::mem::take(&mut current)),
+                None => current.push(c),
+            }
+        }
+        if quote.is_some() {
+            return Err(Error::sql_parse(format!("{statement}: unterminated quoted option value")));
+        }
+        pieces.push(current);
+
+        let mut pairs = Vec::with_capacity(pieces.len());
+        for piece in &pieces {
+            // The first `=` outside quotes.
+            let mut quote: Option<char> = None;
+            let mut split_at = None;
+            for (i, c) in piece.char_indices() {
+                match quote {
+                    Some(q) if c == q => quote = None,
+                    Some(_) => {}
+                    None if c == '\'' || c == '"' => quote = Some(c),
+                    None if c == '=' => {
+                        split_at = Some(i);
+                        break;
+                    }
+                    None => {}
+                }
+            }
+            let Some(at) = split_at else {
+                return Err(malformed(piece));
+            };
+            let key = piece.get(..at).unwrap_or("").trim();
+            let raw_value = piece.get(at + 1..).unwrap_or("").trim();
+            if key.is_empty() || raw_value.is_empty() || key.contains(char::is_whitespace) {
+                return Err(malformed(piece));
+            }
+            let value = if raw_value.len() >= 2
+                && ((raw_value.starts_with('\'') && raw_value.ends_with('\''))
+                    || (raw_value.starts_with('"') && raw_value.ends_with('"')))
+            {
+                raw_value.get(1..raw_value.len() - 1).unwrap_or("").to_string()
+            } else if raw_value.contains(['\'', '"', '=']) || raw_value.contains(char::is_whitespace) {
+                return Err(malformed(piece));
+            } else {
+                raw_value.to_string()
+            };
+            pairs.push((key.to_lowercase(), value));
+        }
+        Ok(pairs)
+    }
+
+    /// v10.1: a boolean option takes true/false, on/off or 1/0 — anything
+    /// else is an error (`delete_branch_after = yes` used to mean false).
+    fn parse_option_bool(key: &str, value: &str) -> Result<bool> {
+        match value.to_ascii_lowercase().as_str() {
+            "true" | "on" | "1" => Ok(true),
+            "false" | "off" | "0" => Ok(false),
+            _ => Err(Error::sql_parse(format!(
+                "invalid value for boolean option {key}: \"{value}\" (expected true or false)"
+            ))),
+        }
+    }
+
     /// Parse merge options
     fn parse_merge_options(options_str: &str) -> Result<Vec<MergeOption>> {
         let mut options = Vec::new();
         let options_str = Self::strip_option_parens(options_str);
 
-        for pair in options_str.split(',') {
-            let parts: Vec<&str> = pair.split('=').map(|s| s.trim()).collect();
-            if parts.len() != 2 {
-                continue;
-            }
-
-            let key = parts.first().map(|s| s.to_lowercase()).unwrap_or_default();
-            let value = parts
-                .get(1)
-                .map(|s| s.trim_matches('\'').trim_matches('"'))
-                .unwrap_or_default();
+        for (key, value) in Self::split_option_pairs("MERGE BRANCH", options_str)? {
+            let value = value.as_str();
 
             match key.as_str() {
                 "conflict_resolution" => {
@@ -217,7 +287,7 @@ impl BranchingParser {
                     options.push(MergeOption::ConflictResolution(resolution));
                 }
                 "delete_branch_after" => {
-                    let delete = value.to_lowercase() == "true";
+                    let delete = Self::parse_option_bool(&key, value)?;
                     options.push(MergeOption::DeleteBranchAfter(delete));
                 }
                 _ => {
