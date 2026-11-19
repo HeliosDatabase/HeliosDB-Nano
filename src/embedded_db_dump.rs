@@ -1,6 +1,9 @@
 //! Implementation of dump/restore traits for EmbeddedDatabase
 
-use crate::storage::dump::{DatabaseInterface, DatabaseRestoreInterface, IndexMetadata, RestoreValidation};
+use crate::storage::dump::{
+    DatabaseInterface, DatabaseRestoreInterface, IndexDump, IndexMetadata, RestoreValidation, SchemaObjects, SequenceDump,
+    ViewDump,
+};
 use crate::{EmbeddedDatabase, Error, Result, Schema, Tuple, Value};
 
 /// How many offending keys a single constraint contributes to the restore
@@ -280,6 +283,179 @@ impl DatabaseInterface for EmbeddedDatabase {
     fn get_table_constraints(&self, table: &str) -> Result<crate::sql::TableConstraints> {
         let catalog = self.storage.catalog();
         catalog.load_table_constraints(table)
+    }
+
+    /// v10.12: everything a restore needs beyond tables, rows and constraints.
+    fn get_schema_objects(&self) -> Result<SchemaObjects> {
+        use crate::storage::dump::sql_text::quote_ident;
+        let catalog = self.storage.catalog();
+        let tables = catalog.list_tables()?;
+        let listed: std::collections::HashSet<&str> = tables.iter().map(String::as_str).collect();
+        let mut objects = SchemaObjects::default();
+
+        // Sequences, with the value last handed out: the live counter when
+        // this process served one, else the durable high-water mark (which may
+        // sit up to CACHE-1 past it — a gap, never a duplicate).
+        for def in catalog.list_sequences()? {
+            let last_value = match crate::sql::sequences::peek_last_served_on(&self.storage, &def.name) {
+                Some(v) => Some(v),
+                None => match catalog.get_sequence_state(&def.name)? {
+                    Some(st) if st.is_called => Some(st.last_reserved),
+                    _ => None,
+                },
+            };
+            objects.sequences.push(SequenceDump {
+                name: def.name,
+                data_type: def.data_type,
+                start_value: def.start_value,
+                increment_by: def.increment_by,
+                min_value: def.min_value,
+                max_value: def.max_value,
+                cache: def.cache,
+                cycle: def.cycle,
+                last_value,
+            });
+        }
+
+        for table in &tables {
+            let identity = catalog.list_identity_columns(table)?;
+            if !identity.is_empty() {
+                objects.identity_columns.push((table.clone(), identity));
+            }
+        }
+
+        // User indexes from their durable definitions. A name a UNIQUE
+        // constraint owns is carried by the table DDL already.
+        let mut vector_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut vectors = self.storage.vector_indexes().list_all_metadata();
+        vectors.sort_by(|a, b| a.table_name.cmp(&b.table_name).then(a.name.cmp(&b.name)));
+        for (name, definition) in catalog.list_index_definitions()? {
+            if !listed.contains(definition.table_name.as_str()) {
+                continue;
+            }
+            let constraint_names: Vec<String> = catalog
+                .load_table_constraints(&definition.table_name)
+                .map(|c| c.unique_constraints.into_iter().map(|u| u.name).collect())
+                .unwrap_or_default();
+            if constraint_names.iter().any(|c| c.eq_ignore_ascii_case(&name)) {
+                continue;
+            }
+            let tag = definition.index_type.as_deref();
+            if tag == Some("expression") {
+                for option in &definition.options {
+                    if let crate::sql::logical_plan::IndexOption::Expression { method, key, .. } = option {
+                        objects.indexes.push(IndexDump {
+                            table: definition.table_name.clone(),
+                            name: name.clone(),
+                            unique: false,
+                            method: method.clone(),
+                            key: key.clone(),
+                            with_options: String::new(),
+                        });
+                    }
+                }
+                continue;
+            }
+            match crate::storage::index_family(tag) {
+                Some(crate::storage::IndexFamily::Art) => {
+                    let unique = crate::sql::executor::ddl::unique_index_columns(
+                        &definition.options,
+                        &definition.column_name,
+                    );
+                    let columns = unique.clone().unwrap_or_else(|| vec![definition.column_name.clone()]);
+                    let key: Vec<String> = columns.iter().map(|c| quote_ident(c)).collect();
+                    objects.indexes.push(IndexDump {
+                        table: definition.table_name.clone(),
+                        name,
+                        unique: unique.is_some(),
+                        method: if tag == Some("hash") { "hash" } else { "btree" }.to_string(),
+                        key: key.join(", "),
+                        with_options: String::new(),
+                    });
+                }
+                Some(crate::storage::IndexFamily::DdlOnly) => {
+                    objects.indexes.push(IndexDump {
+                        table: definition.table_name.clone(),
+                        name,
+                        unique: false,
+                        method: tag.unwrap_or("gin").to_string(),
+                        key: quote_ident(&definition.column_name),
+                        with_options: String::new(),
+                    });
+                }
+                // Vector indexes come from the vector manager below, which
+                // knows the distance metric.
+                Some(crate::storage::IndexFamily::Vector) => {
+                    vector_names.insert(name);
+                }
+                None => objects.not_carried.push(format!(
+                    "index {name} on {}: index type {:?} is not known to this build",
+                    definition.table_name,
+                    tag.unwrap_or("")
+                )),
+            }
+        }
+        for meta in vectors {
+            if !listed.contains(meta.table_name.as_str()) {
+                continue;
+            }
+            vector_names.remove(&meta.name);
+            let opclass = crate::sql::phase3::system_views::vector_index_opclass(&meta);
+            let pq = matches!(meta.index_type, crate::storage::VectorIndexType::Quantized(_))
+                || matches!(&meta.index_type, crate::storage::VectorIndexType::Persistent(cfg) if cfg.pq_enabled);
+            if pq {
+                objects.not_carried.push(format!(
+                    "index {}: product quantization; restored as a plain HNSW index",
+                    meta.name
+                ));
+            }
+            objects.indexes.push(IndexDump {
+                table: meta.table_name.clone(),
+                name: meta.name.clone(),
+                unique: false,
+                method: "hnsw".to_string(),
+                key: format!("{} {}", quote_ident(&meta.column_name), opclass),
+                with_options: String::new(),
+            });
+        }
+
+        // Plain views, oldest first (a view may read an earlier one).
+        let views = self.storage.view_catalog();
+        let mut defs = Vec::new();
+        for name in views.list_views()? {
+            let meta = views.get_view(&name)?;
+            defs.push(meta);
+        }
+        defs.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.view_name.cmp(&b.view_name)));
+        for meta in defs {
+            if meta.creator_schema.is_some() {
+                objects.not_carried.push(format!(
+                    "view {}: created under a non-default search_path; restored as written, resolved against public",
+                    meta.view_name
+                ));
+            }
+            objects.views.push(ViewDump {
+                name: meta.view_name,
+                query_sql: meta.query_sql,
+            });
+        }
+
+        if let Ok(mvs) = self.storage.mv_catalog().list_views() {
+            for mv in mvs {
+                objects
+                    .not_carried
+                    .push(format!("materialized view {mv}: definition not carried"));
+            }
+        }
+        if let Ok(triggers) = self.storage.trigger_registry().list_all_triggers() {
+            for trigger in triggers {
+                objects.not_carried.push(format!(
+                    "trigger {} on {}: not carried",
+                    trigger.name, trigger.table_name
+                ));
+            }
+        }
+        Ok(objects)
     }
 }
 
@@ -658,5 +834,34 @@ impl DatabaseRestoreInterface for EmbeddedDatabase {
 
     fn take_restore_warnings(&mut self) -> Vec<String> {
         RESTORE_WARNINGS.with(|w| std::mem::take(&mut *w.borrow_mut()))
+    }
+
+    /// v10.12: through the same SQL the SQL dump writes, so the two formats
+    /// recreate identical objects — and a UNIQUE index runs the normal
+    /// `CREATE UNIQUE INDEX` validation over the restored rows.
+    fn restore_schema_objects(&mut self, objects: &SchemaObjects) -> Result<()> {
+        use crate::storage::dump::sql_text;
+        for line in &objects.not_carried {
+            note_restore_warning(format!("the dump did not carry: {line}"));
+        }
+        for seq in &objects.sequences {
+            self.execute(&sql_text::sequence_ddl(seq))?;
+            if let Some(statement) = sql_text::sequence_setval(seq) {
+                self.query(&statement, &[])?;
+            }
+        }
+        for (table, columns) in &objects.identity_columns {
+            if !self.storage.catalog().table_exists(table).unwrap_or(false) {
+                continue;
+            }
+            self.storage.catalog().register_identity_columns(table, columns)?;
+        }
+        for index in &objects.indexes {
+            self.execute(&sql_text::index_dump_ddl(index))?;
+        }
+        for view in &objects.views {
+            self.execute(&sql_text::view_ddl(view))?;
+        }
+        Ok(())
     }
 }

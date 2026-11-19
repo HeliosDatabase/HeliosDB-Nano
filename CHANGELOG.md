@@ -27,6 +27,18 @@ changes.
 Reports from users of earlier releases (GitHub numbers) and defects found while the work after
 4.42.0 was being prepared. Each has a test file.
 
+- **A dump now restores the whole schema: sequences, SERIAL and IDENTITY columns, ordinary, UNIQUE
+  and expression indexes, the HNSW operator class, and views.** Neither the SQL nor the binary
+  dump carried them: the dump's index list reported vector indexes only, and nothing wrote
+  sequences or views. After a restore an INSERT without its key failed, a duplicate the unique
+  index used to reject was accepted, views were gone and `nextval` restarted. Both formats now
+  carry them (binary format v3 adds a schema-objects section; v1 and v2 files still restore), the
+  SQL text uses PostgreSQL spellings (`CREATE SEQUENCE`, `setval`, `SERIAL`, `CREATE UNIQUE INDEX`,
+  `CREATE VIEW`), indexes are recreated after the rows so a UNIQUE index validates them, and what
+  is not carried (materialized views, triggers, product quantization) is listed in the SQL header
+  and reported as a restore warning. NUMERIC precision and scale are still not carried (the engine
+  keeps none). Dumps written by earlier releases do not contain these objects. Test files:
+  `tests/dump_schema_completeness.rs`, `tests/security_hdb_005.rs`.
 - **A column alias like `AS offer_id`, or the words "as of" in a string, turned a plain statement
   into a time-travel one.** `AS OF` and `VERSIONS BETWEEN` were found by searching the SQL text:
   `SELECT id AS offer_id FROM t` lost its FROM clause, `'balance as of yesterday'` in a DELETE or

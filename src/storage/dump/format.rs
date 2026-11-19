@@ -18,9 +18,13 @@ pub const DUMP_MAGIC_NUMBER: &[u8; 8] = b"HELIODMP";
 ///   per table, written straight after the index blob and before the row count,
 ///   and records the batch compression in the metadata header.
 ///
+/// * v3 — v10.12: an optional `SCHM` section before `ENDD` carrying the
+///   bincode `SchemaObjects` (sequences with their position, SERIAL / IDENTITY
+///   columns, every user index, views). The `TABL` layout is unchanged.
+///
 /// Readers accept every version up to and including this one; a v1 file simply
-/// has no constraint blob to read.
-pub const DUMP_VERSION: u32 = 2;
+/// has no constraint blob to read, and a v1/v2 file no schema objects.
+pub const DUMP_VERSION: u32 = 3;
 
 /// Compression type for dump files
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

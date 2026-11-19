@@ -47,15 +47,20 @@
 //! * **Nested arrays.** The engine has no input syntax for them at all: the
 //!   `ARRAY[…]` planner arm rejects a non-literal element, and
 //!   `parse_pg_array_text_literal` splits `,` at one brace level only.
-//! * **SERIAL / IDENTITY columns.** The dump writes the resolved `INT4`, so the
-//!   restored column is not an identity column and its
-//!   `information_schema.columns.column_default` differs (`nextval(…)` vs
-//!   NULL). Recorded as a known gap, not asserted here.
+//! * SERIAL / IDENTITY columns used to be written as the resolved `INT4`;
+//!   since v10.12 they are re-declared, asserted by
+//!   `serial_and_identity_round_trip` below.
 //! * **Per-column STORAGE modes.** `STORAGE DICTIONARY` is not re-declared on
 //!   restore (test 9 asserts only that the VALUE is exported resolved, which is
 //!   what the report asked for).
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::many_single_char_names
+)]
 
 use heliosdb_nano::repl::MetaCommand;
 use heliosdb_nano::{EmbeddedDatabase, Tuple, Value};
@@ -971,4 +976,34 @@ fn hdb005_not_enforced_foreign_key_round_trips() {
     rt.restored
         .execute("INSERT INTO hdb005_fk_child VALUES (2, 998)")
         .expect("restored FK is enforced when the source's was not");
+}
+
+/// v10.12: a SERIAL and an IDENTITY column are re-declared as such, so the
+/// restored table generates keys after the restored ones.
+#[test]
+fn serial_and_identity_round_trip() {
+    let rt = round_trip(&[
+        "CREATE TABLE s (id SERIAL PRIMARY KEY, v TEXT)",
+        "CREATE TABLE g (id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, v TEXT)",
+        "INSERT INTO s (v) VALUES ('a'), ('b')",
+        "INSERT INTO g (v) VALUES ('a'), ('b')",
+    ]);
+    assert!(rt.script.contains("\"id\" SERIAL PRIMARY KEY"), "{}", rt.script);
+    assert!(rt.script.contains("\"id\" BIGSERIAL PRIMARY KEY"), "{}", rt.script);
+    for table in ["s", "g"] {
+        rt.restored
+            .execute(&format!("INSERT INTO {table} (v) VALUES ('c')"))
+            .unwrap_or_else(|e| panic!("{table}: insert without key failed: {e}"));
+        let rows = rt
+            .restored
+            .query(&format!("SELECT id FROM {table} WHERE v = 'c'"), &[])
+            .unwrap();
+        let id = match rows[0].values[0] {
+            Value::Int4(n) => i64::from(n),
+            Value::Int8(n) => n,
+            ref other => panic!("{other:?}"),
+        };
+        assert_eq!(id, 3, "{table}: the generator continues after the restored keys");
+    }
+    let _ = &rt.source;
 }

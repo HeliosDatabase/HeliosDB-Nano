@@ -101,6 +101,107 @@ pub struct IndexMetadata {
     pub is_unique: bool,
 }
 
+/// v10.12: the schema objects that live OUTSIDE a table's `Schema` and its
+/// constraint record — sequences, SERIAL / IDENTITY columns, every user index
+/// (ordinary, UNIQUE, expression, HNSW with its metric) and views.
+///
+/// Before this, a dump carried none of them: the per-table index list reported
+/// vector indexes only, the dump module had no code for sequences or views, and
+/// a SERIAL column came back as a plain integer. After a restore an INSERT
+/// without its key failed, a duplicate the unique index used to reject was
+/// accepted, the views were gone and every sequence restarted at 1.
+///
+/// Both formats carry the same value: the SQL writer renders it through
+/// `sql_text` (sequences before the tables, `setval`, indexes after the data,
+/// views last) and the binary writer (format v3) stores it as one `SCHM`
+/// section before the end marker. Restore replays it AFTER the rows are in, so
+/// a `CREATE UNIQUE INDEX` validates the restored rows through the normal path.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SchemaObjects {
+    /// `CREATE SEQUENCE` objects with their position.
+    pub sequences: Vec<SequenceDump>,
+    /// `(table, columns)` declared SERIAL or `GENERATED … AS IDENTITY`.
+    pub identity_columns: Vec<(String, Vec<String>)>,
+    /// Every user index, in the order it is to be recreated.
+    pub indexes: Vec<IndexDump>,
+    /// Plain views, in creation order (a view may read an earlier one).
+    pub views: Vec<ViewDump>,
+    /// Objects the dump does NOT carry, one human-readable line each
+    /// (materialized views, triggers, …). Written into the SQL header and
+    /// reported by restore as warnings, never dropped silently.
+    pub not_carried: Vec<String>,
+}
+
+impl SchemaObjects {
+    /// True when there is nothing to write.
+    pub fn is_empty(&self) -> bool {
+        self.sequences.is_empty()
+            && self.identity_columns.is_empty()
+            && self.indexes.is_empty()
+            && self.views.is_empty()
+            && self.not_carried.is_empty()
+    }
+
+    /// The identity columns recorded for `table`.
+    pub fn identity_for(&self, table: &str) -> &[String] {
+        self.identity_columns
+            .iter()
+            .find(|(t, _)| t == table)
+            .map(|(_, cols)| cols.as_slice())
+            .unwrap_or(&[])
+    }
+}
+
+/// One `CREATE SEQUENCE` and its current position.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SequenceDump {
+    /// Sequence name.
+    pub name: String,
+    /// `smallint` | `integer` | `bigint`.
+    pub data_type: String,
+    /// START WITH.
+    pub start_value: i64,
+    /// INCREMENT BY.
+    pub increment_by: i64,
+    /// MINVALUE.
+    pub min_value: i64,
+    /// MAXVALUE.
+    pub max_value: i64,
+    /// CACHE.
+    pub cache: i64,
+    /// CYCLE.
+    pub cycle: bool,
+    /// The value last handed out, `None` when `nextval` was never called.
+    pub last_value: Option<i64>,
+}
+
+/// One user index, as the SQL that recreates it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IndexDump {
+    /// Table the index is on.
+    pub table: String,
+    /// Index name.
+    pub name: String,
+    /// `CREATE UNIQUE INDEX`.
+    pub unique: bool,
+    /// Access method (`btree`, `hash`, `gin`, `hnsw`, …).
+    pub method: String,
+    /// The key list exactly as it goes between the parentheses, already
+    /// quoted (`"a", "b"`, `lower(email)`, `"emb" vector_cosine_ops`).
+    pub key: String,
+    /// Extra `WITH (…)` options, verbatim, or empty.
+    pub with_options: String,
+}
+
+/// One plain view.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ViewDump {
+    /// View name.
+    pub name: String,
+    /// The defining SELECT, as stored.
+    pub query_sql: String,
+}
+
 /// Dirty state tracker for incremental dumps
 pub struct DirtyTracker {
     /// Last dump timestamp
@@ -189,6 +290,16 @@ pub trait DatabaseInterface: Send + Sync {
         let _ = table;
         Ok(Default::default())
     }
+
+    /// v10.12: sequences, identity columns, every user index and views.
+    ///
+    /// Defaulted to nothing so out-of-tree implementors keep compiling; such
+    /// an implementor dumps exactly what it did before. When this reports an
+    /// index, the per-table [`Self::get_table_indexes`] entry of the same name
+    /// is not written a second time.
+    fn get_schema_objects(&self) -> Result<SchemaObjects> {
+        Ok(SchemaObjects::default())
+    }
 }
 
 /// Database interface for restore operations
@@ -259,6 +370,21 @@ pub trait DatabaseRestoreInterface {
     /// this build cannot evaluate). They land in `RestoreReport`.
     fn take_restore_warnings(&mut self) -> Vec<String> {
         Vec::new()
+    }
+
+    /// v10.12: recreate the dump's sequences, identity columns, indexes and
+    /// views. Called after every table is populated and its constraints are
+    /// registered, so a UNIQUE index validates the restored rows.
+    ///
+    /// Defaulted: an implementor that cannot do it says so instead of
+    /// restoring a database that silently lacks them.
+    fn restore_schema_objects(&mut self, objects: &SchemaObjects) -> Result<()> {
+        if objects.is_empty() {
+            return Ok(());
+        }
+        Err(Error::storage(
+            "this restore target cannot recreate the dump's sequences, indexes and views",
+        ))
     }
 }
 
@@ -399,6 +525,21 @@ impl DumpManager {
         let tables = db.list_tables()?;
         metadata.table_count = tables.len() as u32;
 
+        // v10.12: sequences, identity columns, user indexes and views.
+        let objects = db.get_schema_objects()?;
+        for line in &objects.not_carried {
+            writeln!(writer, "-- NOT CARRIED: {}", sql_text::sanitize_comment(line))
+                .map_err(|e| Error::storage(format!("Failed to write comment: {}", e)))?;
+        }
+        if !objects.sequences.is_empty() {
+            writeln!(writer, "-- Sequences").map_err(|e| Error::storage(format!("Failed to write comment: {}", e)))?;
+            for seq in &objects.sequences {
+                writeln!(writer, "{}", sql_text::sequence_ddl(seq))
+                    .map_err(|e| Error::storage(format!("Failed to write sequence: {}", e)))?;
+            }
+            writeln!(writer).map_err(|e| Error::storage(format!("Failed to write separator: {}", e)))?;
+        }
+
         // Phase 1 — schemas. Collected FKs are held back for phase 3.
         let mut deferred_foreign_keys: Vec<String> = Vec::new();
         let mut schemas: Vec<(String, Schema)> = Vec::with_capacity(tables.len());
@@ -412,7 +553,11 @@ impl DumpManager {
             // it cannot spell: a dump whose first statement does not parse
             // restores nothing at all, so the export must stop here, naming
             // the constraint, instead of producing that file (HDB-005).
-            writeln!(writer, "{}", sql_text::table_ddl(table, &schema, &constraints)?)
+            writeln!(
+                writer,
+                "{}",
+                sql_text::table_ddl_with_identity(table, &schema, &constraints, objects.identity_for(table))?
+            )
                 .map_err(|e| Error::storage(format!("Failed to write create table: {}", e)))?;
 
             for fk in &constraints.foreign_keys {
@@ -459,10 +604,23 @@ impl DumpManager {
             writeln!(writer).map_err(|e| Error::storage(format!("Failed to write separator: {}", e)))?;
         }
 
-        // Phase 4 — indexes.
+        // Phase 4 — sequence positions, now that the data is in.
+        for seq in &objects.sequences {
+            if let Some(statement) = sql_text::sequence_setval(seq) {
+                writeln!(writer, "{}", statement)
+                    .map_err(|e| Error::storage(format!("Failed to write setval: {}", e)))?;
+            }
+        }
+
+        // Phase 5 — indexes, after the data so a UNIQUE index validates the
+        // loaded rows. The schema objects carry every user index; a per-table
+        // entry of the same name is not written twice.
         let mut wrote_index_header = false;
         for (table, _) in &schemas {
             for index in db.get_table_indexes(table)? {
+                if objects.indexes.iter().any(|i| i.name == index.name) {
+                    continue;
+                }
                 if !wrote_index_header {
                     writeln!(writer, "-- Indexes")
                         .map_err(|e| Error::storage(format!("Failed to write comment: {}", e)))?;
@@ -470,6 +628,23 @@ impl DumpManager {
                 }
                 writeln!(writer, "{}", sql_text::index_ddl(table, &index))
                     .map_err(|e| Error::storage(format!("Failed to write index: {}", e)))?;
+            }
+        }
+        for index in &objects.indexes {
+            if !wrote_index_header {
+                writeln!(writer, "-- Indexes").map_err(|e| Error::storage(format!("Failed to write comment: {}", e)))?;
+                wrote_index_header = true;
+            }
+            writeln!(writer, "{}", sql_text::index_dump_ddl(index))
+                .map_err(|e| Error::storage(format!("Failed to write index: {}", e)))?;
+        }
+
+        // Phase 6 — views, last: they read the tables (and earlier views).
+        if !objects.views.is_empty() {
+            writeln!(writer, "\n-- Views").map_err(|e| Error::storage(format!("Failed to write comment: {}", e)))?;
+            for view in &objects.views {
+                writeln!(writer, "{}", sql_text::view_ddl(view))
+                    .map_err(|e| Error::storage(format!("Failed to write view: {}", e)))?;
             }
         }
 
@@ -570,6 +745,8 @@ impl DumpManager {
         // Get all tables
         let tables = db.list_tables()?;
         metadata.table_count = tables.len() as u32;
+        // v10.12 (format v3): written as one SCHM section before ENDD.
+        let objects = db.get_schema_objects()?;
 
         let mut total_rows = 0u64;
         let mut uncompressed_bytes = 0u64;
@@ -605,8 +782,10 @@ impl DumpManager {
 
             uncompressed_bytes += schema_bytes.len() as u64;
 
-            // Get and write indexes
-            let indexes = db.get_table_indexes(table).unwrap_or_default();
+            // Get and write indexes. v3: an index the schema objects carry is
+            // recreated from the SCHM section after the data instead.
+            let mut indexes = db.get_table_indexes(table).unwrap_or_default();
+            indexes.retain(|i| !objects.indexes.iter().any(|o| o.name == i.name));
             let indexes_bytes = bincode::serialize(&indexes)
                 .map_err(|e| Error::storage(format!("Failed to serialize indexes: {}", e)))?;
             writer
@@ -654,6 +833,22 @@ impl DumpManager {
             writer
                 .write_all(&0u32.to_le_bytes())
                 .map_err(|e| Error::storage(format!("Failed to write EOT marker: {}", e)))?;
+        }
+
+        // Format v3: the schema objects, after every table.
+        if !objects.is_empty() {
+            let objects_bytes = bincode::serialize(&objects)
+                .map_err(|e| Error::storage(format!("Failed to serialize schema objects: {}", e)))?;
+            writer
+                .write_all(b"SCHM")
+                .map_err(|e| Error::storage(format!("Failed to write schema marker: {}", e)))?;
+            writer
+                .write_all(&(objects_bytes.len() as u32).to_le_bytes())
+                .map_err(|e| Error::storage(format!("Failed to write schema objects length: {}", e)))?;
+            writer
+                .write_all(&objects_bytes)
+                .map_err(|e| Error::storage(format!("Failed to write schema objects: {}", e)))?;
+            uncompressed_bytes += objects_bytes.len() as u64;
         }
 
         metadata.total_rows = total_rows;
@@ -1005,6 +1200,8 @@ impl DumpManager {
         // Phase A collects these; phases B and C run after the end marker.
         let mut pending_constraints: Vec<(String, crate::sql::TableConstraints)> = Vec::new();
         let mut restored_tables: Vec<String> = Vec::new();
+        // Format v3's SCHM section; replayed after phase B.
+        let mut schema_objects: Option<SchemaObjects> = None;
 
         // Read tables until end marker
         loop {
@@ -1025,6 +1222,21 @@ impl DumpManager {
                 }
                 b"TABL" => {
                     // Table data follows
+                }
+                b"SCHM" if version >= 3 => {
+                    let mut len_bytes = [0u8; 4];
+                    reader
+                        .read_exact(&mut len_bytes)
+                        .map_err(|e| Error::storage(format!("Failed to read schema objects length: {}", e)))?;
+                    let mut bytes = vec![0u8; u32::from_le_bytes(len_bytes) as usize];
+                    reader
+                        .read_exact(&mut bytes)
+                        .map_err(|e| Error::storage(format!("Failed to read schema objects: {}", e)))?;
+                    schema_objects = Some(
+                        bincode::deserialize(&bytes)
+                            .map_err(|e| Error::storage(format!("Failed to deserialize schema objects: {}", e)))?,
+                    );
+                    continue;
                 }
                 _ => {
                     return Err(Error::storage(format!("Invalid marker: {:?}", marker)));
@@ -1171,6 +1383,12 @@ impl DumpManager {
             }
             db.restore_table_constraints(table, constraints)?;
             constraints_restored += count as u64;
+        }
+
+        // v10.12: sequences, identity columns, indexes and views — after the
+        // rows and the constraints, so a UNIQUE index validates the data.
+        if let Some(objects) = &schema_objects {
+            db.restore_schema_objects(objects)?;
         }
 
         // Phase C: validate the restored rows against the COMPLETE graph.

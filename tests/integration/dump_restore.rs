@@ -164,12 +164,12 @@ fn test_dump_version_compatibility() -> Result<()> {
     let metadata = db.read_dump_metadata(&dump_path)?;
     assert!(metadata.dump_id > 0);
 
-    // HDB-003: new dumps are format v2 (magic bytes 0..8, version 8..12 LE),
-    // which is the version that carries the per-table constraint blob.
+    // HDB-003: format v2 carries the per-table constraint blob; v10.12 bumped
+    // the writer to v3, which adds the SCHM schema-objects section.
     let header = fs::read(&dump_path)?;
     assert_eq!(&header[0..8], b"HELIODMP");
     let version = u32::from_le_bytes([header[8], header[9], header[10], header[11]]);
-    assert_eq!(version, 2, "the writer must stamp format v2");
+    assert_eq!(version, 3, "the writer must stamp format v3");
 
     // ... and v1 files are still accepted: the real v1 fixture restores.
     let v1 = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dump_v1_users.hdmp");
