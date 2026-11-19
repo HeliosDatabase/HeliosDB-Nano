@@ -456,7 +456,7 @@ pub(crate) fn code_view(sql: &str) -> String {
     let mut out = String::with_capacity(sql.len());
     let mut cursor = 0usize;
     let mut prev: Option<char> = None;
-    let blank = |out: &mut String, text: &str| out.extend(std::iter::repeat(' ').take(text.len()));
+    let blank = |out: &mut String, text: &str| out.extend(std::iter::repeat_n(' ', text.len()));
 
     while cursor < sql.len() {
         let rest = &sql[cursor..];

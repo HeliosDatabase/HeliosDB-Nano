@@ -33524,7 +33524,7 @@ impl EmbeddedDatabase {
                 high,
                 negated,
             } => {
-                let mut m = |e: &LogicalExpr| {
+                let m = |e: &LogicalExpr| {
                     self.materialize_scalar_subqueries_for_row(e, outer_row, outer_schema, outer_table, params, txn)
                 };
                 Ok(LogicalExpr::Between {

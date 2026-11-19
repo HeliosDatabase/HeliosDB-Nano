@@ -1069,15 +1069,15 @@ fn find_session_calls(view: &str) -> Vec<(usize, usize, SessionFn)> {
             let start = from + rel;
             from = start + name.len();
             let before_ok = start == 0
-                || bytes.get(start - 1).map_or(true, |b| {
-                    !(b.is_ascii_alphanumeric() || matches!(b, b'_' | b'$' | b'.' | b'@'))
-                });
+                || bytes
+                    .get(start - 1)
+                    .is_none_or(|b| !(b.is_ascii_alphanumeric() || matches!(b, b'_' | b'$' | b'.' | b'@')));
             if !before_ok {
                 continue;
             }
             let mut i = start + name.len();
             let skip_ws = |mut i: usize| {
-                while bytes.get(i).map_or(false, |b| b.is_ascii_whitespace()) {
+                while bytes.get(i).is_some_and(|b| b.is_ascii_whitespace()) {
                     i += 1;
                 }
                 i
@@ -1106,7 +1106,7 @@ fn exact_session_select(sql: &str, view: &str, calls: &[(usize, usize, SessionFn
         return None;
     };
     let head = view.get(..*start)?;
-    if !head.starts_with("SELECT") || !head.get(6..).map_or(false, |t| t.trim().is_empty()) {
+    if !head.starts_with("SELECT") || !head.get(6..).is_some_and(|t| t.trim().is_empty()) {
         return None;
     }
     if head.len() == 6 {
@@ -1121,11 +1121,13 @@ fn exact_session_select(sql: &str, view: &str, calls: &[(usize, usize, SessionFn
     let mut view_tokens = tail_view.split_whitespace();
     let mut sql_tokens = tail_sql.split_whitespace();
     let mut v = view_tokens.next()?;
-    let mut a = sql_tokens.next()?;
-    if v == "AS" {
+    let a = if v == "AS" {
         v = view_tokens.next()?;
-        a = sql_tokens.next()?;
-    }
+        sql_tokens.next()?;
+        sql_tokens.next()?
+    } else {
+        sql_tokens.next()?
+    };
     if view_tokens.next().is_some() {
         return None;
     }
@@ -1164,7 +1166,7 @@ fn view_is_query(view: &str) -> bool {
             && !t
                 .as_bytes()
                 .get(w.len())
-                .map_or(false, |b| b.is_ascii_alphanumeric() || *b == b'_')
+                .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
     };
     word_is("SELECT") || word_is("WITH") || t.starts_with('(')
 }
