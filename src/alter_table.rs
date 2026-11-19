@@ -638,9 +638,16 @@ impl EmbeddedDatabase {
         // name the rest of their key in UniqueColumns, not column_name.
         for (name, definition) in catalog.list_index_definitions()? {
             let names_dropped_column = names_column(&definition.column_name)
-                || definition.options.iter().any(|option| {
-                    matches!(option, sql::logical_plan::IndexOption::UniqueColumns(columns)
-                        if columns.iter().any(|column| names_column(column)))
+                || definition.options.iter().any(|option| match option {
+                    sql::logical_plan::IndexOption::UniqueColumns(columns) => {
+                        columns.iter().any(|column| names_column(column))
+                    }
+                    // GH#34: an index over an expression that reads the
+                    // column goes with it, as in PostgreSQL.
+                    sql::logical_plan::IndexOption::Expression { columns, .. } => {
+                        columns.iter().any(|column| names_column(column))
+                    }
+                    _ => false,
                 });
             if definition.table_name == st.table && names_dropped_column && !st.indexes_to_drop.contains(&name) {
                 st.indexes_to_drop.push(name);
@@ -679,6 +686,25 @@ impl EmbeddedDatabase {
         })?;
         let catalog = self.storage.catalog();
         let table = st.table.clone();
+        // GH#34: an expression index keeps its key as SQL text over the column
+        // names; renaming a column it reads would leave that text naming a
+        // column the table no longer has. Refuse, before anything changes.
+        for (name, definition) in catalog.list_index_definitions()? {
+            if definition.table_name != table {
+                continue;
+            }
+            let reads_old = definition.options.iter().any(|option| {
+                matches!(option, sql::logical_plan::IndexOption::Expression { columns, .. }
+                    if columns.iter().any(|column| column.eq_ignore_ascii_case(old)))
+            });
+            if reads_old {
+                return Err(Error::query_execution(format!(
+                    "renaming column \"{old}\" of table \"{table}\", which the expression index \"{name}\" \
+                     reads, {}; drop the index first",
+                    crate::error::UNSUPPORTED_STATEMENT_KIND_MARKER
+                )));
+            }
+        }
         Catalog::validate_rename_column_in(&table, old, st.constraints_mut(&catalog)?)?;
 
         st.schema

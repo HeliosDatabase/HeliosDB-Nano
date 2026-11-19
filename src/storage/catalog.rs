@@ -752,7 +752,24 @@ impl<'a> Catalog<'a> {
         // Reserve user-visible index names first, matching ordinary bootstrap's
         // deterministic order before generated constraint names are allocated.
         for (name, definition) in &definitions {
-            validate_columns(&definition.table_name, std::slice::from_ref(&definition.column_name))?;
+            // GH#34: an expression index's `column_name` is its key text; the
+            // table columns it reads are in its Expression option.
+            let expression_columns = definition.options.iter().find_map(|option| match option {
+                crate::sql::logical_plan::IndexOption::Expression { columns, .. } => Some(columns.as_slice()),
+                _ => None,
+            });
+            match expression_columns {
+                Some(columns) if !columns.is_empty() => validate_columns(&definition.table_name, columns)?,
+                Some(_) => {
+                    if !tables.contains_key(&definition.table_name) {
+                        return Err(Error::storage(format!(
+                            "physical snapshot index references missing table '{}'",
+                            definition.table_name
+                        )));
+                    }
+                }
+                None => validate_columns(&definition.table_name, std::slice::from_ref(&definition.column_name))?,
+            }
             match index_family(definition.index_type.as_deref()) {
                 Some(IndexFamily::Art) => {
                     let columns = crate::sql::executor::ddl::unique_index_columns(&definition.options, &definition.column_name);

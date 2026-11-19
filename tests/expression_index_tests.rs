@@ -216,3 +216,69 @@ fn the_definition_survives_a_reopen() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A sealed image of a database with an expression index hydrates as a
+/// physical snapshot (the standby path): the definition is kept and listed.
+#[test]
+fn a_physical_snapshot_with_an_expression_index_hydrates() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut config = heliosdb_nano::Config::default();
+    config.storage.path = Some(dir.path().to_path_buf());
+    config.storage.memory_only = false;
+    {
+        let db = EmbeddedDatabase::with_config(config.clone()).unwrap();
+        setup(&db, false);
+        db.execute("CREATE INDEX t_c ON mem0 ((payload->>'user_id'))").unwrap();
+        db.execute("CREATE INDEX t_l ON mem0 (lower(payload->>'user_id'))")
+            .unwrap();
+    }
+    let hydrated = EmbeddedDatabase::open_physical_snapshot(config)
+        .unwrap_or_else(|e| panic!("hydrating a snapshot with an expression index: {e}"));
+    let db = hydrated.database;
+    for params in [false, true] {
+        let names: Vec<String> = index_defs(&db, "mem0", params).into_iter().map(|(n, _)| n).collect();
+        assert!(
+            names.contains(&"t_c".to_string()) && names.contains(&"t_l".to_string()),
+            "{names:?}"
+        );
+        let got = rows(&db, "SELECT id FROM mem0 WHERE payload->>'user_id' = 'u2'", params);
+        assert_eq!(got, vec![vec![Value::Int4(2)]]);
+    }
+}
+
+/// DROP COLUMN drops an expression index that reads the column (PostgreSQL's
+/// rule); RENAME COLUMN of such a column is refused rather than leaving the
+/// index's key text naming a column the table no longer has.
+#[test]
+fn drop_and_rename_column_under_an_expression_index() {
+    for params in [false, true] {
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        setup(&db, params);
+        run(&db, "CREATE INDEX t_low ON mem0 (lower(email))", params).unwrap();
+        run(&db, "CREATE INDEX t_uid ON mem0 ((payload->>'user_id'))", params).unwrap();
+
+        let err = run(&db, "ALTER TABLE mem0 RENAME COLUMN email TO mail", params)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("t_low") && err.contains("is not supported"),
+            "params={params}: {err}"
+        );
+        // Nothing changed: the column keeps its name, the index is listed.
+        assert_eq!(
+            rows(&db, "SELECT id FROM mem0 WHERE lower(email) = 'a@x.io'", params),
+            vec![vec![Value::Int4(1)]]
+        );
+        assert!(index_defs(&db, "mem0", params).iter().any(|(n, _)| n == "t_low"));
+        // A column no expression index reads still renames.
+        run(&db, "ALTER TABLE mem0 RENAME COLUMN id TO ident", params).unwrap();
+
+        run(&db, "ALTER TABLE mem0 DROP COLUMN email", params).unwrap();
+        let names: Vec<String> = index_defs(&db, "mem0", params).into_iter().map(|(n, _)| n).collect();
+        assert!(!names.contains(&"t_low".to_string()), "params={params}: {names:?}");
+        assert!(names.contains(&"t_uid".to_string()), "params={params}: {names:?}");
+        // The name is free again, and a new index over a new column works.
+        run(&db, "ALTER TABLE mem0 ADD COLUMN email TEXT", params).unwrap();
+        run(&db, "CREATE INDEX t_low ON mem0 (lower(email))", params).unwrap();
+    }
+}

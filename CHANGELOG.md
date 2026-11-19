@@ -155,6 +155,16 @@ Reports from users of earlier releases (GitHub numbers) and defects found while 
   expression scans the table and its answer is always correct. `CREATE UNIQUE INDEX` on an
   expression is refused with an error, because nothing would enforce it.
   `tests/expression_index_tests.rs`.
+- **A standby could not open a database with an expression index, and `ALTER TABLE` ignored
+  such an index (GitHub #34).** Hydrating a physical snapshot (the standby and
+  `open_physical_snapshot` path) failed with "physical snapshot index has invalid columns",
+  because the check read the index's key text as a column name; it now checks the columns the
+  expression reads. `DROP COLUMN` of a column an expression index reads now drops the index, as
+  in PostgreSQL, instead of leaving a definition over a column that no longer exists. `RENAME
+  COLUMN` of such a column is refused with `0A000` (drop the index first) instead of leaving the
+  index's key naming the old column. The index is still recorded only: it is not maintained,
+  the planner does not read it, and `CREATE UNIQUE INDEX` on an expression is still refused.
+  `tests/expression_index_tests.rs`.
 - **`ORDER BY … NULLS FIRST / NULLS LAST` was ignored (GitHub #43).** The clause was read and
   dropped: `ORDER BY due ASC NULLS LAST` returned the NULLs first. An explicit placement is now
   obeyed, in a query, over `GROUP BY`, over a set operation, under `LIMIT` and in a window's
