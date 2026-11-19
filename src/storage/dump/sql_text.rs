@@ -101,7 +101,7 @@ pub(crate) const INSERT_BATCH_ROWS: usize = 100;
 /// unquoted, preserved if it was not. Re-emitting it quoted is therefore the
 /// only spelling that is right for both, and it is the only one that survives a
 /// name with a space, a reserved word (`"select"`) or an embedded quote.
-pub(crate) fn quote_ident(name: &str) -> String {
+pub fn quote_ident(name: &str) -> String {
     let mut out = String::with_capacity(name.len() + 2);
     out.push('"');
     for ch in name.chars() {
@@ -119,7 +119,7 @@ pub(crate) fn quote_ident(name: &str) -> String {
 /// Splits at the FIRST `.`, exactly as `Catalog::list_tables_qualified` does,
 /// so a table in a non-`public` schema round-trips as `"s"."t"` rather than as
 /// one identifier literally named `s.t`.
-pub(crate) fn quote_table_name(name: &str) -> String {
+pub fn quote_table_name(name: &str) -> String {
     match name.split_once('.') {
         Some((schema, table)) => format!("{}.{}", quote_ident(schema), quote_ident(table)),
         None => quote_ident(name),
@@ -138,7 +138,7 @@ pub(crate) fn quote_table_name(name: &str) -> String {
 ///
 /// Auto-generated names (`fk_child_pid__parent`, `t_pkey`, `t_v_unique`) are
 /// plain lower-case identifiers and are emitted bare.
-pub(crate) fn quote_constraint_name(name: &str) -> String {
+pub fn quote_constraint_name(name: &str) -> String {
     let mut chars = name.chars();
     let head_ok = matches!(chars.next(), Some(c) if c.is_ascii_lowercase() || c == '_');
     let tail_ok = chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
@@ -169,7 +169,7 @@ fn needs_escape_string(s: &str) -> bool {
 ///
 /// The E-form is what keeps every emitted statement on ONE line, which is what
 /// makes the dump greppable and its `-- …` comment lines unambiguous.
-pub(crate) fn quote_literal(s: &str) -> String {
+pub fn quote_literal(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 4);
     if needs_escape_string(s) {
         out.push_str("E'");
@@ -199,7 +199,7 @@ pub(crate) fn quote_literal(s: &str) -> String {
 /// Strip everything from a `-- …` comment that could change how the script
 /// splitter reads the rest of the file (`'` opens a literal, `;` ends a
 /// statement, `$` can open a dollar-quote, a newline would split the comment).
-pub(crate) fn sanitize_comment(text: &str) -> String {
+pub fn sanitize_comment(text: &str) -> String {
     text.chars()
         .map(|c| match c {
             '\'' | '"' | ';' | '$' | '\\' | '\n' | '\r' | '\t' => ' ',
@@ -334,7 +334,7 @@ fn array_text(items: &[Value], element_type: &DataType) -> Result<String> {
 /// `declared` decides the cases the text alone leaves ambiguous: `TIMESTAMP` vs
 /// `TIMESTAMPTZ`, `JSON` vs `JSONB`, the element type an array casts to, and
 /// whether a float needs its width spelled out.
-pub(crate) fn value_literal(value: &Value, declared: &DataType) -> Result<String> {
+pub fn value_literal(value: &Value, declared: &DataType) -> Result<String> {
     let literal = match value {
         Value::Null => "NULL".to_string(),
         Value::Boolean(b) => (if *b { "TRUE" } else { "FALSE" }).to_string(),
@@ -437,7 +437,7 @@ fn stored_expr(stored: &str) -> Option<LogicalExpr> {
 /// rendering in the file (NIT 8). A `default_expr` that is not `LogicalExpr`
 /// JSON at all is passed through verbatim, as it was before: it is then already
 /// SQL text written by some other path.
-pub(crate) fn column_ddl(col: &Column, inline_primary_key: bool, inline_unique: bool) -> Result<String> {
+pub fn column_ddl(col: &Column, inline_primary_key: bool, inline_unique: bool) -> Result<String> {
     column_ddl_with_identity(col, inline_primary_key, inline_unique, false)
 }
 
@@ -456,7 +456,7 @@ fn identity_type_sql(data_type: &crate::DataType) -> String {
 }
 
 /// [`column_ddl`], re-declaring a SERIAL / IDENTITY column as such (v10.12).
-pub(crate) fn column_ddl_with_identity(
+pub fn column_ddl_with_identity(
     col: &Column,
     inline_primary_key: bool,
     inline_unique: bool,
@@ -525,13 +525,13 @@ fn quoted_column_list(columns: &[String]) -> String {
 /// constraint record. PRIMARY KEY is expressed by the column flags and its
 /// record skipped; UNIQUE is expressed by its RECORD (so the name survives) and
 /// the matching column's inline `UNIQUE` suppressed.
-pub(crate) fn table_ddl(table: &str, schema: &Schema, constraints: &TableConstraints) -> Result<String> {
+pub fn table_ddl(table: &str, schema: &Schema, constraints: &TableConstraints) -> Result<String> {
     table_ddl_with_identity(table, schema, constraints, &[])
 }
 
 /// [`table_ddl`] with the table's SERIAL / IDENTITY columns re-declared
 /// (v10.12; before, they came back as plain integers with no generator).
-pub(crate) fn table_ddl_with_identity(
+pub fn table_ddl_with_identity(
     table: &str,
     schema: &Schema,
     constraints: &TableConstraints,
@@ -647,7 +647,7 @@ pub(crate) fn table_ddl_with_identity(
 /// `NotEnforced`, and the `ALTER TABLE … ALTER CONSTRAINT` fast path the same),
 /// so there is no spelling to emit: the mode is recorded in a trailing `-- …`
 /// comment, which the script splitter drops, rather than silently vanishing.
-pub(crate) fn foreign_key_ddl(table: &str, fk: &ForeignKeyConstraint) -> String {
+pub fn foreign_key_ddl(table: &str, fk: &ForeignKeyConstraint) -> String {
     let mut out = format!(
         "ALTER TABLE {} ADD CONSTRAINT {} FOREIGN KEY {} REFERENCES {} {}",
         quote_table_name(table),
@@ -703,7 +703,7 @@ pub(crate) fn foreign_key_ddl(table: &str, fk: &ForeignKeyConstraint) -> String 
 /// would therefore restore a DIFFERENT index when it worked and turn a
 /// loadable dump into an unloadable one whenever rows had since been deleted;
 /// a plain HNSW index answers the same queries, more slowly.
-pub(crate) fn index_ddl(table: &str, index: &IndexMetadata) -> String {
+pub fn index_ddl(table: &str, index: &IndexMetadata) -> String {
     let using = match index.index_type.as_str() {
         "hnsw" | "hnsw_pq" | "persistent_hnsw" | "persistent_hnsw_pq" => " USING hnsw",
         "hash" => " USING hash",
@@ -736,7 +736,7 @@ pub(crate) fn index_ddl(table: &str, index: &IndexMetadata) -> String {
 // ---------------------------------------------------------------------------
 
 /// `CREATE SEQUENCE IF NOT EXISTS "s" AS bigint INCREMENT BY … ;`
-pub(crate) fn sequence_ddl(seq: &super::SequenceDump) -> String {
+pub fn sequence_ddl(seq: &super::SequenceDump) -> String {
     format!(
         "CREATE SEQUENCE IF NOT EXISTS {} AS {} INCREMENT BY {} MINVALUE {} MAXVALUE {} START WITH {} CACHE {}{};",
         quote_table_name(&seq.name),
@@ -752,13 +752,13 @@ pub(crate) fn sequence_ddl(seq: &super::SequenceDump) -> String {
 
 /// `SELECT setval('s', 42, true);` — the sequence continues after its last
 /// value. `None` when `nextval` was never called (nothing to restore).
-pub(crate) fn sequence_setval(seq: &super::SequenceDump) -> Option<String> {
+pub fn sequence_setval(seq: &super::SequenceDump) -> Option<String> {
     seq.last_value
         .map(|v| format!("SELECT setval({}, {}, true);", quote_literal(&seq.name), v))
 }
 
 /// `CREATE [UNIQUE] INDEX "i" ON "t" USING m (key) [WITH (…)];`
-pub(crate) fn index_dump_ddl(index: &super::IndexDump) -> String {
+pub fn index_dump_ddl(index: &super::IndexDump) -> String {
     let with = if index.with_options.is_empty() {
         String::new()
     } else {
@@ -778,7 +778,7 @@ pub(crate) fn index_dump_ddl(index: &super::IndexDump) -> String {
 /// `CREATE VIEW "v" AS SELECT …;` on one line. The stored SELECT keeps the
 /// user's own spelling; its line breaks are folded to spaces outside quoted
 /// text so the module's one-statement-per-line contract holds.
-pub(crate) fn view_ddl(view: &super::ViewDump) -> String {
+pub fn view_ddl(view: &super::ViewDump) -> String {
     let mut body = String::with_capacity(view.query_sql.len());
     let mut quote: Option<char> = None;
     for ch in view.query_sql.trim().trim_end_matches(';').chars() {
@@ -823,13 +823,13 @@ fn row_values(table: &str, schema: &Schema, row: &Tuple) -> Result<String> {
 /// exporter batches, so this single-row form is the unit-test / one-off entry
 /// point onto the same rendering.
 #[allow(dead_code)]
-pub(crate) fn insert_statement(table: &str, schema: &Schema, row: &Tuple) -> Result<String> {
+pub fn insert_statement(table: &str, schema: &Schema, row: &Tuple) -> Result<String> {
     insert_statement_batch(table, schema, std::slice::from_ref(row))
 }
 
 /// `INSERT INTO "t" (…) VALUES (…), (…);` for up to [`INSERT_BATCH_ROWS`] rows,
 /// on ONE line. Returns an empty string for an empty batch.
-pub(crate) fn insert_statement_batch(table: &str, schema: &Schema, rows: &[Tuple]) -> Result<String> {
+pub fn insert_statement_batch(table: &str, schema: &Schema, rows: &[Tuple]) -> Result<String> {
     if rows.is_empty() {
         return Ok(String::new());
     }

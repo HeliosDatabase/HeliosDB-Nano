@@ -792,14 +792,15 @@ impl Parser {
             w if w.eq_ignore_ascii_case("INDEX") => true,
             _ => return None,
         };
-        let mut if_exists = false;
-        if words.peek().is_some_and(|w| w.eq_ignore_ascii_case("IF")) {
+        let if_exists = if words.peek().is_some_and(|w| w.eq_ignore_ascii_case("IF")) {
             words.next();
             if !words.next()?.eq_ignore_ascii_case("EXISTS") {
                 return None;
             }
-            if_exists = true;
-        }
+            true
+        } else {
+            false
+        };
         if words.peek().is_some_and(|w| w.eq_ignore_ascii_case("ONLY")) {
             words.next();
         }

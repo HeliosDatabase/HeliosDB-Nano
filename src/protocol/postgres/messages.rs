@@ -807,9 +807,6 @@ impl BackendMessage {
                 buf.put_u8(BackendMessageType::CopyDone as u8);
                 buf.put_i32(4);
             }
-            _ => {
-                // Other message types not yet implemented
-            }
         }
     }
 

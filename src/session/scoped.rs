@@ -614,7 +614,7 @@ impl SessionScopedState {
         if !taken.is_empty() {
             let count = taken.len();
             let _ = PENDING_STATEMENT_NOTICES
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| Some(n.saturating_sub(count)));
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| Some(n.saturating_sub(count)));
         }
         taken
     }

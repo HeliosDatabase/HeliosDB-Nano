@@ -1,3 +1,4 @@
+#![allow(clippy::large_futures, clippy::assert_is_empty)] // test-only: handler futures grow with the handler
 //! Wire-level equivalence tests for the extended query protocol (R5.W1/W2).
 //!
 //! These drive Parse / Bind / Execute directly on the handler over a duplex
