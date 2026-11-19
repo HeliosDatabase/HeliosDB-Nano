@@ -115,8 +115,6 @@ pub enum ExportSource {
     Query(String),
     /// Export vector store
     VectorStore(String),
-    /// Export branch diff
-    BranchDiff { from: String, to: String },
     /// Export schema only
     Schema,
 }
@@ -230,9 +228,6 @@ impl Exporter {
                     "SELECT id, vector, metadata FROM helios_vector_store WHERE store_name = '{}'",
                     store
                 )
-            }
-            ExportSource::BranchDiff { from, to } => {
-                format!("SELECT * FROM helios_branch_diff('{}', '{}')", from, to)
             }
             ExportSource::Schema => "SELECT * FROM information_schema.tables WHERE table_schema = 'public'".to_string(),
         }

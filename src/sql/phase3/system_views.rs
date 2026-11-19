@@ -4167,13 +4167,14 @@ impl SystemViewRegistry {
             "pg_stat_activity" => Ok(Self::execute_pg_stat_activity(storage)),
             "pg_mv_staleness" => Self::execute_pg_mv_staleness(storage),
             "pg_vector_index_stats" => Self::execute_pg_vector_index_stats(storage),
-            "pg_compare_branches" => {
-                // This view requires parameters (source and target branch names)
-                // For now, return error indicating parameters are needed
-                Err(Error::query_execution(
-                    "pg_compare_branches requires parameters: SELECT * FROM pg_compare_branches('source_branch', 'target_branch')"
-                ))
-            }
+            // v10.2: this view never compared anything; it could only error,
+            // with or without arguments, and the message suggested a call
+            // that also failed. It now says plainly that nothing is compared.
+            "pg_compare_branches" => Err(Error::query_execution(
+                "pg_compare_branches is not implemented: it compares nothing, with or without arguments. \
+                 There is no SQL branch diff in this release; MERGE BRANCH moves the branch's own changes \
+                 without conflict detection",
+            )),
             "pg_branch_stats" => Self::execute_pg_branch_stats(storage),
             "pg_class" => Self::execute_pg_class(storage),
             "pg_attribute" => Self::execute_pg_attribute(storage),
@@ -4346,9 +4347,12 @@ impl SystemViewRegistry {
                 Value::String(branch.name.clone()),
                 Value::Int8(branch.branch_id as i64),
                 Value::Int8(branch.parent_id.map(|id| id as i64).unwrap_or(0)),
-                Value::Timestamp(chrono::DateTime::from_timestamp(branch.created_at as i64, 0).unwrap_or_default()),
+                // v10.2: wall-clock creation time, NULL when not recorded
+                // (`created_at` is a logical counter, not a time).
+                branch.created_at_wall_clock().map(Value::Timestamp).unwrap_or(Value::Null),
                 Value::Int8(branch.created_from_snapshot as i64),
-                Value::Int8((branch.stats.storage_bytes / (1024 * 1024)) as i64), // Convert to MB
+                // Storage size is not measured: NULL, never 0-as-fact.
+                Value::Null,
                 Value::String(format!("{:?}", branch.state)),
             ]);
             results.push(tuple);
@@ -4456,27 +4460,18 @@ impl SystemViewRegistry {
         let mut results = Vec::new();
 
         for branch in branches {
-            // Calculate compression ratio (storage vs uncompressed estimate)
-            // Simple heuristic: assume typical compression of 2:1
-            let compression_ratio = if branch.stats.storage_bytes > 0 {
-                Some(2.0) // Placeholder - would need actual compression tracking
-            } else {
-                None
-            };
-
-            let last_modified_ts = if branch.stats.last_modified > 0 {
-                chrono::DateTime::from_timestamp(branch.stats.last_modified as i64, 0).unwrap_or_default()
-            } else {
-                chrono::DateTime::from_timestamp(branch.created_at as i64, 0).unwrap_or_default()
-            };
-
+            // v10.2: `BranchStats` is maintained by nothing, so every counter
+            // read 0 for a branch that had changed rows, and `last_modified`
+            // fell back to the logical `created_at` printed as a 1970 date.
+            // What is not measured is NULL, never 0-as-fact; the last-modified
+            // column shows the wall-clock creation time when one is recorded.
             let tuple = Tuple::new(vec![
                 Value::String(branch.name.clone()),
-                Value::Int8(branch.stats.modified_keys as i64),
-                Value::Int8(branch.stats.storage_bytes as i64),
-                Value::Int8(branch.stats.commit_count as i64),
-                Value::Timestamp(last_modified_ts),
-                compression_ratio.map(Value::Float8).unwrap_or(Value::Null),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                branch.created_at_wall_clock().map(Value::Timestamp).unwrap_or(Value::Null),
+                Value::Null,
             ]);
             results.push(tuple);
         }

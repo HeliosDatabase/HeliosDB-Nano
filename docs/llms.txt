@@ -78,12 +78,12 @@ See config.example.toml for every section.
 
 ## MCP — the canonical agent path
 
-Requires a build with `--features mcp-endpoint`. 16 tools: `heliosdb_query`,
+Requires a build with `--features mcp-endpoint`. 17 tools: `heliosdb_query`,
 `_schema`, `_list_tables`, `_create_table`, `_insert`,
-`heliosdb_branch_{create,list,merge}`, `heliosdb_search`, `_time_travel`,
+`heliosdb_branch_{create,list,merge,drop}`, `heliosdb_search`, `_time_travel`,
 plus in-process RAG tools `_bm25_index`, `_hybrid_search`,
 `heliosdb_graph_{add_edge,traverse,path}` (graph-rag), `_embed_and_store`
-(code-embed).
+(code-embed; adds the text to the in-memory BM25 index, it does not embed).
 
 ```bash
 # Wire into Claude Code:

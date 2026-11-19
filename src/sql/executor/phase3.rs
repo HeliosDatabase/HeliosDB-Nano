@@ -1353,9 +1353,10 @@ fn handle_show_branches(executor: &Executor) -> Result<Box<dyn PhysicalOperator>
                 crate::Value::String(branch_meta.name.clone()),
                 crate::Value::Int8(branch_meta.branch_id as i64),
                 parent_name.map(crate::Value::String).unwrap_or(crate::Value::Null),
-                crate::Value::Timestamp(
-                    chrono::DateTime::from_timestamp(branch_meta.created_at as i64, 0).unwrap_or_default(),
-                ),
+                branch_meta
+                    .created_at_wall_clock()
+                    .map(crate::Value::Timestamp)
+                    .unwrap_or(crate::Value::Null),
                 crate::Value::String(state_str),
             ]);
             tuples.push(tuple);
@@ -1400,7 +1401,7 @@ fn handle_show_branches(executor: &Executor) -> Result<Box<dyn PhysicalOperator>
                 crate::Column {
                     name: "created_at".to_string(),
                     data_type: crate::DataType::Timestamp,
-                    nullable: false,
+                    nullable: true,
                     primary_key: false,
                     source_table: None,
                     source_table_name: None,

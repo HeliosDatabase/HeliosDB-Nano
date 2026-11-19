@@ -502,6 +502,23 @@ pub struct BranchStats {
     pub last_modified: u64,
 }
 
+/// v10.2: the `BranchOptions::metadata` key holding a branch's wall-clock
+/// creation time, in Unix milliseconds.
+pub const BRANCH_CREATED_AT_UNIX_MS: &str = "created_at_unix_ms";
+
+impl BranchMetadata {
+    /// The wall-clock creation time, or `None` for a branch created before it
+    /// was recorded (and for `main`). `created_at` itself is a logical counter
+    /// and is not a time.
+    pub fn created_at_wall_clock(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.options
+            .metadata
+            .get(BRANCH_CREATED_AT_UNIX_MS)
+            .and_then(|ms| ms.parse::<i64>().ok())
+            .and_then(chrono::DateTime::from_timestamp_millis)
+    }
+}
+
 /// Branch metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BranchMetadata {
@@ -1016,6 +1033,17 @@ impl BranchManager {
 
         // Get current timestamp
         let current_ts = self.next_timestamp();
+
+        // v10.2: `created_at` is the engine's LOGICAL counter, which the
+        // listings used to print as Unix seconds (a 1970 date). The wall-clock
+        // creation time goes into the options map, the one part of the bincode
+        // record that can grow; listings show it, or NULL for a branch made
+        // before it was recorded.
+        let mut options = options;
+        options
+            .metadata
+            .entry(BRANCH_CREATED_AT_UNIX_MS.to_string())
+            .or_insert_with(|| chrono::Utc::now().timestamp_millis().to_string());
 
         // Create metadata
         let metadata = BranchMetadata {

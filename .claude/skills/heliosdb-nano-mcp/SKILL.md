@@ -51,7 +51,7 @@ heliosdb-nano mcp --help \
 | `heliosdb_graph_add_edge` | Add a typed edge between graph nodes | `graph-rag` |
 | `heliosdb_graph_traverse` | Walk the graph from a seed node | `graph-rag` |
 | `heliosdb_graph_path` | Shortest-path between two nodes | `graph-rag` |
-| `heliosdb_embed_and_store` | Embed text in-process, store in vector store | `code-embed` |
+| `heliosdb_embed_and_store` | Add text to the in-process, in-memory BM25 index (no embedding, no vector store, not persisted) | `code-embed` |
 
 ## Recipes
 
@@ -154,7 +154,7 @@ The MCP server also exposes Resources via `resources/list` and `resources/read`.
 - **`heliosdb_query` returns errors as JSON, not exceptions.** Agents must check the `error` field.
 - **Branches created via MCP persist** — agents that don't clean up `agent_run_*` branches leak state. Treat branches as fork-test-discard sandboxes: wrap agent runs with `branch_create` and always drop the branch in a `finally` block.
 - **`heliosdb_branch_merge` is last-writer-wins.** It moves the source's own changes with no conflict detection (see the MERGE section of `heliosdb-nano-branches`). An agent cannot verify that outcome: prefer discarding the branch and re-applying validated SQL via `heliosdb_query`.
-- **`heliosdb_embed_and_store` downloads a model on first call** (`code-embed`). Provision the model into `./.fastembed_cache/` ahead of time in CI.
+- **`heliosdb_embed_and_store` does not embed.** Despite its name it only adds the text to the in-process BM25 index (lost on restart); it computes no vector and writes no table.
 
 ## See also
 - `heliosdb-nano-code-graph` / `heliosdb-nano-graph-rag` — the engines behind the graph tools.

@@ -27,6 +27,20 @@ changes.
 Reports from users of earlier releases (GitHub numbers) and defects found while the work after
 4.42.0 was being prepared. Each has a test file.
 
+- **Branch listings and helper endpoints stop giving false answers.** `SHOW BRANCHES`,
+  `pg_database_branches()` and `pg_branch_stats()` printed `created_at` — a logical counter — as a
+  1970 date; a new branch now records its wall-clock creation time and the listings show it (NULL
+  for `main` and for branches made before this release). `pg_branch_stats()` reported
+  modified_keys, storage_bytes and commit_count as 0 for a branch that had changed rows (nothing
+  maintains them); they are now NULL, as is the storage size in `pg_database_branches()`.
+  `POST /schema/compare` answered every request with "no differences" without comparing anything;
+  it now answers 501. The REST merge said "with no conflicts" although conflicts are never looked
+  for; it now says "conflicts are not detected". `pg_compare_branches` says it is not implemented
+  instead of suggesting a call that also failed, and the export source that queried a non-existent
+  `helios_branch_diff` function is removed. Docs: llms.txt lists 17 MCP tools, and the MCP skill no
+  longer says `heliosdb_embed_and_store` embeds or downloads a model. Test files:
+  `tests/branch_listing_truth.rs`, `tests/td4_show_branches.rs`, in-module tests in
+  `src/api/routes/schema.rs` and `src/api/routes/branches.rs`.
 - **Branch statements refuse words and options they do not understand.** `MERGE BRANCH dev INTO
   main CHECK` and `... DRY RUN` performed the real merge, `DROP BRANCH b4 PLEASE` dropped b4, a WITH
   pair without a value (`WITH (bogus)`, `WITH (replication_factor)`) was skipped silently, a quoted

@@ -677,27 +677,23 @@ pub async fn optimize_schema(
     Ok(Json(ApiResponse::success(response)))
 }
 
-/// Compare two schemas
+/// Compare two schemas.
+///
+/// v10.2: not implemented. This used to answer every request with no
+/// differences, `-- No changes detected` and `is_compatible: true` without
+/// looking at either schema — a false answer to exactly the question asked.
+/// It now says so with 501, the status the branch handlers use for a missing
+/// capability.
 pub async fn compare_schemas(
     State(_state): State<AppState>,
     Json(req): Json<CompareSchemaRequest>,
 ) -> Result<Json<ApiResponse<SchemaComparisonResponse>>, ApiError> {
-    let response = SchemaComparisonResponse {
-        differences: vec![],
-        forward_migration: if req.generate_migration {
-            Some("-- No changes detected".to_string())
-        } else {
-            None
-        },
-        backward_migration: if req.generate_migration {
-            Some("-- No changes detected".to_string())
-        } else {
-            None
-        },
-        is_compatible: true,
-    };
-
-    Ok(Json(ApiResponse::success(response)))
+    let _ = req;
+    Err(ApiError::new(
+        axum::http::StatusCode::NOT_IMPLEMENTED,
+        "NotImplemented",
+        "schema comparison is not implemented; no comparison was made",
+    ))
 }
 
 /// Generate DDL from natural language description

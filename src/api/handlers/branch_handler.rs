@@ -290,8 +290,10 @@ pub async fn merge_branch(
 
     let message = if merge_result.completed {
         if merge_result.conflicts.is_empty() {
+            // v10.2: the merge is last-writer-wins and never looks for
+            // conflicts, so "with no conflicts" was a claim nothing checked.
             format!(
-                "Successfully merged {} keys from '{}' into '{}' with no conflicts",
+                "merged {} keys from '{}' into '{}'; conflicts are not detected",
                 merge_result.merged_keys, source_name, request.target
             )
         } else {

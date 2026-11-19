@@ -68,3 +68,38 @@ fn show_branches_lists_multiple_fresh_data_dir_branches_after_writes() -> Result
 
     Ok(())
 }
+
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+fn created_at_of(db: &EmbeddedDatabase, name: &str) -> Value {
+    let rows = db.query("SHOW BRANCHES", &[]).expect("SHOW BRANCHES");
+    let row = rows
+        .iter()
+        .find(|r| r.values.first() == Some(&Value::String(name.to_string())))
+        .unwrap_or_else(|| panic!("{name} not listed"));
+    row.values.get(3).cloned().expect("created_at column")
+}
+
+/// v10.2: `created_at` was the engine's logical counter printed as Unix
+/// seconds — 1970-01-01 00:00:06.
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+fn created_at_is_wall_clock_for_a_new_branch() {
+    let db = EmbeddedDatabase::new_in_memory().unwrap();
+    db.execute("CREATE BRANCH fresh AS OF NOW").unwrap();
+    match created_at_of(&db, "fresh") {
+        Value::Timestamp(t) => {
+            let age = chrono::Utc::now() - t;
+            assert!(age.num_minutes().abs() < 5, "created_at {t} is not now");
+        }
+        other => panic!("expected a timestamp, got {other:?}"),
+    }
+}
+
+/// A branch with no recorded creation time (main) shows NULL, not 1970.
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+fn created_at_is_null_for_a_branch_without_the_stamp() {
+    let db = EmbeddedDatabase::new_in_memory().unwrap();
+    db.execute("CREATE BRANCH other AS OF NOW").unwrap();
+    assert_eq!(created_at_of(&db, "main"), Value::Null);
+}
