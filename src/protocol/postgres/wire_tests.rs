@@ -14943,6 +14943,17 @@ async fn gh52_boolean_results_are_boolean_with_bound_parameters() {
     .await;
     assert!(sqlstates(&out).is_empty(), "{:?}", sqlstates(&out));
     assert_eq!(row_description(&out).first().map(|(_, oid)| *oid), Some(16));
+}
+
+/// GH#40: LISTEN / UNLISTEN inside a transaction block take effect at COMMIT
+/// and are undone by ROLLBACK (and by ROLLBACK TO SAVEPOINT), as in
+/// PostgreSQL; `pg_listening_channels()` lists the committed channels.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
     clippy::many_single_char_names,
     clippy::large_futures,
     clippy::assert_is_empty
