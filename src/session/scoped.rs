@@ -613,8 +613,9 @@ impl SessionScopedState {
         let taken = std::mem::take(&mut *self.notices.lock());
         if !taken.is_empty() {
             let count = taken.len();
+            #[allow(deprecated)] // `try_update` needs Rust 1.95; the MSRV is 1.88
             let _ = PENDING_STATEMENT_NOTICES
-                .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| Some(n.saturating_sub(count)));
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| Some(n.saturating_sub(count)));
         }
         taken
     }

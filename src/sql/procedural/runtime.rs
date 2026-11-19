@@ -490,7 +490,7 @@ impl ProceduralExecutor {
                 let mut iterations = 0u64;
                 while Self::eval_condition(condition, ctx, "WHILE")? {
                     Self::loop_tick(ctx, &mut iterations)?;
-                    if let LoopFlow::Leave = Self::run_loop_body(body, label.as_deref(), ctx)? {
+                    if matches!(Self::run_loop_body(body, label.as_deref(), ctx)?, LoopFlow::Leave) {
                         break;
                     }
                 }
@@ -500,7 +500,7 @@ impl ProceduralExecutor {
                 let mut iterations = 0u64;
                 loop {
                     Self::loop_tick(ctx, &mut iterations)?;
-                    if let LoopFlow::Leave = Self::run_loop_body(body, label.as_deref(), ctx)? {
+                    if matches!(Self::run_loop_body(body, label.as_deref(), ctx)?, LoopFlow::Leave) {
                         break;
                     }
                 }
@@ -561,7 +561,7 @@ impl ProceduralExecutor {
                     while if *reverse { i >= last } else { i <= last } {
                         Self::loop_tick(ctx, &mut iterations)?;
                         ctx.scope.set(variable, as_value(i))?;
-                        if let LoopFlow::Leave = Self::run_loop_body(body, label.as_deref(), ctx)? {
+                        if matches!(Self::run_loop_body(body, label.as_deref(), ctx)?, LoopFlow::Leave) {
                             break;
                         }
                         let next = if *reverse {
@@ -817,7 +817,7 @@ impl ProceduralExecutor {
                             record_variable,
                         )?;
                         ctx.scope.set(record_variable, value)?;
-                        if let LoopFlow::Leave = Self::run_loop_body(body, label.as_deref(), ctx)? {
+                        if matches!(Self::run_loop_body(body, label.as_deref(), ctx)?, LoopFlow::Leave) {
                             break;
                         }
                     }
