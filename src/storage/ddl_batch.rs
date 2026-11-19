@@ -75,6 +75,18 @@ static OPEN_BATCHES: AtomicUsize = AtomicUsize::new(0);
 /// Writes the detector found outside a batch, in every build.
 static SIDE_WRITES: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(test)]
+thread_local! {
+    /// The same count for this thread only, so a test's equality checks are
+    /// not moved by another test running in parallel.
+    static THREAD_SIDE_WRITES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn thread_side_writes() -> u64 {
+    THREAD_SIDE_WRITES.with(std::cell::Cell::get)
+}
+
 /// Sites the release detector has warned about.
 #[cfg(not(any(debug_assertions, feature = "internal-tests")))]
 static WARNED_SITES: std::sync::LazyLock<parking_lot::Mutex<std::collections::HashSet<(&'static str, u32)>>> =
@@ -214,6 +226,8 @@ fn check_side_write(gate: &WriteGate, what: &str, caller: &'static Location<'sta
 #[allow(clippy::panic)]
 fn report_side_write(what: &str, caller: &'static Location<'static>) {
     SIDE_WRITES.fetch_add(1, Ordering::Relaxed);
+    #[cfg(test)]
+    THREAD_SIDE_WRITES.with(|count| count.set(count.get() + 1));
     #[cfg(any(debug_assertions, feature = "internal-tests"))]
     {
         // A panic while unwinding aborts the process and the rest of the test binary
@@ -821,7 +835,7 @@ mod tests {
         let (_dir, db) = scratch_db();
         let gate = WriteGate::open();
         let other = WriteGate::open();
-        let before = side_writes();
+        let before = thread_side_writes();
         {
             let _open = OpenMarker::enter(&gate);
             assert!(batch_open_for(&gate));
@@ -831,9 +845,9 @@ mod tests {
                 gate.put(&db, b"meta:table:t", b"v", None).unwrap();
             }));
             assert!(escaped.is_err(), "a put outside the batch panics in a test build");
-            assert!(side_writes() > before, "and is counted");
+            assert!(thread_side_writes() > before, "and is counted");
 
-            let counted = side_writes();
+            let counted = thread_side_writes();
             {
                 let _commit = Committing::enter();
                 let mut batch = WriteBatch::default();
@@ -846,15 +860,15 @@ mod tests {
             }
             other.put(&db, b"meta:table:u", b"v", None).unwrap();
             assert_eq!(
-                side_writes(),
+                thread_side_writes(),
                 counted,
                 "the commit, an allowed write and another gate pass"
             );
         }
         assert!(!batch_open_for(&gate));
-        let counted = side_writes();
+        let counted = thread_side_writes();
         gate.put(&db, b"meta:table:t", b"w", None).unwrap();
-        assert_eq!(side_writes(), counted, "nothing is open any more");
+        assert_eq!(thread_side_writes(), counted, "nothing is open any more");
     }
 
     /// A finding while unwinding is counted, never a second panic.
