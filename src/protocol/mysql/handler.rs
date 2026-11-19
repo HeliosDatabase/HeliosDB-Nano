@@ -2333,7 +2333,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
         };
         if delete.returning.is_some() || !delete.order_by.is_empty() || delete.limit.is_some() {
             return Some(Err(
-                "Incorrect usage of DELETE and ORDER BY / LIMIT / RETURNING: not allowed with a multi-table DELETE".to_string(),
+                "Incorrect usage of DELETE and ORDER BY / LIMIT / RETURNING: not allowed with a multi-table DELETE"
+                    .to_string(),
             ));
         }
         Some(self.run_multi_table_delete(&target_names, refs, delete.selection.as_ref(), params))
@@ -2400,7 +2401,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
             select.push_str(&format!(" WHERE {expr}"));
         }
         let rows = if params.is_empty() {
-            self.database.query_with_columns_for_session(self.session_id, &select).map(|(rows, _)| rows)
+            self.database
+                .query_with_columns_for_session(self.session_id, &select)
+                .map(|(rows, _)| rows)
         } else {
             self.database
                 .query_params_with_columns_for_session(self.session_id, &select, params)
@@ -2426,7 +2429,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
                 if cells.iter().any(|v| matches!(v, Value::Null)) {
                     continue; // an outer-join row without a partner
                 }
-                let literals: Vec<String> = cells.iter().map(crate::sql::interpolate::value_to_sql_literal).collect();
+                let literals: Vec<String> = cells
+                    .iter()
+                    .map(crate::sql::interpolate::value_to_sql_literal)
+                    .collect();
                 if let Some((_, _, list)) = keys.get_mut(slot) {
                     if !list.contains(&literals) {
                         list.push(literals);

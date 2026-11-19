@@ -9,7 +9,13 @@
 //! `tests/mysql_wire_hygiene_batch_d.rs`, extended with `err`.
 
 #![allow(dead_code)]
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing, clippy::many_single_char_names)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::many_single_char_names
+)]
 
 use heliosdb_nano::protocol::mysql::MySqlHandler;
 use heliosdb_nano::protocol::postgres::timeouts::ConnectionTimeouts;
@@ -238,7 +244,6 @@ impl MySqlTestClient {
     }
 }
 
-
 fn test_db() -> Arc<EmbeddedDatabase> {
     Arc::new(EmbeddedDatabase::new_in_memory().expect("in-memory db"))
 }
@@ -248,7 +253,10 @@ impl MySqlTestClient {
     async fn err(&mut self, sql: &str) -> (u16, String) {
         let pkt = self.send(sql).await;
         assert_eq!(pkt.first().copied(), Some(0xFF), "expected ERR for `{sql}`");
-        (u16::from_le_bytes([pkt[1], pkt[2]]), String::from_utf8_lossy(&pkt[3..]).into_owned())
+        (
+            u16::from_le_bytes([pkt[1], pkt[2]]),
+            String::from_utf8_lossy(&pkt[3..]).into_owned(),
+        )
     }
 
     /// Rows of a query, each row joined with `|`, sorted.
@@ -278,8 +286,10 @@ async fn archive_query_runs_over_the_wire() {
 #[tokio::test]
 async fn cast_meta_value_as_signed_runs() {
     let mut c = MySqlTestClient::login(test_db()).await;
-    c.ok("CREATE TABLE wp_postmeta (meta_id INT NOT NULL, meta_value VARCHAR(20))").await;
-    c.ok("INSERT INTO wp_postmeta VALUES (1, '10'), (2, '9'), (3, '100')").await;
+    c.ok("CREATE TABLE wp_postmeta (meta_id INT NOT NULL, meta_value VARCHAR(20))")
+        .await;
+    c.ok("INSERT INTO wp_postmeta VALUES (1, '10'), (2, '9'), (3, '100')")
+        .await;
     let (_c, rows) = c
         .query("SELECT meta_id FROM wp_postmeta ORDER BY CAST(meta_value AS SIGNED) DESC")
         .await;
@@ -295,7 +305,8 @@ async fn cast_meta_value_as_signed_runs() {
 #[tokio::test]
 async fn replace_into_twice_leaves_one_row_and_sets_last_insert_id() {
     let mut c = MySqlTestClient::login(test_db()).await;
-    c.ok("CREATE TABLE r (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(20))").await;
+    c.ok("CREATE TABLE r (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(20))")
+        .await;
     let (affected, last_id) = c.ok_insert("REPLACE INTO r (name) VALUES ('x')").await;
     assert_eq!((affected, last_id), (1, 1));
     c.ok_insert("REPLACE INTO r (id, name) VALUES (1, 'y')").await;
@@ -313,7 +324,9 @@ async fn insert_ignore_select_skips_duplicates() {
     c.ok("CREATE TABLE src (id INT, email VARCHAR(20))").await;
     c.ok("INSERT INTO u VALUES (1, 'old1'), (2, 'old2')").await;
     c.ok("INSERT INTO src VALUES (1, 'new1'), (3, 'new3')").await;
-    let (affected, _id) = c.ok_insert("INSERT IGNORE INTO u (id, email) SELECT id, email FROM src").await;
+    let (affected, _id) = c
+        .ok_insert("INSERT IGNORE INTO u (id, email) SELECT id, email FROM src")
+        .await;
     assert_eq!(affected, 1);
     assert_eq!(c.rows("SELECT * FROM u").await, ["1|old1", "2|old2", "3|new3"]);
 }
@@ -337,7 +350,8 @@ async fn insert_select_on_duplicate_key_update() {
 async fn two_tables(c: &mut MySqlTestClient) {
     c.ok("CREATE TABLE t1 (id INT PRIMARY KEY, k VARCHAR(10))").await;
     c.ok("CREATE TABLE t2 (id INT PRIMARY KEY, t1_id INT, flag INT)").await;
-    c.ok("INSERT INTO t1 VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')").await;
+    c.ok("INSERT INTO t1 VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')")
+        .await;
     c.ok("INSERT INTO t2 VALUES (10, 1, 1), (11, 2, 1), (12, 3, 0)").await;
 }
 
@@ -357,7 +371,8 @@ async fn multi_table_delete_removes_the_joined_rows_of_both_tables() {
 async fn multi_table_delete_with_aliases_and_backticks() {
     let mut c = MySqlTestClient::login(test_db()).await;
     two_tables(&mut c).await;
-    c.ok("DELETE `a`, `b` FROM `t1` AS `a` JOIN `t2` AS `b` ON `a`.id = `b`.t1_id WHERE `b`.flag = 1").await;
+    c.ok("DELETE `a`, `b` FROM `t1` AS `a` JOIN `t2` AS `b` ON `a`.id = `b`.t1_id WHERE `b`.flag = 1")
+        .await;
     assert_eq!(c.rows("SELECT id FROM t1").await, ["3", "4"]);
     assert_eq!(c.rows("SELECT id FROM t2").await, ["12"]);
 }
@@ -366,10 +381,16 @@ async fn multi_table_delete_with_aliases_and_backticks() {
 async fn multi_table_delete_names_only_one_table() {
     let mut c = MySqlTestClient::login(test_db()).await;
     two_tables(&mut c).await;
-    let (affected, _) = c.ok_insert("DELETE a FROM t1 a JOIN t2 b ON a.id = b.t1_id WHERE b.flag = 1").await;
+    let (affected, _) = c
+        .ok_insert("DELETE a FROM t1 a JOIN t2 b ON a.id = b.t1_id WHERE b.flag = 1")
+        .await;
     assert_eq!(affected, 2);
     assert_eq!(c.rows("SELECT id FROM t1").await, ["3", "4"]);
-    assert_eq!(c.rows("SELECT id FROM t2").await, ["10", "11", "12"], "the joined table is not touched");
+    assert_eq!(
+        c.rows("SELECT id FROM t2").await,
+        ["10", "11", "12"],
+        "the joined table is not touched"
+    );
 }
 
 #[tokio::test]
@@ -377,7 +398,8 @@ async fn multi_table_delete_without_where_and_with_left_join() {
     let mut c = MySqlTestClient::login(test_db()).await;
     two_tables(&mut c).await;
     // rows of t1 without a partner (anti-join)
-    c.ok("DELETE t1 FROM t1 LEFT JOIN t2 ON t1.id = t2.t1_id WHERE t2.id IS NULL").await;
+    c.ok("DELETE t1 FROM t1 LEFT JOIN t2 ON t1.id = t2.t1_id WHERE t2.id IS NULL")
+        .await;
     assert_eq!(c.rows("SELECT id FROM t1").await, ["1", "2", "3"]);
     // no WHERE: every joined row
     c.ok("DELETE t1, t2 FROM t1 JOIN t2 ON t1.id = t2.t1_id").await;
@@ -389,7 +411,8 @@ async fn multi_table_delete_without_where_and_with_left_join() {
 async fn multi_table_delete_comma_join_form() {
     let mut c = MySqlTestClient::login(test_db()).await;
     two_tables(&mut c).await;
-    c.ok("DELETE a, b FROM t1 a, t2 b WHERE a.id = b.t1_id AND b.flag = 1").await;
+    c.ok("DELETE a, b FROM t1 a, t2 b WHERE a.id = b.t1_id AND b.flag = 1")
+        .await;
     assert_eq!(c.rows("SELECT id FROM t1").await, ["3", "4"]);
     assert_eq!(c.rows("SELECT id FROM t2").await, ["12"]);
 }
@@ -398,7 +421,8 @@ async fn multi_table_delete_comma_join_form() {
 async fn multi_table_delete_using_form() {
     let mut c = MySqlTestClient::login(test_db()).await;
     two_tables(&mut c).await;
-    c.ok("DELETE FROM t1, t2 USING t1 INNER JOIN t2 ON t1.id = t2.t1_id WHERE t2.flag = 1").await;
+    c.ok("DELETE FROM t1, t2 USING t1 INNER JOIN t2 ON t1.id = t2.t1_id WHERE t2.flag = 1")
+        .await;
     assert_eq!(c.rows("SELECT id FROM t1").await, ["3", "4"]);
     assert_eq!(c.rows("SELECT id FROM t2").await, ["12"]);
 }

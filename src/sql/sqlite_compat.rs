@@ -355,7 +355,9 @@ mod tests {
             "SELECT 'x INTEGER PRIMARY KEY AUTOINCREMENT y'"
         );
         assert_eq!(
-            rewrite_autoincrement("CREATE TABLE t (\"INTEGER PRIMARY KEY AUTOINCREMENT\" INT, id INTEGER PRIMARY KEY AUTOINCREMENT)"),
+            rewrite_autoincrement(
+                "CREATE TABLE t (\"INTEGER PRIMARY KEY AUTOINCREMENT\" INT, id INTEGER PRIMARY KEY AUTOINCREMENT)"
+            ),
             "CREATE TABLE t (\"INTEGER PRIMARY KEY AUTOINCREMENT\" INT, id BIGSERIAL PRIMARY KEY)"
         );
     }

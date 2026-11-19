@@ -5,7 +5,13 @@
 //! a duplicate-key error. Every test runs on both executor families (text and
 //! parameterised); the parameterised form binds a filter in the SELECT.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing, clippy::many_single_char_names)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::many_single_char_names
+)]
 
 use heliosdb_nano::{EmbeddedDatabase, Value};
 
@@ -48,7 +54,9 @@ fn both_families(sql_with_filter: &str, check: impl Fn(&EmbeddedDatabase, u64)) 
     let n = db.execute(&sql_with_filter.replace("{F}", "0")).unwrap();
     check(&db, n);
     let db = fixture();
-    let n = db.execute_params(&sql_with_filter.replace("{F}", "$1"), &[Value::Int4(0)]).unwrap();
+    let n = db
+        .execute_params(&sql_with_filter.replace("{F}", "$1"), &[Value::Int4(0)])
+        .unwrap();
     check(&db, n);
 }
 
@@ -97,7 +105,8 @@ fn do_update_with_where_only_updates_matching_rows() {
 #[test]
 fn conflict_on_non_target_constraint_raises_23505() {
     let db = fixture();
-    db.execute("CREATE TABLE v (id INT PRIMARY KEY, email TEXT UNIQUE)").unwrap();
+    db.execute("CREATE TABLE v (id INT PRIMARY KEY, email TEXT UNIQUE)")
+        .unwrap();
     db.execute("INSERT INTO v VALUES (10, 'new3')").unwrap();
     // src row 3 collides on `email`, not on the named target `id`.
     let err = db
@@ -118,7 +127,10 @@ fn returning_lists_inserted_and_updated_rows() {
         )
         .unwrap();
     assert_eq!(n, 2);
-    let mut got: Vec<String> = ret.iter().map(|t| t.values.iter().map(text).collect::<Vec<_>>().join("|")).collect();
+    let mut got: Vec<String> = ret
+        .iter()
+        .map(|t| t.values.iter().map(text).collect::<Vec<_>>().join("|"))
+        .collect();
     got.sort();
     assert_eq!(got, ["1|new1", "3|new3"]);
 
@@ -137,8 +149,10 @@ fn returning_lists_inserted_and_updated_rows() {
 fn inside_begin_rollback_leaves_nothing() {
     let db = fixture();
     db.execute("BEGIN").unwrap();
-    db.execute("INSERT INTO u (id, email) SELECT id, email FROM src ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.email")
-        .unwrap();
+    db.execute(
+        "INSERT INTO u (id, email) SELECT id, email FROM src ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.email",
+    )
+    .unwrap();
     assert_eq!(rows(&db, "SELECT * FROM u"), ["1|new1", "2|old2", "3|new3"]);
     db.execute("ROLLBACK").unwrap();
     assert_eq!(rows(&db, "SELECT * FROM u"), ["1|old1", "2|old2"]);
@@ -155,6 +169,12 @@ fn source_reads_the_target_table() {
 #[test]
 fn plain_insert_select_still_raises_on_a_duplicate_key() {
     let db = fixture();
-    let err = db.execute("INSERT INTO u (id, email) SELECT id, email FROM src").unwrap_err().to_string();
-    assert!(err.to_lowercase().contains("unique") || err.to_lowercase().contains("duplicate"), "{err}");
+    let err = db
+        .execute("INSERT INTO u (id, email) SELECT id, email FROM src")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.to_lowercase().contains("unique") || err.to_lowercase().contains("duplicate"),
+        "{err}"
+    );
 }

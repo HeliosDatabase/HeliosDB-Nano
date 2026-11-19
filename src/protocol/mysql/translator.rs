@@ -1003,9 +1003,8 @@ fn translate_replace_into(sql: &str) -> String {
     // Anchored at the statement head: `REPLACE(a, b, c)` and the word inside
     // an expression are not the statement.
     static REPLACE_RE: OnceLock<Regex> = OnceLock::new();
-    let re = REPLACE_RE.get_or_init(|| {
-        init_regex(r"(?i)^([\s\x{E000}-\x{E01F}]*)REPLACE\s+(?:(?:LOW_PRIORITY|DELAYED)\s+)?INTO\b")
-    });
+    let re = REPLACE_RE
+        .get_or_init(|| init_regex(r"(?i)^([\s\x{E000}-\x{E01F}]*)REPLACE\s+(?:(?:LOW_PRIORITY|DELAYED)\s+)?INTO\b"));
     re.replace(sql, "${1}INSERT OR REPLACE INTO").to_string()
 }
 
@@ -1399,9 +1398,15 @@ mod tests {
 
     #[test]
     fn cast_signed_and_unsigned_map_to_bigint() {
-        assert_eq!(translate("SELECT CAST(meta_value AS SIGNED) FROM t"), "SELECT CAST(meta_value AS BIGINT) FROM t");
+        assert_eq!(
+            translate("SELECT CAST(meta_value AS SIGNED) FROM t"),
+            "SELECT CAST(meta_value AS BIGINT) FROM t"
+        );
         assert_eq!(translate("SELECT CAST(x AS UNSIGNED)"), "SELECT CAST(x AS BIGINT)");
-        assert_eq!(translate("SELECT CAST(x AS signed integer)"), "SELECT CAST(x AS BIGINT)");
+        assert_eq!(
+            translate("SELECT CAST(x AS signed integer)"),
+            "SELECT CAST(x AS BIGINT)"
+        );
         assert_eq!(
             translate("SELECT CAST(CAST(a AS CHAR) AS UNSIGNED) + CAST(b AS SIGNED)"),
             "SELECT CAST(CAST(a AS TEXT) AS BIGINT) + CAST(b AS BIGINT)"
@@ -1411,10 +1416,16 @@ mod tests {
     #[test]
     fn cast_datetime_and_char_map() {
         assert_eq!(translate("SELECT CAST(x AS DATETIME)"), "SELECT CAST(x AS TIMESTAMP)");
-        assert_eq!(translate("SELECT CAST(x AS DATETIME(6))"), "SELECT CAST(x AS TIMESTAMP)");
+        assert_eq!(
+            translate("SELECT CAST(x AS DATETIME(6))"),
+            "SELECT CAST(x AS TIMESTAMP)"
+        );
         assert_eq!(translate("SELECT CAST(x AS CHAR(20))"), "SELECT CAST(x AS TEXT)");
         // other targets and non-CAST uses of the words are untouched
-        assert_eq!(translate("SELECT CAST(x AS DECIMAL(10,2))"), "SELECT CAST(x AS DECIMAL(10,2))");
+        assert_eq!(
+            translate("SELECT CAST(x AS DECIMAL(10,2))"),
+            "SELECT CAST(x AS DECIMAL(10,2))"
+        );
         assert_eq!(translate("SELECT a AS signed FROM t"), "SELECT a AS signed FROM t");
     }
 
@@ -1535,7 +1546,10 @@ mod tests {
         // only the statement head, never the word inside a literal or a call
         let r = translate("INSERT INTO t VALUES ('REPLACE INTO x')");
         assert_eq!(r, "INSERT INTO t VALUES ('REPLACE INTO x')");
-        assert_eq!(translate("SELECT REPLACE(a, 'b', 'c') FROM t"), "SELECT REPLACE(a, 'b', 'c') FROM t");
+        assert_eq!(
+            translate("SELECT REPLACE(a, 'b', 'c') FROM t"),
+            "SELECT REPLACE(a, 'b', 'c') FROM t"
+        );
         assert!(translate("REPLACE LOW_PRIORITY INTO t VALUES (1)").starts_with("INSERT OR REPLACE INTO t"));
     }
 
