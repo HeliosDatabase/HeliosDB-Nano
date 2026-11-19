@@ -88,6 +88,13 @@ fn scalar(db: &EmbeddedDatabase, sql: &str) -> Value {
         .unwrap_or_else(|| panic!("{sql}: no rows"))
 }
 
+fn text(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        other => format!("{other}"),
+    }
+}
+
 fn as_i64(v: &Value) -> i64 {
     match v {
         Value::Int2(n) => i64::from(*n),
@@ -129,8 +136,8 @@ fn ordinary_index_survives() {
             .db
             .query("SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'orders'", &[])
             .unwrap();
-        let defs: Vec<String> = rows.iter().map(|t| format!("{}", t.values[1])).collect();
-        let names: Vec<String> = rows.iter().map(|t| format!("{}", t.values[0])).collect();
+        let defs: Vec<String> = rows.iter().map(|t| text(&t.values[1])).collect();
+        let names: Vec<String> = rows.iter().map(|t| text(&t.values[0])).collect();
         assert!(
             names.iter().any(|n| n == "orders_customer_idx"),
             "{format:?}: {names:?}"
