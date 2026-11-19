@@ -244,6 +244,13 @@ Reports from users of earlier releases (GitHub numbers) and defects found while 
   spelled. An unknown name for `DEALLOCATE`, `EXECUTE`, Bind and Describe is now SQLSTATE 26000
   (invalid_sql_statement_name), which pgjdbc and asyncpg key their re-prepare on. Tests:
   `src/protocol/postgres/wire_tests.rs` (`v014_*`).
+- **A `datetime.date` bound by psycopg 3 in binary format failed with "Cannot cast Bytes([0, 0,
+  35, 80]) to DATE" (GitHub #54, part 1).** Bind decoded binary parameters only for bool, the
+  integers, the floats, timestamp, uuid, oid and text; a binary DATE, TIME or NUMERIC became raw
+  bytes. They are now decoded by the parameter's declared or inferred type: DATE (days since
+  2000-01-01), TIME (microseconds since midnight) and NUMERIC (`numeric_send` digit groups, to the
+  exact decimal text). A DATE of `infinity` is refused rather than guessed. Tests:
+  `src/protocol/postgres/wire_tests.rs` (`gh54_*`).
 
 ### Fixed — six regressions against 4.41.1 found before release
 

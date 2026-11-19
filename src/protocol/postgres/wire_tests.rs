@@ -14646,3 +14646,188 @@ async fn v014_sql_prepare_deallocate_and_failed_block_recovery() {
     let out = v014_bind_execute(&mut handler, &mut client, "s9").await;
     assert_eq!(sqlstates(&out).first().map(String::as_str), Some("26000"));
 }
+
+// ---------------------------------------------------------------------------
+// GitHub #54 part 1: binary-format parameters are decoded by the parameter's
+// declared or inferred type; GitHub #52: a boolean result stays boolean when
+// an argument is a bound parameter.
+// ---------------------------------------------------------------------------
+
+/// Parse (declared types) / Bind (per-parameter formats) / Describe(portal) /
+/// Execute / Sync through the dispatcher; the wire bytes after Parse.
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+async fn gh54_extended(
+    handler: &mut PgConnectionHandler<DuplexStream>,
+    client: &mut DuplexStream,
+    sql: &str,
+    param_types: Vec<i32>,
+    param_formats: Vec<i16>,
+    params: Vec<Option<Vec<u8>>>,
+) -> Vec<u8> {
+    use super::messages::{DescribeTarget, FrontendMessage};
+    for msg in [
+        FrontendMessage::Parse {
+            statement_name: String::new(),
+            query: sql.into(),
+            param_types,
+        },
+        FrontendMessage::Bind {
+            portal_name: String::new(),
+            statement_name: String::new(),
+            param_formats,
+            params,
+            result_formats: vec![],
+        },
+        FrontendMessage::Describe {
+            target: DescribeTarget::Portal,
+            name: String::new(),
+        },
+        FrontendMessage::Execute {
+            portal_name: String::new(),
+            max_rows: 0,
+        },
+        FrontendMessage::Sync,
+    ] {
+        handler.dispatch_message(msg).await.expect("dispatch");
+    }
+    drain(client).await
+}
+
+fn gh54_numeric(ndigits: i16, weight: i16, sign: u16, dscale: i16, groups: &[u16]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&ndigits.to_be_bytes());
+    out.extend_from_slice(&weight.to_be_bytes());
+    out.extend_from_slice(&sign.to_be_bytes());
+    out.extend_from_slice(&dscale.to_be_bytes());
+    for g in groups {
+        out.extend_from_slice(&g.to_be_bytes());
+    }
+    out
+}
+
+#[tokio::test]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+async fn gh54_binary_date_and_friends_are_decoded_by_their_type() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    db.execute(
+        "CREATE TABLE gh54 (id INT PRIMARY KEY, d DATE, t TIME, ts TIMESTAMP, tz TIMESTAMPTZ, \
+         b BOOLEAN, f DOUBLE PRECISION, n NUMERIC(12,4))",
+    )
+    .expect("create");
+    let (mut handler, mut client) = test_handler(Arc::clone(&db));
+
+    // 2024-06-01 is 8918 days after 2000-01-01; [0, 0, 35, 80] (9040) is the
+    // value from the report: 2024-10-01.
+    let date_days: i32 = 9040;
+    let time_micros: i64 = (13 * 3600 + 14 * 60 + 15) * 1_000_000 + 250_000;
+    let ts_micros: i64 = 9040 * 86_400_000_000 + 3_600_000_000;
+    let insert = "INSERT INTO gh54 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)";
+    let params = vec![
+        Some(1i32.to_be_bytes().to_vec()),
+        Some(date_days.to_be_bytes().to_vec()),
+        Some(time_micros.to_be_bytes().to_vec()),
+        Some(ts_micros.to_be_bytes().to_vec()),
+        Some(ts_micros.to_be_bytes().to_vec()),
+        Some(vec![1u8]),
+        Some(2.5f64.to_be_bytes().to_vec()),
+        // -12345.6789: groups 1, 2345 . 6789, weight 1, dscale 4
+        Some(gh54_numeric(3, 1, 0x4000, 4, &[1, 2345, 6789])),
+    ];
+    // Declared types (psycopg 3 declares them) …
+    let out = gh54_extended(
+        &mut handler,
+        &mut client,
+        insert,
+        vec![23, 1082, 1083, 1114, 1184, 16, 701, 1700],
+        vec![1; 8],
+        params.clone(),
+    )
+    .await;
+    assert!(
+        sqlstates(&out).is_empty(),
+        "declared binary insert: {:?}",
+        sqlstates(&out)
+    );
+    // … and left to the server (OID 0, inferred from the target columns).
+    let mut params2 = params;
+    params2[0] = Some(2i32.to_be_bytes().to_vec());
+    let out = gh54_extended(&mut handler, &mut client, insert, vec![0; 8], vec![1; 8], params2).await;
+    assert!(
+        sqlstates(&out).is_empty(),
+        "inferred binary insert: {:?}",
+        sqlstates(&out)
+    );
+
+    let rows = db
+        .query("SELECT id, d::text, t::text, b, f, n::text FROM gh54 ORDER BY id", &[])
+        .expect("select");
+    assert_eq!(rows.len(), 2);
+    for row in &rows {
+        assert_eq!(row.values[1], crate::Value::String("2024-10-01".into()), "{row:?}");
+        assert_eq!(row.values[2], crate::Value::String("13:14:15.250000".into()), "{row:?}");
+        assert_eq!(row.values[3], crate::Value::Boolean(true), "{row:?}");
+        assert_eq!(row.values[4], crate::Value::Float8(2.5), "{row:?}");
+        assert_eq!(row.values[5], crate::Value::String("-12345.6789".into()), "{row:?}");
+    }
+
+    // A binary DATE in a WHERE clause (the report's shape).
+    let out = gh54_extended(
+        &mut handler,
+        &mut client,
+        "SELECT id FROM gh54 WHERE d = $1 ORDER BY id",
+        vec![1082],
+        vec![1],
+        vec![Some(date_days.to_be_bytes().to_vec())],
+    )
+    .await;
+    assert!(sqlstates(&out).is_empty(), "{:?}", sqlstates(&out));
+    assert_eq!(data_rows(&out).len(), 2);
+}
+
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+fn gh54_binary_decoders() {
+    use super::prepared::decode_parameter;
+    use crate::Value;
+    let date = decode_parameter(&[0, 0, 35, 80], 1, 1082).expect("date");
+    assert_eq!(
+        date,
+        Value::Date(chrono::NaiveDate::from_ymd_opt(2024, 10, 1).expect("d"))
+    );
+    let before = decode_parameter(&(-1i32).to_be_bytes(), 1, 1082).expect("date");
+    assert_eq!(
+        before,
+        Value::Date(chrono::NaiveDate::from_ymd_opt(1999, 12, 31).expect("d"))
+    );
+    assert!(decode_parameter(&[0, 0, 35], 1, 1082).is_err());
+    assert!(
+        decode_parameter(&i32::MAX.to_be_bytes(), 1, 1082).is_err(),
+        "infinity is refused, not guessed"
+    );
+    let midnight = decode_parameter(&0i64.to_be_bytes(), 1, 1083).expect("time");
+    assert_eq!(
+        midnight,
+        Value::Time(chrono::NaiveTime::from_hms_opt(0, 0, 0).expect("t"))
+    );
+    for (bytes, want) in [
+        (gh54_numeric(0, 0, 0, 0, &[]), "0"),
+        (gh54_numeric(0, 0, 0, 2, &[]), "0.00"),
+        (gh54_numeric(1, 0, 0, 0, &[42]), "42"),
+        (gh54_numeric(1, -1, 0, 2, &[500]), "0.05"),
+        (gh54_numeric(2, 0, 0, 2, &[1, 5000]), "1.50"),
+        (gh54_numeric(1, 2, 0, 0, &[1]), "100000000"),
+        (gh54_numeric(3, 1, 0x4000, 4, &[1, 2345, 6789]), "-12345.6789"),
+        (gh54_numeric(1, -2, 0, 6, &[1200]), "0.000012"),
+        (gh54_numeric(0, 0, 0xC000, 0, &[]), "NaN"),
+    ] {
+        assert_eq!(
+            decode_parameter(&bytes, 1, 1700).expect("numeric"),
+            Value::Numeric(want.into()),
+            "{want}"
+        );
+    }
+    assert!(
+        decode_parameter(&gh54_numeric(2, 0, 0, 0, &[1]), 1, 1700).is_err(),
+        "short payload"
+    );
+}

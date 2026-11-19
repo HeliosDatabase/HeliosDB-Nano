@@ -619,6 +619,54 @@ fn decode_binary_parameter(data: &[u8], type_oid: i32) -> Result<Value> {
                 .ok_or_else(|| Error::protocol("Timestamp parameter out of range"))?;
             Ok(Value::Timestamp(timestamp))
         }
+        1082 => {
+            // GitHub #54: DATE — int32 days since 2000-01-01 (`date_send`).
+            // psycopg 3 binds a `datetime.date` this way; the `_` arm below
+            // used to hand the engine `Bytes` ("Cannot cast Bytes([0, 0, 35,
+            // 80]) to DATE").
+            let bytes: [u8; 4] = data
+                .try_into()
+                .map_err(|_| Error::protocol("Invalid Date parameter length"))?;
+            let days = i32::from_be_bytes(bytes);
+            if days == i32::MAX || days == i32::MIN {
+                return Err(Error::protocol("Date parameter 'infinity' is not supported"));
+            }
+            let epoch = chrono::NaiveDate::from_ymd_opt(2000, 1, 1)
+                .ok_or_else(|| Error::protocol("Date parameter out of range"))?;
+            let date = epoch
+                .checked_add_signed(chrono::Duration::days(i64::from(days)))
+                .ok_or_else(|| Error::protocol("Date parameter out of range"))?;
+            Ok(Value::Date(date))
+        }
+        1083 => {
+            // GitHub #54: TIME — int64 microseconds since midnight (`time_send`).
+            let bytes: [u8; 8] = data
+                .try_into()
+                .map_err(|_| Error::protocol("Invalid Time parameter length"))?;
+            let micros = i64::from_be_bytes(bytes);
+            if !(0..=86_400_000_000).contains(&micros) {
+                return Err(Error::protocol("Time parameter out of range"));
+            }
+            let secs = u32::try_from(micros / 1_000_000).map_err(|_| Error::protocol("Time parameter out of range"))?;
+            let nanos = u32::try_from((micros % 1_000_000) * 1_000)
+                .map_err(|_| Error::protocol("Time parameter out of range"))?;
+            // 24:00:00 is a legal PostgreSQL time; chrono has no such value, so
+            // it is the last representable instant of the day.
+            let time = if micros == 86_400_000_000 {
+                chrono::NaiveTime::from_hms_micro_opt(23, 59, 59, 999_999)
+            } else {
+                chrono::NaiveTime::from_num_seconds_from_midnight_opt(secs, nanos)
+            }
+            .ok_or_else(|| Error::protocol("Time parameter out of range"))?;
+            Ok(Value::Time(time))
+        }
+        1700 => {
+            // GitHub #54: NUMERIC in `numeric_send` form, decoded to the exact
+            // decimal text the text-format twin would have carried.
+            decode_numeric_binary(data)
+                .map(Value::Numeric)
+                .ok_or_else(|| Error::protocol("Invalid Numeric parameter"))
+        }
         2950 => {
             // UUID (16 RFC 4122 bytes)
             if data.len() != 16 {
@@ -691,6 +739,75 @@ fn decode_binary_parameter(data: &[u8], type_oid: i32) -> Result<Value> {
             Ok(Value::Bytes(data.to_vec()))
         }
     }
+}
+
+/// GitHub #54: PostgreSQL's `numeric_send` form (`ndigits`, `weight`, `sign`,
+/// `dscale`, then `ndigits` base-10000 groups) as decimal text, or `None` when
+/// the payload is malformed. NaN and the infinities come back as PostgreSQL
+/// spells them.
+fn decode_numeric_binary(data: &[u8]) -> Option<String> {
+    let word = |i: usize| -> Option<u16> {
+        let b = data.get(i * 2..i * 2 + 2)?;
+        Some(u16::from_be_bytes([*b.first()?, *b.get(1)?]))
+    };
+    let ndigits = usize::try_from(i16::from_be_bytes(word(0)?.to_be_bytes())).ok()?;
+    let weight = i64::from(i16::from_be_bytes(word(1)?.to_be_bytes()));
+    let sign = word(2)?;
+    let dscale = usize::try_from(i16::from_be_bytes(word(3)?.to_be_bytes())).ok()?;
+    if data.len() != 8 + 2 * ndigits {
+        return None;
+    }
+    match sign {
+        0xC000 => return Some("NaN".to_string()),
+        0xD000 => return Some("Infinity".to_string()),
+        0xF000 => return Some("-Infinity".to_string()),
+        0x0000 | 0x4000 => {}
+        _ => return None,
+    }
+    let mut digits = Vec::with_capacity(ndigits);
+    for i in 0..ndigits {
+        let d = word(4 + i)?;
+        if d >= 10_000 {
+            return None;
+        }
+        digits.push(d);
+    }
+    // Group at decimal position p (10000^p) is digits[weight - p].
+    let group = |p: i64| -> u16 {
+        usize::try_from(weight - p)
+            .ok()
+            .and_then(|i| digits.get(i).copied())
+            .unwrap_or(0)
+    };
+    let mut out = String::new();
+    if sign == 0x4000 {
+        out.push('-');
+    }
+    if weight < 0 {
+        out.push('0');
+    } else {
+        out.push_str(&group(weight).to_string());
+        let mut p = weight - 1;
+        while p >= 0 {
+            out.push_str(&format!("{:04}", group(p)));
+            p -= 1;
+        }
+    }
+    if dscale > 0 {
+        let mut frac = String::with_capacity(dscale + 4);
+        let mut p = -1i64;
+        while frac.len() < dscale {
+            frac.push_str(&format!("{:04}", group(p)));
+            p -= 1;
+        }
+        frac.truncate(dscale);
+        out.push('.');
+        out.push_str(&frac);
+    }
+    if out == "-0" || (out.starts_with("-0") && out.trim_start_matches(['-', '0', '.']).is_empty()) {
+        out.remove(0);
+    }
+    Some(out)
 }
 
 /// Substitute parameters in SQL query.
