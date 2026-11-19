@@ -4281,7 +4281,20 @@ impl<'a> Planner<'a> {
 
     /// Check if a table name is a known table-valued function
     fn is_table_function(name: &str) -> bool {
-        matches!(name.to_lowercase().as_str(), "generate_series" | "unnest")
+        matches!(
+            name.to_lowercase().as_str(),
+            "generate_series" | "unnest" | "pg_listening_channels"
+        )
+    }
+
+    /// GH#40: `pg_catalog.pg_listening_channels()` (and any schema-scoped
+    /// spelling of the bare name) is the catalog function itself.
+    fn canonical_table_function_name(name: &str) -> String {
+        let lower = name.to_lowercase();
+        match lower.rsplit_once('.') {
+            Some((_, "pg_listening_channels")) => "pg_listening_channels".to_string(),
+            _ => lower,
+        }
     }
 
     /// Convert a TableFactor to a plan and record its range entry (GH#29).
@@ -4309,7 +4322,7 @@ impl<'a> Planner<'a> {
                 // Check if this is a table-valued function call (e.g., generate_series(1, 10))
                 // In sqlparser, FROM generate_series(1, 10) is parsed as Table with args
                 if let Some(tf_args) = args {
-                    let lower_name = table_name.to_lowercase();
+                    let lower_name = Self::canonical_table_function_name(&table_name);
                     if Self::is_table_function(&lower_name) {
                         let logical_args = self.extract_table_function_args(tf_args)?;
                         let table_alias = alias.as_ref().map(|a| Self::normalize_ident(&a.name));
@@ -4554,7 +4567,7 @@ impl<'a> Planner<'a> {
                 // Handle TABLE(expr) syntax
                 match expr {
                     Expr::Function(func) => {
-                        let func_name = func.name.to_string().to_lowercase();
+                        let func_name = Self::canonical_table_function_name(&func.name.to_string());
                         if Self::is_table_function(&func_name) {
                             let mut logical_args = Vec::new();
                             if let sqlparser::ast::FunctionArguments::List(ref arg_list) = func.args {

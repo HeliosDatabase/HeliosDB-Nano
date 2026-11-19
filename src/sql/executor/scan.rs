@@ -3322,6 +3322,24 @@ pub(super) fn handle_table_function(executor: &Executor, plan: &LogicalPlan) -> 
                 let schema = build_table_function_schema("unnest", alias, column_alias);
                 Ok(Box::new(UnnestOperator::new(values, schema)))
             }
+            // GH#40: the channels this session LISTENs on (committed ones:
+            // a LISTEN inside an open block shows after its COMMIT), sorted.
+            "pg_listening_channels" => {
+                if !args.is_empty() {
+                    return Err(Error::query_execution("pg_listening_channels takes no arguments"));
+                }
+                let values: Vec<crate::Value> = crate::notify::current_pid()
+                    .map(|pid| crate::notify::hub().listening_channels(pid))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(crate::Value::String)
+                    .collect();
+                let mut schema = (*build_table_function_schema("pg_listening_channels", alias, column_alias)).clone();
+                for column in &mut schema.columns {
+                    column.data_type = crate::DataType::Text;
+                }
+                Ok(Box::new(UnnestOperator::new(values, Arc::new(schema))))
+            }
             _ => Err(Error::query_execution(format!(
                 "Unknown table function: {}",
                 function_name

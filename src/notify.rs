@@ -116,10 +116,21 @@ struct Listener {
     mailbox: Arc<Mailbox>,
 }
 
+/// One action an open transaction block took, applied at its COMMIT.
+enum PendingOp {
+    /// NOTIFY (engine, channel, payload); duplicates folded.
+    Notify(u64, String, String),
+    /// LISTEN channel.
+    Listen(String),
+    /// UNLISTEN channel / UNLISTEN * (`None`).
+    Unlisten(Option<String>),
+}
+
 #[derive(Default)]
 struct Pending {
-    /// (engine, channel, payload) in send order, duplicates folded.
-    queue: Vec<(u64, String, String)>,
+    /// The block's NOTIFY / LISTEN / UNLISTEN in statement order. A savepoint
+    /// marks a length of it, so ROLLBACK TO undoes all three alike.
+    queue: Vec<PendingOp>,
     seen: HashSet<(u64, String, String)>,
 }
 
@@ -197,11 +208,18 @@ impl NotifyHub {
     }
 
     /// `LISTEN channel` for `pid`.
+    ///
+    /// Inside a transaction block it takes effect at COMMIT and is undone by
+    /// ROLLBACK, as in PostgreSQL (GH#40); the checks still run at once.
     pub fn listen(&self, pid: i32, channel: &str) -> Result<()> {
         validate(channel, "")?;
         match self.listeners.lock().get_mut(&pid) {
             Some(listener) => {
-                listener.channels.insert(channel.to_string());
+                if let Some(mut pending) = self.open_txns.get_mut(&pid) {
+                    pending.queue.push(PendingOp::Listen(channel.to_string()));
+                } else {
+                    listener.channels.insert(channel.to_string());
+                }
                 Ok(())
             }
             None => Err(Error::query_execution(format!(
@@ -213,8 +231,17 @@ impl NotifyHub {
     }
 
     /// `UNLISTEN channel` / `UNLISTEN *` (`None`). A no-op for a session that
-    /// does not listen, as in PostgreSQL.
+    /// does not listen, as in PostgreSQL. Inside a transaction block it takes
+    /// effect at COMMIT, like LISTEN.
     pub fn unlisten(&self, pid: i32, channel: Option<&str>) {
+        if let Some(mut pending) = self.open_txns.get_mut(&pid) {
+            pending.queue.push(PendingOp::Unlisten(channel.map(str::to_string)));
+            return;
+        }
+        self.apply_unlisten(pid, channel);
+    }
+
+    fn apply_unlisten(&self, pid: i32, channel: Option<&str>) {
         if let Some(listener) = self.listeners.lock().get_mut(&pid) {
             match channel {
                 Some(channel) => {
@@ -235,7 +262,22 @@ impl NotifyHub {
     pub fn txn_end(&self, pid: i32, commit: bool) {
         if let Some((_, pending)) = self.open_txns.remove(&pid) {
             if commit {
-                for (engine, channel, payload) in pending.queue {
+                // LISTEN/UNLISTEN first, in order, then the notifications: as
+                // in PostgreSQL, a block that both listens and notifies on a
+                // channel hears its own notification.
+                let mut notifications = Vec::new();
+                for op in pending.queue {
+                    match op {
+                        PendingOp::Notify(engine, channel, payload) => notifications.push((engine, channel, payload)),
+                        PendingOp::Listen(channel) => {
+                            if let Some(listener) = self.listeners.lock().get_mut(&pid) {
+                                listener.channels.insert(channel);
+                            }
+                        }
+                        PendingOp::Unlisten(channel) => self.apply_unlisten(pid, channel.as_deref()),
+                    }
+                }
+                for (engine, channel, payload) in notifications {
                     self.deliver(engine, pid, &channel, &payload);
                 }
             }
@@ -248,7 +290,8 @@ impl NotifyHub {
         if let Some(mut pending) = self.open_txns.get_mut(&pid) {
             let key = (engine, channel.to_string(), payload.to_string());
             if pending.seen.insert(key.clone()) {
-                pending.queue.push(key);
+                let (engine, channel, payload) = key;
+                pending.queue.push(PendingOp::Notify(engine, channel, payload));
             }
             return Ok(());
         }
@@ -256,16 +299,24 @@ impl NotifyHub {
         Ok(())
     }
 
-    /// How many notifications `pid`'s open block has queued (savepoint mark).
+    /// How many actions `pid`'s open block has queued (savepoint mark).
     pub fn pending_len(&self, pid: i32) -> usize {
         self.open_txns.get(&pid).map_or(0, |p| p.queue.len())
     }
 
-    /// `ROLLBACK TO SAVEPOINT`: drop what was queued after the mark.
+    /// `ROLLBACK TO SAVEPOINT`: drop what was queued after the mark
+    /// (notifications, LISTENs and UNLISTENs alike).
     pub fn truncate_pending(&self, pid: i32, len: usize) {
         if let Some(mut pending) = self.open_txns.get_mut(&pid) {
             pending.queue.truncate(len);
-            let seen = pending.queue.iter().cloned().collect();
+            let seen = pending
+                .queue
+                .iter()
+                .filter_map(|op| match op {
+                    PendingOp::Notify(engine, channel, payload) => Some((*engine, channel.clone(), payload.clone())),
+                    _ => None,
+                })
+                .collect();
             pending.seen = seen;
         }
     }
@@ -307,7 +358,7 @@ pub(crate) fn current_pid() -> Option<i32> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::assert_is_empty)]
     use super::*;
 
     #[test]
@@ -331,6 +382,42 @@ mod tests {
         // Another database does not hear it.
         hub.notify(-902, 78, "c", "w").unwrap();
         assert_eq!(mailbox.take(), Vec::new());
+    }
+
+    #[test]
+    fn listen_in_a_block_waits_for_commit() {
+        let hub = NotifyHub::default();
+        hub.attach(-911, 5);
+        hub.txn_begin(-911);
+        hub.listen(-911, "a").unwrap();
+        assert!(hub.listening_channels(-911).is_empty());
+        hub.txn_end(-911, false);
+        assert!(hub.listening_channels(-911).is_empty());
+        hub.txn_begin(-911);
+        hub.listen(-911, "a").unwrap();
+        let mark = hub.pending_len(-911);
+        hub.listen(-911, "b").unwrap();
+        hub.truncate_pending(-911, mark);
+        hub.notify(-911, 5, "a", "self").unwrap();
+        hub.txn_end(-911, true);
+        assert_eq!(hub.listening_channels(-911), vec!["a".to_string()]);
+        let got: Vec<_> = hub
+            .mailbox(-911)
+            .unwrap()
+            .take()
+            .into_iter()
+            .map(|n| n.payload)
+            .collect();
+        assert_eq!(got, vec!["self".to_string()]);
+        hub.txn_begin(-911);
+        hub.unlisten(-911, None);
+        assert_eq!(hub.listening_channels(-911), vec!["a".to_string()]);
+        hub.txn_end(-911, false);
+        assert_eq!(hub.listening_channels(-911), vec!["a".to_string()]);
+        hub.txn_begin(-911);
+        hub.unlisten(-911, Some("a"));
+        hub.txn_end(-911, true);
+        assert!(hub.listening_channels(-911).is_empty());
     }
 
     #[test]

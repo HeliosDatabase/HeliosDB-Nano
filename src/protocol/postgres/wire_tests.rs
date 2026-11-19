@@ -14832,6 +14832,9 @@ async fn gh54_binary_date_and_friends_are_decoded_by_their_type() {
     assert_eq!(data_rows(&out).len(), 2);
 }
 
+/// GH#40: LISTEN / UNLISTEN inside a transaction block take effect at COMMIT
+/// and are undone by ROLLBACK (and by ROLLBACK TO SAVEPOINT), as in
+/// PostgreSQL; `pg_listening_channels()` lists the committed channels.
 #[test]
 #[allow(
     clippy::unwrap_used,
@@ -14940,4 +14943,75 @@ async fn gh52_boolean_results_are_boolean_with_bound_parameters() {
     .await;
     assert!(sqlstates(&out).is_empty(), "{:?}", sqlstates(&out));
     assert_eq!(row_description(&out).first().map(|(_, oid)| *oid), Some(16));
+    clippy::many_single_char_names,
+    clippy::large_futures,
+    clippy::assert_is_empty
+)]
+fn listen_and_unlisten_in_a_block_wait_for_commit() {
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime")
+                .block_on(async move {
+                    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+                    let (mut a, mut ca) = test_handler(db.clone());
+                    let (mut b, mut cb) = test_handler(db.clone());
+                    let heard = |bytes: &[u8]| parse_messages(bytes).iter().filter(|(ty, _)| *ty == b'A').count();
+                    let channels = |bytes: &[u8]| -> Vec<String> {
+                        data_rows(bytes)
+                            .into_iter()
+                            .map(|row| String::from_utf8(row[0].clone().unwrap()).unwrap())
+                            .collect()
+                    };
+                    macro_rules! run {
+                        ($h:expr, $c:expr, $sql:expr) => {{
+                            $h.handle_single_query($sql).await.expect($sql);
+                            drain(&mut $c).await
+                        }};
+                    }
+
+                    // ROLLBACK undoes a LISTEN; inside the block it is not yet in effect.
+                    run!(a, ca, "BEGIN");
+                    run!(a, ca, "LISTEN c1");
+                    let listed = run!(a, ca, "SELECT * FROM pg_listening_channels()");
+                    assert!(channels(&listed).is_empty());
+                    run!(a, ca, "ROLLBACK");
+                    run!(b, cb, "NOTIFY c1, 'x'");
+                    assert_eq!(heard(&run!(a, ca, "SELECT 1")), 0);
+                    assert!(channels(&run!(a, ca, "SELECT * FROM pg_listening_channels()")).is_empty());
+
+                    // COMMIT makes it real; ROLLBACK TO SAVEPOINT drops a later one.
+                    run!(a, ca, "BEGIN");
+                    run!(a, ca, "LISTEN c1");
+                    run!(a, ca, "SAVEPOINT s");
+                    run!(a, ca, "LISTEN c2");
+                    run!(a, ca, "ROLLBACK TO SAVEPOINT s");
+                    run!(a, ca, "COMMIT");
+                    let listed = run!(a, ca, "SELECT * FROM pg_catalog.pg_listening_channels()");
+                    assert_eq!(channels(&listed), vec!["c1".to_string()]);
+                    run!(b, cb, "NOTIFY c1, 'y'");
+                    assert_eq!(heard(&run!(a, ca, "SELECT 1")), 1);
+
+                    // A rolled-back UNLISTEN * leaves the listen in place.
+                    run!(a, ca, "BEGIN");
+                    run!(a, ca, "UNLISTEN *");
+                    run!(a, ca, "ROLLBACK");
+                    run!(b, cb, "NOTIFY c1, 'z'");
+                    assert_eq!(heard(&run!(a, ca, "SELECT 1")), 1);
+
+                    // A committed UNLISTEN ends it.
+                    run!(a, ca, "BEGIN");
+                    run!(a, ca, "UNLISTEN c1");
+                    run!(a, ca, "COMMIT");
+                    assert!(channels(&run!(a, ca, "SELECT * FROM pg_listening_channels()")).is_empty());
+                    run!(b, cb, "NOTIFY c1, 'w'");
+                    assert_eq!(heard(&run!(a, ca, "SELECT 1")), 0);
+                });
+        })
+        .expect("spawn")
+        .join()
+        .expect("test thread");
 }

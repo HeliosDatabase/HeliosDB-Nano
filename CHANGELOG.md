@@ -136,9 +136,15 @@ Reports from users of earlier releases (GitHub numbers) and defects found while 
   `UNLISTEN *` stop listening, and a session's listens end when it disconnects. The embedded
   API, the REPL and the MySQL wire can send (to the PostgreSQL wire listeners of the same
   database) but refuse `LISTEN` with `0A000`. Notifications stay on the node that sent them;
-  they are not replicated to standbys. `LISTEN` takes effect at once rather than at the
-  listener's COMMIT, and `pg_listening_channels()` is not provided.
-  `tests/listen_notify.rs`.
+  they are not replicated to standbys. `tests/listen_notify.rs`.
+- **`LISTEN` / `UNLISTEN` inside a transaction took effect at once (GitHub #40).** A `LISTEN`
+  that was rolled back kept listening, and a rolled-back `UNLISTEN` stopped it. Inside a
+  transaction block they now take effect at COMMIT and are undone by ROLLBACK (`ROLLBACK TO
+  SAVEPOINT` undoes the ones after the savepoint), as in PostgreSQL; a block that listens and
+  notifies on one channel hears its own notification. `SELECT * FROM pg_listening_channels()`
+  lists the session's committed channels (the select-list spelling `SELECT
+  pg_listening_channels()` is not provided). `src/notify.rs` and
+  `src/protocol/postgres/wire_tests.rs` (`listen_and_unlisten_in_a_block_wait_for_commit`).
 
 - **`CREATE INDEX` on an expression was rejected (GitHub #34).** `CREATE INDEX ON t
   ((payload->>'user_id'))`, `ON t (lower(email))` and `USING gin (to_tsvector('simple', …))`
