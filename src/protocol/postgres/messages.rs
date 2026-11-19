@@ -683,6 +683,26 @@ impl BackendMessage {
                 buf.put_u8(BackendMessageType::CloseComplete as u8);
                 buf.put_i32(4);
             }
+            // A WARNING / NOTICE: the ErrorResponse field layout under 'N'
+            // (severity twice, as S and the non-localized V, then C and M).
+            BackendMessage::NoticeResponse {
+                severity,
+                code,
+                message,
+            } => {
+                buf.put_u8(BackendMessageType::NoticeResponse as u8);
+                let len = 4 + 1 + 2 * (1 + severity.len() + 1) + (1 + code.len() + 1) + (1 + message.len() + 1);
+                buf.put_i32(len as i32);
+                buf.put_u8(b'S');
+                write_cstring(buf, severity);
+                buf.put_u8(b'V');
+                write_cstring(buf, severity);
+                buf.put_u8(b'C');
+                write_cstring(buf, code);
+                buf.put_u8(b'M');
+                write_cstring(buf, message);
+                buf.put_u8(0);
+            }
             BackendMessage::ErrorResponse {
                 severity,
                 code,
