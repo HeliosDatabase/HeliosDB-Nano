@@ -4302,6 +4302,7 @@ fn run_repl(args: ReplArgs) -> Result<()> {
                 verbose: false,
                 connection: None,
                 format: heliosdb_nano::storage::DumpOutputFormat::Binary,
+                sql: Default::default(),
             };
             if let Err(e) = dump_manager.dump(&dump_options, &db) {
                 eprintln!("ERROR: cannot dump the database: {e}");
