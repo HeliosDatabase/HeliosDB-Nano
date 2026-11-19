@@ -25,7 +25,7 @@ fn enabled(on: bool) -> &'static str {
 ///
 /// One block, used by `\status`, `\config` and `\telemetry`, read from the
 /// storage engine and the configuration the handle was opened with.
-pub(crate) fn storage_features(db: &EmbeddedDatabase) -> String {
+pub fn storage_features(db: &EmbeddedDatabase) -> String {
     let compression = format!("{:?}", db.config.storage.compression).to_lowercase();
     let mut out = String::new();
     let _ = writeln!(out, "  WAL: {}", enabled(db.storage.is_wal_enabled()));
@@ -200,6 +200,7 @@ pub struct ReplicationState {
     /// The handle serves a physical standby (writes are refused).
     pub physical_standby: bool,
     /// The write-ahead log is on, with its current LSN when known.
+    #[allow(clippy::option_option)]
     pub wal: Option<Option<u64>>,
     /// The role record beside the data directory (a switchover or promotion
     /// leaves one), when there is one that can be read.

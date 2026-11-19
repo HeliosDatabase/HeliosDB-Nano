@@ -172,8 +172,7 @@ impl StatementScanner {
     /// what the current one means and has not been read yet.
     fn scan(&mut self, eof: bool) {
         let mut i = self.pos;
-        loop {
-            let Some(b) = self.byte(i) else { break };
+        while let Some(b) = self.byte(i) {
             match self.state {
                 ScanState::Dollar => {
                     if b == b'$' {
@@ -450,7 +449,7 @@ mod tests {
     #[test]
     fn the_last_statement_without_a_semicolon_comes_at_finish() {
         let mut scanner = StatementScanner::new();
-        assert!(scanner.feed("SELECT 1;\nSELECT 2\n").len() == 1);
+        assert_eq!(scanner.feed("SELECT 1;\nSELECT 2\n").len(), 1);
         assert!(scanner.is_open());
         assert_eq!(scanner.finish(), vec!["SELECT 2"]);
         assert!(!scanner.is_open());

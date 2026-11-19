@@ -3312,7 +3312,7 @@ mod tests {
         // A table entry that no longer names a field would warn about nothing
         // and rot silently: set each key and see the loader accept it as known.
         for (path, reason) in INERT_KEYS {
-            assert!(!reason.is_empty());
+            assert!(!reason.is_empty(), "{path} needs a reason");
             let (section, key) = path.split_once('.').unwrap();
             let value = match key {
                 k if k.ends_with("_secs") || k.ends_with("_threads") || k.ends_with("_port") => "1",
@@ -3370,7 +3370,7 @@ mod tests {
         assert_eq!(config.replication.startup_timeout_secs, 30);
         assert_eq!(config.replication.sync_mode, "async");
         assert!(config.replication.primary_host.is_none());
-        assert!(config.replication.standby_hosts.is_empty());
+        assert_eq!(config.replication.standby_hosts.len(), 0);
         assert!(config.replication.node_id.is_none());
         assert_eq!(config.replication.min_acks, 1);
         assert_eq!(config.replication.sync_timeout_ms, 10_000);

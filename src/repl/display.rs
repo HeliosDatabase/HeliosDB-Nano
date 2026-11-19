@@ -418,7 +418,7 @@ pub fn render_table(settings: &DisplaySettings, columns: &[String], rows: &[Tupl
     let widths: Vec<usize> = (0..columns.len())
         .map(|index| {
             grid.iter()
-                .flat_map(|row| {
+                .filter_map(|row| {
                     row.get(index)
                         .map(|cell| cell.split('\n').map(text_width).max().unwrap_or(0))
                 })
