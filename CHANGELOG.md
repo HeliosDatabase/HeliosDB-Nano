@@ -27,6 +27,28 @@ changes.
 Reports from users of earlier releases (GitHub numbers) and defects found while the work after
 4.42.0 was being prepared. Each has a test file.
 
+- **The shell runs scripts.** `heliosdb-nano repl -c "SQL"` and `repl -f FILE` run without a prompt,
+  `--format table|csv|tsv|json|jsonl|markdown|vertical` chooses the output, and a failed statement
+  sets the exit code. The engine now decides whether a statement returned rows, so a `SELECT` on a
+  branch, `VALUES`, `RETURNING`, `EXECUTE` and `SHOW` print their rows (a `SELECT` on a branch
+  printed only "Query returned 1 row(s)"). Statements are split the way the PostgreSQL listener
+  splits them (quotes, dollar quotes, comments), so a multi-line PL/pgSQL body can be typed or
+  piped. `\status`, `\conninfo` and `\replication` report the real role and state. Test files:
+  `tests/cli_script_mode.rs`, `tests/cli_shell_pipe.rs`, `tests/run_statement_outcome.rs`.
+- **The config file is read as written.** `start` uses `[server] listen_addr` and `port` from the
+  file when no flag is given (they were ignored); `0.0.0.0` under trust authentication is refused
+  unless `--allow-insecure-trust`. Unknown keys and keys nothing reads are named on start,
+  `--strict-config` refuses them, and `heliosdb-nano config check --config FILE` lists them without
+  starting. `compression = "zstd"` and an `[audit]` section that leaves keys out, both as documented,
+  were refused and now load. Test file: `tests/config_ops_cli_tests.rs`.
+- **`stop` waits for the shutdown, and `stop` / `status` report through exit codes** (0 done or
+  running, 1 failed, 3 not running, 4 stale PID file; `status --json`). `stop` signals only a
+  server it has verified, finds one by `--data-dir`, and no longer kills a server still shutting
+  down (`--force` after `--timeout`). Test file: `tests/stop_status_cli_tests.rs`.
+- **Webhook endpoints verify signatures when a secret is set** (`HELIOS_GITHUB_WEBHOOK_SECRET`,
+  `HELIOS_GITLAB_WEBHOOK_TOKEN`, `HELIOS_WEBHOOK_SECRET`): an unsigned request gets 401, and
+  secrets and MCP bearer tokens are compared in constant time. Test file:
+  `tests/webhook_auth_tests.rs`.
 - **Code graph and graph RAG: faster lookups, honest caching, a benchmark.** The code-graph and
   graph-RAG tables get indexes for their lookups (on `main`; a store written by an earlier release
   gains them when opened), with the same LSP answers. Re-index removes the rows of changed and
