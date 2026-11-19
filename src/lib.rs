@@ -9671,6 +9671,7 @@ impl EmbeddedDatabase {
                     columns: None,
                     source: Box::new(source),
                     returning: None,
+                    on_conflict: None,
                 };
                 // #100 deliberately passes NO transaction here: CTAS population
                 // stays on the streaming engine path so the compensating DROP
@@ -10621,6 +10622,13 @@ impl EmbeddedDatabase {
         if let Some((count, _, _)) = self.try_handle_prepared_plan_with_params(&plan, &[], Some(txn))? {
             return Ok(count);
         }
+
+        // `INSERT ... SELECT ... ON CONFLICT`: the source rows go through the
+        // `INSERT ... VALUES` conflict arm below (v02.7).
+        let plan = match self.lower_insert_select_conflict(&plan, Some(txn), &[])? {
+            Some(lowered) => lowered,
+            None => plan,
+        };
 
         // Execute plan based on type
         match &plan {
@@ -11734,7 +11742,15 @@ impl EmbeddedDatabase {
                 columns,
                 source,
                 returning,
+                on_conflict,
             } => {
+                // A conflict clause is lowered to the `INSERT ... VALUES` arm before
+                // this point (`lower_insert_select_conflict`); never drop it silently.
+                if on_conflict.is_some() {
+                    return Err(Error::query_execution(
+                        "INSERT ... SELECT ... ON CONFLICT reached the bulk insert path",
+                    ));
+                }
                 // RLS on the SOURCE read: the rows this statement copies must be the
                 // rows the session may SELECT, or an RLS-protected table could be
                 // drained wholesale through `INSERT INTO t2 SELECT * FROM t1`. The
@@ -22532,6 +22548,61 @@ impl EmbeddedDatabase {
             && self.storage.is_branch_active()
     }
 
+    /// v02.7: an `INSERT ... SELECT ... ON CONFLICT ...` used to lose its
+    /// conflict clause (the plan had nowhere to keep it), so a source row that
+    /// collided with an existing key failed the statement. The source is run
+    /// here, in the statement's own transaction and under the session's row
+    /// level security, and its rows are handed to the `INSERT ... VALUES` arm as
+    /// literal rows, so speculative insertion, arbiter selection, branch
+    /// arbitration and `DO UPDATE` validation are shared, not re-implemented.
+    ///
+    /// `Ok(None)` for every other plan, and for an `INSERT ... SELECT` without a
+    /// conflict clause (which keeps its staged bulk path untouched).
+    fn lower_insert_select_conflict(
+        &self,
+        plan: &sql::LogicalPlan,
+        txn: Option<&storage::Transaction>,
+        params: &[Value],
+    ) -> Result<Option<sql::LogicalPlan>> {
+        let sql::LogicalPlan::InsertSelect {
+            table_name,
+            columns,
+            source,
+            returning,
+            on_conflict: Some(on_conflict),
+        } = plan
+        else {
+            return Ok(None);
+        };
+        let rls_filtered_source = if self.has_effective_tenant_context() {
+            Some(self.apply_rls_to_plan((**source).clone())?)
+        } else {
+            None
+        };
+        let source_plan: &sql::LogicalPlan = match &rls_filtered_source {
+            Some(filtered) => filtered,
+            None => source,
+        };
+        let mut executor = sql::Executor::with_storage(&self.storage)
+            .with_timeout(self.effective_statement_timeout_ms())
+            .with_parameters(params.to_vec());
+        if let Some(t) = txn {
+            executor = executor.with_transaction(t);
+        }
+        let source_rows = executor.execute(source_plan)?;
+        let values = source_rows
+            .iter()
+            .map(|row| row.values.iter().cloned().map(sql::LogicalExpr::Literal).collect())
+            .collect();
+        Ok(Some(sql::LogicalPlan::Insert {
+            table_name: table_name.clone(),
+            columns: columns.clone(),
+            values,
+            returning: returning.clone(),
+            on_conflict: Some(on_conflict.clone()),
+        }))
+    }
+
     /// Spec R5.4 (decision 10): the params family's main-branch statements that write
     /// more than one row, or read a row they then change, run in an implicit
     /// statement transaction, as every text-family statement does: `INSERT … ON
@@ -22781,6 +22852,10 @@ impl EmbeddedDatabase {
         if let sql::LogicalPlan::DropDatabase { name, if_exists } = plan {
             return self.handle_drop_database(name, *if_exists);
         }
+        // `INSERT ... SELECT ... ON CONFLICT` runs through the `INSERT ... VALUES`
+        // conflict arm below (v02.7).
+        let lowered_insert_select = self.lower_insert_select_conflict(plan, session_txn, params)?;
+        let plan = lowered_insert_select.as_ref().unwrap_or(plan);
         match plan {
             // CONSTRAINT DDL, routed to the SAME bodies the text family runs.
             //
@@ -23568,7 +23643,15 @@ impl EmbeddedDatabase {
                 columns,
                 source,
                 returning,
+                on_conflict,
             } => {
+                // A conflict clause is lowered to the `INSERT ... VALUES` arm before
+                // this point (`lower_insert_select_conflict`); never drop it silently.
+                if on_conflict.is_some() {
+                    return Err(Error::query_execution(
+                        "INSERT ... SELECT ... ON CONFLICT reached the bulk insert path",
+                    ));
+                }
                 // RLS on the SOURCE read (see the text family's InsertSelect arm):
                 // rows hidden from this session must not be copyable into another
                 // table. Cloned only when a tenant context exists.
@@ -34594,11 +34677,13 @@ impl EmbeddedDatabase {
                 columns,
                 source,
                 returning,
+                on_conflict,
             } => Ok(sql::LogicalPlan::InsertSelect {
                 table_name,
                 columns,
                 source: self.apply_rls_to_boxed_plan(source)?,
                 returning,
+                on_conflict,
             }),
             sql::LogicalPlan::CreateTableAs {
                 name,

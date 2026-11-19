@@ -61,6 +61,48 @@ Reports from users of earlier releases (GitHub numbers) and defects found while 
   and reported as a restore warning. NUMERIC precision and scale are still not carried (the engine
   keeps none). Dumps written by earlier releases do not contain these objects. Test files:
   `tests/dump_schema_completeness.rs`, `tests/security_hdb_005.rs`.
+- **A MySQL query that uses `YEAR()`, `MONTH()` or `CAST(x AS SIGNED)` was rewritten into something
+  the engine rejects.** The MySQL translator rewrote column-type names in every statement:
+  `SELECT YEAR(post_date), MONTH(post_date) …` became `SMALLINT(post_date)`, `WHERE engine = 5` lost its
+  condition, `SELECT AUTO_INCREMENT FROM information_schema.tables` lost its column, and
+  `CAST(x AS UNSIGNED)` became `CAST(x AS)`. Type names, `AUTO_INCREMENT`, `ENGINE=` and `CHARSET` are
+  now rewritten only in `CREATE` and `ALTER` statements (`COLLATE` is still stripped everywhere). In
+  every statement `CAST(x AS SIGNED|UNSIGNED [INTEGER])` becomes `BIGINT`, `AS DATETIME[(n)]`
+  `TIMESTAMP` and `AS CHAR[(n)]` `TEXT`. Test files: `tests/mysql_translator_dml_compat.rs`, unit
+  tests in `src/protocol/mysql/translator.rs`.
+- **`INSERT OR REPLACE` failed in several forms, `REPLACE INTO` was refused, and text that merely
+  mentioned `INSERT OR IGNORE` or `AUTOINCREMENT` was altered.** The SQLite compatibility layer
+  rewrote the statement text with regular expressions anywhere in it: `INSERT OR REPLACE` without a
+  column list, with quoted columns or with `RETURNING` failed; `INSERT … VALUES (…, 'tip: INSERT OR
+  IGNORE INTO t VALUES (1)')` stored the text with the words removed and swallowed a duplicate-key
+  error; `SELECT 'x INTEGER PRIMARY KEY AUTOINCREMENT y'` returned `BIGSERIAL`. The conflict clause is
+  now read from the parser (`INSERT OR IGNORE` is `ON CONFLICT DO NOTHING`, `INSERT OR REPLACE` the
+  documented upsert that assigns every inserted column, all of the table's columns when none are
+  named), so it works with multi-row VALUES, quoted columns, `RETURNING` and parameters, and no text
+  is rewritten. `REPLACE [INTO] t …` is accepted on every wire and in the embedded API (the MySQL
+  translator emits `INSERT OR REPLACE INTO`); the `AUTOINCREMENT` rewrite applies only to `CREATE` /
+  `ALTER` outside quotes. `OR REPLACE|IGNORE` together with an explicit `ON CONFLICT` is a syntax
+  error. Delete-then-insert semantics (a row conflicting on a second unique column, unnamed columns
+  returning to their defaults, MySQL affected rows 2) is not part of this change. Test file:
+  `tests/sqlite_conflict_clauses.rs`, `tests/mysql_translator_dml_compat.rs`.
+- **`INSERT … SELECT … ON CONFLICT` ignored its conflict clause.** The plan had nowhere to keep it, so
+  `INSERT INTO u SELECT … FROM src ON CONFLICT DO NOTHING` (and `DO UPDATE`, MySQL `INSERT IGNORE …
+  SELECT` and `… SELECT … ON DUPLICATE KEY UPDATE`, SQLite `INSERT OR IGNORE … SELECT`) failed with a
+  duplicate-key error on the first colliding row. The conflict clause is now carried on the plan and
+  the source rows run through the `INSERT … VALUES` conflict path (arbiter selection, branches,
+  `DO UPDATE … WHERE`, `RETURNING`), in both executor families. A plain `INSERT … SELECT` keeps its
+  staged bulk path. Test file: `tests/insert_select_on_conflict.rs`.
+- **A MySQL multi-table `DELETE` deleted the wrong rows.** `DELETE a, b FROM a JOIN b ON … WHERE …`
+  was rewritten into two statements, so the second ran after the first had removed the join rows and
+  deleted nothing (or the wrong set); a `DELETE a FROM a JOIN b …` that named one table deleted from
+  both; the comma form guessed a key column called `option_id`. The MySQL listener now decides the
+  target rows of every named table once, with one `SELECT` over the join and the `WHERE`, and only then
+  deletes them by primary key, inside the statement's own savepoint; the count answered is the rows
+  deleted from all tables. Both spellings (`DELETE a, b FROM …` and `DELETE FROM a, b USING …`),
+  `LEFT JOIN`, no `WHERE`, aliases, backtick names and a self join (WordPress transient cleanup) work,
+  also with prepared-statement parameters. A target without a primary key is refused with an error
+  before anything is deleted. The planner now refuses a multi-table `DELETE` it cannot run instead of
+  deleting from its first table only. Test file: `tests/mysql_translator_dml_compat.rs`.
 - **A column alias like `AS offer_id`, or the words "as of" in a string, turned a plain statement
   into a time-travel one.** `AS OF` and `VERSIONS BETWEEN` were found by searching the SQL text:
   `SELECT id AS offer_id FROM t` lost its FROM clause, `'balance as of yesterday'` in a DELETE or

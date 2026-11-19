@@ -65,7 +65,7 @@ The standard portable form. Works for any client that speaks PG wire.
 INSERT OR REPLACE INTO settings (key, value) VALUES ('theme', 'dark');
 INSERT OR IGNORE  INTO seen (event_id) VALUES (12345);
 ```
-Translated internally to `ON CONFLICT … DO UPDATE` / `DO NOTHING`. Use either form; pick what matches the rest of your codebase.
+Read by the parser and run as `ON CONFLICT … DO UPDATE` (every inserted column; every table column when none are named) / `DO NOTHING`. `REPLACE [INTO] t …` is accepted too. A second unique constraint still raises instead of deleting the old row. Use either form; pick what matches the rest of your codebase.
 
 ### Recipe 4: `INSERT … SELECT` (bulk copy + transform)
 ```sql
@@ -74,6 +74,7 @@ SELECT id, customer, total
   FROM orders
  WHERE created < NOW() - INTERVAL '90 days';
 ```
+`INSERT … SELECT … ON CONFLICT DO NOTHING | DO UPDATE` skips or updates the colliding rows like PostgreSQL (the source rows run through the VALUES conflict path).
 For very large batches see `heliosdb-nano-transactions` (bulk-load patterns).
 
 ### Recipe 5: Parameterized (Python — psycopg2)

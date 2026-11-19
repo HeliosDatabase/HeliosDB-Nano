@@ -319,6 +319,7 @@ impl Optimizer {
                 columns,
                 source,
                 returning,
+                on_conflict,
             } => {
                 let optimized_source = self.optimize_recursive_inner(*source, depth)?;
                 LogicalPlan::InsertSelect {
@@ -326,6 +327,7 @@ impl Optimizer {
                     columns,
                     source: Box::new(optimized_source),
                     returning,
+                    on_conflict,
                 }
             }
             // CTAS - optimize the source sub-plan, exactly as InsertSelect

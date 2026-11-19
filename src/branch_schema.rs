@@ -992,6 +992,7 @@ impl EmbeddedDatabase {
                     columns: None,
                     source: Box::new(source),
                     returning: None,
+                    on_conflict: None,
                 };
                 self.execute_plan_with_params(&insert, params, None)
                     .map(|(count, _returned)| count)

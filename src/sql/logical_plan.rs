@@ -382,6 +382,9 @@ pub enum LogicalPlan {
         source: Box<LogicalPlan>,
         /// RETURNING clause (expressions to return from affected rows)
         returning: Option<Vec<ReturningItem>>,
+        /// ON CONFLICT action (DO NOTHING or DO UPDATE). `None` keeps the staged
+        /// bulk path; `Some` runs through the `INSERT ... VALUES` conflict arms.
+        on_conflict: Option<OnConflictAction>,
     },
 
     /// Create table

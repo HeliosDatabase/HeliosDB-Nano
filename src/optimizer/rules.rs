@@ -1915,11 +1915,13 @@ impl JoinPredicatePushdownRule {
                 columns,
                 source,
                 returning,
+                on_conflict,
             } => LogicalPlan::InsertSelect {
                 table_name,
                 columns,
                 source: Box::new(Self::rewrite(*source)),
                 returning,
+                on_conflict,
             },
 
             // Leaves and other variants (Scan / FilteredScan / DDL / DML /

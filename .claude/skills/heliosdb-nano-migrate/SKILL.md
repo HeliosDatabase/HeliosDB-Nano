@@ -18,7 +18,7 @@ allowed-tools: Bash(heliosdb-nano *), Bash(psql *), Bash(mysql *), Bash(python3 
 | `?` positional placeholders | ✅ (auto-renumber to `$N`) | Recipe 1 |
 | `:name` named placeholders | ✅ | Recipe 1 |
 | `@name` named placeholders | ✅ | Recipe 1 |
-| `INSERT OR REPLACE` / `OR IGNORE` | ✅ (translates to `ON CONFLICT … DO UPDATE/NOTHING`) | Recipe 1 |
+| `INSERT OR REPLACE` / `OR IGNORE` | ✅ (parser-read; runs as `ON CONFLICT … DO UPDATE/NOTHING`; `REPLACE INTO` too) | Recipe 1 |
 | `INTEGER PRIMARY KEY AUTOINCREMENT` | ✅ (translates to `BIGSERIAL`) | Recipe 1 |
 | `sqlite_master`, `pg_class`, `information_schema` | ✅ all three coexist | `heliosdb-nano-schema` |
 | `PRAGMA foreign_keys / journal_mode / synchronous / busy_timeout` | ✅ no-op-with-ack | Recipe 1 |

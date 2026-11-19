@@ -1982,10 +1982,11 @@ impl<'a> Planner<'a> {
                 // WHERE, so `SET v = t.nosuch` is 42703 whether or not a row
                 // ever conflicts. The scope is popped before the source query
                 // is planned: an INSERT source cannot see its target.
+                let on_clause = self.sqlite_conflict_clause(insert.or, &insert.on, &columns, &table_name)?;
                 let on_conflict = {
                     let _scope = self.push_scope();
                     self.record_insert_target(&insert.table_name, insert.table_alias.as_ref(), &table_name);
-                    self.convert_on_conflict(&insert.on, &table_name)?
+                    self.convert_on_conflict(&on_clause, &table_name)?
                 };
                 match source_opt {
                     Some(source) => self.insert_to_plan(table_name, columns, source, returning, on_conflict),
@@ -2210,6 +2211,13 @@ impl<'a> Planner<'a> {
                 self.update_to_plan(table, assignments, from.as_ref(), selection, returning_items)
             }
             Statement::Delete(delete_stmt) => {
+                // MySQL's `DELETE a, b FROM ...` names the tables to delete from
+                // in `tables`; the MySQL wire runs it itself (it decides every
+                // table's rows once, before any delete). Anywhere else it must
+                // be refused: ignoring the list would delete from the wrong table.
+                if !delete_stmt.tables.is_empty() {
+                    return Err(Error::query_execution("Multi-table DELETE not supported"));
+                }
                 // Extract table from FromTable enum
                 let table = match &delete_stmt.from {
                     sqlparser::ast::FromTable::WithFromKeyword(tables) => {
@@ -7076,6 +7084,7 @@ impl<'a> Planner<'a> {
                 columns: column_names,
                 source: Box::new(source_plan),
                 returning,
+                on_conflict,
             })
         }
     }
@@ -9059,6 +9068,70 @@ impl<'a> Planner<'a> {
                 }
             }
         }
+    }
+
+    /// SQLite's `INSERT OR IGNORE` / `INSERT OR REPLACE` (and MySQL's `REPLACE
+    /// INTO`, which the parser fallback spells the same way), read from the
+    /// parser's `Insert.or` instead of from the statement text.
+    ///
+    /// `OR IGNORE` is `ON CONFLICT DO NOTHING`; `OR REPLACE` is the documented
+    /// upsert that assigns every inserted column from `EXCLUDED` (the named
+    /// columns, or all of the table's columns when none are named). The result
+    /// is an ordinary parser `OnInsert`, so the conflict clause resolves exactly
+    /// like a hand-written one. `OR ABORT` / `OR FAIL` / `OR ROLLBACK` keep
+    /// behaving as a plain INSERT. Combining `OR REPLACE|IGNORE` with an explicit
+    /// `ON CONFLICT` is a syntax error.
+    fn sqlite_conflict_clause(
+        &self,
+        or: Option<sqlparser::ast::SqliteOnConflict>,
+        on: &Option<sqlparser::ast::OnInsert>,
+        columns: &[sqlparser::ast::Ident],
+        table_name: &str,
+    ) -> Result<Option<sqlparser::ast::OnInsert>> {
+        use sqlparser::ast as sp;
+
+        let replace = match or {
+            Some(sp::SqliteOnConflict::Replace) => true,
+            Some(sp::SqliteOnConflict::Ignore) => false,
+            _ => return Ok(on.clone()),
+        };
+        if on.is_some() {
+            return Err(Error::sql_parse(
+                "syntax error: INSERT OR REPLACE / OR IGNORE cannot be combined with ON CONFLICT",
+            ));
+        }
+        let action = if replace {
+            let idents: Vec<sp::Ident> = if columns.is_empty() {
+                let catalog = self.catalog.ok_or_else(|| {
+                    Error::query_execution("INSERT OR REPLACE without a column list needs the table's columns")
+                })?;
+                let schema = catalog.get_table_schema(table_name)?;
+                schema
+                    .columns
+                    .iter()
+                    .map(|c| sp::Ident::with_quote('"', c.name.clone()))
+                    .collect()
+            } else {
+                columns.to_vec()
+            };
+            let assignments = idents
+                .into_iter()
+                .map(|id| sp::Assignment {
+                    target: sp::AssignmentTarget::ColumnName(sp::ObjectName(vec![id.clone()])),
+                    value: sp::Expr::CompoundIdentifier(vec![sp::Ident::new("EXCLUDED"), id]),
+                })
+                .collect();
+            sp::OnConflictAction::DoUpdate(sp::DoUpdate {
+                assignments,
+                selection: None,
+            })
+        } else {
+            sp::OnConflictAction::DoNothing
+        };
+        Ok(Some(sp::OnInsert::OnConflict(sp::OnConflict {
+            conflict_target: None,
+            action,
+        })))
     }
 
     fn convert_on_conflict(

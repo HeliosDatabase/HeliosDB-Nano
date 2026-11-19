@@ -47,15 +47,25 @@ pub fn translate(sql: &str) -> String {
     let (masked, regions) = mask_protected_regions(&normalized);
 
     // Apply transformations in order, on the masked text.
-    let mut result = translate_types(&masked);
-    result = translate_auto_increment(&result);
-    result = translate_charset_collation(&result);
+    //
+    // CAST targets are mapped in every statement; this must run before the
+    // DDL-only type pass, whose UNSIGNED strip would otherwise turn
+    // `CAST(x AS UNSIGNED)` into `CAST(x AS)`.
+    let mut result = translate_cast_targets(&masked);
+    // Column-type names, AUTO_INCREMENT, ENGINE= and CHARSET are DDL syntax. In a
+    // query the same words are function names (`YEAR(d)`), columns (`engine`,
+    // `charset`) or `information_schema` column names (`AUTO_INCREMENT`).
+    if is_ddl_statement(&result) {
+        result = translate_types(&result);
+        result = translate_auto_increment(&result);
+        result = translate_charset_engine(&result);
+    }
+    result = translate_collation(&result);
     result = translate_on_duplicate_key(&result);
     result = translate_replace_into(&result);
     result = translate_insert_ignore(&result);
     result = translate_limit_offset(&result);
     result = translate_functions(&result);
-    result = translate_multi_table_delete(&result);
     result = translate_key_indexes(&result);
     result = translate_alter_table_keys(&result);
     result = translate_misc(&result);
@@ -847,7 +857,7 @@ fn translate_auto_increment(sql: &str) -> String {
 // 4. CHARACTER SET / COLLATE / ENGINE / CHARSET  → strip
 // ---------------------------------------------------------------------------
 
-fn translate_charset_collation(sql: &str) -> String {
+fn translate_charset_engine(sql: &str) -> String {
     let mut s = sql.to_string();
 
     // DEFAULT CHARACTER SET <name> (must be matched BEFORE bare CHARACTER SET)
@@ -870,17 +880,88 @@ fn translate_charset_collation(sql: &str) -> String {
     let re = CHARSET_SHORT_RE.get_or_init(|| init_regex(r"(?i)\s*CHARSET\s*=?\s*\w+"));
     s = re.replace_all(&s, "").to_string();
 
-    // COLLATE <name> (with or without =)
-    static COLLATE_RE: OnceLock<Regex> = OnceLock::new();
-    let re = COLLATE_RE.get_or_init(|| init_regex(r"(?i)\s*COLLATE\s*=?\s*\w+"));
-    s = re.replace_all(&s, "").to_string();
-
     // ENGINE=InnoDB / ENGINE=MyISAM / etc.
     static ENGINE_RE: OnceLock<Regex> = OnceLock::new();
     let re = ENGINE_RE.get_or_init(|| init_regex(r"(?i)\s*ENGINE\s*=\s*\w+"));
     s = re.replace_all(&s, "").to_string();
 
     s
+}
+
+/// `COLLATE <name>` is stripped from every statement (`ORDER BY x COLLATE
+/// utf8mb4_bin` is a query).
+fn translate_collation(sql: &str) -> String {
+    static COLLATE_RE: OnceLock<Regex> = OnceLock::new();
+    let re = COLLATE_RE.get_or_init(|| init_regex(r"(?i)\s*COLLATE\s*=?\s*\w+"));
+    re.replace_all(sql, "").to_string()
+}
+
+/// Is the first keyword of the masked statement `CREATE` or `ALTER`?
+/// Leading whitespace and comment placeholders are skipped.
+fn is_ddl_statement(masked: &str) -> bool {
+    let rest = masked.trim_start_matches(|c: char| c.is_whitespace() || is_placeholder_char(c));
+    let word: String = rest.chars().take_while(char::is_ascii_alphabetic).collect();
+    word.eq_ignore_ascii_case("CREATE") || word.eq_ignore_ascii_case("ALTER")
+}
+
+/// Map MySQL `CAST` targets the engine has no type for: `AS SIGNED|UNSIGNED
+/// [INTEGER]` -> `BIGINT`, `AS DATETIME[(n)]` -> `TIMESTAMP`, `AS CHAR[(n)]` ->
+/// `TEXT`. Only the type at the end of a `CAST(... AS <type>)` call is touched,
+/// at the nesting level of that call.
+fn translate_cast_targets(sql: &str) -> String {
+    static CAST_OPEN_RE: OnceLock<Regex> = OnceLock::new();
+    static TARGET_RE: OnceLock<Regex> = OnceLock::new();
+    let open = CAST_OPEN_RE.get_or_init(|| init_regex(r"(?i)\bCAST\s*\("));
+    let target = TARGET_RE.get_or_init(|| {
+        init_regex(r"(?is)^(.*\S)\s+AS\s+(?:(SIGNED|UNSIGNED)(?:\s+INTEGER)?|(DATETIME)(?:\s*\(\s*\d+\s*\))?|(CHAR)(?:\s*\(\s*\d+\s*\))?)\s*$")
+    });
+
+    let mut out = String::with_capacity(sql.len());
+    let mut rest = sql;
+    while let Some(m) = open.find(rest) {
+        out.push_str(&rest[..m.end()]);
+        let tail = &rest[m.end()..];
+        // Find the matching close paren (literals are masked, so parens in
+        // them cannot unbalance the scan).
+        let mut depth = 1usize;
+        let mut close = None;
+        for (i, ch) in tail.char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(close) = close else {
+            out.push_str(tail);
+            return out;
+        };
+        let body = &tail[..close];
+        match target.captures(body) {
+            Some(caps) => {
+                let expr = translate_cast_targets(&caps[1]);
+                let new_type = if caps.get(2).is_some() {
+                    "BIGINT"
+                } else if caps.get(3).is_some() {
+                    "TIMESTAMP"
+                } else {
+                    "TEXT"
+                };
+                out.push_str(&format!("{expr} AS {new_type}"));
+            }
+            None => out.push_str(&translate_cast_targets(body)),
+        }
+        out.push(')');
+        rest = &tail[close + 1..];
+    }
+    out.push_str(rest);
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -915,13 +996,17 @@ fn translate_values_refs(clause: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// 6. REPLACE INTO → INSERT INTO  (MVP: conflict handling deferred)
+// 6. REPLACE INTO → INSERT OR REPLACE INTO  (the parser reads the conflict clause)
 // ---------------------------------------------------------------------------
 
 fn translate_replace_into(sql: &str) -> String {
+    // Anchored at the statement head: `REPLACE(a, b, c)` and the word inside
+    // an expression are not the statement.
     static REPLACE_RE: OnceLock<Regex> = OnceLock::new();
-    let re = REPLACE_RE.get_or_init(|| init_regex(r"(?i)\bREPLACE\s+INTO\b"));
-    re.replace_all(sql, "INSERT INTO").to_string()
+    let re = REPLACE_RE.get_or_init(|| {
+        init_regex(r"(?i)^([\s\x{E000}-\x{E01F}]*)REPLACE\s+(?:(?:LOW_PRIORITY|DELAYED)\s+)?INTO\b")
+    });
+    re.replace(sql, "${1}INSERT OR REPLACE INTO").to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -1094,146 +1179,15 @@ fn split_top_level_commas(s: &str) -> Vec<&str> {
 }
 
 // ---------------------------------------------------------------------------
-// 10. Multi-table DELETE → single-table DELETE ... USING
+// 10. Multi-table DELETE is NOT rewritten here
 // ---------------------------------------------------------------------------
-
-/// Translate MySQL multi-table DELETE to PostgreSQL DELETE ... USING.
-///
-/// MySQL:  `DELETE t, tt FROM wp_terms AS t INNER JOIN wp_term_taxonomy AS tt
-///          ON t.term_id = tt.term_id WHERE tt.taxonomy = 'nav_menu'`
-/// PG:     `DELETE FROM wp_terms USING wp_term_taxonomy
-///          WHERE wp_terms.term_id = wp_term_taxonomy.term_id
-///          AND wp_term_taxonomy.taxonomy = 'nav_menu'`
-///
-/// Strategy: detect `DELETE <alias_list> FROM`, extract the first table as
-/// the target, convert the rest to USING with the JOIN condition merged into
-/// WHERE.
-fn translate_multi_table_delete(sql: &str) -> String {
-    // Match: DELETE <alias1>[, <alias2>...] FROM <table_spec> [JOIN ...] [WHERE ...]
-    static MULTI_DEL_RE: OnceLock<Regex> = OnceLock::new();
-    // Table and alias names use `\i` (not `\w`): backtick-quoted names are
-    // masked placeholders by the time this pass runs.
-    let re = MULTI_DEL_RE.get_or_init(|| {
-        init_regex(
-            r"(?i)^(\s*DELETE)\s+\i+(?:\s*,\s*\i+)*\s+FROM\s+(\i+)\s+(?:AS\s+)?(\i+)\s+((?:INNER\s+)?JOIN\s+(\i+)\s+(?:AS\s+)?(\i+)\s+ON\s+(.+?))\s+(WHERE\s+.+)$"
-        )
-    });
-
-    if let Some(caps) = re.captures(sql) {
-        // caps[2] = first real table name (e.g. wp_terms)
-        // caps[3] = first alias (e.g. t)
-        // caps[5] = second real table name (e.g. wp_term_taxonomy)
-        // caps[6] = second alias (e.g. tt)
-        // caps[7] = ON condition (e.g. t.term_id = tt.term_id)
-        // caps[8] = WHERE clause (e.g. WHERE tt.taxonomy = 'nav_menu')
-
-        let table1 = &caps[2];
-        let alias1 = &caps[3];
-        let table2 = &caps[5];
-        let alias2 = &caps[6];
-        let on_condition = &caps[7];
-        let where_clause = &caps[8];
-
-        // Strip the "WHERE " prefix from the WHERE clause
-        let where_body = where_clause
-            .trim()
-            .strip_prefix("WHERE ")
-            .or_else(|| where_clause.trim().strip_prefix("where "))
-            .unwrap_or(where_clause.trim());
-
-        // Build a common subquery FROM clause that uses the original aliases.
-        // This lets the ON and WHERE clauses use their original alias references.
-        let subquery_from = format!("{table1} AS {alias1} INNER JOIN {table2} AS {alias2} ON {on_condition}");
-        let subquery_where = where_body;
-
-        // Find a join column from the ON condition for each table.
-        // ON condition looks like: t.term_id = tt.term_id
-        // We need to extract which column from alias1 and alias2 to use.
-        let (col1, col2) = extract_join_columns(on_condition, alias1, alias2);
-
-        // Generate two DELETE statements with IN subqueries:
-        //   DELETE FROM table1 WHERE col1 IN (SELECT alias1.col1 FROM ... WHERE ...)
-        //   DELETE FROM table2 WHERE col2 IN (SELECT alias2.col2 FROM ... WHERE ...)
-        let del1 = format!(
-            "DELETE FROM {table1} WHERE {col1} IN (SELECT {alias1}.{col1} FROM {subquery_from} WHERE {subquery_where})"
-        );
-        let del2 = format!(
-            "DELETE FROM {table2} WHERE {col2} IN (SELECT {alias2}.{col2} FROM {subquery_from} WHERE {subquery_where})"
-        );
-
-        return format!("{del1};{del2}");
-    }
-
-    // Also handle comma-join DELETE: DELETE a, b FROM table1 a, table2 b WHERE ...
-    // WordPress uses: DELETE a, b FROM wp_options a, wp_options b WHERE a.option_name LIKE ...
-    static COMMA_DEL_RE: OnceLock<Regex> = OnceLock::new();
-    let comma_re = COMMA_DEL_RE.get_or_init(|| {
-        init_regex(
-            r"(?is)^\s*DELETE\s+(\i+)\s*,\s*(\i+)\s+FROM\s+(\i+)\s+(?:AS\s+)?(\i+)\s*,\s*(\i+)\s+(?:AS\s+)?(\i+)\s+(WHERE\s+.+)$"
-        )
-    });
-
-    if let Some(caps) = comma_re.captures(sql) {
-        let del_alias1 = &caps[1]; // alias to delete from
-        let del_alias2 = &caps[2];
-        let table1 = &caps[3];
-        let alias1 = &caps[4];
-        let table2 = &caps[5];
-        let alias2 = &caps[6];
-        let where_clause = caps[7].trim();
-        let where_body = where_clause
-            .strip_prefix("WHERE ")
-            .or_else(|| where_clause.strip_prefix("where "))
-            .unwrap_or(where_clause);
-
-        // Find PK column from schema (default to "option_id" for wp_options pattern)
-        let pk_col = "option_id"; // WordPress transient cleanup always uses wp_options
-
-        // For same-table self-join DELETE, use a subquery with the WHERE condition
-        let subquery_from = format!("{table1} AS {alias1}, {table2} AS {alias2}");
-        let del1 = format!(
-            "DELETE FROM {table1} WHERE {pk_col} IN (SELECT {del_alias1}.{pk_col} FROM {subquery_from} WHERE {where_body})"
-        );
-        // Only generate second DELETE if tables differ
-        if table1 != table2 {
-            let del2 = format!(
-                "DELETE FROM {table2} WHERE {pk_col} IN (SELECT {del_alias2}.{pk_col} FROM {subquery_from} WHERE {where_body})"
-            );
-            return format!("{del1};{del2}");
-        }
-        return del1;
-    }
-
-    sql.to_string()
-}
-
-/// Extract join column names from an ON condition like `t.term_id = tt.term_id`.
-///
-/// Returns (col_for_alias1, col_for_alias2).  Falls back to "id" if parsing fails.
-fn extract_join_columns(on_condition: &str, alias1: &str, alias2: &str) -> (String, String) {
-    // Split on '=' and look for alias.column patterns
-    let (mut col1, mut col2) = (String::from("id"), String::from("id"));
-
-    if let Some((lhs, rhs)) = on_condition.split_once('=') {
-        let lhs = lhs.trim();
-        let rhs = rhs.trim();
-
-        // Try to match alias1.col and alias2.col from either side
-        for token in &[lhs, rhs] {
-            if let Some(dot) = token.find('.') {
-                let prefix = token.get(..dot).unwrap_or("").trim();
-                let suffix = token.get(dot + 1..).unwrap_or("id").trim();
-                if prefix.eq_ignore_ascii_case(alias1) {
-                    col1 = suffix.to_string();
-                } else if prefix.eq_ignore_ascii_case(alias2) {
-                    col2 = suffix.to_string();
-                }
-            }
-        }
-    }
-
-    (col1, col2)
-}
+//
+// `DELETE a, b FROM a JOIN b ... WHERE ...` and `DELETE FROM a, b USING ...`
+// reach the handler as one statement (backtick names already resolved). The
+// handler decides the rows of every named table once, before deleting any
+// (`MySqlHandler::try_multi_table_delete`). The previous rewrite emitted one
+// DELETE per table, so the second ran after the first had removed the join
+// partners it depended on.
 
 // ---------------------------------------------------------------------------
 // 11. KEY / UNIQUE KEY prefix indexes → strip or convert in CREATE TABLE
@@ -1412,6 +1366,78 @@ mod tests {
         assert_eq!(&sql[at..at + 9], "version()");
     }
 
+    // ---- v02.3: type-name rewrites are DDL-only; CAST targets are mapped ----
+
+    #[test]
+    fn year_and_month_calls_are_left_alone() {
+        let sql = "SELECT YEAR(d) AS y, MONTH(d) FROM t GROUP BY YEAR(d), MONTH(d)";
+        assert_eq!(translate(sql), sql);
+    }
+
+    #[test]
+    fn unquoted_year_column_in_a_query_is_left_alone() {
+        let sql = "SELECT year, datetime FROM t WHERE year > 2000 AND tinyint = 1";
+        assert_eq!(translate(sql), sql);
+    }
+
+    #[test]
+    fn create_table_types_still_translate() {
+        let r = translate("CREATE TABLE t (y YEAR, d DATETIME, n INT UNSIGNED AUTO_INCREMENT) ENGINE=InnoDB");
+        assert!(r.contains("SMALLINT") && r.contains("TIMESTAMP"), "{r}");
+        assert!(r.contains("SERIAL") && !r.contains("AUTO_INCREMENT"), "{r}");
+        assert!(!r.contains("ENGINE") && !r.contains("UNSIGNED"), "{r}");
+        // a leading comment does not hide the statement kind
+        let r = translate("/* c */ CREATE TABLE t (d DATETIME) ENGINE=InnoDB");
+        assert!(r.contains("TIMESTAMP") && !r.contains("ENGINE"), "{r}");
+    }
+
+    #[test]
+    fn alter_table_add_column_still_translates() {
+        let r = translate("ALTER TABLE t ADD COLUMN d DATETIME, ADD COLUMN y YEAR");
+        assert!(r.contains("TIMESTAMP") && r.contains("SMALLINT"), "{r}");
+    }
+
+    #[test]
+    fn cast_signed_and_unsigned_map_to_bigint() {
+        assert_eq!(translate("SELECT CAST(meta_value AS SIGNED) FROM t"), "SELECT CAST(meta_value AS BIGINT) FROM t");
+        assert_eq!(translate("SELECT CAST(x AS UNSIGNED)"), "SELECT CAST(x AS BIGINT)");
+        assert_eq!(translate("SELECT CAST(x AS signed integer)"), "SELECT CAST(x AS BIGINT)");
+        assert_eq!(
+            translate("SELECT CAST(CAST(a AS CHAR) AS UNSIGNED) + CAST(b AS SIGNED)"),
+            "SELECT CAST(CAST(a AS TEXT) AS BIGINT) + CAST(b AS BIGINT)"
+        );
+    }
+
+    #[test]
+    fn cast_datetime_and_char_map() {
+        assert_eq!(translate("SELECT CAST(x AS DATETIME)"), "SELECT CAST(x AS TIMESTAMP)");
+        assert_eq!(translate("SELECT CAST(x AS DATETIME(6))"), "SELECT CAST(x AS TIMESTAMP)");
+        assert_eq!(translate("SELECT CAST(x AS CHAR(20))"), "SELECT CAST(x AS TEXT)");
+        // other targets and non-CAST uses of the words are untouched
+        assert_eq!(translate("SELECT CAST(x AS DECIMAL(10,2))"), "SELECT CAST(x AS DECIMAL(10,2))");
+        assert_eq!(translate("SELECT a AS signed FROM t"), "SELECT a AS signed FROM t");
+    }
+
+    #[test]
+    fn where_engine_equals_is_left_alone() {
+        let sql = "SELECT * FROM t WHERE engine = 5 AND charset = 'x'";
+        assert_eq!(translate(sql), sql);
+    }
+
+    #[test]
+    fn select_auto_increment_from_information_schema_is_left_alone() {
+        let sql = "SELECT AUTO_INCREMENT FROM information_schema.tables WHERE table_name = 't'";
+        assert_eq!(translate(sql), sql);
+    }
+
+    #[test]
+    fn collate_is_stripped_from_queries() {
+        assert_eq!(
+            translate("SELECT a FROM t ORDER BY a COLLATE utf8mb4_bin"),
+            "SELECT a FROM t ORDER BY a"
+        );
+    }
+
     #[test]
     fn test_auto_increment() {
         let sql = "CREATE TABLE wp_posts (ID bigint(20) NOT NULL AUTO_INCREMENT, PRIMARY KEY (ID))";
@@ -1505,11 +1531,12 @@ mod tests {
     fn test_replace_into() {
         let sql = "REPLACE INTO t (id, name) VALUES (1, 'foo')";
         let result = translate(sql);
-        assert!(
-            result.starts_with("INSERT INTO"),
-            "REPLACE INTO -> INSERT INTO: {result}"
-        );
-        assert!(!result.contains("REPLACE"), "REPLACE should be removed: {result}");
+        assert_eq!(result, "INSERT OR REPLACE INTO t (id, name) VALUES (1, 'foo')");
+        // only the statement head, never the word inside a literal or a call
+        let r = translate("INSERT INTO t VALUES ('REPLACE INTO x')");
+        assert_eq!(r, "INSERT INTO t VALUES ('REPLACE INTO x')");
+        assert_eq!(translate("SELECT REPLACE(a, 'b', 'c') FROM t"), "SELECT REPLACE(a, 'b', 'c') FROM t");
+        assert!(translate("REPLACE LOW_PRIORITY INTO t VALUES (1)").starts_with("INSERT OR REPLACE INTO t"));
     }
 
     #[test]
@@ -1748,34 +1775,13 @@ mod tests {
     }
 
     #[test]
-    fn test_multi_table_delete() {
+    fn test_multi_table_delete_is_one_statement() {
+        // The handler decides the rows of every named table once; the
+        // translator no longer splits the statement in two.
         let sql = "DELETE t, tt FROM wp_terms AS t INNER JOIN wp_term_taxonomy AS tt ON t.term_id = tt.term_id WHERE tt.taxonomy = 'nav_menu'";
-        let result = translate(sql);
-        // Should produce two semicolon-separated DELETE statements with IN subqueries
-        let parts: Vec<&str> = result.split(';').collect();
-        assert!(parts.len() >= 2, "Should produce two DELETE statements: {result}");
-        assert!(
-            parts[0].contains("DELETE FROM wp_terms WHERE term_id IN"),
-            "First DELETE should target wp_terms with IN subquery: {result}"
-        );
-        assert!(
-            parts[1].contains("DELETE FROM wp_term_taxonomy WHERE term_id IN"),
-            "Second DELETE should target wp_term_taxonomy with IN subquery: {result}"
-        );
-        // Subqueries should use original aliases, not resolved table names
-        assert!(result.contains("INNER JOIN"), "Subquery should contain JOIN: {result}");
-    }
-
-    #[test]
-    fn test_multi_table_delete_no_alias_keyword() {
+        assert_eq!(translate(sql), sql);
         let sql = "DELETE a, b FROM wp_terms a JOIN wp_term_taxonomy b ON a.term_id = b.term_id WHERE b.count = 0";
-        let result = translate(sql);
-        let parts: Vec<&str> = result.split(';').collect();
-        assert!(parts.len() >= 2, "Should handle JOIN without AS keyword: {result}");
-        assert!(
-            parts[0].contains("DELETE FROM wp_terms"),
-            "First DELETE should target wp_terms: {result}"
-        );
+        assert_eq!(translate(sql), sql);
     }
 
     #[test]
@@ -2140,31 +2146,13 @@ mod tests {
 
     #[test]
     fn test_hdb007_backticked_aliases_in_multi_table_delete_still_resolve() {
-        // Review finding on the fix pass: every occurrence of `t` used to get its own
-        // placeholder, so `extract_join_columns` no longer saw the alias twice and fell
-        // back to `id`; the comma form emitted two DELETEs for one table.
+        // Backtick names are resolved to bare names; the statement stays one.
         let sql = "DELETE `t`, `tt` FROM wp_terms AS `t` INNER JOIN wp_term_taxonomy AS `tt` \
                    ON `t`.term_id = `tt`.term_id WHERE `tt`.taxonomy = 'nav_menu'";
         let result = translate(sql);
-        let parts: Vec<&str> = result.split(';').collect();
-        assert_eq!(parts.len(), 2, "two DELETE statements: {result}");
-        assert!(
-            parts[0].contains("DELETE FROM wp_terms WHERE term_id IN (SELECT t.term_id FROM"),
-            "join column must resolve through the backticked alias: {result}"
-        );
-        assert!(
-            parts[1].contains("DELETE FROM wp_term_taxonomy WHERE term_id IN (SELECT tt.term_id FROM"),
-            "second target must resolve the same way: {result}"
-        );
-        assert!(!result.contains('`'), "backticks stripped: {result}");
-        assert!(result.contains("'nav_menu'"), "literal intact: {result}");
-
-        let same_table = "DELETE a, b FROM `wp_options` a, `wp_options` b WHERE a.option_name = b.option_name";
-        let result = translate(same_table);
         assert_eq!(
-            result.matches("DELETE FROM").count(),
-            1,
-            "one table quoted twice is still one target: {result}"
+            result,
+            "DELETE t, tt FROM wp_terms AS t INNER JOIN wp_term_taxonomy AS tt ON t.term_id = tt.term_id WHERE tt.taxonomy = 'nav_menu'"
         );
     }
 

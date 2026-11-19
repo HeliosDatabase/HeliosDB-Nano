@@ -2211,7 +2211,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
             // batch committed to the write set stay staged, exactly as MySQL
             // leaves them.
             let savepoint = self.statement_savepoint();
-            match self.database.execute_for_session(self.session_id, stmt) {
+            match self.execute_statement(stmt) {
                 Ok(affected) => {
                     total_affected += affected;
                     // After INSERT, try to capture the auto-generated ID
@@ -2230,7 +2230,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
                     // order is the fix: un-aborting first would leave them
                     // committable.
                     self.rollback_failed_statement(savepoint);
-                    return self.send_statement_error(&e.to_string()).await;
+                    return self.send_statement_error(&e).await;
                 }
             }
         }
@@ -2260,11 +2260,218 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
     // `send_statement_error`, so reviving it as written would have skipped both
     // the HDB-008 handling and the per-statement savepoint added by this item.
 
+    // ------------------------------------------------------------------
+    // Multi-table DELETE
+    // ------------------------------------------------------------------
+
+    /// Run one statement of `execute_dml`: a multi-table `DELETE` is answered
+    /// here, everything else goes to the engine as written.
+    fn execute_statement(&self, stmt: &str) -> std::result::Result<u64, String> {
+        match self.try_multi_table_delete(stmt, &[]) {
+            Some(result) => result,
+            None => self
+                .database
+                .execute_for_session(self.session_id, stmt)
+                .map_err(|e| e.to_string()),
+        }
+    }
+
+    /// MySQL's multi-table `DELETE`, in both spellings:
+    ///
+    /// * `DELETE t1[, t2] FROM <table references> [WHERE ...]`
+    /// * `DELETE FROM t1[, t2] USING <table references> [WHERE ...]`
+    ///
+    /// The target rows of EVERY named table are decided once, by one `SELECT`
+    /// over the join and the `WHERE`, before any row is deleted; only then are
+    /// the rows removed, table by table, by primary key. The earlier rewrite
+    /// emitted one `DELETE` per table, so the second ran after the first had
+    /// removed the join partners it depended on and deleted the wrong set.
+    ///
+    /// Returns `None` when `stmt` is not a multi-table `DELETE` (it then runs
+    /// unchanged). The caller's statement savepoint covers the whole statement.
+    fn try_multi_table_delete(&self, stmt: &str, params: &[Value]) -> Option<std::result::Result<u64, String>> {
+        use sqlparser::ast::{FromTable, Statement, TableFactor, TableWithJoins};
+
+        let trimmed = stmt.trim_start();
+        if !starts_with_icase(trimmed, "DELETE") {
+            return None;
+        }
+        let after = trimmed.get("DELETE".len()..)?.trim_start();
+        // `DELETE FROM t ...` is the single-table form unless a USING list
+        // follows; look for the keyword in the code view only.
+        if starts_with_icase(after, "FROM") && !super::translator::code_view(trimmed).contains("USING") {
+            return None;
+        }
+        let parsed = sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::PostgreSqlDialect {}, stmt).ok()?;
+        let [Statement::Delete(delete)] = parsed.as_slice() else {
+            return None;
+        };
+        let from_list: &Vec<TableWithJoins> = match &delete.from {
+            FromTable::WithFromKeyword(list) | FromTable::WithoutKeyword(list) => list,
+        };
+        // (target name, table references)
+        let (target_names, refs): (Vec<String>, &[TableWithJoins]) = if !delete.tables.is_empty() {
+            let names = delete
+                .tables
+                .iter()
+                .filter_map(|n| n.0.last().map(|i| i.value.to_lowercase()))
+                .collect();
+            (names, from_list.as_slice())
+        } else if let (Some(using), true) = (delete.using.as_deref(), from_list.len() > 1) {
+            let mut names = Vec::new();
+            for item in from_list {
+                match &item.relation {
+                    TableFactor::Table { name, .. } if item.joins.is_empty() => {
+                        names.extend(name.0.last().map(|i| i.value.to_lowercase()));
+                    }
+                    _ => return Some(Err("Multi-table DELETE: every target must be a plain table".to_string())),
+                }
+            }
+            (names, using)
+        } else {
+            return None;
+        };
+        if delete.returning.is_some() || !delete.order_by.is_empty() || delete.limit.is_some() {
+            return Some(Err(
+                "Incorrect usage of DELETE and ORDER BY / LIMIT / RETURNING: not allowed with a multi-table DELETE".to_string(),
+            ));
+        }
+        Some(self.run_multi_table_delete(&target_names, refs, delete.selection.as_ref(), params))
+    }
+
+    fn run_multi_table_delete(
+        &self,
+        target_names: &[String],
+        refs: &[sqlparser::ast::TableWithJoins],
+        selection: Option<&sqlparser::ast::Expr>,
+        params: &[Value],
+    ) -> std::result::Result<u64, String> {
+        use sqlparser::ast::TableFactor;
+
+        // Every plain table the references name: (match key, SQL qualifier, table).
+        let mut relations: Vec<(String, String, String)> = Vec::new();
+        for item in refs {
+            let factors = std::iter::once(&item.relation).chain(item.joins.iter().map(|j| &j.relation));
+            for factor in factors {
+                if let TableFactor::Table { name, alias, .. } = factor {
+                    let Some(last) = name.0.last() else { continue };
+                    let table = if last.quote_style.is_some() {
+                        last.value.clone()
+                    } else {
+                        last.value.to_lowercase()
+                    };
+                    let (key, qualifier) = match alias {
+                        Some(a) => (a.name.value.to_lowercase(), a.name.to_string()),
+                        None => (last.value.to_lowercase(), last.to_string()),
+                    };
+                    relations.push((key, qualifier, table));
+                }
+            }
+        }
+
+        // One entry per distinct named target: (qualifier, table, key columns).
+        let catalog = self.database.storage.catalog();
+        let mut targets: Vec<(String, String, Vec<String>)> = Vec::new();
+        for name in target_names {
+            let Some((_, qualifier, table)) = relations.iter().find(|(key, _, _)| key == name) else {
+                return Err(format!("Unknown table '{name}' in MULTI DELETE"));
+            };
+            if targets.iter().any(|(q, _, _)| q == qualifier) {
+                continue;
+            }
+            let pk = catalog.primary_key_columns(table).map_err(|e| e.to_string())?;
+            if pk.is_empty() {
+                return Err(format!(
+                    "Multi-table DELETE needs a primary key on '{table}' to name the rows it removes"
+                ));
+            }
+            targets.push((qualifier.clone(), table.clone(), pk));
+        }
+
+        // ONE statement decides the rows of every target.
+        let quote = |col: &str| format!("\"{}\"", col.replace('"', "\"\""));
+        let select_list: Vec<String> = targets
+            .iter()
+            .flat_map(|(qualifier, _, pk)| pk.iter().map(move |c| format!("{qualifier}.{}", quote(c))))
+            .collect();
+        let from_clause: Vec<String> = refs.iter().map(ToString::to_string).collect();
+        let mut select = format!("SELECT {} FROM {}", select_list.join(", "), from_clause.join(", "));
+        if let Some(expr) = selection {
+            select.push_str(&format!(" WHERE {expr}"));
+        }
+        let rows = if params.is_empty() {
+            self.database.query_with_columns_for_session(self.session_id, &select).map(|(rows, _)| rows)
+        } else {
+            self.database
+                .query_params_with_columns_for_session(self.session_id, &select, params)
+                .map(|(rows, _)| rows)
+        }
+        .map_err(|e| e.to_string())?;
+
+        // Distinct key tuples per table (two aliases of one table merge).
+        let mut keys: Vec<(String, Vec<String>, Vec<Vec<String>>)> = Vec::new();
+        let mut offset = 0usize;
+        for (_, table, pk) in &targets {
+            let slot = match keys.iter().position(|(t, _, _)| t == table) {
+                Some(i) => i,
+                None => {
+                    keys.push((table.clone(), pk.clone(), Vec::new()));
+                    keys.len() - 1
+                }
+            };
+            for row in &rows {
+                let Some(cells) = row.values.get(offset..offset + pk.len()) else {
+                    continue;
+                };
+                if cells.iter().any(|v| matches!(v, Value::Null)) {
+                    continue; // an outer-join row without a partner
+                }
+                let literals: Vec<String> = cells.iter().map(crate::sql::interpolate::value_to_sql_literal).collect();
+                if let Some((_, _, list)) = keys.get_mut(slot) {
+                    if !list.contains(&literals) {
+                        list.push(literals);
+                    }
+                }
+            }
+            offset += pk.len();
+        }
+
+        // Only now delete.
+        let mut affected = 0u64;
+        for (table, pk, list) in &keys {
+            for chunk in list.chunks(200) {
+                let predicate = if let [only] = pk.as_slice() {
+                    let items: Vec<&str> = chunk.iter().filter_map(|k| k.first().map(String::as_str)).collect();
+                    format!("{} IN ({})", quote(only), items.join(", "))
+                } else {
+                    chunk
+                        .iter()
+                        .map(|k| {
+                            let parts: Vec<String> = pk
+                                .iter()
+                                .zip(k)
+                                .map(|(c, lit)| format!("{} = {lit}", quote(c)))
+                                .collect();
+                            format!("({})", parts.join(" AND "))
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" OR ")
+                };
+                let sql = format!("DELETE FROM {} WHERE {predicate}", quote(table));
+                affected += self
+                    .database
+                    .execute_for_session(self.session_id, &sql)
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(affected)
+    }
+
     /// Extract the table name from an INSERT statement.
     fn extract_insert_table(sql: &str) -> Option<String> {
         static INSERT_TABLE_RE: OnceLock<Regex> = OnceLock::new();
         let re = INSERT_TABLE_RE.get_or_init(|| {
-            Regex::new(r#"(?i)\bINSERT\s+INTO\s+[`"]*(\w+)[`"]*"#)
+            Regex::new(r#"(?i)\bINSERT\s+(?:OR\s+\w+\s+)?INTO\s+[`"]*(\w+)[`"]*"#)
                 .unwrap_or_else(|_| Regex::new("^$").expect("static regex"))
         });
         re.captures(sql).and_then(|c| c.get(1).map(|m| m.as_str().to_string()))
@@ -3551,10 +3758,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
             // drivers send a multi-row INSERT, so the statement savepoint has to
             // cover it too or the hole simply moves here.
             let savepoint = self.statement_savepoint();
-            match self
-                .database
-                .execute_params_for_session(self.session_id, trimmed, &params)
-            {
+            let outcome = match self.try_multi_table_delete(trimmed, &params) {
+                Some(result) => result,
+                None => self
+                    .database
+                    .execute_params_for_session(self.session_id, trimmed, &params)
+                    .map_err(|e| e.to_string()),
+            };
+            match outcome {
                 Ok(affected) => {
                     let mut insert_id = 0;
                     if is_insert && affected > 0 {

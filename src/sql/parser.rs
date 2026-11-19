@@ -335,6 +335,7 @@ impl Parser {
                 let rewritten = Self::rewrite_partition_syntax(&processed_sql)
                     .or_else(|| Self::rewrite_delete_returning(&processed_sql))
                     .or_else(|| Self::rewrite_drop_index_on(&processed_sql))
+                    .or_else(|| Self::rewrite_replace_into(&processed_sql))
                     .map(|s| (s, false))
                     .or_else(|| Self::rewrite_fk_default_referenced_columns(&processed_sql).map(|s| (s, true)));
                 match rewritten {
@@ -2982,6 +2983,17 @@ impl Parser {
         // Everything from `RETURNING` onward is carried through VERBATIM —
         // including the projection list, a trailing `;` and anything after it.
         Some(format!("DELETE FROM {table} WHERE TRUE {}", rest.trim_start()))
+    }
+
+    /// `REPLACE [INTO] t ...` -> `INSERT OR REPLACE INTO t ...`.
+    ///
+    /// sqlparser refuses `REPLACE` under the PostgreSQL dialect ("Unsupported
+    /// statement REPLACE"), but reads `INSERT OR REPLACE`. Runs only from the
+    /// parse-failure fallback, so SQL that parses today is untouched.
+    fn rewrite_replace_into(sql: &str) -> Option<String> {
+        let after = Self::strip_kw(sql, "REPLACE")?;
+        let rest = Self::strip_kw(after, "INTO").unwrap_or(after);
+        Some(format!("INSERT OR REPLACE INTO {rest}"))
     }
 
     /// MySQL spelling `DROP INDEX [IF EXISTS] <index> ON <table>` → the

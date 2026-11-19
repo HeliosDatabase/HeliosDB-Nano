@@ -3497,6 +3497,7 @@ where
 
             if ha_state().is_read_only() {
                 let is_write = starts_with_icase(trimmed, "INSERT")
+                    || starts_with_icase(trimmed, "REPLACE")
                     || starts_with_icase(trimmed, "UPDATE")
                     || starts_with_icase(trimmed, "DELETE")
                     || starts_with_icase(trimmed, "CREATE")
@@ -3564,6 +3565,7 @@ where
         let is_dml_returning = !is_select && !is_cte && {
             let upper = trimmed.to_uppercase();
             (starts_with_icase(trimmed, "INSERT")
+                || starts_with_icase(trimmed, "REPLACE")
                 || starts_with_icase(trimmed, "UPDATE")
                 || starts_with_icase(trimmed, "DELETE"))
                 && upper.contains("RETURNING")
@@ -4925,7 +4927,7 @@ where
     /// Get command tag for a query
     pub(super) fn get_command_tag(&self, query: &str, affected: u64) -> String {
         let trimmed = query.trim();
-        if starts_with_icase(trimmed, "INSERT") {
+        if starts_with_icase(trimmed, "INSERT") || starts_with_icase(trimmed, "REPLACE") {
             format!("INSERT 0 {}", affected)
         } else if starts_with_icase(trimmed, "UPDATE") {
             format!("UPDATE {}", affected)

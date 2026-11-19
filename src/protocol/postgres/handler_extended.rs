@@ -705,7 +705,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
             // substituted) query.
             let upper = statement.query.to_uppercase();
             let trimmed = statement.query.trim();
-            let is_insert = super::handler::starts_with_icase(trimmed, "INSERT");
+            let is_insert = super::handler::starts_with_icase(trimmed, "INSERT")
+                || super::handler::starts_with_icase(trimmed, "REPLACE");
             let is_update = super::handler::starts_with_icase(trimmed, "UPDATE");
             let is_delete = super::handler::starts_with_icase(trimmed, "DELETE");
             let is_dml_returning = upper.contains("RETURNING") && (is_insert || is_update || is_delete);
