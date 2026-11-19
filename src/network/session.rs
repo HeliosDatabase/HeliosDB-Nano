@@ -260,7 +260,7 @@ impl Session {
         // Send parameter status messages
         responses.push(BackendMessage::ParameterStatus {
             name: "server_version".to_string(),
-            value: "17.0 (HeliosDB Nano 3.27.0)".to_string(),
+            value: crate::sql::params::pg_server_version_string(),
         });
         responses.push(BackendMessage::ParameterStatus {
             name: "server_encoding".to_string(),

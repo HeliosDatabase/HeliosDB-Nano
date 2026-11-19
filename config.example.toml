@@ -134,6 +134,10 @@ transaction_isolation = "READ_COMMITTED"
 # There is no silent-accept value: a client asking for serializability is never
 # left believing it got it. Real SSI is a separate, unshipped milestone.
 serializable_policy = "warn"
+# Partitioning DDL (PARTITION BY / PARTITION OF / ATTACH / DETACH) is accepted
+# as schema only: rows are not routed. "warn" accepts it with a WARNING;
+# "error" refuses it (0A000). See docs/compatibility/partitioning.md.
+partition_policy = "warn"
 
 # Slow query log threshold in milliseconds.
 # Queries exceeding this threshold are logged at WARN level with their SQL

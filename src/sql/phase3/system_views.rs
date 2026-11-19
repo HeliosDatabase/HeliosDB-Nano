@@ -2944,6 +2944,41 @@ impl SystemViewRegistry {
             },
             description: "One row per live backend (connection), joinable on pg_backend_pid()".to_string(),
         });
+
+        // v07.2: pg_settings — one row per parameter of the ONE registry
+        // (`sql::params`), PostgreSQL's column set, this session's values. The
+        // embedded engine had no pg_settings at all, and the wire answered
+        // four canned rows (one of them a wrong server_version).
+        self.register_view(SystemViewSchema {
+            name: "pg_settings".to_string(),
+            schema: Schema {
+                columns: crate::sql::params::PG_SETTINGS_COLUMNS
+                    .iter()
+                    .map(|name| {
+                        let data_type = if *name == "pending_restart" {
+                            DataType::Boolean
+                        } else {
+                            DataType::Text
+                        };
+                        sv_col(name, data_type)
+                    })
+                    .collect(),
+            },
+            description: "Run-time parameters: one row per setting SHOW and current_setting() know".to_string(),
+        });
+
+        // v07.6: heliosdb_features — the Cargo features this binary contains.
+        self.register_view(SystemViewSchema {
+            name: "heliosdb_features".to_string(),
+            schema: Schema {
+                columns: vec![
+                    sv_col("name", DataType::Text),
+                    sv_col("compiled", DataType::Boolean),
+                    sv_col("source", DataType::Text),
+                ],
+            },
+            description: "The Cargo features compiled into this binary, and what each provides".to_string(),
+        });
     }
 
     /// Register a system view
@@ -4273,6 +4308,21 @@ impl SystemViewRegistry {
             "heliosdb_copy_phase_stats" => Self::execute_heliosdb_copy_phase_stats(),
             // Code-graph track grammar inventory.
             "hdb_code_languages" => Self::execute_hdb_code_languages(),
+            // v07.2: the one parameter registry.
+            "heliosdb_features" => Ok(crate::sql::features::features()
+                .into_iter()
+                .map(|f| {
+                    Tuple::new(vec![
+                        Value::String(f.name.to_string()),
+                        Value::Boolean(f.compiled),
+                        Value::String(f.source.to_string()),
+                    ])
+                })
+                .collect()),
+            "pg_settings" => Ok(crate::sql::params::pg_settings_rows()
+                .into_iter()
+                .map(Tuple::new)
+                .collect()),
             // pg_tables — delegate to the legacy SystemViewRegistry
             // which has the schema-namespacing split we want.
             "pg_tables" => Self::execute_pg_tables_compat(storage),

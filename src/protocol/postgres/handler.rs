@@ -1746,11 +1746,8 @@ where
             }
 
             // Send parameter status messages
-            self.send_parameter_status(
-                "server_version",
-                &format!("16.0 (HeliosDB Nano {})", env!("CARGO_PKG_VERSION")),
-            )
-            .await?;
+            self.send_parameter_status("server_version", &crate::sql::params::pg_server_version_string())
+                .await?;
             self.send_parameter_status("server_encoding", "UTF8").await?;
             self.send_parameter_status("client_encoding", "UTF8").await?;
             self.send_parameter_status("DateStyle", "ISO, MDY").await?;
@@ -3179,6 +3176,12 @@ where
         } else if starts_with_icase(trimmed, "SHOW ") && !crate::sql::Parser::is_show_branches(trimmed) {
             // Handle SHOW commands for client compatibility
             let param = trimmed[5..].trim().trim_end_matches(';').trim();
+            if param.eq_ignore_ascii_case("all") {
+                let (schema, rows) = self.show_all_result();
+                self.send_query_result(&schema, &rows).await?;
+                self.send_ready_for_query().await?;
+                return Ok(());
+            }
             let (col_name, value) = if param.eq_ignore_ascii_case("synchronous_commit") {
                 // R1.3-p2: effective per-session value.
                 let effective = self
@@ -3404,6 +3407,7 @@ where
                     // next client chooses a branch.
                     self.database.reset_session_branch(self.session_id);
                     // Reset session GUCs to their defaults.
+                    self.database.reset_session_gucs(self.session_id);
                     let _ = self.database.set_session_synchronous_commit(self.session_id, None);
                     let _ = self.database.set_session_fast_autocommit(self.session_id, false);
                     // Back to `public` so a pooled connection can't inherit the
@@ -4703,6 +4707,17 @@ where
         if let Some(unconfirmed) = crate::storage::replication_wait::take_unconfirmed() {
             return Err(Error::transaction(unconfirmed));
         }
+        // v07.3: notices the engine raised for this statement (the
+        // partitioning WARNING) go out before its CommandComplete, on the
+        // simple and the extended protocol alike.
+        for notice in self.database.take_statement_notices(self.session_id) {
+            self.send_message(BackendMessage::NoticeResponse {
+                severity: notice.severity,
+                code: notice.code,
+                message: notice.message,
+            })
+            .await?;
+        }
         self.send_message(BackendMessage::CommandComplete { tag: tag.to_string() })
             .await
     }
@@ -5009,54 +5024,26 @@ where
     fn resolve_show_parameter(param: &str) -> Result<(String, String)> {
         let param_lower = param.to_lowercase();
         let col = param_lower.clone();
+        // v07.1 / v07.2: the fixed compatibility answers (version, encodings,
+        // locale, isolation, read-only, hot standby) come from the ONE registry
+        // `current_setting()` and `pg_settings` read, so the surfaces agree.
+        let canonical = match param_lower.as_str() {
+            "transaction isolation level" => "transaction_isolation",
+            "time zone" => "timezone",
+            other => other,
+        };
+        if let Some(value) = crate::sql::params::fixed_value(canonical) {
+            return Ok((col, value));
+        }
         let val = match param_lower.as_str() {
-            "server_version" => format!("16.0 (HeliosDB Nano {})", env!("CARGO_PKG_VERSION")),
-            "server_encoding" => "UTF8".to_string(),
-            "client_encoding" => "UTF8".to_string(),
-            "standard_conforming_strings" => "on".to_string(),
-            "transaction_isolation" | "transaction isolation level" => "read committed".to_string(),
-            "datestyle" => "ISO, MDY".to_string(),
-            "timezone" | "time zone" => "UTC".to_string(),
-            "integer_datetimes" => "on".to_string(),
             // `max_connections` is answered by `resolve_session_show_parameter`
             // from the listener's real limit (GH#28) — never a literal.
-            "lc_collate" => "en_US.UTF-8".to_string(),
-            "lc_ctype" => "en_US.UTF-8".to_string(),
             "search_path" => "\"$user\", public".to_string(),
-            "default_transaction_isolation" => "read committed".to_string(),
-            "is_superuser" => "on".to_string(),
-            // Answered because the ERROR below would otherwise BREAK a
-            // connection: libpq's `target_session_attrs=read-write` (and
-            // tokio-postgres' / JDBC's equivalents) probe exactly this name
-            // while choosing a host, and treat a failed probe as a failed
-            // connection. "off" is the truth, not a placeholder: nothing in
-            // this engine makes a session read-only — `BEGIN READ ONLY` is
-            // classified as a plain `BEGIN` and no write path consults a
-            // read-only flag. It used to answer the empty string, which libpq
-            // happened to read as "not read-only" by accident.
-            //
-            // Spec P1.3: on a physical standby it is "on" — the truth there,
-            // every write is refused — so `target_session_attrs=read-write`
-            // skips a standby exactly as it skips a PostgreSQL hot standby.
-            //
-            // Spec P5.1 §11.E: so it is on a primary a promoted standby fenced
-            // (the session resolver answers first, from the engine's gate too).
-            "transaction_read_only" | "default_transaction_read_only" => {
-                if crate::standby_posture::in_recovery(None) || crate::standby_posture::is_fenced() {
-                    "on".to_string()
-                } else {
-                    "off".to_string()
-                }
-            }
-            // Spec P1.3: the GUC behind the `in_hot_standby` ParameterStatus
-            // the startup burst reports.
-            "in_hot_standby" => {
-                if crate::standby_posture::in_recovery(None) {
-                    "on".to_string()
-                } else {
-                    "off".to_string()
-                }
-            }
+            // `transaction_read_only` / `default_transaction_read_only` and
+            // `in_hot_standby` are answered by `params::fixed_value` above:
+            // libpq's `target_session_attrs=read-write` probes them while
+            // choosing a host, and "on" on a standby (or a fenced primary) is
+            // what makes it skip one (Spec P1.3, P5.1 §11.E).
             // PostgreSQL's wording, verbatim (guc.c), so a client's own error
             // matching keeps working. `sqlstate_for_query_execution_message`
             // maps it to 42704 undefined_object.
@@ -5187,6 +5174,19 @@ where
             // connection (e.g. `X25519MLKEM768` vs classical `X25519`), or
             // empty on a plaintext connection.
             "ssl_key_exchange" => self.tls_kx_group.clone().unwrap_or_default(),
+            // THIS session's path, as the simple-query `SHOW search_path` arm
+            // renders it (so `SHOW ALL` agrees with it).
+            "search_path" => {
+                let mut path = self.database.session_search_path(self.session_id).unwrap_or_default();
+                if path.is_empty() {
+                    "\"$user\", public".to_string()
+                } else {
+                    if !path.iter().any(|s| s == "public") {
+                        path.push("public".to_string());
+                    }
+                    path.join(", ")
+                }
+            }
             // sprinter a3077a3f68d8: a user-settable GUC — THIS session's value.
             //
             // The static compatibility table below KEEPS priority for the names
@@ -5207,13 +5207,56 @@ where
             // would never give for a parameter it has.
             _ => match Self::resolve_show_parameter(param) {
                 Ok(pair) => return Ok(pair),
-                Err(unknown) => match self.database.session_show_guc(self.session_id, &lower) {
+                Err(unknown) => match self
+                    .database
+                    .session_show_guc(self.session_id, &lower)
+                    // v07.2: a server-level name (`shared_buffers`, ...) the
+                    // embedded path always answered, and the wire gave 42704.
+                    .or_else(|| self.database.server_show_value(&lower))
+                {
                     Some(value) => value,
                     None => return Err(unknown),
                 },
             },
         };
         Ok((lower, value))
+    }
+
+    /// v07.2: `SHOW ALL` on the wire — `name, setting, description` for every
+    /// parameter the registry lists, each value from the same per-connection
+    /// resolver `SHOW <name>` uses, so the two cannot disagree.
+    pub(super) fn show_all_result(&self) -> (Schema, Vec<Tuple>) {
+        let rows = crate::sql::params::show_all_rows(|name| {
+            self.resolve_session_show_parameter(name).ok().map(|(_, value)| value)
+        })
+        .into_iter()
+        .map(|(name, setting, description)| {
+            Tuple::new(vec![
+                Value::String(name),
+                Value::String(setting),
+                Value::String(description),
+            ])
+        })
+        .collect();
+        (Self::show_all_schema(), rows)
+    }
+
+    /// The `SHOW ALL` row shape.
+    pub(super) fn show_all_schema() -> Schema {
+        Schema::new(vec![
+            crate::Column::new("name", crate::DataType::Text),
+            crate::Column::new("setting", crate::DataType::Text),
+            crate::Column::new("description", crate::DataType::Text),
+        ])
+    }
+
+    /// True for `SHOW ALL`.
+    pub(super) fn is_show_all(sql: &str) -> bool {
+        let trimmed = sql.trim();
+        starts_with_icase(trimmed, "SHOW ")
+            && trimmed
+                .get(5..)
+                .is_some_and(|rest| rest.trim().trim_end_matches(';').trim().eq_ignore_ascii_case("all"))
     }
 
     /// This connection's SQL identity for the reporting surfaces (HDB-009): the

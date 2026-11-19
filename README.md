@@ -815,12 +815,13 @@ Optional HA features (opt-in at compile time):
 | Flag | Description |
 |------|-------------|
 | `ha-tier1` | Physical standby — **enabled by default** |
-| `ha-tier2` | Multi-primary: branch-based active-active |
-| `ha-tier3` | Sharding: consistent hash ring |
-| `ha-dedup` | Content-addressed deduplication across nodes |
 | `ha-ab-testing` | Branch-based experiment routing |
-| `ha-branch-replication` | Selective branch sync to remote servers |
-| `ha-full` | All optional HA features bundled |
+| `ha-full` | `ha-tier1` + `ha-ab-testing` (plus the deprecated names below) |
+| `ha-tier2`, `ha-tier3`, `ha-dedup`, `ha-branch-replication` | Deprecated: select nothing beyond `ha-tier1`; kept so existing builds work |
+
+Multi-primary replication and sharding are on the roadmap; no release contains
+them. `SELECT * FROM heliosdb_features` (or `\version` in the shell) lists what a
+binary really contains.
 
 ```bash
 cargo build --release --features ha-full    # everything
@@ -916,7 +917,7 @@ ORT_LIB_PATH=/opt/onnxruntime-linux-x64-1.24.4/lib ORT_PREFER_DYNAMIC_LINK=1 \
 cargo build --release --no-default-features \
   --features "fips,encryption,vector-search,ha-tier1"
 
-# Full HA bundle — multi-primary + sharding + dedup + branch replication.
+# HA bundle — physical standby + A/B experiment routing.
 cargo build --release --features "ha-full"
 ```
 

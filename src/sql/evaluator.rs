@@ -1001,10 +1001,7 @@ impl Evaluator {
             "similar_to_escape" => self.similar_to_escape_fn(&arg_values),
 
             // PostgreSQL compatibility functions (SQLAlchemy, psql, pgAdmin, DBeaver)
-            "version" | "pg_catalog.version" => Ok(Value::String(format!(
-                "PostgreSQL 16.0 (HeliosDB Nano {})",
-                env!("CARGO_PKG_VERSION")
-            ))),
+            "version" | "pg_catalog.version" => Ok(Value::String(crate::sql::params::pg_version_function_string())),
             // Session-aware: the effective current schema is the first
             // `search_path` entry the session installed (threaded via the
             // per-statement thread-local both the wire and embedded paths set),
@@ -1397,78 +1394,25 @@ impl Evaluator {
                     }
                 };
                 let missing_ok = matches!(arg_values.get(1), Some(Value::Boolean(true)));
+                // v07.2: ONE registry (`sql::params`) answers every name `SHOW`,
+                // `SHOW ALL` and `pg_settings` answer, with the same value:
+                // the fixed compatibility names, this session's overrides of
+                // the user-settable GUCs (read off the per-statement session
+                // backend, never the process-global registry), the server-level
+                // values of the engine this statement runs on, and the
+                // per-session identity / path / branch. An UNREGISTERED name is
+                // still `None`, so the 42704 / `missing_ok` behaviour for a GUC
+                // this server does not know is unchanged.
                 let value = match name.as_str() {
-                    // Server identity
-                    "server_version" => Some("17.0".to_string()),
-                    "server_version_num" => Some("170000".to_string()),
-                    // Encoding / locale (default UTF-8 / C)
-                    "client_encoding" | "server_encoding" => Some("UTF8".to_string()),
-                    "lc_collate" | "lc_ctype" | "lc_messages" | "lc_monetary" | "lc_numeric" | "lc_time" => {
-                        Some("C".to_string())
-                    }
-                    "datestyle" => Some("ISO, MDY".to_string()),
-                    "timezone" => Some("UTC".to_string()),
-                    "standard_conforming_strings" => Some("on".to_string()),
-                    "integer_datetimes" => Some("on".to_string()),
-                    // Trivia some clients probe
-                    "is_superuser" => Some("on".to_string()),
-                    // HDB-009: the session's real login identity, not a
-                    // hardcoded `postgres` that contradicted `current_user`.
-                    "session_authorization" | "current_user" | "current_role" => Some(Self::session_identity()),
-                    // sprinter f4f5d450e816: the session's own `application_name`
-                    // — set by `SET`, by `SET LOCAL`, or (the way every driver
-                    // actually does it) by the PostgreSQL startup packet. Read
-                    // from the per-statement session backend for the same reason
-                    // `current_user` above is: this evaluator has no session
-                    // handle, and the process-global `SessionSettings` registry
-                    // would answer connection A with connection B's value.
-                    //
-                    // The default is the EMPTY STRING, not a missing setting: a
-                    // stock PostgreSQL prints a blank line for
-                    // `SHOW application_name`, it does not raise 42704.
-                    "application_name" => Some(
-                        crate::session_scoped_state_tls()
-                            .map(|state| state.application_name())
-                            .unwrap_or_default(),
-                    ),
-                    // The session's own path, as `SHOW search_path` renders it.
-                    "search_path" => {
-                        let mut path = crate::session_search_path_tls();
-                        Some(if path.is_empty() {
-                            "\"$user\", public".to_string()
-                        } else {
-                            if !path.iter().any(|schema| schema == "public") {
-                                path.push("public".to_string());
-                            }
-                            path.join(", ")
-                        })
-                    }
-                    // sprinter 6bc4a4040eb7 (B1): THIS session's branch — the
-                    // same binding `USE BRANCH`, `SET heliosdb.branch` and the
-                    // PostgreSQL startup forms write, read from the per-statement
-                    // session backend for the reason `application_name` is.
-                    // `main` when the session is on none.
+                    // Not GUCs in PostgreSQL either, but probed through here.
+                    "current_user" | "current_role" => Some(Self::session_identity()),
+                    // sprinter 6bc4a4040eb7 (B1): THIS session's branch.
                     "heliosdb.branch" => Some(crate::statement_branch_name_tls().unwrap_or_else(|| {
                         crate::session_scoped_state_tls()
                             .and_then(|state| state.branch_binding())
                             .map_or_else(|| "main".to_string(), |binding| binding.name.clone())
                     })),
-                    // sprinter a3077a3f68d8: every USER-SETTABLE GUC —
-                    // `statement_timeout`, `work_mem`, `bulk_load_mode`, the
-                    // planner switches. THIS session's override if it set one,
-                    // else the registry default, read for the same reason
-                    // `application_name` above is: the evaluator holds no session
-                    // handle, and the process-global registry would answer
-                    // connection A with connection B's value.
-                    //
-                    // An UNREGISTERED name still falls through to `None`, so the
-                    // 42704 / `missing_ok` behaviour for a GUC this server does
-                    // not know is byte-unchanged.
-                    _ if crate::sql::is_user_settable(&name) => crate::session_guc_tls(&name)
-                        .or_else(|| crate::sql::default_value(&name))
-                        .as_ref()
-                        .map(crate::sql::render_value),
-                    _ => None,
+                    other => crate::sql::params::current_value(other),
                 };
                 match value {
                     Some(v) => Ok(Value::String(v)),

@@ -12,12 +12,14 @@ pub mod constraints;
 pub(crate) mod default_volatility; // Spec R5.2: a column DEFAULT's volatility, and its one evaluation rule
 pub mod evaluator;
 pub mod executor;
+pub mod features;
 pub mod functions;
 pub mod interpolate; // Shared `$`-placeholder scanner + SQL-literal renderer for routine bodies
 pub mod logical_plan;
 pub(crate) mod mv_destamp; // Materialized-view plans: derived-alias stamps rewritten away before persistence (GH#29 c3)
 pub(crate) mod normalize;
 pub mod numeric_special; // PG NaN/±Infinity semantics for String-backed Value::Numeric
+pub mod params;
 pub mod parser;
 pub mod planner;
 pub mod procedural;

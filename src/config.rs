@@ -1020,6 +1020,19 @@ pub struct StorageConfig {
     ///
     /// Default: `Warn`.
     pub serializable_policy: SerializablePolicy,
+    /// v07.3: what to do with partitioning DDL (`CREATE TABLE … PARTITION BY`,
+    /// `CREATE TABLE … PARTITION OF`, `ALTER TABLE … ATTACH/DETACH PARTITION`,
+    /// `ALTER INDEX … ATTACH PARTITION`).
+    ///
+    /// Partitioning is accepted as SCHEMA ONLY: rows are not routed to
+    /// partitions, a parent does not read its partitions, and bounds are not
+    /// enforced (docs/compatibility/partitioning.md). Like
+    /// [`Self::serializable_policy`] there is no silent value:
+    ///
+    /// * `"warn"` (default) — accept the statement and say so: a PostgreSQL
+    ///   `WARNING` notice on the wire plus a server-log `WARN` line;
+    /// * `"error"` — refuse it with SQLSTATE 0A000; nothing is created.
+    pub partition_policy: PartitionPolicy,
     /// Slow query log threshold in milliseconds (None to disable)
     ///
     /// Queries exceeding this threshold are logged at WARN level with their
@@ -1475,6 +1488,7 @@ impl Default for StorageConfig {
             // #103: warn (never silently accept) that SERIALIZABLE is served
             // as snapshot isolation. `"error"` refuses it instead.
             serializable_policy: SerializablePolicy::Warn,
+            partition_policy: PartitionPolicy::Warn,
             slow_query_threshold_ms: Some(1000), // 1 second default
             logical_wal_per_statement: false,    // rely on RocksDB WAL at commit (see field docs)
             wal_checkpoint_on_close: true,       // GH#35: a clean close leaves nothing to redo
@@ -1768,6 +1782,39 @@ impl<'de> Deserialize<'de> for SerializablePolicy {
             )),
             other => Err(serde::de::Error::custom(format!(
                 "invalid storage.serializable_policy '{}': expected \"warn\" or \"error\"",
+                other
+            ))),
+        }
+    }
+}
+
+/// v07.3: how partitioning DDL is answered (`storage.partition_policy`). See
+/// [`StorageConfig::partition_policy`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PartitionPolicy {
+    /// Default. Accept the statement (schema only) and warn.
+    Warn,
+    /// Refuse the statement with SQLSTATE 0A000; nothing is created.
+    Error,
+}
+
+impl<'de> Deserialize<'de> for PartitionPolicy {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        match raw.as_str() {
+            "warn" => Ok(PartitionPolicy::Warn),
+            "error" => Ok(PartitionPolicy::Error),
+            "silent" | "accept" | "off" => Err(serde::de::Error::custom(
+                "storage.partition_policy has no silent-accept value: partitioning is accepted as \
+                 schema only (rows are not routed), so it is always reported. Use \"warn\" (the \
+                 default) or \"error\"",
+            )),
+            other => Err(serde::de::Error::custom(format!(
+                "invalid storage.partition_policy '{}': expected \"warn\" or \"error\"",
                 other
             ))),
         }
@@ -3446,6 +3493,17 @@ redirect_uri = "http://localhost:8080/auth/v1/callback"
         // The default must never be "accept silently": a client asking for a
         // level the engine does not implement has to be told.
         assert_eq!(StorageConfig::default().serializable_policy, SerializablePolicy::Warn);
+    }
+
+    #[test]
+    fn partition_policy_defaults_to_warn_and_rejects_unknown_values() {
+        assert_eq!(StorageConfig::default().partition_policy, PartitionPolicy::Warn);
+        let config = Config::from_toml_str("[storage]\npartition_policy = \"error\"\n").expect("parse");
+        assert_eq!(config.storage.partition_policy, PartitionPolicy::Error);
+        let err = Config::from_toml_str("[storage]\npartition_policy = \"accept\"\n").expect_err("no silence");
+        assert!(err.to_string().contains("silent-accept"), "{}", err);
+        let err = Config::from_toml_str("[storage]\npartition_policy = \"wran\"\n").expect_err("typo");
+        assert!(err.to_string().contains("partition_policy"), "{}", err);
     }
 
     #[test]

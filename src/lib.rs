@@ -292,17 +292,10 @@ pub mod mcp;
 // #[cfg(feature = "sync-experimental")]
 // pub mod sync;
 
-// High Availability modules (require HA feature flags)
-// Tier 1: Warm Standby (Active-Passive replication)
-// Tier 2: Multi-Primary (Branch-based Active-Active)
-// Tier 3: Sharding (Horizontal scaling)
-#[cfg(any(
-    feature = "ha-tier1",
-    feature = "ha-tier2",
-    feature = "ha-tier3",
-    feature = "ha-dedup",
-    feature = "ha-branch-replication"
-))]
+// High Availability: physical standby replication (ha-tier1). The deprecated
+// ha-tier2 / ha-tier3 / ha-dedup / ha-branch-replication features imply
+// ha-tier1 and select nothing else (v07.6).
+#[cfg(feature = "ha-tier1")]
 pub mod replication;
 
 // Spec P1.3: a physical standby's posture. Compiled in every build because the
@@ -339,7 +332,8 @@ mod embedded_db_dump;
 
 // Re-exports
 pub use config::{
-    Config, KeySource, ProfileConfig, SerializablePolicy, SnapshotSchemaEvolution, ZkeEncryptionConfig, ZkeMode,
+    Config, KeySource, PartitionPolicy, ProfileConfig, SerializablePolicy, SnapshotSchemaEvolution,
+    ZkeEncryptionConfig, ZkeMode,
 };
 pub use crypto::{
     NonceTracker, TimestampValidator, ZeroKnowledgeSession, ZkeConfig, ZkeDerivedKeys, ZkeKeyDerivation,
@@ -1545,6 +1539,12 @@ pub struct SessionNotice {
     /// Primary message text.
     pub message: String,
 }
+
+/// v07.3: the ONE wording of what partitioning DDL does here (the notice, the
+/// log line and the refusal).
+pub const PARTITIONING_IS_SCHEMA_ONLY: &str = "partitioning is accepted as schema only: rows are not routed to \
+     partitions, a partitioned table does not read its partitions, and partition bounds are not enforced \
+     (see docs/compatibility/partitioning.md)";
 
 /// #103: the ONE place the SERIALIZABLE-is-snapshot-isolation truth is worded.
 ///
@@ -3487,12 +3487,19 @@ impl EmbeddedDatabase {
                 Ok((Vec::new(), Self::empty_result_schema()))
             }
             DbSettingStatement::Show { .. } => {
-                let value = state
-                    .and_then(|s| s.guc(name))
-                    .or_else(|| self.session_settings.get(name))
-                    .as_ref()
-                    .map(sql::render_value)
-                    .unwrap_or_default();
+                // v07.2: a compatibility name this engine does not vary
+                // (`timezone`, `datestyle`, `client_encoding`,
+                // `transaction_isolation`, ...) answers its fixed value, as the
+                // wire and `current_setting()` do; the shadowed `SET` is not
+                // reported as though it were in force.
+                let value = sql::params::fixed_value(name).unwrap_or_else(|| {
+                    state
+                        .and_then(|s| s.guc(name))
+                        .or_else(|| self.session_settings.get(name))
+                        .as_ref()
+                        .map(sql::render_value)
+                        .unwrap_or_default()
+                });
                 Ok((
                     vec![Tuple {
                         values: vec![Value::String(value)],
@@ -3919,6 +3926,36 @@ impl EmbeddedDatabase {
         Some(sql::render_value(&value))
     }
 
+    /// v07.2: the handle's SERVER-level registry, seeded from the config and
+    /// published by engine instance so the storage-less readers
+    /// (`current_setting`, `pg_settings`) see the value `SHOW` sees.
+    fn new_server_settings(config: &Config, storage: &storage::StorageEngine) -> sql::SessionSettings {
+        let settings = sql::SessionSettings::new();
+        let limit = i64::try_from(config.server.max_connections).unwrap_or(i64::MAX);
+        settings.seed("max_connections", sql::SettingValue::Integer(limit));
+        sql::params::publish_server_settings(storage.instance_id(), &settings);
+        settings
+    }
+
+    /// v07.2: the PostgreSQL listener's real connection limit, so
+    /// `pg_settings` and `current_setting('max_connections')` agree with
+    /// `SHOW max_connections` on the wire.
+    pub(crate) fn publish_listener_limit(&self, max_connections: usize) {
+        let limit = i64::try_from(max_connections).unwrap_or(i64::MAX);
+        self.session_settings
+            .seed("max_connections", sql::SettingValue::Integer(limit));
+    }
+
+    /// v07.2: `SHOW <server-level name>` on the wire (`shared_buffers`,
+    /// `time_travel_enabled`, ...), which used to be 42704 there although the
+    /// embedded path answered it. `None` for a name that is not server-level.
+    pub(crate) fn server_show_value(&self, name: &str) -> Option<String> {
+        if !sql::is_server_level(name) {
+            return None;
+        }
+        self.session_settings.get(name).as_ref().map(sql::render_value)
+    }
+
     /// The registry name a `SHOW` target maps to, when it is a user-settable GUC.
     fn show_guc_name(name: &str) -> Option<&'static str> {
         let name = match name {
@@ -3931,6 +3968,15 @@ impl EmbeddedDatabase {
             .iter()
             .copied()
             .find(|candidate| *candidate == name && sql::is_user_settable(candidate))
+    }
+
+    /// `DISCARD ALL` / `RESET ALL` on a wire session: every user-settable GUC
+    /// (`row_security`, ...) back to the server default.
+    pub(crate) fn reset_session_gucs(&self, session_id: crate::session::SessionId) {
+        if let Ok(session_lock) = self.session_manager.get_session(session_id) {
+            let scoped = std::sync::Arc::clone(&session_lock.read().scoped);
+            scoped.reset_all_gucs();
+        }
     }
 
     /// This session's override for a user-settable GUC, read off its backend.
@@ -4135,12 +4181,22 @@ impl EmbeddedDatabase {
                 Ok(Some((Vec::new(), Self::empty_result_schema())))
             }
             DbSettingStatement::Show { name } => {
-                let Some(value) = self.session_settings.get(&name) else {
-                    return Ok(None);
+                // v07.2: `SHOW ALL` and every known name read the ONE registry
+                // (`sql::params`), the same reader `current_setting()` and
+                // `pg_settings` use.
+                if name == "all" {
+                    return Ok(Some(Self::show_all_result()));
+                }
+                let value = match self.session_settings.get(&name) {
+                    Some(value) if sql::is_server_level(&name) => sql::render_value(&value),
+                    _ => match sql::params::current_value(&name) {
+                        Some(value) => value,
+                        None => return Ok(None),
+                    },
                 };
                 Ok(Some((
                     vec![Tuple {
-                        values: vec![Value::String(value.as_string())],
+                        values: vec![Value::String(value)],
                         row_id: None,
                         branch_id: None,
                     }],
@@ -4155,6 +4211,26 @@ impl EmbeddedDatabase {
                 Ok(Some((Vec::new(), Self::empty_result_schema())))
             }
         }
+    }
+
+    /// `SHOW ALL`: `name, setting, description` for every known parameter.
+    fn show_all_result() -> (Vec<Tuple>, std::sync::Arc<Schema>) {
+        let rows = sql::params::show_all_rows(sql::params::current_value)
+            .into_iter()
+            .map(|(name, setting, description)| {
+                Tuple::new(vec![
+                    Value::String(name),
+                    Value::String(setting),
+                    Value::String(description),
+                ])
+            })
+            .collect();
+        let schema = std::sync::Arc::new(Schema::new(vec![
+            Column::new("name", DataType::Text),
+            Column::new("setting", DataType::Text),
+            Column::new("description", DataType::Text),
+        ]));
+        (rows, schema)
     }
 
     fn prepared_statement_key(&self, name: &str) -> (i32, String) {
@@ -6078,7 +6154,93 @@ impl EmbeddedDatabase {
         if !sql::Parser::is_partition_attach_detach_statement(sql) {
             return Ok(None);
         }
+        // v07.3: `storage.partition_policy = "error"` refuses before anything
+        // happens; `"warn"` queues the WARNING notice.
+        self.admit_partition_ddl()?;
+        let Some(statement) = sql::Parser::parse_partition_attach_detach(sql) else {
+            // A shape whose names this reader cannot split stays the
+            // schema-only no-op it always was (the notice says so).
+            return Ok(Some(0));
+        };
+        if statement.is_index {
+            // `ALTER INDEX … ATTACH PARTITION`: indexes are not partitioned here.
+            return Ok(Some(0));
+        }
+        let catalog = self.storage.catalog();
+        let planner = sql::Planner::with_catalog(&catalog)
+            .with_current_schema(self.current_schema())
+            .with_search_path(self.current_search_path());
+        let parent = planner.resolve_partition_name(&statement.parent);
+        if !catalog.table_exists(&parent)? {
+            if statement.if_exists {
+                return Ok(Some(0));
+            }
+            return Err(Error::query_execution(format!(
+                "relation \"{}\" does not exist",
+                statement.parent.trim_matches('"')
+            )));
+        }
+        let child = planner.resolve_partition_name(&statement.child);
+        if !catalog.table_exists(&child)? {
+            return Err(Error::query_execution(format!(
+                "relation \"{}\" does not exist",
+                statement.child.trim_matches('"')
+            )));
+        }
+        if statement.detach {
+            // The data-loss fix: unlink the child from the DROP cascade, in one
+            // DDL write group. ATTACH deliberately registers nothing (an
+            // attached table outside the cascade is the safe side).
+            let mut ddl = storage::DdlBatch::new(&self.storage);
+            if catalog.stage_partition_detach(&parent, &child, &mut ddl)? {
+                ddl.commit()?.wait_replicated();
+            }
+        }
         Ok(Some(0))
+    }
+
+    /// v07.3: the one gate for partitioning DDL (`CREATE TABLE … PARTITION BY`,
+    /// `CREATE TABLE … PARTITION OF`, `ALTER TABLE … ATTACH/DETACH PARTITION`,
+    /// `ALTER INDEX … ATTACH PARTITION`). Partitioning is accepted as schema
+    /// only; `storage.partition_policy` decides whether that is refused
+    /// (0A000, nothing created) or accepted with a WARNING the PostgreSQL
+    /// listener delivers before the statement's CommandComplete.
+    fn admit_partition_ddl(&self) -> Result<()> {
+        match self.storage.config().storage.partition_policy {
+            crate::config::PartitionPolicy::Error => Err(Error::query_execution(format!(
+                "partitioning DDL {} (storage.partition_policy = \"error\"): {} Set \
+                 storage.partition_policy = \"warn\" to accept it as schema only",
+                crate::error::UNSUPPORTED_STATEMENT_KIND_MARKER,
+                PARTITIONING_IS_SCHEMA_ONLY
+            ))),
+            crate::config::PartitionPolicy::Warn => {
+                tracing::warn!("{}", PARTITIONING_IS_SCHEMA_ONLY);
+                if let Some(state) = crate::session_scoped_state_tls() {
+                    state.push_notice(SessionNotice {
+                        severity: "WARNING".to_string(),
+                        code: "01000".to_string(),
+                        message: PARTITIONING_IS_SCHEMA_ONLY.to_string(),
+                    });
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// v07.3: the notices the engine queued on `session_id`'s backend for the
+    /// statement that just ran (empty, after one relaxed load, when nothing
+    /// anywhere is queued).
+    pub(crate) fn take_statement_notices(&self, session_id: crate::session::SessionId) -> Vec<SessionNotice> {
+        if !crate::session::scoped::statement_notices_pending() {
+            return Vec::new();
+        }
+        match self.session_manager.get_session(session_id) {
+            Ok(session) => {
+                let scoped = std::sync::Arc::clone(&session.read().scoped);
+                scoped.take_notices()
+            }
+            Err(_) => Vec::new(),
+        }
     }
 
     /// Every pre-parse utility interceptor of [`execute`](Self::execute), in
@@ -9783,6 +9945,9 @@ impl EmbeddedDatabase {
     }
 
     fn execute_create_table_plan(&self, plan: &sql::LogicalPlan, original_sql: Option<&str>) -> Result<u64> {
+        if original_sql.is_some_and(sql::Parser::is_partition_create) {
+            self.admit_partition_ddl()?;
+        }
         let (name, columns, constraints, if_not_exists) = match plan {
             sql::LogicalPlan::CreateTable {
                 name,
@@ -13124,6 +13289,7 @@ impl EmbeddedDatabase {
         // and installs the UDF invocation bridge. It runs here, not beside
         // `sequences::install_persistence` above, because it needs the finished
         // handle (it captures a `clone_for_trigger()` of it).
+        let session_settings = Self::new_server_settings(&config, &storage);
         Self {
             storage,
             config,
@@ -13149,7 +13315,7 @@ impl EmbeddedDatabase {
             prepared_fast_selects: std::sync::Arc::new(parking_lot::RwLock::new(
                 std::collections::HashMap::new(),
             )),
-            session_settings: sql::SessionSettings::new(),
+            session_settings,
             current_schema: std::sync::Arc::new(parking_lot::RwLock::new(None)),
             search_path: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
             current_schema_set: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -13282,6 +13448,7 @@ impl EmbeddedDatabase {
         // and installs the UDF invocation bridge. It runs here, not beside
         // `sequences::install_persistence` above, because it needs the finished
         // handle (it captures a `clone_for_trigger()` of it).
+        let session_settings = Self::new_server_settings(&config, &storage);
         Self {
             storage,
             config,
@@ -13307,7 +13474,7 @@ impl EmbeddedDatabase {
             prepared_fast_selects: std::sync::Arc::new(parking_lot::RwLock::new(
                 std::collections::HashMap::new(),
             )),
-            session_settings: sql::SessionSettings::new(),
+            session_settings,
             current_schema: std::sync::Arc::new(parking_lot::RwLock::new(None)),
             search_path: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
             current_schema_set: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -13603,6 +13770,7 @@ impl EmbeddedDatabase {
         // and installs the UDF invocation bridge. It runs here, not beside
         // `sequences::install_persistence` above, because it needs the finished
         // handle (it captures a `clone_for_trigger()` of it).
+        let session_settings = Self::new_server_settings(&config, &storage);
         Self {
             storage,
             config,
@@ -13622,7 +13790,7 @@ impl EmbeddedDatabase {
             prepared_statements: std::sync::Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
             prepared_statement_sql: std::sync::Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
             prepared_fast_selects: std::sync::Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
-            session_settings: sql::SessionSettings::new(),
+            session_settings,
             current_schema: std::sync::Arc::new(parking_lot::RwLock::new(None)),
             search_path: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
             current_schema_set: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -31763,6 +31931,9 @@ impl EmbeddedDatabase {
         let Some((using_str, with_check_str)) = self.tenant_manager.get_rls_conditions(table_name, cmd) else {
             return Ok(None);
         };
+        if !self.row_security_applies(table_name)? {
+            return Ok(None);
+        }
 
         let tenant_context = self.effective_tenant_context();
         let evaluator = tenant::RLSExpressionEvaluator::new(std::sync::Arc::new(schema.clone()), tenant_context);
@@ -33109,6 +33280,10 @@ impl EmbeddedDatabase {
     /// # }
     /// ```
     #[cfg(feature = "server")]
+    #[deprecated(
+        since = "4.42.0",
+        note = "not needed: the per-tenant QPS window is evaluated lazily in the quota check"
+    )]
     pub fn start_qps_reset_task(&self) -> tokio::task::JoinHandle<()> {
         let tenant_manager = self.tenant_manager.clone();
 
@@ -34120,9 +34295,53 @@ impl EmbeddedDatabase {
         let Some((using_expr, _)) = self.tenant_manager.get_rls_conditions(table_name, "SELECT") else {
             return Ok(None);
         };
+        if !self.row_security_applies(table_name)? {
+            return Ok(None);
+        }
         let tenant_context = self.effective_tenant_context();
         let rls_evaluator = tenant::RLSExpressionEvaluator::new(schema.clone(), tenant_context);
         Ok(Some(rls_evaluator.parse(&using_expr)?))
+    }
+
+    /// `row_security` (PostgreSQL's GUC; `SET row_security = off` is the
+    /// first line of every pg_dump script). Called only once a policy is known
+    /// to apply to `table_name` for this statement:
+    ///
+    /// * on (the default): `Ok(true)` — the policy filters / checks as always;
+    /// * off, for a session that bypasses RLS (no login identity — the
+    ///   embedded API and the REPL, which run as the process owner — the
+    ///   built-in `postgres` / `helios` roles, or a role with SUPERUSER or
+    ///   BYPASSRLS): `Ok(false)` — the policy is not applied, as PostgreSQL
+    ///   does for such a role;
+    /// * off, for any other role: PostgreSQL's 42501 "query would be affected
+    ///   by row-level security policy" — never silently filtered rows, and
+    ///   never silently unfiltered ones.
+    fn row_security_applies(&self, table_name: &str) -> Result<bool> {
+        if sql::params::row_security_enabled() {
+            return Ok(true);
+        }
+        if self.session_bypasses_rls() {
+            return Ok(false);
+        }
+        // `ConstraintViolation` with "row-level security" in the text is what
+        // `sqlstate_for_error` reports as 42501, like the WITH CHECK refusal.
+        Err(Error::ConstraintViolation(format!(
+            "query would be affected by row-level security policy for table \"{table_name}\""
+        )))
+    }
+
+    /// Does the role running this statement bypass row-level security?
+    fn session_bypasses_rls(&self) -> bool {
+        let Some(login) = crate::session_login_user_tls() else {
+            return true;
+        };
+        if &*login == "postgres" || &*login == "helios" {
+            return true;
+        }
+        matches!(
+            self.storage.catalog().get_role(&login),
+            Ok(Some(role)) if role.rolsuper || role.rolbypassrls
+        )
     }
 
     /// Recursively apply RLS to all Scan operators in a plan

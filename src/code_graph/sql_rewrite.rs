@@ -87,13 +87,97 @@ pub fn rewrite_lsp_calls(sql: &str) -> String {
 }
 
 fn contains_lsp_ignore_case(s: &str) -> bool {
-    // Simple ASCII-lowercase scan — allocates once, worth it to keep
-    // the hot no-op path cheap on long queries.
-    let l = s.to_ascii_lowercase();
-    l.contains("lsp_definition")
-        || l.contains("lsp_references")
-        || l.contains("lsp_call_hierarchy")
-        || l.contains("lsp_hover")
+    // v07.8: allocation-free prefilter (most statements never mention it);
+    // `find_lsp_call` then decides, outside literals and comments.
+    s.as_bytes().windows(4).any(|w| w.eq_ignore_ascii_case(b"lsp_"))
+}
+
+/// v07.8: `s` lower-cased with every byte inside a string literal, a quoted
+/// identifier, a dollar-quoted body, a `--` line comment or a `/* */` block
+/// comment (and every non-ASCII byte) replaced by a space. Byte offsets are
+/// unchanged, so a match in the result is a match in `s` that is real SQL —
+/// text that merely MENTIONS `lsp_hover(` or `hdb_code.pause(` is never one.
+pub(crate) fn mask_non_code(s: &str) -> Vec<u8> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    let n = bytes.len();
+    while i < n {
+        let b = bytes.get(i).copied().unwrap_or(b' ');
+        let next = bytes.get(i + 1).copied();
+        let end = match b {
+            b'\'' | b'"' => {
+                // Up to the closing quote; a doubled quote is an escape.
+                let mut j = i + 1;
+                loop {
+                    match bytes.get(j) {
+                        None => break n,
+                        Some(&c) if c == b => {
+                            if bytes.get(j + 1) == Some(&b) {
+                                j += 2;
+                            } else {
+                                break j + 1;
+                            }
+                        }
+                        Some(_) => j += 1,
+                    }
+                }
+            }
+            b'-' if next == Some(b'-') => {
+                let mut j = i;
+                while j < n && bytes.get(j) != Some(&b'\n') {
+                    j += 1;
+                }
+                j
+            }
+            b'/' if next == Some(b'*') => {
+                let mut j = i + 2;
+                while j < n && !(bytes.get(j) == Some(&b'*') && bytes.get(j + 1) == Some(&b'/')) {
+                    j += 1;
+                }
+                (j + 2).min(n)
+            }
+            b'$' => {
+                // `$tag$ … $tag$` (the tag may be empty).
+                let mut j = i + 1;
+                while j < n && bytes.get(j).is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_') {
+                    j += 1;
+                }
+                if bytes.get(j) == Some(&b'$') && !bytes.get(i + 1).is_some_and(u8::is_ascii_digit) {
+                    let tag = &s.as_bytes()[i..=j];
+                    let body = j + 1;
+                    match s
+                        .as_bytes()
+                        .get(body..)
+                        .and_then(|rest| rest.windows(tag.len()).position(|w| w == tag))
+                    {
+                        Some(at) => body + at + tag.len(),
+                        None => n,
+                    }
+                } else {
+                    i + 1
+                }
+            }
+            _ => i + 1,
+        };
+        let masked = end > i + 1 || matches!(b, b'\'' | b'"');
+        for k in i..end.min(n) {
+            let c = bytes.get(k).copied().unwrap_or(b' ');
+            out.push(if masked || !c.is_ascii() {
+                b' '
+            } else {
+                c.to_ascii_lowercase()
+            });
+        }
+        i = end.max(i + 1);
+    }
+    out
+}
+
+/// Byte positions of every occurrence of `needle` in `hay`.
+fn find_all(hay: &[u8], needle: &[u8]) -> impl Iterator<Item = usize> + '_ {
+    let needle = needle.to_vec();
+    (0..hay.len().saturating_sub(needle.len() - 1)).filter(move |&i| hay.get(i..i + needle.len()) == Some(&needle[..]))
 }
 
 #[derive(Debug)]
@@ -256,8 +340,10 @@ fn parse_on_branch(rest: &str) -> Option<(String, usize)> {
 }
 
 fn find_lsp_call(s: &str) -> Option<Hit> {
-    // Scan for the earliest case-insensitive match of any `lsp_*(`.
-    let lower = s.to_ascii_lowercase();
+    // Scan for the earliest case-insensitive match of any `lsp_*(` that is
+    // real SQL — never one inside a literal, a quoted identifier or a comment
+    // (v07.8: stored text mentioning `lsp_hover(…)` was rewritten).
+    let lower = mask_non_code(s);
     let candidates: &[(Func, &str)] = &[
         (Func::Definition, "lsp_definition"),
         (Func::References, "lsp_references"),
@@ -266,7 +352,7 @@ fn find_lsp_call(s: &str) -> Option<Hit> {
     ];
     let mut best: Option<(usize, &Func, &str)> = None;
     for (func, name) in candidates {
-        if let Some(idx) = lower.find(name) {
+        for idx in find_all(&lower, name.as_bytes()) {
             // Require that what follows (after optional whitespace) is `(`.
             let after = &s[idx + name.len()..];
             let after_trim = after.trim_start();
@@ -289,6 +375,7 @@ fn find_lsp_call(s: &str) -> Option<Hit> {
                 Some((cur, _, _)) if cur <= idx => {}
                 _ => best = Some((idx, func, name)),
             }
+            break;
         }
     }
     let (idx, func, name) = best?;
@@ -483,6 +570,49 @@ fn expand_hover(args: &[String], as_of: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lsp_call_inside_string_literal_is_not_rewritten() {
+        for sql in [
+            "INSERT INTO notes VALUES ('see lsp_hover(42) for details')",
+            "SELECT \"lsp_definition(x)\" FROM t",
+            "SELECT 1 -- lsp_references(1)",
+            "SELECT 1 /* lsp_call_hierarchy(1, 1) */",
+            "SELECT $$ lsp_hover(1) $$",
+            "SELECT 'ŉ lsp_hover(1)'",
+        ] {
+            assert_eq!(rewrite_lsp_calls(sql), sql, "{sql}");
+        }
+    }
+
+    #[test]
+    fn real_lsp_call_after_a_literal_mention_is_still_rewritten() {
+        let out = rewrite_lsp_calls("SELECT 'lsp_hover(1)', * FROM lsp_hover(42)");
+        assert!(out.starts_with("SELECT 'lsp_hover(1)', * FROM ("), "{out}");
+    }
+
+    #[test]
+    fn pause_inside_literal_is_not_intercepted() {
+        assert_eq!(
+            detect_pause_resume("INSERT INTO notes VALUES ('call hdb_code.pause(''idx'') first')"),
+            None
+        );
+        assert_eq!(detect_pause_resume("SELECT 'hdb_code.pause(''idx'')'"), None);
+    }
+
+    #[test]
+    fn pause_requires_leading_select() {
+        assert_eq!(
+            detect_pause_resume("SELECT hdb_code.pause('idx');"),
+            Some(PauseResume::Pause("idx".into()))
+        );
+        assert_eq!(
+            detect_pause_resume("select  HDB_CODE.RESUME('i')"),
+            Some(PauseResume::Resume("i".into()))
+        );
+        assert_eq!(detect_pause_resume("UPDATE t SET a = hdb_code.pause('idx')"), None);
+        assert_eq!(detect_pause_resume("SELECT hdb_code.pause('idx'), 1"), None);
+    }
 
     #[test]
     fn pass_through_no_lsp() {
@@ -806,17 +936,29 @@ pub enum PauseResume {
 }
 
 pub fn detect_pause_resume(sql: &str) -> Option<PauseResume> {
-    let s = sql.trim().trim_end_matches(';');
-    let low = s.to_ascii_lowercase();
+    // v07.8: only the documented form, `SELECT hdb_code.pause('idx')` /
+    // `SELECT hdb_code.resume('idx')`, as the WHOLE statement. The name used to
+    // be found anywhere in the text, so `INSERT INTO notes VALUES ('call
+    // hdb_code.pause(''idx'') first')` ran the pause handler instead of the
+    // INSERT (and lost the row).
+    let s = sql.trim().trim_end_matches(';').trim_end();
+    let head = s.get(..6)?;
+    if !head.eq_ignore_ascii_case("select") || !s[6..].starts_with(|c: char| c.is_whitespace()) {
+        return None;
+    }
+    let s = s[6..].trim_start();
     for (needle, ctor) in &[("hdb_code.pause", true), ("hdb_code.resume", false)] {
-        if let Some(i) = low.find(needle) {
-            let after = &s[i + needle.len()..];
+        if s.get(..needle.len()).is_some_and(|h| h.eq_ignore_ascii_case(needle)) {
+            let after = &s[needle.len()..];
             let after = after.trim_start();
             if !after.starts_with('(') {
                 continue;
             }
             let inner = &after[1..];
             let close = inner.find(')')?;
+            if !inner[close + 1..].trim().is_empty() {
+                return None;
+            }
             let arg = inner[..close].trim().trim_matches('\'').to_string();
             if arg.is_empty() {
                 return None;

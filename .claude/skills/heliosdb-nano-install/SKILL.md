@@ -8,7 +8,7 @@ allowed-tools: Bash(cargo *), Bash(heliosdb-nano *), Bash(rustc *), Read
 
 ## When to use
 - The user has nothing installed yet.
-- They need a feature that's not in the default build (MCP, code-graph, FIPS, HA tier 2+).
+- They need a feature that's not in the default build (MCP, code-graph, FIPS, A/B routing).
 - They want to know what `heliosdb-nano --version` returns or which features were compiled in.
 
 ## Compiler requirements
@@ -45,12 +45,12 @@ Prebuilt release binaries require no Rust toolchain.
 | `code-embed` | — | fastembed-rs (ONNX), local in-process embedder; **implies `code-graph`** | Embed without external HTTP service |
 | `mcp-endpoint` | — | JSON-RPC 2.0 dispatcher, stdio/HTTP/WS, 17-tool catalog | MCP server for AI agents |
 | `fips` | — (exclusive with `ring-crypto`) | AWS-LC FIPS #4816 + SHA-256 + PBKDF2 | FIPS 140-3 compliance |
-| `ha-tier2` | — | Branch-based multi-primary, vector-clock conflict resolution; implies `ha-tier1` | Active-active replication |
-| `ha-tier3` | — | Consistent hash ring, cross-shard routing, dynamic resharding | Horizontal sharding |
-| `ha-dedup` | — | Content-addressed deduplication across nodes | Storage savings |
+| `ha-tier2` | — | Deprecated: selects nothing beyond `ha-tier1` (no multi-primary, sharding, cross-node dedup or branch-to-server sync exists) | Nothing — do not rely on it |
+| `ha-tier3` | — | Deprecated: selects nothing beyond `ha-tier1` (no multi-primary, sharding, cross-node dedup or branch-to-server sync exists) | Nothing — do not rely on it |
+| `ha-dedup` | — | Deprecated: selects nothing beyond `ha-tier1` (no multi-primary, sharding, cross-node dedup or branch-to-server sync exists) | Nothing — do not rely on it |
 | `ha-ab-testing` | — | Branch-to-experiment routing | A/B test branches |
-| `ha-branch-replication` | — | Selective branch sync to remote servers; implies `ha-tier2` | Per-branch replication topology |
-| `ha-full` | — | Bundle: `ha-tier1 + ha-tier2 + ha-tier3 + ha-dedup + ha-ab-testing + ha-branch-replication` | All HA features |
+| `ha-branch-replication` | — | Deprecated: selects nothing beyond `ha-tier1` (no multi-primary, sharding, cross-node dedup or branch-to-server sync exists) | Nothing — do not rely on it |
+| `ha-full` | — | Bundle: `ha-tier1 + ha-ab-testing` (plus the deprecated names) | Physical standby + A/B routing |
 | `compression` | — | MySQL wire-protocol packet compression (zlib via flate2) | Bandwidth on slow links |
 | `server` | — | Server-mode async runtime knobs | Heavyweight server build |
 

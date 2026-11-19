@@ -211,10 +211,12 @@ pub const REGISTERED_PARAMETERS: &[&str] = &[
     "idle_in_transaction_session_timeout",
     "idle_session_timeout",
     "lock_timeout",
+    "max_connections",
     "mv_auto_refresh",
     "mv_max_cpu_percent",
     "optimizer",
     "query_timeout",
+    "row_security",
     "server_encoding",
     "server_version",
     "shared_buffers",
@@ -374,10 +376,20 @@ impl SessionSettings {
         settings.insert("timezone".to_string(), SettingValue::String("UTC".to_string()));
 
         // Server info (read-only)
+        // v07.1: the ONE PostgreSQL version string every surface reports.
         settings.insert(
             "server_version".to_string(),
-            SettingValue::String(env!("CARGO_PKG_VERSION").to_string()),
+            SettingValue::String(super::params::pg_server_version_string()),
         );
+        // v07.2: declared so `SET max_connections` gets PostgreSQL's 55P02 and
+        // `SHOW` / `pg_settings` read one value; seeded from the config and the
+        // PostgreSQL listener's real limit (`EmbeddedDatabase::publish_listener_limit`).
+        settings.insert("max_connections".to_string(), SettingValue::Integer(100));
+
+        // `SET row_security = off` (pg_dump's preamble): per session, default on.
+        // Off makes a query that a row-level-security policy would filter FAIL
+        // with 42501 for a role that does not bypass RLS, as PostgreSQL does.
+        settings.insert("row_security".to_string(), SettingValue::Boolean(true));
         settings.insert("server_encoding".to_string(), SettingValue::String("UTF8".to_string()));
 
         Self {
@@ -416,6 +428,20 @@ impl SessionSettings {
         let normalized_name = name.to_lowercase();
         let settings = self.settings.read().ok()?;
         settings.get(&normalized_name).cloned()
+    }
+
+    /// A weak handle on the map, for [`super::params::publish_server_settings`].
+    pub(crate) fn downgrade(&self) -> std::sync::Weak<RwLock<HashMap<String, SettingValue>>> {
+        Arc::downgrade(&self.settings)
+    }
+
+    /// Store a server-level value the SERVER itself determined (the config, the
+    /// listener's connection limit), bypassing the read-only refusal a client's
+    /// `SET` gets.
+    pub(crate) fn seed(&self, name: &str, value: SettingValue) {
+        if let Ok(mut settings) = self.settings.write() {
+            settings.insert(name.to_lowercase(), value);
+        }
     }
 
     /// Get all settings
@@ -457,6 +483,14 @@ impl SessionSettings {
                     return Err(Error::query_execution(format!(
                         "invalid value for parameter \"{}\": \"{}\"",
                         name, raw
+                    )));
+                }
+            }
+            "row_security" => {
+                if value.as_bool().is_none() || matches!(value, SettingValue::Integer(i) if !(0..=1).contains(i)) {
+                    return Err(Error::query_execution(format!(
+                        "parameter \"row_security\" requires a Boolean value, not \"{}\"",
+                        value.as_string()
                     )));
                 }
             }

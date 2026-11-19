@@ -384,25 +384,6 @@ impl PgCatalog {
                 return Ok(None);
             }
             Some(self.query_pg_tables()?)
-        } else if Self::contains_word(&matchable, "pg_settings") {
-            // NOT gated on `where_clause_is_fully_supported`: `pg_settings` is
-            // the one view here with no registry twin, so deferring would turn
-            // psql's and pgAdmin's startup probes into "relation does not
-            // exist". Today's behaviour (an uninterpretable WHERE keeps every
-            // row) is kept deliberately for this view alone.
-            //
-            // NIT-C: the canned shape is only `name, setting, unit, category`,
-            // and clause detection now sees a predicate written across a line
-            // break (the whitespace fold). So a MULTI-LINE predicate on a
-            // column this shape lacks — `SELECT name, setting FROM
-            // pg_settings\nWHERE context = 'user'` — now yields ZERO rows
-            // (`row_value` answers NULL for `context`, and `lit_eq_value`
-            // drops the row) where it used to yield all four canned rows.
-            // Both answers are fiction; the fold is kept because it fixes the
-            // far more common multi-line `WHERE name = …` / `WHERE name IN (…)`
-            // spellings. Note the asymmetry: `<>` on an absent column still
-            // keeps every row, because `eval_simple_pred` negates the match.
-            Some(self.query_pg_settings()?)
         } else {
             // KanttBan #22 (v3.31.0): pg_namespace / pg_class / pg_attribute /
             // pg_index / pg_constraint / pg_user / pg_roles previously had
@@ -541,7 +522,7 @@ impl PgCatalog {
     /// still correct-if-noisy for every driver I've tested — but see
     /// `where_clause_is_fully_supported`, which the caller consults FIRST for
     /// any view the planner can serve, so "keep every row" is now only the
-    /// last resort for `pg_settings` (HDB-011).
+    /// last resort (HDB-011).
     ///
     /// `q` is the ASCII-lowered, literal/comment-STRIPPED, whitespace-FOLDED
     /// statement (`matchable_folded`) and `q_orig` the ORIGINAL text at the
@@ -1159,45 +1140,6 @@ impl PgCatalog {
                 ]));
             }
         }
-
-        Ok((schema, rows))
-    }
-
-    /// Query pg_settings (configuration parameters)
-    fn query_pg_settings(&self) -> Result<(Schema, Vec<Tuple>)> {
-        let schema = Schema::new(vec![
-            Column::new("name", DataType::Text),
-            Column::new("setting", DataType::Text),
-            Column::new("unit", DataType::Text),
-            Column::new("category", DataType::Text),
-        ]);
-
-        let rows = vec![
-            Tuple::new(vec![
-                Value::String("server_version".to_string()),
-                Value::String("17.0".to_string()),
-                Value::Null,
-                Value::String("Preset Options".to_string()),
-            ]),
-            Tuple::new(vec![
-                Value::String("server_encoding".to_string()),
-                Value::String("UTF8".to_string()),
-                Value::Null,
-                Value::String("Preset Options".to_string()),
-            ]),
-            Tuple::new(vec![
-                Value::String("client_encoding".to_string()),
-                Value::String("UTF8".to_string()),
-                Value::Null,
-                Value::String("Client Connection Defaults".to_string()),
-            ]),
-            Tuple::new(vec![
-                Value::String("max_connections".to_string()),
-                Value::String("100".to_string()),
-                Value::Null,
-                Value::String("Connections and Authentication".to_string()),
-            ]),
-        ];
 
         Ok((schema, rows))
     }
@@ -1960,7 +1902,6 @@ impl PgCatalog {
             "pg_roles",
             "pg_user",
             "pg_proc",
-            "pg_settings",
             "pg_policies",
             "pg_matviews",
         ];
@@ -2479,13 +2420,13 @@ mod tests {
         assert!(result.unwrap().is_none());
     }
 
-    /// HDB-011: `pg_type` moved to the planner, so the "this router still
-    /// answers something" smoke test now uses `pg_settings` — the one view left
-    /// here with no registry twin.
+    /// HDB-011: `pg_type` moved to the planner; v07.2 moved `pg_settings` to
+    /// the engine's one parameter registry (the view `sql::params` serves), so
+    /// the "this router still answers something" smoke test uses `pg_tables`.
     #[test]
     fn test_handle_query_catalog() {
         let catalog = PgCatalog::new();
-        let result = catalog.handle_query("SELECT * FROM pg_settings");
+        let result = catalog.handle_query("SELECT * FROM pg_tables");
         assert!(result.is_ok());
         assert!(result.unwrap().is_some());
     }
@@ -2747,12 +2688,17 @@ mod tests {
         );
     }
 
-    /// A real `pg_settings` reference is still intercepted.
+    /// v07.2: `pg_settings` is no longer a four-row canned answer here; it
+    /// DEFERS to the engine, whose registry-backed view has every parameter,
+    /// PostgreSQL's columns and this session's values.
     #[test]
-    fn task38_real_pg_settings_still_intercepted() {
+    fn v07_pg_settings_defers_to_the_engine_view() {
         let catalog = PgCatalog::new();
         let result = catalog.handle_query("SELECT name, setting FROM pg_settings").unwrap();
-        assert!(result.is_some(), "real pg_settings SELECT must still be served");
+        assert!(
+            result.is_none(),
+            "pg_settings must reach the engine view, got {result:?}"
+        );
     }
 
     // ---- Direct unit coverage of the F2/F3 helpers ---------------------
@@ -3114,9 +3060,8 @@ mod tests {
     }
 
     /// HDB-011: `pg_tables` has a registry twin, so an uninterpretable WHERE
-    /// defers instead of silently returning every table. `pg_settings` has no
-    /// twin, so it deliberately keeps the old keep-every-row behaviour rather
-    /// than breaking psql / pgAdmin startup.
+    /// defers instead of silently returning every table. v07.2: `pg_settings`
+    /// now has one too (the engine's parameter registry), so it defers as well.
     #[test]
     fn hdb011_unsupported_where_defers_only_for_registry_served_views() {
         let catalog = PgCatalog::new();
@@ -3139,12 +3084,12 @@ mod tests {
             "an OR predicate on the next line must reach the planner, got {deferred_two_line:?}"
         );
 
-        let still_served = catalog
+        let deferred_settings = catalog
             .handle_query("SELECT name FROM pg_settings WHERE name = 'a' OR name = 'zzz'")
             .unwrap();
         assert!(
-            still_served.is_some(),
-            "pg_settings has no registry twin and must still answer"
+            deferred_settings.is_none(),
+            "pg_settings is served by the engine view, got {deferred_settings:?}"
         );
     }
 

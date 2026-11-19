@@ -482,6 +482,22 @@ pub struct SessionScopedState {
     /// block per name and disarmed by [`Self::end_transaction`], the same shape
     /// `application_name_saved` above uses.
     gucs_saved: parking_lot::Mutex<Option<HashMap<String, Option<SettingValue>>>>,
+    /// v07.3: notices a statement raised from inside the engine (the
+    /// partitioning WARNING), delivered by the PostgreSQL listener before the
+    /// statement's CommandComplete. Bounded; a session-less caller nobody
+    /// drains keeps only the newest few.
+    notices: parking_lot::Mutex<Vec<crate::SessionNotice>>,
+}
+
+/// v07.3: a process-wide count of queued statement notices, so the listener's
+/// per-statement check costs one relaxed load while nothing is queued (the
+/// steady state). Approximate (a backend dropped with notices queued is not subtracted); a stale
+/// non-zero only costs a session lookup.
+pub(crate) static PENDING_STATEMENT_NOTICES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// v07.3: are any statement notices queued anywhere?
+pub(crate) fn statement_notices_pending() -> bool {
+    PENDING_STATEMENT_NOTICES.load(Ordering::Relaxed) > 0
 }
 
 impl SessionScopedState {
@@ -532,6 +548,7 @@ impl SessionScopedState {
             holds_temp_tables: AtomicBool::new(false),
             cancel_requested: Arc::new(AtomicBool::new(false)),
             cancel_secret: AtomicI64::new(CANCEL_NOT_ARMED),
+            notices: parking_lot::Mutex::new(Vec::new()),
         });
         live_backends().insert(state.backend_pid, Arc::downgrade(&state));
         state
@@ -576,7 +593,30 @@ impl SessionScopedState {
             holds_temp_tables: AtomicBool::new(false),
             cancel_requested: Arc::new(AtomicBool::new(false)),
             cancel_secret: AtomicI64::new(CANCEL_NOT_ARMED),
+            notices: parking_lot::Mutex::new(Vec::new()),
         })
+    }
+
+    /// v07.3: queue a notice for the statement running on this backend.
+    pub(crate) fn push_notice(&self, notice: crate::SessionNotice) {
+        let mut queue = self.notices.lock();
+        if queue.len() >= 16 {
+            queue.remove(0);
+        } else {
+            PENDING_STATEMENT_NOTICES.fetch_add(1, Ordering::Relaxed);
+        }
+        queue.push(notice);
+    }
+
+    /// v07.3: take this backend's queued statement notices.
+    pub(crate) fn take_notices(&self) -> Vec<crate::SessionNotice> {
+        let taken = std::mem::take(&mut *self.notices.lock());
+        if !taken.is_empty() {
+            let count = taken.len();
+            let _ = PENDING_STATEMENT_NOTICES
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| Some(n.saturating_sub(count)));
+        }
+        taken
     }
 
     /// `pg_backend_pid()`.
@@ -754,6 +794,16 @@ impl SessionScopedState {
         drop(map);
         self.guc_overrides_present.store(present, Ordering::Relaxed);
         self.refresh_guc_mirror(name, None);
+    }
+
+    /// `DISCARD ALL` / `RESET ALL`: drop every session override, so each name
+    /// reads back as the server default again.
+    pub fn reset_all_gucs(&self) {
+        let names: Vec<String> = self.gucs.read().keys().cloned().collect();
+        for name in names {
+            self.reset_guc(&name);
+        }
+        *self.gucs_saved.lock() = None;
     }
 
     /// This session's override for `name`, if it has one.

@@ -506,6 +506,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
         // (`derive_result_schema`), so Execute emits DataRow + CommandComplete
         // directly under the portal's wire plan — the catalog fast-path shape,
         // never `send_query_result` (which would repeat the RowDescription).
+        if Self::is_show_all(trimmed_query) {
+            let (schema, rows) = self.show_all_result();
+            self.prepared_statements
+                .update_portal_state(&portal_name, PortalState::Complete)?;
+            let plan = super::codec::wire_plan(&schema, &portal.result_formats);
+            self.send_data_rows_with_formats(&rows, &plan).await?;
+            self.send_command_complete("SHOW").await?;
+            return Ok(());
+        }
         if let Some(param) = Self::session_show_parameter_name(trimmed_query) {
             // `?` cannot fire here — `session_show_parameter_name` already
             // narrowed `param` to the six names this function answers itself —
@@ -1332,6 +1341,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
                     .map(|ident| ident.value.to_ascii_lowercase())
                     .collect::<Vec<_>>()
                     .join(".");
+                if name == "all" {
+                    return Ok(Some(Self::show_all_schema()));
+                }
                 match Self::session_show_parameter_name(&format!("SHOW {name}"))
                     .or_else(|| Self::session_show_parameter_name(&format!("SHOW {dotted}")))
                 {

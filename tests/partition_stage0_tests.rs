@@ -8,6 +8,13 @@
 //!
 //! These exercise the EmbeddedDatabase surface end-to-end (parser rewrite →
 //! planner column-copy → executor), the shape the pgrust corpus hits hardest.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::many_single_char_names
+)]
 
 use heliosdb_nano::{EmbeddedDatabase, Result, Value};
 
@@ -426,5 +433,73 @@ fn pg_class_relpartbound_is_null() -> Result<()> {
             row.values[1]
         );
     }
+    Ok(())
+}
+
+/// v07.3 (data loss): DETACH used to be a no-op, so a later DROP of the old
+/// parent still cascaded to the detached table and dropped its rows.
+/// PostgreSQL keeps a detached table.
+#[test]
+fn detach_unlinks_child_from_drop_cascade() -> Result<()> {
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute("CREATE TABLE dl_parent (a INT) PARTITION BY RANGE (a)")?;
+    db.execute("CREATE TABLE dl_keep PARTITION OF dl_parent FOR VALUES FROM (0) TO (10)")?;
+    db.execute("CREATE TABLE dl_drop PARTITION OF dl_parent FOR VALUES FROM (10) TO (20)")?;
+    db.execute("INSERT INTO dl_keep (a) VALUES (1), (2)")?;
+    assert_eq!(db.execute("ALTER TABLE dl_parent DETACH PARTITION dl_keep")?, 0);
+    db.execute("DROP TABLE dl_parent")?;
+    // The detached child and its rows survive; the attached one went with the parent.
+    assert_eq!(db.query("SELECT a FROM dl_keep", &[])?.len(), 2);
+    assert!(
+        db.query("SELECT a FROM dl_drop", &[]).is_err(),
+        "attached child cascades"
+    );
+    Ok(())
+}
+
+/// v07.3: ATTACH / DETACH naming a table that does not exist is PostgreSQL's
+/// 42P01, not a silent success; IF EXISTS on a missing parent is a no-op.
+#[test]
+fn attach_or_detach_of_missing_table_errors() -> Result<()> {
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute("CREATE TABLE mt_parent (a INT) PARTITION BY RANGE (a)")?;
+    for sql in [
+        "ALTER TABLE nosuch ATTACH PARTITION alsonot FOR VALUES FROM (0) TO (1)",
+        "ALTER TABLE nosuch DETACH PARTITION alsonot",
+        "ALTER TABLE mt_parent ATTACH PARTITION alsonot FOR VALUES FROM (0) TO (1)",
+        "ALTER TABLE mt_parent DETACH PARTITION alsonot",
+    ] {
+        let err = db.execute(sql).expect_err(sql).to_string();
+        assert!(err.contains("does not exist"), "{sql}: {err}");
+    }
+    assert_eq!(db.execute("ALTER TABLE IF EXISTS nosuch DETACH PARTITION alsonot")?, 0);
+    Ok(())
+}
+
+/// v07.3: `storage.partition_policy = "error"` refuses all four shapes with
+/// 0A000's "is not supported" and creates nothing.
+#[test]
+fn partition_policy_error_refuses_all_four_shapes_and_creates_nothing() -> Result<()> {
+    let mut config = heliosdb_nano::Config::in_memory();
+    config.storage.partition_policy = heliosdb_nano::PartitionPolicy::Error;
+    let db = EmbeddedDatabase::with_config(config)?;
+    db.execute("CREATE TABLE pp_plain (a INT)")?;
+    for sql in [
+        "CREATE TABLE pp_parent (a INT) PARTITION BY RANGE (a)",
+        "CREATE TABLE pp_child PARTITION OF pp_plain FOR VALUES FROM (0) TO (10)",
+        "ALTER TABLE pp_plain ATTACH PARTITION pp_plain FOR VALUES FROM (0) TO (10)",
+        "ALTER TABLE pp_plain DETACH PARTITION pp_plain",
+        "ALTER INDEX pp_idx ATTACH PARTITION pp_idx2",
+    ] {
+        let err = db.execute(sql).expect_err(sql).to_string();
+        assert!(
+            err.contains("is not supported") && err.contains("partition_policy"),
+            "{sql}: {err}"
+        );
+    }
+    assert!(db.query("SELECT a FROM pp_parent", &[]).is_err(), "nothing created");
+    assert!(db.query("SELECT a FROM pp_child", &[]).is_err(), "nothing created");
+    // A plain table is unaffected.
+    db.execute("CREATE TABLE pp_other (a INT)")?;
     Ok(())
 }

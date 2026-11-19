@@ -163,6 +163,9 @@ impl PgServer {
         };
 
         let connection_limiter = Arc::new(Semaphore::new(config.max_connections));
+        // v07.2: `pg_settings` / `current_setting('max_connections')` report the
+        // limit this listener enforces, as `SHOW max_connections` does.
+        database.publish_listener_limit(config.max_connections);
 
         Ok(Self {
             config,
@@ -208,6 +211,9 @@ impl PgServer {
         };
 
         let connection_limiter = Arc::new(Semaphore::new(config.max_connections));
+        // v07.2: `pg_settings` / `current_setting('max_connections')` report the
+        // limit this listener enforces, as `SHOW max_connections` does.
+        database.publish_listener_limit(config.max_connections);
 
         Ok(Self {
             config,

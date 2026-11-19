@@ -47,7 +47,7 @@ Without explicit cargo features, these surfaces are absent — recipes that need
 - MCP server → needs `--features mcp-endpoint`
 - Local embedder → needs `--features code-embed`
 - FIPS crypto → needs `--features fips` (and `--no-default-features`)
-- HA tier 2/3, dedup, A/B routing → needs `--features ha-full` (or per-tier flags)
+- A/B experiment routing → `--features ha-ab-testing` (or `ha-full`). Multi-primary, sharding and cross-node dedup do not exist; `SELECT * FROM heliosdb_features` lists what a binary contains
 
 Default features that ARE on: `encryption`, `vector-search`, `ring-crypto`, `ha-tier1`.
 

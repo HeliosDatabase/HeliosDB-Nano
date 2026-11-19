@@ -10,7 +10,7 @@ allowed-tools: Bash(heliosdb-nano *), Bash(psql *), Bash(systemctl *), Read
 - Multiple processes / hosts need to share one Nano database.
 - You need encryption-in-transit (TLS).
 - You need password / md5 / SCRAM-SHA-256 authentication.
-- You need a warm standby (tier 1), active-active (tier 2), or sharded (tier 3) topology.
+- You need a physical standby (`ha-tier1`). Active-active and sharding do not exist.
 
 > **Risk note**: this skill is production-affecting. Confirm with the user before running `start --daemon`, `stop`, force-kill, or HA reconfiguration in production.
 
@@ -303,17 +303,9 @@ SWITCHOVER TO '3f2a…';         -- new_primary | epoch | final_sequence | this_
 - **Roles across restarts:** `<data dir>.role.toml` (0600) beside each data dir (`[replication] role`, `primary_host`, the TLS a standby follows over; `[directory]` history, epoch, store IDENTITY); `start` applies it over the config file (WARN) — only to that directory (missing/empty/rebuilt → exit 2 naming the file) and never against the CLI (a contradicting `--replication-role` / `--primary-host` → exit 2 naming the file); restart with no role on the command line — a systemd `ExecStart` that passes `--replication-role` / `--primary-host` is refused after a switchover: move the role into the config file or drop those flags (the record supplies them; `--daemon` forwards what it resolved). The record sits beside the RESOLVED data path (symlinks followed). `promote`, `pg_promote`, `recover` rewrite one they find (`recover` also follows its recorded TLS); delete it to go back. A second `SWITCHOVER TO` from the new primary swaps back (epoch + 1 again).
 - **Failures:** before the standby took the request — nothing changed; taken but its answer lost — never "nothing changed", the fence wait settles it; taken but no fence — still the primary; fenced but the new primary never serves, or demotion stopped before the directory changed (a rewind that stopped before converting reopens the store fenced) — stays the FENCED primary serving reads (full HTTP back), the error names `recover --from-primary … --replace --then stop` (finishes it whatever the plan picks: a full copy, chosen for a small or mostly-different store, is swapped in and the old dir moved to `D.replaced-<UTC>`, never deleted; `--then stop` so a copied command leaves no server in the operator's shell) then `start --replication-role standby --primary-host NEW` through the service manager; rewind failed after converting — the process exits 2, `start` refuses the dir naming the `recover` that finishes it. Every wait is bounded; the switchover runs on its own task (a cancelled caller abandons nothing); only ITS promotion's fence is accepted (the answer carries the promotion identity), and after a switchover that saw no fence the slot stays closed until a late fence can no longer come; SIGTERM during the demotion waits for it (≤ 300 s, else ERROR naming the `recover`, exit non-zero); printed `recover`/`start` commands carry the token and the pair's TLS flags.
 
-### Recipe 5: Active-active (Tier 2, requires `--features ha-tier2`)
-```bash
-# Each node runs as both primary and reachable from peers.
-heliosdb-nano start \
-    --data-dir ./node-a \
-    --replication-role primary \
-    --node-id 11111111-1111-1111-1111-111111111111 \
-    --standby-hosts 'nodeB:5433,nodeC:5433' \
-    --sync-mode async
-```
-Conflict resolution uses vector clocks at branch level — see `docs/guides/ha_cluster_tutorial.md`.
+### Recipe 5: Active-active / sharding — not available
+No release contains multi-primary replication or sharding. The `ha-tier2` / `ha-tier3`
+feature names are deprecated and select nothing beyond `ha-tier1` (physical standby).
 
 ### Recipe 6: User management (REPL)
 ```

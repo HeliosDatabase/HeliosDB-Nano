@@ -30,6 +30,20 @@ struct ReplHelper {
 
 /// Whether the shell runs `sql` on the query route, for its rows, rather than as
 /// a command, which only shows a row count.
+/// v07.1: run a `SHOW` statement and format its rows under the column names
+/// the engine gives (`SHOW work_mem` -> one `work_mem` column; `SHOW ALL` ->
+/// `name`, `setting`, `description`).
+fn render_show(db: &crate::EmbeddedDatabase, sql: &str) -> crate::Result<String> {
+    let (results, columns) = db.query_with_columns(sql)?;
+    let schema = crate::Schema::new(
+        columns
+            .iter()
+            .map(|name| crate::Column::new(name, crate::DataType::Text))
+            .collect(),
+    );
+    Ok(formatter::format_results(&results, &schema))
+}
+
 fn sql_returns_rows(sql: &str) -> bool {
     let sql_upper = sql.trim().to_uppercase();
     sql_upper.starts_with("SELECT")
@@ -406,6 +420,23 @@ impl ReplShell {
                 }
             }
 
+            // v07.1: `SHOW <name>` / `SHOW ALL` have no plan to take headers
+            // from (the planner does not plan SHOW), so the shell used to print
+            // only "Query returned 1 row(s)". The engine names the columns.
+            if sql_upper.starts_with("SHOW ") && !crate::sql::Parser::is_show_branches(sql.trim()) {
+                match render_show(&self.db, sql) {
+                    Ok(text) => {
+                        let duration = start.elapsed();
+                        println!("\n{}", text);
+                        if self.show_timing {
+                            println!("{}", formatter::format_timing(duration.as_secs_f64()));
+                        }
+                    }
+                    Err(e) => eprintln!("{}", formatter::format_error(&e.to_string())),
+                }
+                return;
+            }
+
             // Execute query
             match self.db.query(sql, &[]) {
                 Ok(results) => {
@@ -547,5 +578,19 @@ mod tests {
         assert!(sql_returns_rows("SELECT 1"));
         assert!(sql_returns_rows("DELETE FROM t RETURNING id"));
         assert!(!sql_returns_rows("DELETE FROM t"));
+    }
+
+    /// v07.1: the shell prints the VALUE of a SHOW (it used to print only
+    /// "Query returned 1 row(s)"), and SHOW ALL works as `\set` suggests.
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+    fn the_shell_prints_show_values() {
+        let db = crate::EmbeddedDatabase::new_in_memory().unwrap();
+        let text = super::render_show(&db, "SHOW work_mem").unwrap();
+        assert!(text.contains("work_mem") && text.contains("4096"), "{text}");
+        let text = super::render_show(&db, "SHOW server_version").unwrap();
+        assert!(text.contains(&crate::sql::params::pg_server_version_string()), "{text}");
+        let text = super::render_show(&db, "SHOW ALL").unwrap();
+        assert!(text.contains("description") && text.contains("row_security"), "{text}");
     }
 }

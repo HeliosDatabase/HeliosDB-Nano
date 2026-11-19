@@ -4711,18 +4711,16 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                 println!("{}: {}", "Target".cyan(), std::env::consts::ARCH);
                 println!("{}: {}", "OS".cyan(), std::env::consts::OS);
                 println!();
-                println!("{}", "Enabled Features:".bold());
-                #[cfg(feature = "encryption")]
-                println!("  {} Encryption (AES-256-GCM)", "✓".green());
-                #[cfg(not(feature = "encryption"))]
-                println!("  {} Encryption", "✗".dimmed());
-                #[cfg(feature = "vector-search")]
-                println!("  {} Vector Search", "✓".green());
-                #[cfg(not(feature = "vector-search"))]
-                println!("  {} Vector Search", "✗".dimmed());
-                println!("  {} Compression (zstd)", "✓".green());
-                println!("  {} Time-Travel Queries", "✓".green());
-                println!("  {} Multi-Tenancy", "✓".green());
+                // v07.6: the same table `SELECT * FROM heliosdb_features` serves.
+                println!("{}", "Features:".bold());
+                for feature in crate::sql::features::features() {
+                    let mark = if feature.compiled {
+                        "✓".green()
+                    } else {
+                        "✗".dimmed()
+                    };
+                    println!("  {} {} — {}", mark, feature.name, feature.source);
+                }
                 println!();
                 Ok(MetaCommandResult::Continue)
             }
@@ -4922,41 +4920,16 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                 println!("{}:", "Replication Features".bold());
                 #[cfg(feature = "ha-tier1")]
                 {
-                    println!("  {}: {} (Warm Standby)", "Tier 1".cyan(), "Enabled".green());
+                    println!("  {}: {} (physical standby)", "Replication".cyan(), "Enabled".green());
                 }
                 #[cfg(not(feature = "ha-tier1"))]
                 {
                     println!(
                         "  {}: {} (enable with --features ha-tier1)",
-                        "Tier 1".cyan(),
+                        "Replication".cyan(),
                         "Disabled".dimmed()
                     );
                 }
-                #[cfg(feature = "ha-tier2")]
-                {
-                    println!("  {}: {} (Multi-Primary)", "Tier 2".cyan(), "Enabled".green());
-                }
-                #[cfg(not(feature = "ha-tier2"))]
-                {
-                    println!(
-                        "  {}: {} (enable with --features ha-tier2)",
-                        "Tier 2".cyan(),
-                        "Disabled".dimmed()
-                    );
-                }
-                #[cfg(feature = "ha-tier3")]
-                {
-                    println!("  {}: {} (Sharding)", "Tier 3".cyan(), "Enabled".green());
-                }
-                #[cfg(not(feature = "ha-tier3"))]
-                {
-                    println!(
-                        "  {}: {} (enable with --features ha-tier3)",
-                        "Tier 3".cyan(),
-                        "Disabled".dimmed()
-                    );
-                }
-
                 println!();
                 println!("{}:", "Configuration".bold());
                 println!("  Mode: {} (standalone)", "Single Node".yellow());

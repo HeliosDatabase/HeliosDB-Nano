@@ -255,7 +255,7 @@ todo = "warn"
 default = ["encryption", "vector-search", "ring-crypto", "ha-tier1"]
 encryption = []
 vector-search = []
-simd = []
+simd = []  # DEPRECATED (v07.6): selects nothing (no cfg site uses it); kept so existing builds work
 # Read-hot-path lock-contention census (W3.1 plateau attribution). Compiles
 # per-query try-lock-first contention accounting into the plan/parse/result
 # cache shard mutexes and the ART index registry, surfaced by the
@@ -356,26 +356,18 @@ fips = ["dep:aws-lc-rs"]
 # - Read replica support
 ha-tier1 = []
 
-# HA Tier 2: Multi-Primary (Active-Active) — OPTIONAL
-# - Branch-based replication (unique to HeliosDB)
-# - Vector clock conflict resolution
-# - Multi-region support
+# DEPRECATED (v07.6): the next four select NOTHING beyond ha-tier1. There is
+# no multi-primary, sharding, cross-node dedup or branch-to-server replication
+# code in this crate; the names are kept so existing `--features` lines build,
+# and will be removed in a later release. `SELECT * FROM heliosdb_features`
+# lists what a binary really contains.
 ha-tier2 = ["ha-tier1"]
+ha-tier3 = ["ha-tier1"]
+ha-dedup = ["ha-tier1"]
+ha-branch-replication = ["ha-tier1"]
 
-# HA Tier 3: Sharding (Horizontal Scaling) — OPTIONAL
-# - Consistent hash ring
-# - Cross-shard query routing
-# - Dynamic resharding
-ha-tier3 = []
-
-# HA-Dedup: Content-addressed deduplication across nodes — OPTIONAL
-ha-dedup = []
-
-# A/B Testing: Branch-based experiment routing — OPTIONAL
+# A/B Testing: Branch-based experiment routing — OPTIONAL (real code: src/ab_testing)
 ha-ab-testing = []
-
-# Branch-to-Server Replication: Selective branch sync to remote servers — OPTIONAL
-ha-branch-replication = ["ha-tier2"]
 
 # Convenience bundle: all optional HA features
 ha-full = [

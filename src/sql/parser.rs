@@ -24,6 +24,21 @@ pub struct Parser {
 /// it. Private: nothing outside this module may depend on it.
 const FK_DEFAULT_PK_SENTINEL: &str = "__hdb_fk_ref_default_pk";
 
+/// v07.3: the parts of an `ALTER TABLE|INDEX … ATTACH|DETACH PARTITION …`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartitionAttachDetach {
+    /// `ALTER INDEX` rather than `ALTER TABLE`.
+    pub is_index: bool,
+    /// `IF EXISTS` was given.
+    pub if_exists: bool,
+    /// The parent name as written.
+    pub parent: String,
+    /// `DETACH` rather than `ATTACH`.
+    pub detach: bool,
+    /// The partition name as written.
+    pub child: String,
+}
+
 /// Stage-0 partitioning: the pre-parse-captured shape of a
 /// `CREATE TABLE child PARTITION OF parent { FOR VALUES … | DEFAULT } …`
 /// child-table declaration. sqlparser 0.53 has no `PARTITION OF` grammar, so
@@ -707,6 +722,87 @@ impl Parser {
             return false;
         }
         Self::contains_kw_phrase(trimmed, b"ATTACH PARTITION") || Self::contains_kw_phrase(trimmed, b"DETACH PARTITION")
+    }
+
+    /// v07.3: a `CREATE TABLE … PARTITION BY …` parent or a `CREATE TABLE …
+    /// PARTITION OF …` child — the two CREATE shapes of partitioning DDL.
+    /// Anything that does not start with `CREATE` is out after one prefix check.
+    pub fn is_partition_create(sql: &str) -> bool {
+        let trimmed = sql.trim_start();
+        if !crate::starts_with_icase(trimmed, "CREATE") {
+            return false;
+        }
+        Self::extract_partition_of(trimmed).is_some() || Self::preprocess_strip_partition_by(trimmed) != trimmed
+    }
+
+    /// v07.3: `ALTER TABLE [IF EXISTS] [ONLY] parent {ATTACH|DETACH} PARTITION
+    /// child …` / `ALTER INDEX parent ATTACH PARTITION child`, split into its
+    /// parts (names raw, quotes kept for the resolver). `None` for a statement
+    /// that is not one of these or whose names cannot be read.
+    pub fn parse_partition_attach_detach(sql: &str) -> Option<PartitionAttachDetach> {
+        let trimmed = sql.trim().trim_end_matches(';').trim_end();
+        let tokens = Self::split_sql_words(trimmed);
+        let mut words = tokens.iter().map(String::as_str).peekable();
+        if !words.next()?.eq_ignore_ascii_case("ALTER") {
+            return None;
+        }
+        let is_index = match words.next()? {
+            w if w.eq_ignore_ascii_case("TABLE") => false,
+            w if w.eq_ignore_ascii_case("INDEX") => true,
+            _ => return None,
+        };
+        let mut if_exists = false;
+        if words.peek().is_some_and(|w| w.eq_ignore_ascii_case("IF")) {
+            words.next();
+            if !words.next()?.eq_ignore_ascii_case("EXISTS") {
+                return None;
+            }
+            if_exists = true;
+        }
+        if words.peek().is_some_and(|w| w.eq_ignore_ascii_case("ONLY")) {
+            words.next();
+        }
+        let parent = words.next()?.to_string();
+        let detach = match words.next()? {
+            w if w.eq_ignore_ascii_case("ATTACH") => false,
+            w if w.eq_ignore_ascii_case("DETACH") => true,
+            _ => return None,
+        };
+        if !words.next()?.eq_ignore_ascii_case("PARTITION") {
+            return None;
+        }
+        let child = words.next()?.to_string();
+        Some(PartitionAttachDetach {
+            is_index,
+            if_exists,
+            parent,
+            detach,
+            child,
+        })
+    }
+
+    /// Whitespace-separated words of `sql`, a double-quoted span kept inside
+    /// its word (so `"My Table"` and `s."T"` stay one word each).
+    fn split_sql_words(sql: &str) -> Vec<String> {
+        let mut words = Vec::new();
+        let mut current = String::new();
+        let mut quoted = false;
+        for ch in sql.chars() {
+            if ch == '"' {
+                quoted = !quoted;
+                current.push(ch);
+            } else if ch.is_whitespace() && !quoted {
+                if !current.is_empty() {
+                    words.push(std::mem::take(&mut current));
+                }
+            } else {
+                current.push(ch);
+            }
+        }
+        if !current.is_empty() {
+            words.push(current);
+        }
+        words
     }
 
     /// Allocation-free case-insensitive search for a two-word keyword phrase

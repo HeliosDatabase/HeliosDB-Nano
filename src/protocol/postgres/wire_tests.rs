@@ -14083,3 +14083,392 @@ fn listen_notify_between_two_wire_connections() {
         .join()
         .expect("test thread");
 }
+
+// ---------------------------------------------------------------------------
+// row_security, SHOW ALL and the one parameter registry (v07.1 / v07.2)
+// ---------------------------------------------------------------------------
+
+/// Simple-query one-row answer of `sql`, or the ErrorResponse's SQLSTATE.
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+async fn rs_scalar(handler: &mut PgConnectionHandler<DuplexStream>, client: &mut DuplexStream, sql: &str) -> String {
+    handler.handle_single_query(sql).await.unwrap();
+    let out = drain(client).await;
+    if let Some(code) = error_sqlstate(&out) {
+        return format!("ERROR {code}");
+    }
+    first_data_row_text(&out).unwrap_or_else(|| panic!("no row for {sql}"))
+}
+
+/// The SQLSTATE of the first ErrorResponse in `bytes`, if any.
+fn error_sqlstate(bytes: &[u8]) -> Option<String> {
+    parse_messages(bytes)
+        .into_iter()
+        .find(|(t, _)| *t == b'E')
+        .and_then(|(_, p)| {
+            p.split(|&b| b == 0)
+                .find(|field| field.first() == Some(&b'C'))
+                .map(|field| String::from_utf8_lossy(field.get(1..).unwrap_or(&[])).to_string())
+        })
+}
+
+/// pg_dump's preamble: `SET row_security = off` takes effect on THIS session,
+/// SHOW / current_setting / pg_settings report it, and RESET restores on.
+#[tokio::test]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+async fn row_security_set_show_reset_over_the_wire() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(Arc::clone(&db));
+    let (mut other, mut other_client) = test_handler(db);
+    assert_eq!(rs_scalar(&mut handler, &mut client, "SHOW row_security").await, "on");
+    handler.handle_single_query("SET row_security = off;").await.unwrap();
+    assert!(error_sqlstate(&drain(&mut client).await).is_none());
+    assert_eq!(rs_scalar(&mut handler, &mut client, "SHOW row_security").await, "off");
+    assert_eq!(
+        rs_scalar(&mut handler, &mut client, "SELECT current_setting('row_security')").await,
+        "off"
+    );
+    assert_eq!(
+        rs_scalar(
+            &mut handler,
+            &mut client,
+            "SELECT setting FROM pg_settings WHERE name = 'row_security'"
+        )
+        .await,
+        "off"
+    );
+    // Another connection is untouched.
+    assert_eq!(
+        rs_scalar(&mut other, &mut other_client, "SHOW row_security").await,
+        "on"
+    );
+    handler.handle_single_query("RESET row_security").await.unwrap();
+    let _ = drain(&mut client).await;
+    assert_eq!(rs_scalar(&mut handler, &mut client, "SHOW row_security").await, "on");
+    // A non-boolean value is refused.
+    handler.handle_single_query("SET row_security = banana").await.unwrap();
+    assert!(error_sqlstate(&drain(&mut client).await).is_some());
+}
+
+/// `row_security = off` for a role without BYPASSRLS: 42501, never rows.
+#[tokio::test]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+async fn row_security_off_is_42501_for_a_role_without_bypassrls_over_the_wire() {
+    use crate::tenant::{IsolationMode, RLSCommand, TenantContext};
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    db.execute("CREATE TABLE rso (id INT PRIMARY KEY, owner TEXT NOT NULL)")
+        .unwrap();
+    db.execute("INSERT INTO rso VALUES (1, 'alice'), (2, 'bob')").unwrap();
+    db.execute("CREATE ROLE plain LOGIN").unwrap();
+    let tenant = db
+        .tenant_manager
+        .register_tenant("rso".to_string(), IsolationMode::SharedSchema);
+    db.tenant_manager.set_current_context(TenantContext {
+        tenant_id: tenant.id,
+        user_id: "alice".to_string(),
+        roles: vec![],
+        isolation_mode: IsolationMode::SharedSchema,
+    });
+    db.tenant_manager.create_rls_policy(
+        "rso".to_string(),
+        "own".to_string(),
+        String::new(),
+        RLSCommand::Select,
+        "owner = 'alice'".to_string(),
+        None,
+    );
+    let (mut handler, mut client) = test_handler(Arc::clone(&db));
+    db.set_session_login_user(handler.session_id, Some("plain".to_string()))
+        .unwrap();
+    assert_eq!(
+        rs_scalar(&mut handler, &mut client, "SELECT count(*) FROM rso").await,
+        "1"
+    );
+    handler.handle_single_query("SET row_security = off").await.unwrap();
+    let _ = drain(&mut client).await;
+    assert_eq!(
+        rs_scalar(&mut handler, &mut client, "SELECT count(*) FROM rso").await,
+        "ERROR 42501"
+    );
+    // Extended protocol too.
+    handler
+        .handle_parse_extended("rs1".into(), "SELECT id FROM rso".into(), vec![])
+        .await
+        .unwrap();
+    handler
+        .handle_bind_extended("rp1".into(), "rs1".into(), vec![], vec![], vec![])
+        .await
+        .unwrap();
+    let _ = handler.handle_execute_extended("rp1".into(), 0).await;
+    let out = drain(&mut client).await;
+    assert!(data_rows(&out).is_empty(), "no rows may be served");
+    // A superuser bypasses.
+    let (mut admin, mut admin_client) = test_handler(Arc::clone(&db));
+    db.set_session_login_user(admin.session_id, Some("postgres".to_string()))
+        .unwrap();
+    admin.handle_single_query("SET row_security = off").await.unwrap();
+    let _ = drain(&mut admin_client).await;
+    assert_eq!(
+        rs_scalar(&mut admin, &mut admin_client, "SELECT count(*) FROM rso").await,
+        "2"
+    );
+}
+
+/// SHOW ALL: name, setting, description; each setting equals SHOW <name> on
+/// the same connection, on the simple and the extended protocol.
+#[tokio::test]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+async fn show_all_lists_every_registered_parameter_over_the_wire() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+    handler.handle_single_query("SET work_mem = 8192").await.unwrap();
+    let _ = drain(&mut client).await;
+    handler.handle_single_query("SHOW ALL").await.unwrap();
+    let out = drain(&mut client).await;
+    assert_eq!(row_description_names(&out), vec!["name", "setting", "description"]);
+    let rows = data_rows(&out);
+    assert_eq!(rows.len(), crate::sql::params::PARAMS.len());
+    let cell = |row: &Vec<Option<Vec<u8>>>, i: usize| String::from_utf8_lossy(row[i].as_ref().unwrap()).to_string();
+    for row in &rows {
+        let name = cell(row, 0);
+        let shown = rs_scalar(&mut handler, &mut client, &format!("SHOW {name}")).await;
+        assert_eq!(shown, cell(row, 1), "SHOW ALL vs SHOW {name}");
+        assert!(!cell(row, 2).is_empty());
+    }
+    assert!(rows.iter().any(|r| cell(r, 0) == "work_mem" && cell(r, 1) == "8192"));
+
+    handler
+        .handle_parse_extended("sa".into(), "SHOW ALL".into(), vec![])
+        .await
+        .unwrap();
+    handler
+        .handle_bind_extended("sap".into(), "sa".into(), vec![], vec![], vec![])
+        .await
+        .unwrap();
+    handler.handle_execute_extended("sap".into(), 0).await.unwrap();
+    assert_eq!(data_rows(&drain(&mut client).await).len(), rows.len());
+}
+
+/// v07.1 / v07.2: one server_version on every surface, server_version_num,
+/// and SHOW == current_setting == pg_settings (max_connections included).
+#[tokio::test]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+async fn server_version_is_one_value_on_every_surface() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+    let expected = crate::sql::params::pg_server_version_string();
+    assert_eq!(
+        rs_scalar(&mut handler, &mut client, "SHOW server_version").await,
+        expected
+    );
+    assert_eq!(
+        rs_scalar(&mut handler, &mut client, "SELECT current_setting('server_version')").await,
+        expected
+    );
+    assert_eq!(
+        rs_scalar(
+            &mut handler,
+            &mut client,
+            "SELECT setting FROM pg_settings WHERE name = 'server_version'"
+        )
+        .await,
+        expected
+    );
+    assert!(rs_scalar(&mut handler, &mut client, "SELECT version()")
+        .await
+        .contains(&expected));
+    assert_eq!(
+        rs_scalar(&mut handler, &mut client, "SHOW server_version_num").await,
+        "160000"
+    );
+    assert_eq!(
+        rs_scalar(
+            &mut handler,
+            &mut client,
+            "SELECT current_setting('server_version_num')"
+        )
+        .await,
+        "160000"
+    );
+    for name in ["max_connections", "shared_buffers", "statement_timeout", "timezone"] {
+        let shown = rs_scalar(&mut handler, &mut client, &format!("SHOW {name}")).await;
+        assert!(!shown.starts_with("ERROR"), "SHOW {name}: {shown}");
+        assert_eq!(
+            rs_scalar(&mut handler, &mut client, &format!("SELECT current_setting('{name}')")).await,
+            shown,
+            "current_setting('{name}')"
+        );
+        assert_eq!(
+            rs_scalar(
+                &mut handler,
+                &mut client,
+                &format!("SELECT setting FROM pg_settings WHERE name = '{name}'")
+            )
+            .await,
+            shown,
+            "pg_settings {name}"
+        );
+    }
+    handler
+        .handle_single_query("SELECT name, setting, unit, category, short_desc, context, vartype, source, min_val, max_val, enumvals, boot_val, reset_val, sourcefile, pending_restart FROM pg_settings")
+        .await
+        .unwrap();
+    let out = drain(&mut client).await;
+    assert!(error_sqlstate(&out).is_none());
+    assert_eq!(data_rows(&out).len(), crate::sql::params::PARAMS.len());
+}
+
+/// The `NoticeResponse` messages in `bytes`, as (severity, message).
+fn notices(bytes: &[u8]) -> Vec<(String, String)> {
+    parse_messages(bytes)
+        .into_iter()
+        .filter(|(t, _)| *t == b'N')
+        .map(|(_, p)| {
+            let field = |code: u8| {
+                p.split(|&b| b == 0)
+                    .find(|f| f.first() == Some(&code))
+                    .map(|f| String::from_utf8_lossy(f.get(1..).unwrap_or(&[])).to_string())
+                    .unwrap_or_default()
+            };
+            (field(b'S'), field(b'M'))
+        })
+        .collect()
+}
+
+/// v07.3: every partitioning DDL shape delivers one WARNING notice, before
+/// its CommandComplete, on the simple and the extended protocol; a plain
+/// CREATE TABLE delivers none.
+#[tokio::test]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+async fn partition_ddl_delivers_one_warning_notice() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+    handler
+        .handle_single_query("CREATE TABLE pn_plain (a INT)")
+        .await
+        .unwrap();
+    assert!(notices(&drain(&mut client).await).is_empty(), "plain CREATE: no notice");
+    for sql in [
+        "CREATE TABLE pn_parent (a INT) PARTITION BY RANGE (a)",
+        "CREATE TABLE pn_child PARTITION OF pn_parent FOR VALUES FROM (0) TO (10)",
+        "ALTER TABLE pn_parent DETACH PARTITION pn_child",
+        "ALTER TABLE pn_parent ATTACH PARTITION pn_child FOR VALUES FROM (0) TO (10)",
+        "ALTER INDEX pn_idx ATTACH PARTITION pn_idx2",
+    ] {
+        handler.handle_single_query(sql).await.unwrap();
+        let out = drain(&mut client).await;
+        let got = notices(&out);
+        assert_eq!(got.len(), 1, "{sql}: {got:?}");
+        assert_eq!(got[0].0, "WARNING");
+        assert!(got[0].1.contains("schema only"), "{sql}: {got:?}");
+        // Before CommandComplete.
+        let kinds: Vec<u8> = parse_messages(&out).into_iter().map(|(t, _)| t).collect();
+        let n = kinds.iter().position(|k| *k == b'N').unwrap();
+        let c = kinds.iter().position(|k| *k == b'C').unwrap();
+        assert!(n < c, "{sql}: notice after CommandComplete {kinds:?}");
+    }
+    // Extended protocol.
+    handler
+        .handle_parse_extended(
+            "pn".into(),
+            "CREATE TABLE pn_ext (a INT) PARTITION BY LIST (a)".into(),
+            vec![],
+        )
+        .await
+        .unwrap();
+    handler
+        .handle_bind_extended("pnp".into(), "pn".into(), vec![], vec![], vec![])
+        .await
+        .unwrap();
+    handler.handle_execute_extended("pnp".into(), 0).await.unwrap();
+    let got = notices(&drain(&mut client).await);
+    assert_eq!(got.len(), 1, "extended: {got:?}");
+}
+
+/// The HeliosProxy contract: `SHOW ALL` is one text row per setting
+/// (`name, setting, description`) holding the seven names a proxy tracks,
+/// each value equal to `SHOW <name>`, and it follows SET, RESET and
+/// DISCARD ALL on the same connection.
+#[tokio::test]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+async fn show_all_follows_set_reset_and_discard_all() {
+    const TRACKED: [&str; 7] = [
+        "search_path",
+        "row_security",
+        "datestyle",
+        "timezone",
+        "client_encoding",
+        "standard_conforming_strings",
+        "server_version",
+    ];
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+    async fn show_all(
+        handler: &mut PgConnectionHandler<DuplexStream>,
+        client: &mut DuplexStream,
+    ) -> std::collections::HashMap<String, String> {
+        handler.handle_single_query("SHOW ALL").await.unwrap();
+        let out = drain(client).await;
+        let fields = row_description(&out);
+        assert_eq!(
+            fields,
+            vec![
+                ("name".to_string(), 25),
+                ("setting".to_string(), 25),
+                ("description".to_string(), 25)
+            ],
+            "three text columns"
+        );
+        data_rows(&out)
+            .into_iter()
+            .map(|row| {
+                let text = |i: usize| String::from_utf8_lossy(row[i].as_ref().unwrap()).to_string();
+                (text(0).to_lowercase(), text(1))
+            })
+            .collect()
+    }
+    let check = |all: &std::collections::HashMap<String, String>, stage: &str| {
+        for name in TRACKED {
+            assert!(all.contains_key(name), "{stage}: SHOW ALL lacks {name}");
+        }
+    };
+    let all = show_all(&mut handler, &mut client).await;
+    check(&all, "start");
+    for name in TRACKED {
+        let shown = rs_scalar(&mut handler, &mut client, &format!("SHOW {name}")).await;
+        assert_eq!(all[name], shown, "start: SHOW ALL vs SHOW {name}");
+    }
+    assert_eq!(all["row_security"], "on");
+    let start = all;
+
+    for sql in ["SET row_security = off", "SET search_path = app, public"] {
+        handler.handle_single_query(sql).await.unwrap();
+        assert!(error_sqlstate(&drain(&mut client).await).is_none(), "{sql}");
+    }
+    let all = show_all(&mut handler, &mut client).await;
+    assert_eq!(all["row_security"], "off");
+    assert_eq!(
+        all["search_path"],
+        rs_scalar(&mut handler, &mut client, "SHOW search_path").await
+    );
+    assert_ne!(all["search_path"], start["search_path"]);
+
+    handler.handle_single_query("RESET row_security").await.unwrap();
+    let _ = drain(&mut client).await;
+    let all = show_all(&mut handler, &mut client).await;
+    assert_eq!(all["row_security"], "on", "after RESET");
+    assert_ne!(
+        all["search_path"], start["search_path"],
+        "RESET of one name leaves the other"
+    );
+
+    handler.handle_single_query("SET row_security = off").await.unwrap();
+    let _ = drain(&mut client).await;
+    handler.handle_single_query("DISCARD ALL").await.unwrap();
+    assert!(error_sqlstate(&drain(&mut client).await).is_none());
+    let all = show_all(&mut handler, &mut client).await;
+    for name in TRACKED {
+        assert_eq!(all[name], start[name], "after DISCARD ALL: {name}");
+        let shown = rs_scalar(&mut handler, &mut client, &format!("SHOW {name}")).await;
+        assert_eq!(all[name], shown, "after DISCARD ALL: SHOW ALL vs SHOW {name}");
+    }
+}

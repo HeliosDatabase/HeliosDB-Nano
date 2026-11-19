@@ -368,10 +368,6 @@ verify a last-writer-wins outcome.
 With `--features ha-ab-testing`, branches can be wired to traffic-split experiment
 rules. See `docs/guides/ha_cluster_tutorial.md` and the `heliosdb-nano-server` skill.
 
-### Recipe 6: Selective branch replication (`ha-branch-replication` feature)
-Branches can be marked for selective sync to specific remote replicas — useful for
-staging or jurisdiction-pinned data. See `docs/guides/ha_cluster_tutorial.md`.
-
 ## Pitfalls
 - **Merge does not detect conflicts.** A row both the target and the branch changed is
   last-writer-wins, silently, the branch being last. Verify after any merge where the target may
@@ -379,8 +375,8 @@ staging or jurisdiction-pinned data. See `docs/guides/ha_cluster_tutorial.md`.
 - **`conflict_resolution` is rejected**, not ignored — the statement errors on ≥4.16.0.
 - **Merge is "source into current"** for the library API. `db.merge_branch("dev")`
   merges `dev` into whatever branch you are on. Switch first, then merge.
-- **Branches are per-DB-instance.** Without `ha-tier2` / `ha-branch-replication`, a
-  branch created on one node is local to that node.
+- **Branches are per-DB-instance.** A branch created on one node is local to that node (a
+  physical standby replicates the whole store; there is no per-branch replication).
 - **Branches are not free while they live.** A row its parent changes costs a copy on every live
   child that still reads it, and a table its parent drops is a copy of every row. A row the parent
   INSERTS gives every such child a tombstone (the row is not there at its fork point), which the child's

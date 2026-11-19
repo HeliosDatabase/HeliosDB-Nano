@@ -49,11 +49,11 @@ cargo install heliosdb-nano \
 | Feature | Adds | Implies | Skills |
 |---------|------|---------|--------|
 | `ha-tier1` (default) | Read-only physical standby (active-passive), physical WAL over one replication port | — | `heliosdb-nano-server` |
-| `ha-tier2` | Multi-primary (active-active), branch-based replication, vector-clock conflicts | `ha-tier1` | `heliosdb-nano-server`, `heliosdb-nano-branches` |
-| `ha-tier3` | Sharding (consistent hash ring, cross-shard routing) | — | `heliosdb-nano-server`, `heliosdb-nano-deploy` |
-| `ha-dedup` | Content-addressed dedup across nodes | — | `heliosdb-nano-server` |
+| `ha-tier2` | Deprecated: selects nothing beyond `ha-tier1` | `ha-tier1` | — |
+| `ha-tier3` | Deprecated: selects nothing beyond `ha-tier1` | `ha-tier1` | — |
+| `ha-dedup` | Deprecated: selects nothing beyond `ha-tier1` | `ha-tier1` | — |
 | `ha-ab-testing` | Branch-to-experiment routing | — | `heliosdb-nano-branches`, `heliosdb-nano-server` |
-| `ha-branch-replication` | Selective branch sync to remote replicas | `ha-tier2` | `heliosdb-nano-branches`, `heliosdb-nano-server` |
+| `ha-branch-replication` | Deprecated: selects nothing beyond `ha-tier1` | `ha-tier1` | — |
 | `ha-full` | Bundle: all `ha-*` features | (all of the above) | `heliosdb-nano-server`, `heliosdb-nano-deploy` |
 
 ## Build presets (common combinations)
@@ -78,7 +78,7 @@ cargo install heliosdb-nano \
 | `heliosdb-nano-schema` | (none) | `vector-search` for HNSW DDL (default) |
 | `heliosdb-nano-query` | (none) | — |
 | `heliosdb-nano-transactions` | (none) | — |
-| `heliosdb-nano-branches` | (none) | `ha-tier2`, `ha-branch-replication`, `ha-ab-testing` |
+| `heliosdb-nano-branches` | (none) | `ha-ab-testing` |
 | `heliosdb-nano-time-travel` | (none) | — |
 | `heliosdb-nano-backup` | (none) | — |
 | `heliosdb-nano-vector` | `vector-search` (default) | `code-embed` for in-process embedder |

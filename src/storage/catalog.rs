@@ -6981,6 +6981,34 @@ impl<'a> Catalog<'a> {
         ddl.put(Self::partition_parent_key(child), &pv)
     }
 
+    /// v07.3: `ALTER TABLE parent DETACH PARTITION child` — unlink `child` from
+    /// `parent`'s list and delete its reverse link, staged into `ddl`, so a
+    /// later `DROP TABLE parent` no longer cascades to the detached table (it
+    /// used to: DETACH was a no-op and the dropped parent took the child and its
+    /// rows with it). `Ok(false)` when `child` is not registered under `parent`.
+    pub(crate) fn stage_partition_detach(
+        &self,
+        parent: &str,
+        child: &str,
+        ddl: &mut super::DdlBatch<'_>,
+    ) -> Result<bool> {
+        let mut children = self.partition_children(parent)?;
+        let before = children.len();
+        children.retain(|c| c != child);
+        if children.len() == before {
+            return Ok(false);
+        }
+        if children.is_empty() {
+            ddl.delete(Self::partition_children_key(parent));
+        } else {
+            let value = bincode::serialize(&children)
+                .map_err(|e| Error::query_execution(format!("partition-child serialize: {e}")))?;
+            ddl.put(Self::partition_children_key(parent), &value)?;
+        }
+        ddl.delete(Self::partition_parent_key(child));
+        Ok(true)
+    }
+
     /// The partition children registered under `parent`. Empty when the table
     /// has no registered partitions (the common, zero-cost case).
     pub fn partition_children(&self, parent: &str) -> Result<Vec<String>> {
