@@ -296,11 +296,21 @@ mod truthful {
         // Help is written from the command registry.
         let mut found = Vec::new();
         for spec in heliosdb_nano::repl::registry::all() {
-            let literal = spec.display_form();
-            if !literal.starts_with('\\') {
+            if !spec.name.starts_with('\\') {
                 continue;
             }
-            for alternative in literal.split(", ") {
+            // Every spelling takes the arguments the name takes.
+            let spellings: Vec<String> = std::iter::once(spec.name)
+                .chain(spec.aliases.iter().copied())
+                .map(|form| {
+                    if spec.args.is_empty() {
+                        form.to_string()
+                    } else {
+                        format!("{form} {}", spec.args)
+                    }
+                })
+                .collect();
+            for alternative in spellings.iter().map(String::as_str) {
                 let mut probe = String::new();
                 let mut skip = 0usize;
                 let mut word = false;
