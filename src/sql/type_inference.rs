@@ -186,6 +186,20 @@ impl TypeInference for LogicalExpr {
                     // Spec P5.2 §2: PostgreSQL's `boolean`; the extended
                     // protocol's Describe advertises it, the session answers it.
                     "pg_promote" | "pg_catalog.pg_promote" => Ok(DataType::Boolean),
+                    // v01.10: `x op ANY / ALL (array)`.
+                    "__hdb_quantified" => Ok(DataType::Boolean),
+                    // v01.7: `LIKE … ESCAPE`.
+                    "like_escape" | "similar_to_escape" => Ok(DataType::Boolean),
+                    // GitHub #52: PostgreSQL declares these `boolean`. Typed by
+                    // name, never by their arguments, so `pg_try_advisory_lock($1)`
+                    // is described as boolean (OID 16) at Parse as it is with a
+                    // literal key.
+                    "pg_try_advisory_lock"
+                    | "pg_catalog.pg_try_advisory_lock"
+                    | "pg_try_advisory_xact_lock"
+                    | "pg_catalog.pg_try_advisory_xact_lock"
+                    | "pg_advisory_unlock"
+                    | "pg_catalog.pg_advisory_unlock" => Ok(DataType::Boolean),
                     "pg_current_wal_lsn"
                     | "pg_catalog.pg_current_wal_lsn"
                     | "pg_current_wal_insert_lsn"

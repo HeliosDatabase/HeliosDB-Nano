@@ -267,6 +267,14 @@ Reports from users of earlier releases (GitHub numbers) and defects found while 
   through untouched; a `$` after an identifier character (`a$$`) or before a digit (`$1`) does not
   open a dollar quote, so MySQL and SQLite statements are unchanged. Text with no comment marker is
   no longer copied. Tests: `src/sql/parser.rs` (`v015_*`).
+- **`x op ANY(array)` gave silent wrong answers.** `'x' = ANY(tags)` over an array column was
+  planned as the constant false, `= ANY('{2,3}')` likewise, and every operator was read as `=`
+  (`<>` as NOT IN): `1 <> ANY(ARRAY[1,2])` and `3 > ANY(ARRAY[1,2])` were false. The array operand is
+  now any expression evaluated per row (a column, a bound parameter, an array text literal), the
+  operator is honoured with PostgreSQL's three-valued rule (no match beside a NULL element is NULL),
+  `ALL(array)` is implemented as its dual, `= ANY (subquery)` is `IN (subquery)`, and a form that
+  cannot be planned (another operator over a subquery) is SQLSTATE 0A000, never a constant.
+  Queries that silently returned no rows now return rows. Test: `tests/any_array_semantics.rs`.
 
 ### Fixed — six regressions against 4.41.1 found before release
 

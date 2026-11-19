@@ -40,6 +40,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 const ANY_ARRAY_MARKER_FUNCTION: &str = "__hdb_any_array";
+/// v01.10: the quantified comparison `x op ANY / ALL (array)`; see
+/// `Planner::quantified_to_logical` and `Evaluator::evaluate_quantified`.
+const QUANTIFIED_MARKER_FUNCTION: &str = "__hdb_quantified";
+/// v01.10: the marker of an `ANY` / `ALL` shape that is refused (0A000).
+pub const QUANTIFIED_UNSUPPORTED: &str = "this ANY/ALL form is not supported";
 
 /// PostgreSQL's wording for an aggregate call inside an aggregate's
 /// `FILTER (WHERE …)`. The PostgreSQL wire maps it to 42803
@@ -5879,6 +5884,10 @@ impl<'a> Planner<'a> {
         }
     }
 
+    /// The array operand of `ANY` / `ALL`, evaluated per row: a bound
+    /// parameter, an array column, an array text literal (`'{2,3}'`), a
+    /// function or any other expression. The evaluator accepts a
+    /// `Value::Array` or PostgreSQL's `{a,b}` text form. v01.10.
     fn runtime_any_array_expr(&self, expr: &Expr) -> Result<LogicalExpr> {
         use sqlparser::ast::{Expr as SqlExpr, Value as SqlValue};
 
@@ -5887,11 +5896,118 @@ impl<'a> Planner<'a> {
             SqlExpr::Cast { expr: inner, .. } if matches!(inner.as_ref(), SqlExpr::Value(SqlValue::Placeholder(_))) => {
                 self.expr_to_logical(inner)
             }
-            _ => Err(Error::query_execution(format!(
-                "ANY(array): unsupported runtime array expression: {:?}",
-                expr
-            ))),
+            SqlExpr::Nested(inner) => self.runtime_any_array_expr(inner),
+            _ => match self.expr_to_logical(expr) {
+                Ok(logical) => Ok(logical),
+                // A cast to an array type the planner cannot express: the
+                // evaluator reads the operand itself (array or `{..}` text).
+                Err(e) => match expr {
+                    SqlExpr::Cast { expr: inner, .. } => self.expr_to_logical(inner).map_err(|_| e),
+                    _ => Err(e),
+                },
+            },
         }
+    }
+
+    /// v01.10: `left op ANY(right)` (`all == false`) and `left op ALL(right)`.
+    ///
+    /// `= ANY` keeps the IN-list lowering (a literal array is a plain IN list;
+    /// anything else is the runtime marker the IN evaluator expands per row).
+    /// Every other operator, and every `ALL`, is the quantified marker
+    /// [`QUANTIFIED_MARKER_FUNCTION`], evaluated with PostgreSQL's three-valued
+    /// rule: ANY is true when some element satisfies the operator, NULL when
+    /// none does and a comparison was NULL, false otherwise (ALL is the dual).
+    /// A shape that cannot be planned is an error, never a constant.
+    fn quantified_to_logical(
+        &self,
+        left: &Expr,
+        compare_op: &sqlparser::ast::BinaryOperator,
+        right: &Expr,
+        all: bool,
+    ) -> Result<LogicalExpr> {
+        use sqlparser::ast::BinaryOperator as SqlOp;
+        let quantifier = if all { "ALL" } else { "ANY" };
+        let op_symbol = match compare_op {
+            SqlOp::Eq => "=",
+            SqlOp::NotEq => "<>",
+            SqlOp::Lt => "<",
+            SqlOp::LtEq => "<=",
+            SqlOp::Gt => ">",
+            SqlOp::GtEq => ">=",
+            other => {
+                return Err(Error::query_execution(format!(
+                    "operator {other} {quantifier}(...): {QUANTIFIED_UNSUPPORTED}"
+                )));
+            }
+        };
+        let logical_left = self.expr_to_logical(left)?;
+
+        // `x = ANY (SELECT …)` is `x IN (SELECT …)`; the other subquery forms
+        // are refused rather than answered wrongly.
+        let subquery = match right {
+            Expr::Subquery(q) => Some(q),
+            Expr::Nested(inner) => match inner.as_ref() {
+                Expr::Subquery(q) => Some(q),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(query) = subquery {
+            if !all && op_symbol == "=" {
+                let subquery_plan = self.query_to_plan((**query).clone())?;
+                return Ok(LogicalExpr::InSubquery {
+                    expr: Box::new(logical_left),
+                    subquery: Box::new(subquery_plan),
+                    negated: false,
+                });
+            }
+            return Err(Error::query_execution(format!(
+                "{op_symbol} {quantifier}(subquery): {QUANTIFIED_UNSUPPORTED}"
+            )));
+        }
+
+        let literal_list = self
+            .literal_array_to_list(right)
+            .or_else(|_| self.array_expr_to_list(right))
+            .ok();
+        if !all && op_symbol == "=" {
+            return match literal_list {
+                Some(list) => Ok(LogicalExpr::InList {
+                    expr: Box::new(logical_left),
+                    list,
+                    negated: false,
+                }),
+                None => Ok(LogicalExpr::InList {
+                    expr: Box::new(logical_left),
+                    list: vec![LogicalExpr::ScalarFunction {
+                        fun: ANY_ARRAY_MARKER_FUNCTION.to_string(),
+                        args: vec![self.runtime_any_array_expr(right)?],
+                    }],
+                    negated: false,
+                }),
+            };
+        }
+        // Marker arguments: operator, ALL flag, left, then either one array
+        // expression ("array") or the literal elements ("list").
+        let mut args = vec![
+            LogicalExpr::Literal(Value::String(op_symbol.to_string())),
+            LogicalExpr::Literal(Value::Boolean(all)),
+            logical_left,
+        ];
+        match literal_list {
+            Some(list) => {
+                args.push(LogicalExpr::Literal(Value::String("list".to_string())));
+                args.extend(list);
+            }
+            None => {
+                args.push(LogicalExpr::Literal(Value::String("array".to_string())));
+                args.push(self.runtime_any_array_expr(right)?);
+            }
+        }
+        Ok(LogicalExpr::ScalarFunction {
+            fun: QUANTIFIED_MARKER_FUNCTION.to_string(),
+            args,
+        })
     }
 
     pub(crate) fn expr_to_logical(&self, expr: &Expr) -> Result<LogicalExpr> {
@@ -6340,45 +6456,13 @@ impl<'a> Planner<'a> {
                 compare_op,
                 right,
                 is_some: _,
-            } => {
-                use sqlparser::ast::BinaryOperator;
-                let negated = matches!(compare_op, BinaryOperator::NotEq);
-                // Literal arrays become a normal InList. Parameter arrays use
-                // an internal marker that the InList evaluator expands at
-                // runtime after parameter binding. Column/subquery arrays
-                // still fall back to constant false; full array-column ANY
-                // support is a bigger executor feature.
-                let logical_expr = self.expr_to_logical(left)?;
-                match self
-                    .literal_array_to_list(right)
-                    .or_else(|_| self.array_expr_to_list(right))
-                {
-                    Ok(list) => Ok(LogicalExpr::InList {
-                        expr: Box::new(logical_expr),
-                        list,
-                        negated,
-                    }),
-                    Err(_) => match self.runtime_any_array_expr(right) {
-                        Ok(array_expr) => Ok(LogicalExpr::InList {
-                            expr: Box::new(logical_expr),
-                            list: vec![LogicalExpr::ScalarFunction {
-                                fun: ANY_ARRAY_MARKER_FUNCTION.to_string(),
-                                args: vec![array_expr],
-                            }],
-                            negated,
-                        }),
-                        Err(_) => {
-                            // The left expression may have side-effects
-                            // worth preserving in the plan; eagerly
-                            // evaluating to a constant boolean drops it.
-                            // For drizzle's usage the left is also a
-                            // simple column reference, so dropping is
-                            // benign.
-                            Ok(LogicalExpr::Literal(Value::Boolean(negated)))
-                        }
-                    },
-                }
-            }
+            } => self.quantified_to_logical(left, compare_op, right, false),
+            // v01.10: `x op ALL(array)`, the dual of ANY.
+            Expr::AllOp {
+                left,
+                compare_op,
+                right,
+            } => self.quantified_to_logical(left, compare_op, right, true),
 
             // Scalar subquery: `(SELECT col FROM t WHERE ...)` used as
             // an expression. We don't materialise here because the

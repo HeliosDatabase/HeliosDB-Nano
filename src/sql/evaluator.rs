@@ -11,6 +11,28 @@ use rust_decimal::Decimal;
 use std::sync::Arc;
 
 const ANY_ARRAY_MARKER_FUNCTION: &str = "__hdb_any_array";
+/// v01.10: `x op ANY / ALL (array)`, built by `Planner::quantified_to_logical`.
+const QUANTIFIED_MARKER_FUNCTION: &str = "__hdb_quantified";
+
+/// v01.7: `~`, `SIMILAR TO` compile their pattern once per statement rather
+/// than once per row: a single-entry, per-thread cache keyed by the compiled
+/// pattern text (which already carries the flags). `Regex` clones share the
+/// compiled program.
+fn cached_regex(pattern: &str) -> std::result::Result<regex::Regex, regex::Error> {
+    thread_local! {
+        static LAST: std::cell::RefCell<Option<(String, regex::Regex)>> = const { std::cell::RefCell::new(None) };
+    }
+    LAST.with(|last| {
+        if let Some((key, re)) = last.borrow().as_ref() {
+            if key == pattern {
+                return Ok(re.clone());
+            }
+        }
+        let re = regex::Regex::new(pattern)?;
+        *last.borrow_mut() = Some((pattern.to_string(), re.clone()));
+        Ok(re)
+    })
+}
 
 /// Upper bound (1 GiB) on a string length that string-building functions
 /// (repeat/lpad/rpad) will attempt to allocate. Beyond this the allocation
@@ -771,6 +793,10 @@ impl Evaluator {
         // Evaluate all arguments
         let arg_values: Result<Vec<Value>> = args.iter().map(|arg| self.evaluate(arg, tuple)).collect();
         let arg_values = arg_values?;
+
+        if fun == QUANTIFIED_MARKER_FUNCTION {
+            return self.evaluate_quantified(&arg_values);
+        }
 
         // KanttBan #23 (v3.31.1 phase 1): drizzle-kit / psql /
         // pgAdmin call several pg_catalog helpers both with and
@@ -6443,6 +6469,83 @@ impl Evaluator {
             }
         }
         Some(out)
+    }
+
+    /// v01.10: `left op ANY / ALL (elements)` with PostgreSQL's three-valued
+    /// rule. `args`: operator symbol, ALL flag, left value, then `"array"` and
+    /// one array value (a `Value::Array` or `{a,b}` text), or `"list"` and the
+    /// elements. An element given as text is read as the left value's type
+    /// first, as PostgreSQL types an untyped array literal by the other operand.
+    fn evaluate_quantified(&self, args: &[Value]) -> Result<Value> {
+        use super::BinaryOperator;
+        let malformed = || Error::query_execution("malformed ANY/ALL marker");
+        let (op, all, left, mode, rest) = match args {
+            [Value::String(op), Value::Boolean(all), left, Value::String(mode), rest @ ..] => {
+                (op.as_str(), *all, left, mode.as_str(), rest)
+            }
+            _ => return Err(malformed()),
+        };
+        let op = match op {
+            "=" => BinaryOperator::Eq,
+            "<>" => BinaryOperator::NotEq,
+            "<" => BinaryOperator::Lt,
+            "<=" => BinaryOperator::LtEq,
+            ">" => BinaryOperator::Gt,
+            ">=" => BinaryOperator::GtEq,
+            _ => return Err(malformed()),
+        };
+        let owned;
+        let elements: &[Value] = match mode {
+            "list" => rest,
+            "array" => match rest.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(Value::Array(values)) => values,
+                Some(Value::String(text)) => {
+                    owned = Self::parse_pg_text_array(text)
+                        .ok_or_else(|| Error::query_execution(format!("malformed array literal: \"{text}\"")))?;
+                    &owned
+                }
+                Some(other) => {
+                    return Err(Error::query_execution(format!(
+                        "ANY/ALL expects an array expression, got {other:?}"
+                    )))
+                }
+                None => return Err(malformed()),
+            },
+            _ => return Err(malformed()),
+        };
+        if elements.is_empty() {
+            return Ok(Value::Boolean(all));
+        }
+        if matches!(left, Value::Null) {
+            return Ok(Value::Null);
+        }
+        let left_type = left.data_type();
+        let mut saw_null = false;
+        for element in elements {
+            let element = match element {
+                Value::String(_) if !matches!(left, Value::String(_)) => self
+                    .cast_value(element.clone(), &left_type)
+                    .unwrap_or_else(|_| element.clone()),
+                other => other.clone(),
+            };
+            match self.evaluate_binary_op(left, &op, &element)? {
+                Value::Boolean(true) if !all => return Ok(Value::Boolean(true)),
+                Value::Boolean(false) if all => return Ok(Value::Boolean(false)),
+                Value::Boolean(_) => {}
+                Value::Null => saw_null = true,
+                other => {
+                    return Err(Error::query_execution(format!(
+                        "ANY/ALL comparison did not yield a boolean: {other:?}"
+                    )))
+                }
+            }
+        }
+        if saw_null {
+            Ok(Value::Null)
+        } else {
+            Ok(Value::Boolean(all))
+        }
     }
 
     fn values_equal(&self, left: &Value, right: &Value) -> bool {
