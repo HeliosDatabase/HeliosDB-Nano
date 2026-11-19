@@ -34436,7 +34436,8 @@ impl EmbeddedDatabase {
             | sql::LogicalPlan::AlterTableAddUnique { .. }
             | sql::LogicalPlan::AlterTableAddPrimaryKey { .. }
             | sql::LogicalPlan::AlterTableAddCheck { .. }
-            | sql::LogicalPlan::DropTableCascade { .. }) => Ok(plan),
+            | sql::LogicalPlan::DropTableCascade { .. }
+            | sql::LogicalPlan::Notification(_)) => Ok(plan),
 
             #[cfg(feature = "ha-tier1")]
             plan @ (sql::LogicalPlan::Switchover { .. }
