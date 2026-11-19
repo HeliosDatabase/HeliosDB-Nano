@@ -13493,7 +13493,15 @@ async fn a_portal_is_bound_by_its_own_description() {
 /// the new column used to go out in text after two binary ones. One code for
 /// all, or none, still fits any width.
 #[tokio::test]
-#[allow(clippy::expect_used)] // Test code: `expect` documents the failing step.
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::many_single_char_names,
+    clippy::large_futures,
+    clippy::assert_is_empty
+)] // Test code.
 async fn result_formats_fixed_per_column_at_bind_hold_their_width() {
     let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
     db.execute("CREATE TABLE g (id INT PRIMARY KEY, v INT)")
@@ -13535,7 +13543,15 @@ async fn result_formats_fixed_per_column_at_bind_hold_their_width() {
 /// statement lands exactly there: after the generation the handler checked under,
 /// before the arm. Every DML kind, autocommit and in a transaction.
 #[test]
-#[allow(clippy::expect_used)] // Test code: `expect` documents the failing step.
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::many_single_char_names,
+    clippy::large_futures,
+    clippy::assert_is_empty
+)] // Test code.
 fn a_shape_change_after_the_handlers_check_is_refused_by_the_arm_before_it_writes() {
     use crate::session::IsolationLevel;
     use crate::{Column, DataType, Schema, Value};
@@ -13654,6 +13670,15 @@ fn sequence_parameters_out_of_range_classify_as_22023() -> std::result::Result<(
 /// `::vector(3)`. Both forms must reach the evaluator and come back as the
 /// pgvector text form; a wrong dimension is an error, not a stored value.
 #[tokio::test]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::many_single_char_names,
+    clippy::large_futures,
+    clippy::assert_is_empty
+)] // Test code.
 async fn extended_bound_parameter_casts_to_vector() {
     let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
     for (sql, param) in [
@@ -13708,6 +13733,15 @@ async fn extended_bound_parameter_casts_to_vector() {
 /// closed by Sync, so the reply carries RowDescription/NoData, the rows, the
 /// tag and the ReadyForQuery status. A handler error is rendered as text so two
 /// spellings of a statement can be compared even where both are refused.
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::many_single_char_names,
+    clippy::large_futures,
+    clippy::assert_is_empty
+)] // Test code.
 fn lc_extended<'a>(
     handler: &'a mut PgConnectionHandler<DuplexStream>,
     client: &'a mut DuplexStream,
@@ -13749,6 +13783,7 @@ fn lc_extended<'a>(
     })
 }
 
+#[allow(clippy::expect_used)] // Test code.
 fn lc_fresh() -> (PgConnectionHandler<DuplexStream>, DuplexStream) {
     let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
     test_handler(db)

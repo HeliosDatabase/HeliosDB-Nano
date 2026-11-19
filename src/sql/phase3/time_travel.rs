@@ -115,27 +115,30 @@ impl TimeTravelParser {
 
     /// Cheap byte-level pre-check: `as` + whitespace + `of`, or `versions`.
     fn may_contain_clause(sql: &str) -> bool {
-        let b = sql.as_bytes();
-        let n = b.len();
+        let bytes = sql.as_bytes();
+        let len = bytes.len();
         let mut i = 0;
-        while i + 1 < n {
-            let c = b.get(i).copied().unwrap_or(0) | 0x20;
-            let d = b.get(i + 1).copied().unwrap_or(0) | 0x20;
-            if c == b'a' && d == b's' {
+        while i + 1 < len {
+            let first = bytes.get(i).copied().unwrap_or(0) | 0x20;
+            let second = bytes.get(i + 1).copied().unwrap_or(0) | 0x20;
+            if first == b'a' && second == b's' {
                 let mut j = i + 2;
                 let mut ws = false;
-                while b
+                while bytes
                     .get(j)
                     .is_some_and(|x| x.is_ascii_whitespace() || *x == b'/' || *x == b'-')
                 {
                     ws = true;
                     j += 1;
                 }
-                if ws && b.get(j).is_some_and(|x| x | 0x20 == b'o') && b.get(j + 1).is_some_and(|x| x | 0x20 == b'f') {
+                if ws
+                    && bytes.get(j).is_some_and(|x| x | 0x20 == b'o')
+                    && bytes.get(j + 1).is_some_and(|x| x | 0x20 == b'f')
+                {
                     return true;
                 }
-            } else if c == b'v'
-                && d == b'e'
+            } else if first == b'v'
+                && second == b'e'
                 && sql.get(i..).is_some_and(|r| {
                     r.len() >= 8
                         && r.as_bytes()
@@ -225,23 +228,23 @@ fn is_word_char(c: u8) -> bool {
 /// comments become one token (or none); every token boundary is an ASCII byte,
 /// so all offsets are char boundaries of the original string.
 fn tokenize(sql: &str) -> Vec<Token> {
-    let b = sql.as_bytes();
-    let n = b.len();
-    let at = |i: usize| b.get(i).copied().unwrap_or(0);
+    let bytes = sql.as_bytes();
+    let len = bytes.len();
+    let at = |i: usize| bytes.get(i).copied().unwrap_or(0);
     let mut toks: Vec<Token> = Vec::new();
     let mut i = 0usize;
-    while i < n {
+    while i < len {
         let c = at(i);
         if c.is_ascii_whitespace() {
             i += 1;
         } else if c == b'-' && at(i + 1) == b'-' {
-            while i < n && at(i) != b'\n' {
+            while i < len && at(i) != b'\n' {
                 i += 1;
             }
         } else if c == b'/' && at(i + 1) == b'*' {
             let mut depth = 1usize;
             i += 2;
-            while i < n && depth > 0 {
+            while i < len && depth > 0 {
                 if at(i) == b'/' && at(i + 1) == b'*' {
                     depth += 1;
                     i += 2;
@@ -269,7 +272,7 @@ fn tokenize(sql: &str) -> Vec<Token> {
                 }
             }
             i += 1;
-            while i < n {
+            while i < len {
                 let d = at(i);
                 if backslash && d == b'\\' {
                     i += 2;
@@ -284,7 +287,7 @@ fn tokenize(sql: &str) -> Vec<Token> {
                     i += 1;
                 }
             }
-            let end = i.min(n);
+            let end = i.min(len);
             i = end;
             toks.push(Token {
                 kind: Tk::Str,
@@ -294,7 +297,7 @@ fn tokenize(sql: &str) -> Vec<Token> {
         } else if c == b'"' || c == b'`' {
             let start = i;
             i += 1;
-            while i < n {
+            while i < len {
                 if at(i) == c {
                     if at(i + 1) == c {
                         i += 2;
@@ -306,7 +309,7 @@ fn tokenize(sql: &str) -> Vec<Token> {
                     i += 1;
                 }
             }
-            let end = i.min(n);
+            let end = i.min(len);
             i = end;
             toks.push(Token {
                 kind: Tk::Quoted,
@@ -317,7 +320,7 @@ fn tokenize(sql: &str) -> Vec<Token> {
             // $tag$ ... $tag$ (tag may be empty, may not start with a digit)
             let mut j = i + 1;
             if is_word_start(at(j)) && !at(j).is_ascii_digit() {
-                while j < n && is_word_char(at(j)) && at(j) != b'$' {
+                while j < len && is_word_char(at(j)) && at(j) != b'$' {
                     j += 1;
                 }
             }
@@ -326,7 +329,7 @@ fn tokenize(sql: &str) -> Vec<Token> {
                 let body = j + 1;
                 let end = match sql.get(body..).and_then(|r| r.find(tag)) {
                     Some(off) => body + off + tag.len(),
-                    None => n,
+                    None => len,
                 };
                 toks.push(Token {
                     kind: Tk::Str,
@@ -344,7 +347,7 @@ fn tokenize(sql: &str) -> Vec<Token> {
             }
         } else if is_word_start(c) {
             let start = i;
-            while i < n && is_word_char(at(i)) {
+            while i < len && is_word_char(at(i)) {
                 i += 1;
             }
             toks.push(Token {
@@ -570,7 +573,13 @@ fn scan_tokens(sql: &str, toks: &[Token]) -> Vec<TimeTravelClause> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::many_single_char_names
+)]
 mod tests {
     use super::*;
 
