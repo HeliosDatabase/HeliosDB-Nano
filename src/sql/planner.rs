@@ -6183,10 +6183,43 @@ impl<'a> Planner<'a> {
             }),
 
             Expr::Like {
-                negated, expr, pattern, ..
+                negated,
+                any,
+                expr,
+                pattern,
+                escape_char,
             } => {
+                // v01.7: `LIKE ANY (…)` used to be read as a plain LIKE.
+                if *any {
+                    return Err(Error::query_execution(format!(
+                        "Like ANY (...): {QUANTIFIED_UNSUPPORTED}"
+                    )));
+                }
                 let left_expr = self.expr_to_logical(expr)?;
                 let right_expr = self.expr_to_logical(pattern)?;
+                // v01.7: an ESCAPE clause used to be dropped. It lowers to the
+                // internal `like_escape(text, pattern, escape, ci)` call, as
+                // SIMILAR TO … ESCAPE does; without one the operator keeps the
+                // backslash default and the storage pushdown.
+                if let Some(esc) = escape_char {
+                    let call = LogicalExpr::ScalarFunction {
+                        fun: "like_escape".to_string(),
+                        args: vec![
+                            left_expr,
+                            right_expr,
+                            LogicalExpr::Literal(Value::String(esc.clone())),
+                            LogicalExpr::Literal(Value::Boolean(false)),
+                        ],
+                    };
+                    return Ok(if *negated {
+                        LogicalExpr::UnaryExpr {
+                            op: UnaryOperator::Not,
+                            expr: Box::new(call),
+                        }
+                    } else {
+                        call
+                    });
+                }
                 let op = if *negated {
                     BinaryOperator::NotLike
                 } else {
@@ -6201,10 +6234,43 @@ impl<'a> Planner<'a> {
             }
 
             Expr::ILike {
-                negated, expr, pattern, ..
+                negated,
+                any,
+                expr,
+                pattern,
+                escape_char,
             } => {
+                // v01.7: `LIKE ANY (…)` used to be read as a plain LIKE.
+                if *any {
+                    return Err(Error::query_execution(format!(
+                        "ILike ANY (...): {QUANTIFIED_UNSUPPORTED}"
+                    )));
+                }
                 let left_expr = self.expr_to_logical(expr)?;
                 let right_expr = self.expr_to_logical(pattern)?;
+                // v01.7: an ESCAPE clause used to be dropped. It lowers to the
+                // internal `like_escape(text, pattern, escape, ci)` call, as
+                // SIMILAR TO … ESCAPE does; without one the operator keeps the
+                // backslash default and the storage pushdown.
+                if let Some(esc) = escape_char {
+                    let call = LogicalExpr::ScalarFunction {
+                        fun: "like_escape".to_string(),
+                        args: vec![
+                            left_expr,
+                            right_expr,
+                            LogicalExpr::Literal(Value::String(esc.clone())),
+                            LogicalExpr::Literal(Value::Boolean(true)),
+                        ],
+                    };
+                    return Ok(if *negated {
+                        LogicalExpr::UnaryExpr {
+                            op: UnaryOperator::Not,
+                            expr: Box::new(call),
+                        }
+                    } else {
+                        call
+                    });
+                }
                 let op = if *negated {
                     BinaryOperator::NotILike
                 } else {

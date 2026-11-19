@@ -275,6 +275,30 @@ Reports from users of earlier releases (GitHub numbers) and defects found while 
   `ALL(array)` is implemented as its dual, `= ANY (subquery)` is `IN (subquery)`, and a form that
   cannot be planned (another operator over a subquery) is SQLSTATE 0A000, never a constant.
   Queries that silently returned no rows now return rows. Test: `tests/any_array_semantics.rs`.
+- **LIKE answered differently depending on the route a statement took, ignored ESCAPE, and a
+  pattern with many `%` could pin a core.** A literal pattern pushed to storage was matched by a
+  recursive matcher with no escape handling, a normalized or bound pattern by a regex compiled per
+  row in which `%` did not cross a newline: `s LIKE '100\%'` matched `100%` on one route and
+  `100\%` on the other, `'a\nb' LIKE 'a%b'` was false on one, and `%a%a%a%a%a%a%b` against a
+  100-character row took over a minute. `LIKE … ESCAPE 'x'` was dropped by the planner. One linear
+  matcher (backslash escape by default, `%` and `_` over characters including newline) now serves
+  the evaluator, the storage pushdown, the PostgreSQL catalog and MySQL `SHOW … LIKE` (which now
+  honours `wp\_%`); `ESCAPE` is honoured (`''` disables escaping; more than one character, or a
+  pattern ending in its escape character, is SQLSTATE 22025); `LIKE ANY (…)` is refused (0A000)
+  instead of being read as a plain LIKE; `~` and `SIMILAR TO` reuse the last compiled regex. Case
+  rules are unchanged. Tests: `tests/like_semantics.rs`, `src/sql/like_match.rs`.
+- **LIKE answered differently depending on the route a statement took, ignored ESCAPE, and a
+  pattern with many `%` could pin a core.** A literal pattern pushed to storage was matched by a
+  recursive matcher with no escape handling, a normalized or bound pattern by a regex compiled per
+  row in which `%` did not cross a newline: `s LIKE '100\%'` matched `100%` on one route and
+  `100\%` on the other, `'a\nb' LIKE 'a%b'` was false on one, and `%a%a%a%a%a%a%b` against a
+  100-character row took over a minute. `LIKE … ESCAPE 'x'` was dropped by the planner. One linear
+  matcher (backslash escape by default, `%` and `_` over characters including newline) now serves
+  the evaluator, the storage pushdown, the PostgreSQL catalog and MySQL `SHOW … LIKE` (which now
+  honours `wp\_%`); `ESCAPE` is honoured (`''` disables escaping; more than one character, or a
+  pattern ending in its escape character, is SQLSTATE 22025); `LIKE ANY (…)` is refused (0A000)
+  instead of being read as a plain LIKE; `~` and `SIMILAR TO` reuse the last compiled regex. Case
+  rules are unchanged. Tests: `tests/like_semantics.rs`, `src/sql/like_match.rs`.
 
 ### Fixed — six regressions against 4.41.1 found before release
 

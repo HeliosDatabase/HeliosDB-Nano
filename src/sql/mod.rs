@@ -15,6 +15,7 @@ pub mod executor;
 pub mod features;
 pub mod functions;
 pub mod interpolate; // Shared `$`-placeholder scanner + SQL-literal renderer for routine bodies
+pub mod like_match; // v01.7: the one LIKE matcher of every route
 pub mod logical_plan;
 pub(crate) mod mv_destamp; // Materialized-view plans: derived-alias stamps rewritten away before persistence (GH#29 c3)
 pub(crate) mod normalize;

@@ -324,44 +324,9 @@ impl FilterPredicate {
             _ => return false,
         };
 
-        // Simple LIKE pattern matching
-        // % matches any sequence, _ matches any single character
-        Self::match_like_pattern(text, pattern)
-    }
-
-    fn match_like_pattern(text: &str, pattern: &str) -> bool {
-        let text_chars: Vec<char> = text.chars().collect();
-        let pattern_chars: Vec<char> = pattern.chars().collect();
-        Self::match_like_recursive(&text_chars, &pattern_chars, 0, 0)
-    }
-
-    // SAFETY: All slice indices (ti, pi) are bounds-checked against text.len()/pattern.len()
-    // at the top of the function and before each access.
-    #[allow(clippy::indexing_slicing)]
-    fn match_like_recursive(text: &[char], pattern: &[char], ti: usize, pi: usize) -> bool {
-        if pi == pattern.len() {
-            return ti == text.len();
-        }
-
-        if pattern[pi] == '%' {
-            // Try matching 0 or more characters
-            for i in ti..=text.len() {
-                if Self::match_like_recursive(text, pattern, i, pi + 1) {
-                    return true;
-                }
-            }
-            return false;
-        }
-
-        if ti == text.len() {
-            return false;
-        }
-
-        if pattern[pi] == '_' || pattern[pi] == text[ti] {
-            return Self::match_like_recursive(text, pattern, ti + 1, pi + 1);
-        }
-
-        false
+        // v01.7: the shared linear matcher, with the evaluator's default
+        // backslash escape, so the pushed and the evaluated route agree.
+        crate::sql::like_match::like_match(text, pattern, Some('\\'), false).unwrap_or(false)
     }
 }
 

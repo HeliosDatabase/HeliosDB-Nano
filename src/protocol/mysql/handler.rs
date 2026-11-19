@@ -4100,28 +4100,11 @@ fn map_error_code(err_msg: &str) -> (u16, &'static str) {
 // SQL LIKE pattern matching
 // ============================================================================
 
-/// Match a value against a SQL LIKE pattern.
-///
-/// Supports `%` (any sequence of characters) and `_` (any single character).
+/// Match a value against a SQL LIKE pattern: the shared matcher (v01.7),
+/// with MySQL's default backslash escape, so `SHOW TABLES LIKE 'wp\_%'`
+/// matches `wp_posts` and not `wpxposts`. Case-sensitive, as before.
 fn sql_like_match(value: &str, pattern: &str) -> bool {
-    // Build regex by processing the pattern character-by-character:
-    // - `%` becomes `.*` (match any sequence)
-    // - `_` becomes `.`  (match any single char)
-    // - all other characters are regex-escaped
-    let mut regex_str = String::from("^");
-    for ch in pattern.chars() {
-        match ch {
-            '%' => regex_str.push_str(".*"),
-            '_' => regex_str.push('.'),
-            _ => {
-                // Escape regex-special characters
-                let escaped = regex::escape(&ch.to_string());
-                regex_str.push_str(&escaped);
-            }
-        }
-    }
-    regex_str.push('$');
-    Regex::new(&regex_str).map(|re| re.is_match(value)).unwrap_or(false)
+    crate::sql::like_match::like_match(value, pattern, Some('\\'), false).unwrap_or(false)
 }
 
 /// Extract the LIKE pattern from a SQL statement (e.g. `SHOW TABLES LIKE 'wp_%'`).
@@ -4539,6 +4522,14 @@ mod tests {
     fn test_sql_like_match_underscore_wildcard() {
         assert!(sql_like_match("ab", "a_"));
         assert!(!sql_like_match("abc", "a_"));
+    }
+
+    /// v01.7: the backslash escape is honoured (shared matcher).
+    #[test]
+    fn test_sql_like_match_backslash_escape() {
+        assert!(sql_like_match("wp_posts", "wp\\_%"));
+        assert!(!sql_like_match("wpxposts", "wp\\_%"));
+        assert!(sql_like_match("a\nb", "a%b"));
     }
 
     #[test]

@@ -1007,46 +1007,10 @@ impl PgCatalog {
             .collect()
     }
 
-    /// Simple SQL LIKE pattern matching (supports % and _ wildcards)
+    /// SQL LIKE pattern matching: the shared matcher (v01.7), PostgreSQL's
+    /// default backslash escape.
     fn sql_like_match(text: &str, pattern: &str) -> bool {
-        let t_chars: Vec<char> = text.chars().collect();
-        let p_chars: Vec<char> = pattern.chars().collect();
-
-        Self::like_match_recursive(&t_chars, &p_chars, 0, 0)
-    }
-
-    #[allow(clippy::indexing_slicing)] // Safety: pi/ti bounds checked at function entry and before use
-    fn like_match_recursive(text: &[char], pattern: &[char], ti: usize, pi: usize) -> bool {
-        if pi == pattern.len() {
-            return ti == text.len();
-        }
-
-        match pattern[pi] {
-            '%' => {
-                // % matches zero or more characters
-                for i in ti..=text.len() {
-                    if Self::like_match_recursive(text, pattern, i, pi + 1) {
-                        return true;
-                    }
-                }
-                false
-            }
-            '_' => {
-                // _ matches exactly one character
-                if ti < text.len() {
-                    Self::like_match_recursive(text, pattern, ti + 1, pi + 1)
-                } else {
-                    false
-                }
-            }
-            c => {
-                if ti < text.len() && text[ti] == c {
-                    Self::like_match_recursive(text, pattern, ti + 1, pi + 1)
-                } else {
-                    false
-                }
-            }
-        }
+        crate::sql::like_match::like_match(text, pattern, Some('\\'), false).unwrap_or(false)
     }
 
     /// Query pg_class (relation/table information) - returns real tables from catalog

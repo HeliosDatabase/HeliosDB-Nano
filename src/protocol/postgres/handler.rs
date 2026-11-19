@@ -7400,6 +7400,16 @@ fn sqlstate_for_query_execution_message(message: &str) -> &'static str {
     if message.contains(crate::sql::planner::WINDOW_IN_FILTER) {
         return sqlstate::WINDOWING_ERROR; // 42P20
     }
+    // v01.7: a LIKE pattern ending in its escape character, or an ESCAPE
+    // clause that is not one character.
+    if message.contains(crate::sql::like_match::LIKE_PATTERN_ENDS_WITH_ESCAPE)
+        || message.contains(crate::sql::like_match::INVALID_ESCAPE_STRING)
+    {
+        return sqlstate::INVALID_ESCAPE_SEQUENCE; // 22025
+    }
+    if message.contains(crate::sql::planner::QUANTIFIED_UNSUPPORTED) {
+        return sqlstate::FEATURE_NOT_SUPPORTED; // 0A000
+    }
     if message.contains(crate::sql::planner::FILTER_ON_NON_AGGREGATE_WINDOW) {
         return sqlstate::FEATURE_NOT_SUPPORTED; // 0A000
     }

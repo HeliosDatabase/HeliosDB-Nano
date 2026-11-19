@@ -1025,6 +1025,8 @@ impl Evaluator {
             // by the planner only when an ESCAPE clause is present — see
             // `similar_to_escape_fn`). Not a user-facing function.
             "similar_to_escape" => self.similar_to_escape_fn(&arg_values),
+            // v01.7: internal lowering target for `LIKE … ESCAPE 'x'`.
+            "like_escape" => self.like_escape_fn(&arg_values),
 
             // PostgreSQL compatibility functions (SQLAlchemy, psql, pgAdmin, DBeaver)
             "version" | "pg_catalog.version" => Ok(Value::String(crate::sql::params::pg_version_function_string())),
@@ -6739,128 +6741,88 @@ impl Evaluator {
     /// LIKE pattern matching operator
     /// Supports SQL LIKE patterns: % (any sequence), _ (single char)
     fn like_op(&self, left: &Value, right: &Value, negated: bool) -> Result<Value> {
-        // Handle NULL values
+        Self::like_values(left, right, Some('\\'), false, negated, "LIKE")
+    }
+
+    /// v01.7: `LIKE` / `ILIKE` through the shared linear matcher
+    /// (`crate::sql::like_match`): no regex per row, `%` spans newlines, and
+    /// `escape` is the escape character (`None`: escaping disabled).
+    fn like_values(
+        left: &Value,
+        right: &Value,
+        escape: Option<char>,
+        case_insensitive: bool,
+        negated: bool,
+        what: &str,
+    ) -> Result<Value> {
         if matches!(left, Value::Null) || matches!(right, Value::Null) {
             return Ok(Value::Null);
         }
-
-        // Get string values
         let text = match left {
             Value::String(s) => s.as_str(),
             _ => {
                 return Err(Error::query_execution(format!(
-                    "LIKE requires string operand, got {:?}",
+                    "{what} requires string operand, got {:?}",
                     left
                 )))
             }
         };
-
         let pattern = match right {
             Value::String(s) => s.as_str(),
             _ => {
                 return Err(Error::query_execution(format!(
-                    "LIKE pattern must be a string, got {:?}",
+                    "{what} pattern must be a string, got {:?}",
                     right
                 )))
             }
         };
-
-        // Convert SQL LIKE pattern to regex
-        let regex_pattern = self.like_pattern_to_regex(pattern);
-
-        let result = match regex::Regex::new(&regex_pattern) {
-            Ok(re) => re.is_match(text),
-            Err(e) => {
-                return Err(Error::query_execution(format!(
-                    "Invalid LIKE pattern '{}': {}",
-                    pattern, e
-                )))
-            }
-        };
-
-        Ok(Value::Boolean(if negated { !result } else { result }))
-    }
-
-    /// Convert SQL LIKE pattern to regex pattern
-    /// % -> .* (any sequence)
-    /// _ -> . (single char)
-    /// Escape regex special chars
-    fn like_pattern_to_regex(&self, pattern: &str) -> String {
-        let mut regex = String::with_capacity(pattern.len() * 2 + 2);
-        regex.push('^'); // Anchor at start
-
-        let mut chars = pattern.chars();
-        while let Some(c) = chars.next() {
-            match c {
-                // Escape character - next char is literal
-                '\\' => {
-                    if let Some(next) = chars.next() {
-                        // Escape regex special chars
-                        if "^$.*+?{}[]|()\\".contains(next) {
-                            regex.push('\\');
-                        }
-                        regex.push(next);
-                    }
-                }
-                // SQL wildcards
-                '%' => regex.push_str(".*"),
-                '_' => regex.push('.'),
-                // Escape regex special characters
-                '^' | '$' | '.' | '*' | '+' | '?' | '{' | '}' | '[' | ']' | '|' | '(' | ')' => {
-                    regex.push('\\');
-                    regex.push(c);
-                }
-                // Regular character
-                _ => regex.push(c),
-            }
-        }
-
-        regex.push('$'); // Anchor at end
-        regex
+        let result = crate::sql::like_match::like_match(text, pattern, escape, case_insensitive)
+            .ok_or_else(|| Error::query_execution(crate::sql::like_match::LIKE_PATTERN_ENDS_WITH_ESCAPE))?;
+        Ok(Value::Boolean(result != negated))
     }
 
     /// ILIKE pattern matching operator (case-insensitive LIKE)
     fn ilike_op(&self, left: &Value, right: &Value, negated: bool) -> Result<Value> {
-        // Handle NULL values
-        if matches!(left, Value::Null) || matches!(right, Value::Null) {
-            return Ok(Value::Null);
-        }
+        Self::like_values(left, right, Some('\\'), true, negated, "ILIKE")
+    }
 
-        // Get string values
-        let text = match left {
-            Value::String(s) => s.to_lowercase(),
+    /// v01.7: internal lowering target of `LIKE` / `ILIKE … ESCAPE 'x'`
+    /// (`like_escape(text, pattern, escape, case_insensitive)`), emitted by the
+    /// planner only when an ESCAPE clause is written. `''` disables escaping;
+    /// more than one character is an error (22025). The negated form is the
+    /// planner's `NOT` around the call.
+    fn like_escape_fn(&self, args: &[Value]) -> Result<Value> {
+        let (text, pattern, escape, ci) = match args {
+            [text, pattern, escape, Value::Boolean(ci)] => (text, pattern, escape, *ci),
             _ => {
+                return Err(Error::query_execution(
+                    "like_escape requires 4 arguments (text, pattern, escape, case_insensitive)",
+                ))
+            }
+        };
+        let escape = match escape {
+            Value::Null => return Ok(Value::Null),
+            Value::String(s) => {
+                let mut it = s.chars();
+                match (it.next(), it.next()) {
+                    (None, _) => None,
+                    (Some(c), None) => Some(c),
+                    (Some(_), Some(_)) => {
+                        return Err(Error::query_execution(format!(
+                            "{}: ESCAPE must be exactly one character",
+                            crate::sql::like_match::INVALID_ESCAPE_STRING
+                        )))
+                    }
+                }
+            }
+            other => {
                 return Err(Error::query_execution(format!(
-                    "ILIKE requires string operand, got {:?}",
-                    left
+                    "LIKE ESCAPE must be a string, got {:?}",
+                    other
                 )))
             }
         };
-
-        let pattern = match right {
-            Value::String(s) => s.to_lowercase(),
-            _ => {
-                return Err(Error::query_execution(format!(
-                    "ILIKE pattern must be a string, got {:?}",
-                    right
-                )))
-            }
-        };
-
-        // Convert SQL LIKE pattern to regex
-        let regex_pattern = self.like_pattern_to_regex(&pattern);
-
-        let result = match regex::Regex::new(&regex_pattern) {
-            Ok(re) => re.is_match(&text),
-            Err(e) => {
-                return Err(Error::query_execution(format!(
-                    "Invalid ILIKE pattern '{}': {}",
-                    pattern, e
-                )))
-            }
-        };
-
-        Ok(Value::Boolean(if negated { !result } else { result }))
+        Self::like_values(text, pattern, escape, ci, false, if ci { "ILIKE" } else { "LIKE" })
     }
 
     /// Regular expression matching operator (POSIX ~, ~*, !~, !~*)
@@ -6898,7 +6860,7 @@ impl Evaluator {
             pattern.to_string()
         };
 
-        let result = match regex::Regex::new(&regex_pattern) {
+        let result = match cached_regex(&regex_pattern) {
             Ok(re) => re.is_match(text),
             Err(e) => {
                 return Err(Error::query_execution(format!(
@@ -6944,7 +6906,7 @@ impl Evaluator {
         // uses PostgreSQL's default escape character (backslash).
         let regex_pattern = self.similar_to_pattern_to_regex(pattern, Some('\\'));
 
-        let result = match regex::Regex::new(&regex_pattern) {
+        let result = match cached_regex(&regex_pattern) {
             Ok(re) => re.is_match(text),
             Err(e) => {
                 return Err(Error::query_execution(format!(
@@ -7029,7 +6991,7 @@ impl Evaluator {
         };
 
         let regex_pattern = self.similar_to_pattern_to_regex(pattern, escape);
-        let result = match regex::Regex::new(&regex_pattern) {
+        let result = match cached_regex(&regex_pattern) {
             Ok(re) => re.is_match(text),
             Err(e) => {
                 return Err(Error::query_execution(format!(
