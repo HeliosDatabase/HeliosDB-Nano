@@ -13956,7 +13956,8 @@ fn pg_comment_scanners_nest_block_comments() {
         pg_split_sql_respecting_quotes("/* a /* ; */ ; */ SELECT 1; SELECT 2"),
         vec!["/* a /* ; */ ; */ SELECT 1".to_string(), "SELECT 2".to_string()]
     );
-=======
+}
+
 /// GH#40: two connections over the in-module helpers — A LISTENs, B NOTIFYs.
 /// The NotificationResponse (`A`: sender pid, channel, payload) reaches A
 /// right before its next ReadyForQuery, only once B's transaction committed;
