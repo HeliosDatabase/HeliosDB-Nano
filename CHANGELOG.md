@@ -233,6 +233,17 @@ Reports from users of earlier releases (GitHub numbers) and defects found while 
   is logged. Straight-line bodies behave as before. A trigger created by an earlier build keeps
   its stored recipe until it is dropped and created again. 4.41.1 does the same.
   `tests/trigger_row_mutation_tests.rs`.
+- **`DEALLOCATE` did not reach statements prepared with the protocol's Parse message, and an
+  unknown statement name had no PostgreSQL SQLSTATE (GitHub #54, part 2).** psycopg 3 (with libpq
+  before 17) and pgjdbc drop their server-side statements with SQL `DEALLOCATE name` or
+  `DEALLOCATE ALL`; the text went to the engine, which only knew SQL `PREPARE` names and answered
+  "Prepared statement '…' does not exist". `DEALLOCATE [PREPARE] name | ALL` now removes the
+  statement from the connection's protocol-level statements as well as the SQL registry, on the
+  simple and the extended protocol (a `DEALLOCATE ALL` sent through Parse/Bind/Execute keeps its
+  own portal). A bare name is matched as spelled and then folded to lower case; a quoted name as
+  spelled. An unknown name for `DEALLOCATE`, `EXECUTE`, Bind and Describe is now SQLSTATE 26000
+  (invalid_sql_statement_name), which pgjdbc and asyncpg key their re-prepare on. Tests:
+  `src/protocol/postgres/wire_tests.rs` (`v014_*`).
 
 ### Fixed — six regressions against 4.41.1 found before release
 

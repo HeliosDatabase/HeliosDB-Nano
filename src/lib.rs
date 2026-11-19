@@ -4324,10 +4324,7 @@ impl EmbeddedDatabase {
             sql::LogicalPlan::Deallocate { name } => {
                 if let Some(name) = name {
                     if !self.remove_prepared_statement_state(name) {
-                        return Err(Error::query_execution(format!(
-                            "Prepared statement '{}' does not exist",
-                            name
-                        )));
+                        return Err(Error::prepared_statement_missing(name));
                     }
                 } else {
                     self.clear_prepared_statements_for_backend(self.prepared_statement_key("").0);
@@ -4423,10 +4420,7 @@ impl EmbeddedDatabase {
                 return Ok(None);
             }
             if !self.remove_prepared_statement_state(name) {
-                return Err(Error::query_execution(format!(
-                    "Prepared statement '{}' does not exist",
-                    name
-                )));
+                return Err(Error::prepared_statement_missing(name));
             }
             return Ok(Some((Vec::new(), Self::empty_result_schema())));
         }
@@ -4457,10 +4451,7 @@ impl EmbeddedDatabase {
             };
 
         let Some(source_sql) = source_sql else {
-            return Err(Error::query_execution(format!(
-                "Prepared statement '{}' does not exist",
-                name
-            )));
+            return Err(Error::prepared_statement_missing(name));
         };
 
         let plan = (*self.parameterized_plan_cached(&source_sql)?).clone();

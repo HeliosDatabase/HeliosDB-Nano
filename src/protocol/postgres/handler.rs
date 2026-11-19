@@ -3475,6 +3475,17 @@ where
             return self.send_failed_transaction_error().await;
         }
 
+        // v01.4 (GitHub #54): `DEALLOCATE [PREPARE] name | ALL` reaches the
+        // statements a client prepared with the protocol's Parse message, not
+        // only those of SQL `PREPARE`. psycopg 3 (libpq before 17) and pgjdbc
+        // drop their server-side statements this way.
+        if let Some(target) = Self::parse_deallocate_target(trimmed) {
+            let tag = self.deallocate(target)?;
+            self.send_command_complete(tag).await?;
+            self.send_ready_for_query().await?;
+            return Ok(());
+        }
+
         // A standby never runs a write. On a physical standby the guard above
         // (`reject_guarded_standby_statement`) already refused it; this covers a
         // process whose HA role says standby without that guard. Spec P2.1: the
@@ -5372,6 +5383,100 @@ where
         target.is_empty() || target.eq_ignore_ascii_case("NONE") || target.eq_ignore_ascii_case("DEFAULT")
     }
 
+    /// v01.4: classify `DEALLOCATE [PREPARE] { name | ALL }`. `None` when the
+    /// text is not that statement (it then goes to the engine as before).
+    pub(crate) fn parse_deallocate_target(trimmed: &str) -> Option<DeallocateTarget> {
+        let rest = trimmed.trim_end_matches(';').trim();
+        if !starts_with_icase(rest, "DEALLOCATE") {
+            return None;
+        }
+        let mut arg = rest.get("DEALLOCATE".len()..)?;
+        if !arg.starts_with(|c: char| c.is_ascii_whitespace()) {
+            return None;
+        }
+        arg = arg.trim_start();
+        if starts_with_icase(arg, "PREPARE")
+            && arg
+                .get(7..)
+                .is_some_and(|t| t.starts_with(|c: char| c.is_ascii_whitespace()))
+        {
+            arg = arg.get(7..)?.trim_start();
+        }
+        let arg = arg.trim_end();
+        if arg.is_empty() {
+            return None;
+        }
+        if arg.eq_ignore_ascii_case("ALL") {
+            return Some(DeallocateTarget::All);
+        }
+        if let Some(inner) = arg.strip_prefix('"') {
+            let inner = inner.strip_suffix('"')?;
+            if inner.is_empty() {
+                return None;
+            }
+            return Some(DeallocateTarget::Quoted(inner.replace("\"\"", "\"")));
+        }
+        if arg.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$') {
+            return Some(DeallocateTarget::Bare(arg.to_string()));
+        }
+        None
+    }
+
+    /// v01.4: drop the target from this connection's protocol-level statements
+    /// AND from the engine's SQL `PREPARE` registry. Returns the command tag.
+    /// A name neither holds is SQLSTATE 26000.
+    fn deallocate(&mut self, target: DeallocateTarget) -> Result<&'static str> {
+        let is_bare = matches!(target, DeallocateTarget::Bare(_));
+        match target {
+            DeallocateTarget::All => {
+                self.prepared_statements.clear_named_statements()?;
+                self.database.execute_for_session(self.session_id, "DEALLOCATE ALL")?;
+                Ok("DEALLOCATE ALL")
+            }
+            DeallocateTarget::Bare(name) | DeallocateTarget::Quoted(name) => {
+                // The exact spelling first, so `S_1` and `_pg3_0` match the
+                // Parse name; then, for a bare name, PostgreSQL's folded form.
+                let mut spellings = vec![name.clone()];
+                if is_bare {
+                    let folded = name.to_lowercase();
+                    if folded != name {
+                        spellings.push(folded);
+                    }
+                }
+                let mut removed = false;
+                for spelling in &spellings {
+                    if self.prepared_statements.remove_statement(spelling)? {
+                        removed = true;
+                        break;
+                    }
+                }
+                let mut engine_removed = false;
+                for spelling in &spellings {
+                    // The engine keys SQL `PREPARE` names by their spelling in
+                    // the statement (quotes included), so ask it the same way.
+                    let sql = if is_bare {
+                        format!("DEALLOCATE {spelling}")
+                    } else {
+                        format!("DEALLOCATE \"{}\"", spelling.replace('"', "\"\""))
+                    };
+                    match self.database.execute_for_session(self.session_id, &sql) {
+                        Ok(_) => {
+                            engine_removed = true;
+                            break;
+                        }
+                        Err(e) if crate::Error::is_prepared_statement_missing_message(&e.to_string()) => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+                if removed || engine_removed {
+                    Ok("DEALLOCATE")
+                } else {
+                    Err(crate::Error::prepared_statement_missing(&name))
+                }
+            }
+        }
+    }
+
     /// Item 5: classify a `DISCARD …` statement, returning the canonical
     /// target (`"ALL" | "PLANS" | "SEQUENCES" | "TEMP"`) or `None` when this is
     /// not a recognized DISCARD form (so it falls through to normal parsing).
@@ -6753,6 +6858,17 @@ mod b1_startup_options_tests {
 /// the constraint sniffing that predates it); codes come from the shared
 /// constants in [`crate::network::protocol::sqlstate`]. Phase 2 will carry
 /// structured codes from the raise sites instead of sniffing text.
+/// v01.4: the target of a `DEALLOCATE` statement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DeallocateTarget {
+    /// `DEALLOCATE ALL`.
+    All,
+    /// An unquoted name, matched as spelled and then folded to lower case.
+    Bare(String),
+    /// A double-quoted name, matched as spelled.
+    Quoted(String),
+}
+
 pub(crate) fn sqlstate_for_error(error: &Error) -> &'static str {
     use crate::network::protocol::sqlstate;
 
@@ -7098,6 +7214,11 @@ fn sqlstate_for_query_execution_message(message: &str) -> &'static str {
     // the sequence name (`session::scoped::currval_undefined_message`).
     if message.contains(crate::session::scoped::CURRVAL_UNDEFINED_PREFIX) {
         return sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE; // 55000
+    }
+    // v01.4: an unknown prepared statement name (SQL DEALLOCATE / EXECUTE, wire
+    // Bind / Describe). Anchored on the emitter's prefix and suffix.
+    if crate::Error::is_prepared_statement_missing_message(message) {
+        return sqlstate::INVALID_SQL_STATEMENT_NAME; // 26000
     }
     // Spec P1.3: a physical standby that is not ready (`heliosdb_require_ready()`
     // and the read guard). 55000 is the code a proxy's health check keys on to

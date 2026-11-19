@@ -14472,3 +14472,177 @@ async fn show_all_follows_set_reset_and_discard_all() {
         assert_eq!(all[name], shown, "after DISCARD ALL: SHOW ALL vs SHOW {name}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// v01.4 (GitHub #54 part 2): DEALLOCATE reaches protocol-level prepared
+// statements; an unknown statement name is SQLSTATE 26000.
+// ---------------------------------------------------------------------------
+
+/// Parse one named statement through the dispatcher and Sync.
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+async fn v014_parse(handler: &mut PgConnectionHandler<DuplexStream>, client: &mut DuplexStream, name: &str, sql: &str) {
+    use super::messages::FrontendMessage;
+    handler
+        .dispatch_message(FrontendMessage::Parse {
+            statement_name: name.into(),
+            query: sql.into(),
+            param_types: vec![],
+        })
+        .await
+        .expect("parse");
+    handler.dispatch_message(FrontendMessage::Sync).await.expect("sync");
+    let out = drain(client).await;
+    assert!(sqlstates(&out).is_empty(), "parse `{sql}`: {:?}", sqlstates(&out));
+}
+
+/// Bind + Execute + Sync of a stored statement; the wire bytes.
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+async fn v014_bind_execute(
+    handler: &mut PgConnectionHandler<DuplexStream>,
+    client: &mut DuplexStream,
+    name: &str,
+) -> Vec<u8> {
+    use super::messages::FrontendMessage;
+    handler
+        .dispatch_message(FrontendMessage::Bind {
+            portal_name: String::new(),
+            statement_name: name.into(),
+            param_formats: vec![],
+            params: vec![],
+            result_formats: vec![],
+        })
+        .await
+        .expect("bind dispatch");
+    handler
+        .dispatch_message(FrontendMessage::Execute {
+            portal_name: String::new(),
+            max_rows: 0,
+        })
+        .await
+        .expect("execute dispatch");
+    handler.dispatch_message(FrontendMessage::Sync).await.expect("sync");
+    drain(client).await
+}
+
+#[tokio::test]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+async fn v014_deallocate_drops_a_protocol_level_statement() {
+    for (spelling, name) in [
+        ("DEALLOCATE s1", "s1"),
+        ("DEALLOCATE \"s1\"", "s1"),
+        ("DEALLOCATE PREPARE s1", "s1"),
+        ("deallocate prepare \"S_1\";", "S_1"),
+        ("DEALLOCATE _pg3_0", "_pg3_0"),
+        ("DEALLOCATE S_1", "S_1"),
+    ] {
+        let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+        let (mut handler, mut client) = test_handler(db);
+        v014_parse(&mut handler, &mut client, name, "SELECT 1").await;
+        let out = v014_bind_execute(&mut handler, &mut client, name).await;
+        assert!(sqlstates(&out).is_empty(), "{spelling}: before: {:?}", sqlstates(&out));
+
+        let out = wire_query(&mut handler, &mut client, spelling).await;
+        assert_eq!(command_tags(&out), vec!["DEALLOCATE".to_string()], "{spelling}");
+        assert!(sqlstates(&out).is_empty(), "{spelling}: {:?}", sqlstates(&out));
+
+        let out = v014_bind_execute(&mut handler, &mut client, name).await;
+        assert_eq!(
+            sqlstates(&out).first().map(String::as_str),
+            Some("26000"),
+            "{spelling}: Bind after DEALLOCATE"
+        );
+    }
+}
+
+#[tokio::test]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+async fn v014_unknown_statement_is_26000_everywhere() {
+    use super::messages::{DescribeTarget, FrontendMessage};
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut handler, mut client) = test_handler(db);
+    assert_wire_sqlstate(&mut handler, &mut client, "DEALLOCATE nosuch", "26000").await;
+    assert_wire_sqlstate(&mut handler, &mut client, "DEALLOCATE \"NoSuch\"", "26000").await;
+    // Bind to a statement that was never parsed.
+    let out = v014_bind_execute(&mut handler, &mut client, "never").await;
+    assert_eq!(sqlstates(&out).first().map(String::as_str), Some("26000"), "Bind");
+    // Describe of one.
+    handler
+        .dispatch_message(FrontendMessage::Describe {
+            target: DescribeTarget::Statement,
+            name: "never".into(),
+        })
+        .await
+        .expect("describe dispatch");
+    handler.dispatch_message(FrontendMessage::Sync).await.expect("sync");
+    let out = drain(&mut client).await;
+    assert_eq!(sqlstates(&out), vec!["26000".to_string()], "Describe");
+    // SQL EXECUTE of an unknown name.
+    assert_wire_sqlstate(&mut handler, &mut client, "EXECUTE nosuch", "26000").await;
+}
+
+#[tokio::test]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+async fn v014_deallocate_all_through_the_extended_protocol_keeps_its_portal() {
+    use super::messages::FrontendMessage;
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut handler, mut client) = test_handler(db);
+    v014_parse(&mut handler, &mut client, "_pg3_0", "SELECT 1").await;
+    v014_parse(&mut handler, &mut client, "_pg3_1", "SELECT 2").await;
+    wire_setup(&mut handler, &mut client, "PREPARE sqlp AS SELECT 3").await;
+
+    // psycopg 3 sends DEALLOCATE ALL on the unnamed statement.
+    handler
+        .dispatch_message(FrontendMessage::Parse {
+            statement_name: String::new(),
+            query: "DEALLOCATE ALL".into(),
+            param_types: vec![],
+        })
+        .await
+        .expect("parse");
+    let out = v014_bind_execute(&mut handler, &mut client, "").await;
+    assert!(sqlstates(&out).is_empty(), "DEALLOCATE ALL: {:?}", sqlstates(&out));
+    assert_eq!(command_tags(&out), vec!["DEALLOCATE ALL".to_string()]);
+    assert_eq!(
+        parse_messages(&out).iter().filter(|(ty, _)| *ty == b'Z').count(),
+        1,
+        "exactly one ReadyForQuery (the Sync's)"
+    );
+
+    for name in ["_pg3_0", "_pg3_1"] {
+        let out = v014_bind_execute(&mut handler, &mut client, name).await;
+        assert_eq!(
+            sqlstates(&out).first().map(String::as_str),
+            Some("26000"),
+            "{name} must be gone"
+        );
+    }
+    assert_wire_sqlstate(&mut handler, &mut client, "EXECUTE sqlp", "26000").await;
+    // The same name can be parsed again.
+    v014_parse(&mut handler, &mut client, "_pg3_0", "SELECT 7").await;
+    let out = v014_bind_execute(&mut handler, &mut client, "_pg3_0").await;
+    assert_eq!(first_data_row_text(&out).as_deref(), Some("7"));
+}
+
+#[tokio::test]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+async fn v014_sql_prepare_deallocate_and_failed_block_recovery() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut handler, mut client) = test_handler(db);
+    wire_setup(&mut handler, &mut client, "PREPARE p AS SELECT 1").await;
+    let out = wire_query(&mut handler, &mut client, "DEALLOCATE p").await;
+    assert_eq!(command_tags(&out), vec!["DEALLOCATE".to_string()]);
+    assert_wire_sqlstate(&mut handler, &mut client, "DEALLOCATE p", "26000").await;
+
+    // Inside a failed block DEALLOCATE is refused (25P02), after ROLLBACK it works.
+    v014_parse(&mut handler, &mut client, "s9", "SELECT 1").await;
+    wire_setup(&mut handler, &mut client, "BEGIN").await;
+    let out = wire_query(&mut handler, &mut client, "SELECT * FROM missing_table").await;
+    assert_eq!(sqlstates(&out).len(), 1);
+    assert_wire_sqlstate(&mut handler, &mut client, "DEALLOCATE ALL", "25P02").await;
+    wire_setup(&mut handler, &mut client, "ROLLBACK").await;
+    let out = wire_query(&mut handler, &mut client, "DEALLOCATE ALL").await;
+    assert!(sqlstates(&out).is_empty(), "{:?}", sqlstates(&out));
+    assert_eq!(command_tags(&out), vec!["DEALLOCATE ALL".to_string()]);
+    let out = v014_bind_execute(&mut handler, &mut client, "s9").await;
+    assert_eq!(sqlstates(&out).first().map(String::as_str), Some("26000"));
+}

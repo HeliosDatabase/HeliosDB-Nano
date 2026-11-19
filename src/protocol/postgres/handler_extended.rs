@@ -316,7 +316,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
         let statement = self
             .prepared_statements
             .get_statement(&statement_name)?
-            .ok_or_else(|| Error::query_execution(format!("Prepared statement '{}' not found", statement_name)))?;
+            .ok_or_else(|| Error::prepared_statement_missing(&statement_name))?;
 
         // Validate parameter count
         if !params.is_empty() && !statement.param_types.is_empty() && params.len() != statement.param_types.len() {
@@ -375,7 +375,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
         let statement = self
             .prepared_statements
             .get_statement(&portal.statement_name)?
-            .ok_or_else(|| Error::query_execution(format!("Statement '{}' not found", portal.statement_name)))?;
+            .ok_or_else(|| Error::prepared_statement_missing(&portal.statement_name))?;
 
         if statement.query.trim().is_empty() {
             self.prepared_statements
@@ -478,7 +478,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
         let is_failed_savepoint_recovery = self.transaction_failed()
             && super::handler::classify_transaction_control(trimmed_query)
                 == Some(super::handler::TxnControl::RollbackToSavepoint);
+        // v01.4: `DEALLOCATE` reaches this connection's protocol-level
+        // statements too; one implementation, in the simple-query handler.
+        let is_deallocate = Self::parse_deallocate_target(trimmed_query).is_some();
         if is_transaction_control
+            || is_deallocate
             || is_set_role
             || is_timeout_guc
             || is_application_name_set
@@ -919,7 +923,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
                 let statement = self
                     .prepared_statements
                     .get_statement(&name)?
-                    .ok_or_else(|| Error::query_execution(format!("Statement '{}' not found", name)))?;
+                    .ok_or_else(|| Error::prepared_statement_missing(&name))?;
                 let statement = self.refresh_result_schema(statement)?;
 
                 // Send ParameterDescription
@@ -956,9 +960,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
                 let statement = self
                     .prepared_statements
                     .get_statement(&portal.statement_name)?
-                    .ok_or_else(|| {
-                        Error::query_execution(format!("Statement '{}' not found", portal.statement_name))
-                    })?;
+                    .ok_or_else(|| Error::prepared_statement_missing(&portal.statement_name))?;
                 let statement = self.refresh_result_schema(statement)?;
 
                 // Send RowDescription or NoData. It binds this portal; the

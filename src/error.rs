@@ -315,6 +315,15 @@ pub const DDL_OVER_STAGED_ROWS_MARKER: &str = "after writing it in the same tran
 /// `invalid_parameter_value`.
 pub const SEQUENCE_PARAMETER_INVALID_MARKER: &str = "invalid sequence parameter";
 
+/// v01.4: the prefix and suffix of "this prepared statement name is unknown"
+/// ([`Error::prepared_statement_missing`]): SQL `DEALLOCATE` / `EXECUTE` of an
+/// unknown name, and a wire Bind or Describe of a statement that was never
+/// parsed or has been deallocated. SQLSTATE 26000 invalid_sql_statement_name,
+/// the code pgjdbc and asyncpg key their re-prepare on.
+pub const PREPARED_STATEMENT_MISSING_PREFIX: &str = "Prepared statement '";
+/// v01.4: see [`PREPARED_STATEMENT_MISSING_PREFIX`].
+pub const PREPARED_STATEMENT_MISSING_SUFFIX: &str = "' does not exist";
+
 /// Spec R5.3: the marker of `EXPLAIN ANALYZE` of a statement it cannot run as
 /// part of the statement's transaction ([`Error::explain_analyze_unsupported`]).
 /// SQLSTATE 0A000.
@@ -822,6 +831,18 @@ impl Error {
             | Self::Generic(message) => message.contains(APPLIED_PUBLICATION_FAILURE_MARKER),
             _ => false,
         }
+    }
+
+    /// v01.4: a prepared statement of this name does not exist. SQLSTATE 26000.
+    pub fn prepared_statement_missing(name: &str) -> Self {
+        Error::QueryExecution(format!(
+            "{PREPARED_STATEMENT_MISSING_PREFIX}{name}{PREPARED_STATEMENT_MISSING_SUFFIX}"
+        ))
+    }
+
+    /// v01.4: whether `message` is the [`Error::prepared_statement_missing`] text.
+    pub fn is_prepared_statement_missing_message(message: &str) -> bool {
+        message.contains(PREPARED_STATEMENT_MISSING_PREFIX) && message.contains(PREPARED_STATEMENT_MISSING_SUFFIX)
     }
 
     /// Spec R5.3 (review F17): a `CREATE` / `ALTER SEQUENCE` parameter out of range

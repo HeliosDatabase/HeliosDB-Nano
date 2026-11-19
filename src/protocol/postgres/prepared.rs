@@ -347,6 +347,24 @@ impl PreparedStatementManager {
         Ok(portals.remove(name).is_some())
     }
 
+    /// v01.4: `DEALLOCATE ALL`. Drops every NAMED statement and keeps the
+    /// unnamed statement and every portal, so a `DEALLOCATE ALL` sent through
+    /// Parse/Bind/Execute on the unnamed statement completes its own portal.
+    pub fn clear_named_statements(&self) -> Result<()> {
+        use crate::error::LockResultExt;
+        let mut statements = self
+            .statements
+            .write()
+            .map_lock_err("Failed to acquire write lock on statements")?;
+        let mut order = self
+            .statement_order
+            .write()
+            .map_lock_err("Failed to acquire write lock on statement order")?;
+        statements.retain(|name, _| name.is_empty());
+        order.retain(|name| name.is_empty());
+        Ok(())
+    }
+
     /// Clear all statements and portals
     pub fn clear_all(&self) -> Result<()> {
         use crate::error::LockResultExt;
