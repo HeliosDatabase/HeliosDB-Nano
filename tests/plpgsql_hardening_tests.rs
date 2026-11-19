@@ -369,137 +369,129 @@ mod plpgsql_hardening_tests {
 
     // ========================================================================
     // 3. Control Flow (5 tests)
+    //
+    // Variables and parameters are written with the mandatory `$` sigil.
+    // Every test asserts unconditionally: these used to print
+    // `[NOT IMPLEMENTED]` and pass while IF always took ELSE.
     // ========================================================================
 
     #[test]
     fn test_plpgsql_if_elsif_else() {
         let db = new_db();
-        db.execute("CREATE TABLE plp_if(result TEXT)").unwrap();
-        let create = db.execute(
+        db.execute("CREATE TABLE plp_if(val TEXT)").unwrap();
+        db.execute(
             "CREATE PROCEDURE plp_if_proc(val INTEGER) LANGUAGE plpgsql AS $$\
             BEGIN\n\
-                IF val > 10 THEN\n\
+                IF $val > 10 THEN\n\
                     INSERT INTO plp_if VALUES ('big');\n\
-                ELSIF val > 5 THEN\n\
+                ELSIF $val > 5 THEN\n\
                     INSERT INTO plp_if VALUES ('medium');\n\
                 ELSE\n\
                     INSERT INTO plp_if VALUES ('small');\n\
                 END IF;\n\
             END;\n\
             $$",
+        )
+        .expect("CREATE PROCEDURE must be accepted");
+        db.execute("CALL plp_if_proc(3)")
+            .expect("CALL plp_if_proc(3) must succeed");
+        db.execute("CALL plp_if_proc(7)")
+            .expect("CALL plp_if_proc(7) must succeed");
+        db.execute("CALL plp_if_proc(20)")
+            .expect("CALL plp_if_proc(20) must succeed");
+        let rows = db.query("SELECT val FROM plp_if ORDER BY val", &[]).unwrap();
+        let got: Vec<Value> = rows.iter().map(|r| r.get(0).unwrap().clone()).collect();
+        assert_eq!(
+            got,
+            vec![
+                Value::String("big".to_string()),
+                Value::String("medium".to_string()),
+                Value::String("small".to_string())
+            ]
         );
-        match create {
-            Ok(_) => {
-                let call = db.execute("CALL plp_if_proc(3)");
-                match call {
-                    Ok(_) => {
-                        let rows = db.query("SELECT result FROM plp_if", &[]).unwrap();
-                        assert_eq!(rows.len(), 1);
-                        assert_eq!(rows[0].get(0).unwrap(), &Value::String("small".to_string()));
-                    }
-                    Err(e) => eprintln!("[NOT IMPLEMENTED] IF/ELSIF/ELSE in procedure: {}", e),
-                }
-            }
-            Err(e) => eprintln!("[NOT IMPLEMENTED] IF/ELSIF/ELSE procedure: {}", e),
-        }
     }
 
     #[test]
     fn test_plpgsql_loop_exit_when() {
         let db = new_db();
         db.execute("CREATE TABLE plp_loop(val INT)").unwrap();
-        let create = db.execute(
+        db.execute(
             "CREATE PROCEDURE plp_loop_proc() LANGUAGE plpgsql AS $$\
             DECLARE\n\
                 i INTEGER := 0;\n\
             BEGIN\n\
                 LOOP\n\
-                    i := i + 1;\n\
-                    INSERT INTO plp_loop VALUES (i);\n\
-                    EXIT WHEN i >= 3;\n\
+                    i := $i + 1;\n\
+                    INSERT INTO plp_loop VALUES ($i);\n\
+                    EXIT WHEN $i >= 3;\n\
                 END LOOP;\n\
+                INSERT INTO plp_loop VALUES (100);\n\
             END;\n\
             $$",
+        )
+        .expect("CREATE PROCEDURE must be accepted");
+        db.execute("CALL plp_loop_proc()")
+            .expect("CALL plp_loop_proc() must succeed");
+        let rows = db.query("SELECT val FROM plp_loop ORDER BY val", &[]).unwrap();
+        let got: Vec<Value> = rows.iter().map(|r| r.get(0).unwrap().clone()).collect();
+        assert_eq!(
+            got,
+            vec![Value::Int4(1), Value::Int4(2), Value::Int4(3), Value::Int4(100)]
         );
-        match create {
-            Ok(_) => {
-                let call = db.execute("CALL plp_loop_proc()");
-                match call {
-                    Ok(_) => {
-                        let rows = db.query("SELECT val FROM plp_loop ORDER BY val", &[]).unwrap();
-                        assert_eq!(rows.len(), 3);
-                    }
-                    Err(e) => eprintln!("[NOT IMPLEMENTED] LOOP/EXIT WHEN: {}", e),
-                }
-            }
-            Err(e) => eprintln!("[NOT IMPLEMENTED] LOOP/EXIT WHEN procedure: {}", e),
-        }
     }
 
     #[test]
     fn test_plpgsql_while_loop() {
         let db = new_db();
         db.execute("CREATE TABLE plp_while(val INT)").unwrap();
-        let create = db.execute(
+        db.execute(
             "CREATE PROCEDURE plp_while_proc() LANGUAGE plpgsql AS $$\
             DECLARE\n\
                 counter INTEGER := 1;\n\
             BEGIN\n\
-                WHILE counter <= 3 LOOP\n\
-                    INSERT INTO plp_while VALUES (counter);\n\
-                    counter := counter + 1;\n\
+                WHILE $counter <= 3 LOOP\n\
+                    INSERT INTO plp_while VALUES ($counter);\n\
+                    counter := $counter + 1;\n\
                 END LOOP;\n\
             END;\n\
             $$",
-        );
-        match create {
-            Ok(_) => {
-                let call = db.execute("CALL plp_while_proc()");
-                match call {
-                    Ok(_) => {
-                        let rows = db.query("SELECT val FROM plp_while ORDER BY val", &[]).unwrap();
-                        // KNOWN LIMITATION: WHILE loop DML inside plpgsql procedures
-                        // executes via clone_for_trigger which may not share storage
-                        // with the caller. Rows may not be visible after CALL.
-                        if rows.is_empty() {
-                            eprintln!("[KNOWN LIMITATION] WHILE loop inserts not visible after CALL (clone_for_trigger isolation)");
-                        } else {
-                            assert_eq!(rows.len(), 3);
-                        }
-                    }
-                    Err(e) => eprintln!("[NOT IMPLEMENTED] WHILE loop: {}", e),
-                }
-            }
-            Err(e) => eprintln!("[NOT IMPLEMENTED] WHILE loop procedure: {}", e),
-        }
+        )
+        .expect("CREATE PROCEDURE must be accepted");
+        db.execute("CALL plp_while_proc()")
+            .expect("CALL plp_while_proc() must succeed");
+        let rows = db.query("SELECT val FROM plp_while ORDER BY val", &[]).unwrap();
+        let got: Vec<Value> = rows.iter().map(|r| r.get(0).unwrap().clone()).collect();
+        assert_eq!(got, vec![Value::Int4(1), Value::Int4(2), Value::Int4(3)]);
     }
 
     #[test]
     fn test_plpgsql_for_loop_integer_range() {
         let db = new_db();
         db.execute("CREATE TABLE plp_for(val INT)").unwrap();
-        let create = db.execute(
+        db.execute(
             "CREATE PROCEDURE plp_for_proc() LANGUAGE plpgsql AS $$\
             BEGIN\n\
                 FOR i IN 1..5 LOOP\n\
-                    INSERT INTO plp_for VALUES (i);\n\
+                    INSERT INTO plp_for VALUES ($i);\n\
                 END LOOP;\n\
             END;\n\
             $$",
+        )
+        .expect("CREATE PROCEDURE must be accepted");
+        db.execute("CALL plp_for_proc()")
+            .expect("CALL plp_for_proc() must succeed");
+        let rows = db.query("SELECT val FROM plp_for ORDER BY val", &[]).unwrap();
+        let got: Vec<Value> = rows.iter().map(|r| r.get(0).unwrap().clone()).collect();
+        assert_eq!(
+            got,
+            vec![
+                Value::Int4(1),
+                Value::Int4(2),
+                Value::Int4(3),
+                Value::Int4(4),
+                Value::Int4(5)
+            ]
         );
-        match create {
-            Ok(_) => {
-                let call = db.execute("CALL plp_for_proc()");
-                match call {
-                    Ok(_) => {
-                        let rows = db.query("SELECT val FROM plp_for ORDER BY val", &[]).unwrap();
-                        assert_eq!(rows.len(), 5);
-                    }
-                    Err(e) => eprintln!("[NOT IMPLEMENTED] FOR loop: {}", e),
-                }
-            }
-            Err(e) => eprintln!("[NOT IMPLEMENTED] FOR loop procedure: {}", e),
-        }
     }
 
     #[test]
@@ -555,7 +547,7 @@ mod plpgsql_hardening_tests {
     fn test_plpgsql_declare_variables() {
         let db = new_db();
         db.execute("CREATE TABLE plp_decl(val INT)").unwrap();
-        let create = db.execute(
+        db.execute(
             "CREATE PROCEDURE plp_decl_proc() LANGUAGE plpgsql AS $$\
             DECLARE\n\
                 x INTEGER;\n\
@@ -563,111 +555,80 @@ mod plpgsql_hardening_tests {
             BEGIN\n\
                 x := 10;\n\
                 y := 20;\n\
-                INSERT INTO plp_decl VALUES (x + y);\n\
+                INSERT INTO plp_decl VALUES ($x + $y);\n\
             END;\n\
             $$",
-        );
-        match create {
-            Ok(_) => {
-                let call = db.execute("CALL plp_decl_proc()");
-                match call {
-                    Ok(_) => {
-                        let rows = db.query("SELECT val FROM plp_decl", &[]).unwrap();
-                        assert_eq!(rows.len(), 1);
-                        // Expect 30, but INSERT with variable references may not resolve
-                        // (SQL executor gets raw SQL string, not evaluated expressions)
-                        eprintln!("[INFO] Declared variable procedure executed. Row count: {}", rows.len());
-                    }
-                    Err(e) => eprintln!("[NOT IMPLEMENTED] DECLARE variables in procedure: {}", e),
-                }
-            }
-            Err(e) => eprintln!("[NOT IMPLEMENTED] DECLARE variables: {}", e),
-        }
+        )
+        .expect("CREATE PROCEDURE must be accepted");
+        db.execute("CALL plp_decl_proc()")
+            .expect("CALL plp_decl_proc() must succeed");
+        let rows = db.query("SELECT val FROM plp_decl ORDER BY val", &[]).unwrap();
+        let got: Vec<Value> = rows.iter().map(|r| r.get(0).unwrap().clone()).collect();
+        assert_eq!(got, vec![Value::Int4(30)]);
     }
 
     #[test]
     fn test_plpgsql_variable_assignment() {
         let db = new_db();
         db.execute("CREATE TABLE plp_assign(val INT)").unwrap();
-        let create = db.execute(
+        db.execute(
             "CREATE PROCEDURE plp_assign_proc() LANGUAGE plpgsql AS $$\
             DECLARE\n\
                 result INTEGER := 0;\n\
             BEGIN\n\
                 result := 5 + 3;\n\
-                INSERT INTO plp_assign VALUES (result);\n\
+                INSERT INTO plp_assign VALUES ($result);\n\
             END;\n\
             $$",
-        );
-        match create {
-            Ok(_) => {
-                let call = db.execute("CALL plp_assign_proc()");
-                match call {
-                    Ok(_) => {
-                        let rows = db.query("SELECT val FROM plp_assign", &[]).unwrap();
-                        assert_eq!(rows.len(), 1);
-                    }
-                    Err(e) => eprintln!("[NOT IMPLEMENTED] Variable assignment := : {}", e),
-                }
-            }
-            Err(e) => eprintln!("[NOT IMPLEMENTED] Variable assignment procedure: {}", e),
-        }
+        )
+        .expect("CREATE PROCEDURE must be accepted");
+        db.execute("CALL plp_assign_proc()")
+            .expect("CALL plp_assign_proc() must succeed");
+        let rows = db.query("SELECT val FROM plp_assign ORDER BY val", &[]).unwrap();
+        let got: Vec<Value> = rows.iter().map(|r| r.get(0).unwrap().clone()).collect();
+        assert_eq!(got, vec![Value::Int4(8)]);
     }
 
     #[test]
     fn test_plpgsql_variable_with_default() {
         let db = new_db();
         db.execute("CREATE TABLE plp_def(val INT)").unwrap();
-        let create = db.execute(
+        db.execute(
             "CREATE PROCEDURE plp_def_proc() LANGUAGE plpgsql AS $$\
             DECLARE\n\
-                x INTEGER := 42;\n\
+                x INTEGER := 40 + 2;\n\
             BEGIN\n\
-                INSERT INTO plp_def VALUES (x);\n\
+                INSERT INTO plp_def VALUES ($x);\n\
             END;\n\
             $$",
-        );
-        match create {
-            Ok(_) => {
-                let call = db.execute("CALL plp_def_proc()");
-                match call {
-                    Ok(_) => {
-                        let rows = db.query("SELECT val FROM plp_def", &[]).unwrap();
-                        assert_eq!(rows.len(), 1);
-                    }
-                    Err(e) => eprintln!("[NOT IMPLEMENTED] Variable with DEFAULT: {}", e),
-                }
-            }
-            Err(e) => eprintln!("[NOT IMPLEMENTED] Variable DEFAULT procedure: {}", e),
-        }
+        )
+        .expect("CREATE PROCEDURE must be accepted");
+        db.execute("CALL plp_def_proc()")
+            .expect("CALL plp_def_proc() must succeed");
+        let rows = db.query("SELECT val FROM plp_def ORDER BY val", &[]).unwrap();
+        let got: Vec<Value> = rows.iter().map(|r| r.get(0).unwrap().clone()).collect();
+        assert_eq!(got, vec![Value::Int4(42)]);
     }
 
     #[test]
     fn test_plpgsql_type_casting() {
         let db = new_db();
         db.execute("CREATE TABLE plp_cast(val TEXT)").unwrap();
-        let create = db.execute(
+        db.execute(
             "CREATE PROCEDURE plp_cast_proc() LANGUAGE plpgsql AS $$\
             DECLARE\n\
                 num INTEGER := 123;\n\
             BEGIN\n\
-                INSERT INTO plp_cast VALUES (CAST(num AS TEXT));\n\
+                INSERT INTO plp_cast VALUES (CAST($num AS TEXT));\n\
             END;\n\
             $$",
-        );
-        match create {
-            Ok(_) => {
-                let call = db.execute("CALL plp_cast_proc()");
-                match call {
-                    Ok(_) => {
-                        let rows = db.query("SELECT val FROM plp_cast", &[]).unwrap();
-                        assert_eq!(rows.len(), 1);
-                    }
-                    Err(e) => eprintln!("[NOT IMPLEMENTED] Type casting in PL/pgSQL: {}", e),
-                }
-            }
-            Err(e) => eprintln!("[NOT IMPLEMENTED] Type casting procedure: {}", e),
-        }
+        )
+        .expect("CREATE PROCEDURE must be accepted");
+        db.execute("CALL plp_cast_proc()")
+            .expect("CALL plp_cast_proc() must succeed");
+        let rows = db.query("SELECT val FROM plp_cast ORDER BY val", &[]).unwrap();
+        let got: Vec<Value> = rows.iter().map(|r| r.get(0).unwrap().clone()).collect();
+        assert_eq!(got, vec![Value::String("123".to_string())]);
     }
 
     // ========================================================================

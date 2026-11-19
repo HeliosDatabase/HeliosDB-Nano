@@ -282,21 +282,41 @@ fn plpgsql_function_body_can_write_and_the_rows_are_visible() {
 }
 
 #[test]
-fn plpgsql_control_flow_in_a_function_is_refused_loudly() {
-    // NOT a silent wrong answer. `ProceduralParser::parse_expression` captures
-    // expression TEXT instead of parsing it, so an `IF <cond> THEN` condition
-    // evaluates to a non-boolean string and the ELSE branch always runs. The
-    // function path refuses rather than manufacturing that wrong answer.
+fn plpgsql_control_flow_in_a_function_takes_the_right_branch() {
+    // An IF condition is evaluated as SQL after `$`-interpolation. The
+    // function path used to refuse every IF, because the condition was kept
+    // as a string literal of its own text and so always counted as false.
     let db = db();
     db.execute(
         "CREATE FUNCTION fn_branchy(x INTEGER) RETURNS INTEGER AS $$ \
          BEGIN IF $1 > 0 THEN RETURN 1; ELSE RETURN 2; END IF; END $$ LANGUAGE plpgsql",
     )
-    .expect("CREATE FUNCTION must still be accepted — the refusal is at call time");
+    .expect("CREATE FUNCTION must be accepted");
 
-    let err = err_of(&db, "SELECT fn_branchy(1)");
+    assert_eq!(as_i64(&scalar(&db, "SELECT fn_branchy(1)")), 1);
+    assert_eq!(as_i64(&scalar(&db, "SELECT fn_branchy(-1)")), 2);
+}
+
+#[test]
+fn plpgsql_raise_and_exception_handlers_in_a_function_are_still_refused() {
+    let db = db();
+    db.execute(
+        "CREATE FUNCTION fn_raisey(x INTEGER) RETURNS INTEGER AS $$ \
+         BEGIN IF $1 > 0 THEN RAISE NOTICE 'positive'; END IF; RETURN $1; END $$ LANGUAGE plpgsql",
+    )
+    .expect("CREATE FUNCTION must be accepted");
+    let err = err_of(&db, "SELECT fn_raisey(1)");
     assert!(err.contains("was NOT executed"), "must be loud, got: {err}");
-    assert!(err.contains("IF statement"), "must name the construct, got: {err}");
+    assert!(err.contains("RAISE"), "must name the construct, got: {err}");
+
+    db.execute(
+        "CREATE FUNCTION fn_catchy(x INTEGER) RETURNS INTEGER AS $$ \
+         BEGIN RETURN $1; EXCEPTION WHEN OTHERS THEN RETURN 0; END $$ LANGUAGE plpgsql",
+    )
+    .expect("CREATE FUNCTION must be accepted");
+    let err = err_of(&db, "SELECT fn_catchy(1)");
+    assert!(err.contains("was NOT executed"), "must be loud, got: {err}");
+    assert!(err.contains("EXCEPTION handler"), "must name the construct, got: {err}");
 }
 
 // ===========================================================================

@@ -128,6 +128,9 @@ pub struct Config {
     /// Lock configuration (v3.1.0)
     #[serde(default)]
     pub locks: LockConfig,
+    /// PL/pgSQL routine execution limits (`[procedural]`)
+    #[serde(default)]
+    pub procedural: ProceduralConfig,
     /// Dump configuration (v3.1.0)
     #[serde(default)]
     pub dump: DumpConfig,
@@ -157,6 +160,7 @@ impl Default for Config {
             sync: SyncConfig::default(),
             session: SessionConfig::default(),
             locks: LockConfig::default(),
+            procedural: ProceduralConfig::default(),
             dump: DumpConfig::default(),
             resource_quotas: ResourceQuotaConfig::default(),
             api: ApiConfig::default(),
@@ -2598,6 +2602,17 @@ impl SessionConfig {
         }
         Ok(())
     }
+}
+
+/// PL/pgSQL routine execution limits (`[procedural]`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProceduralConfig {
+    /// The most iterations one LOOP, WHILE or FOR of a PL/pgSQL routine may
+    /// run before the call fails with an error naming this setting
+    /// (default: 0 = unlimited, as in PostgreSQL). Every iteration also checks
+    /// the statement timeout, so a runaway loop under a timeout is cancelled.
+    pub max_loop_iterations: u64,
 }
 
 /// Lock configuration (v3.1.0)

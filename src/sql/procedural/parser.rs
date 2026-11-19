@@ -7,6 +7,113 @@ use super::ast::*;
 use crate::sql::LogicalExpr;
 use crate::{DataType, Error, Result};
 
+/// What ends an embedded SQL fragment (an expression or a query). A `;` at
+/// nesting depth 0, and a `)` that closes a parenthesis opened before the
+/// fragment, always end it.
+#[derive(Clone, Copy, Default)]
+struct Stops {
+    /// `,` at nesting depth 0 (USING options, parameter lists).
+    comma: bool,
+    /// `..` at nesting depth 0 (numeric FOR bounds).
+    dotdot: bool,
+    /// Whole keywords that end the fragment at nesting depth 0, outside any
+    /// `CASE … END` of the fragment itself.
+    keywords: &'static [&'static str],
+}
+
+impl Stops {
+    /// Stop at these whole keywords (and at `;`).
+    const fn keywords(keywords: &'static [&'static str]) -> Self {
+        Self {
+            comma: false,
+            dotdot: false,
+            keywords,
+        }
+    }
+}
+
+/// A character that may continue an identifier (`$` is legal after the first
+/// character in PostgreSQL).
+fn is_ident_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '$'
+}
+
+/// A character that may start an identifier or keyword.
+fn is_ident_start(c: char) -> bool {
+    c.is_alphabetic() || c == '_'
+}
+
+/// `s` starts with keyword `kw` (ASCII, any case). A keyword ending in a word
+/// character must also END there: `END` does not match `endpoint`.
+fn starts_with_keyword(s: &str, kw: &str) -> bool {
+    let (sb, kb) = (s.as_bytes(), kw.as_bytes());
+    match sb.get(..kb.len()) {
+        Some(prefix) if prefix.eq_ignore_ascii_case(kb) => {}
+        _ => return false,
+    }
+    let word_like = kw.chars().last().is_some_and(|c| c.is_alphanumeric() || c == '_');
+    if !word_like {
+        return true;
+    }
+    // The matched prefix is ASCII, so `kb.len()` is a character boundary.
+    s.get(kb.len()..)
+        .and_then(|r| r.chars().next())
+        .is_none_or(|c| !is_ident_char(c))
+}
+
+/// Length of the dollar-quote delimiter (`$$` or `$tag$`) starting `s`.
+/// `$1` and `$name` (the routine-variable sigil) are not one.
+fn dollar_tag_len(s: &str) -> Option<usize> {
+    let mut chars = s.char_indices();
+    if !matches!(chars.next(), Some((_, '$'))) {
+        return None;
+    }
+    for (i, c) in chars {
+        if c == '$' {
+            return Some(i + 1);
+        }
+        if !(c.is_alphanumeric() || c == '_') || (i == 1 && c.is_ascii_digit()) {
+            return None;
+        }
+    }
+    None
+}
+
+/// If a string literal, quoted identifier, dollar-quoted string or comment
+/// starts `s`, its length in bytes (the rest of `s` when unterminated).
+/// `escape_string` marks an `E'…'` literal, where a backslash escapes.
+fn quoted_len(s: &str, escape_string: bool) -> Option<usize> {
+    let bytes = s.as_bytes();
+    match bytes.first()? {
+        q @ (b'\'' | b'"') => {
+            let q = *q;
+            let mut i = 1;
+            while let Some(&b) = bytes.get(i) {
+                if b == b'\\' && escape_string && q == b'\'' {
+                    i += 2;
+                } else if b == q {
+                    if bytes.get(i + 1) == Some(&q) {
+                        i += 2;
+                    } else {
+                        return Some(i + 1);
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            Some(bytes.len())
+        }
+        b'$' => {
+            let t = dollar_tag_len(s)?;
+            let tag = s.get(..t)?;
+            Some(s.get(t..)?.find(tag).map_or(s.len(), |e| t + e + t))
+        }
+        b'-' if s.starts_with("--") => Some(s.find('\n').unwrap_or(s.len())),
+        b'/' if s.starts_with("/*") => Some(s.find("*/").map_or(s.len(), |e| e + 2)),
+        _ => None,
+    }
+}
+
 /// Procedural language parser
 pub struct ProceduralParser {
     /// Current dialect (Auto for auto-detection)
@@ -181,7 +288,7 @@ impl ProceduralParser {
         self.skip_whitespace();
 
         // Optional label
-        if self.peek_char() == Some('<') && self.source[self.pos..].starts_with("<<") {
+        if self.rest().starts_with("<<") {
             block.label = Some(self.parse_label()?);
             self.skip_whitespace();
         }
@@ -211,14 +318,11 @@ impl ProceduralParser {
         // Optional label after END
         self.skip_whitespace();
         if let Some(ref label) = block.label {
-            self.try_keyword(label);
+            let label = label.clone();
+            self.try_keyword(&label);
         }
 
-        // Optional semicolon
-        self.skip_whitespace();
-        if self.peek_char() == Some(';') {
-            self.advance();
-        }
+        self.eat_semicolon();
 
         Ok(block)
     }
@@ -280,20 +384,16 @@ impl ProceduralParser {
             self.try_keyword("NULL")
         };
 
-        // Check for DEFAULT or :=
+        // Check for DEFAULT, := or =
         self.skip_whitespace();
-        let default = if self.try_keyword("DEFAULT") || self.try_keyword(":=") {
+        let default = if self.try_keyword("DEFAULT") || self.try_keyword(":=") || self.try_keyword("=") {
             self.skip_whitespace();
-            Some(self.parse_expression()?)
+            Some(self.parse_expression(Stops::default())?)
         } else {
             None
         };
 
-        // Expect semicolon
-        self.skip_whitespace();
-        if self.peek_char() == Some(';') {
-            self.advance();
-        }
+        self.eat_semicolon();
 
         Ok(Some(VariableDeclaration {
             name,
@@ -306,30 +406,31 @@ impl ProceduralParser {
 
     /// Parse statements until END keyword
     fn parse_statements_until_end(&mut self) -> Result<Vec<ProceduralStatement>> {
-        let mut statements = Vec::new();
-
-        loop {
-            self.skip_whitespace();
-
-            // Check for END or EXCEPTION
-            if self.check_keyword("END") || self.check_keyword("EXCEPTION") {
-                break;
-            }
-
-            // Parse statement
-            if let Some(stmt) = self.try_parse_statement()? {
-                statements.push(stmt);
-            } else {
-                break;
-            }
-        }
-
-        Ok(statements)
+        self.parse_statements_until(&["END", "EXCEPTION"])
     }
 
     /// Try to parse a single statement
     fn try_parse_statement(&mut self) -> Result<Option<ProceduralStatement>> {
         self.skip_whitespace();
+
+        // `<<label>>` before a loop labels the loop; before DECLARE/BEGIN it
+        // labels a nested block (the nested parser reads it).
+        if self.rest().starts_with("<<") {
+            let save = (self.pos, self.line, self.col);
+            let label = self.parse_label()?;
+            self.skip_whitespace();
+            if self.try_keyword("LOOP") {
+                return Ok(Some(self.parse_loop_statement(Some(label))?));
+            }
+            if self.try_keyword("WHILE") {
+                return Ok(Some(self.parse_while_statement(Some(label))?));
+            }
+            if self.try_keyword("FOR") {
+                return Ok(Some(self.parse_for_statement(Some(label))?));
+            }
+            (self.pos, self.line, self.col) = save;
+            return Ok(Some(self.parse_nested_block()?));
+        }
 
         // IF statement
         if self.try_keyword("IF") {
@@ -338,7 +439,7 @@ impl ProceduralParser {
 
         // WHILE loop
         if self.try_keyword("WHILE") {
-            return Ok(Some(self.parse_while_statement()?));
+            return Ok(Some(self.parse_while_statement(None)?));
         }
 
         // LOOP
@@ -373,11 +474,31 @@ impl ProceduralParser {
 
         // NULL statement
         if self.try_keyword("NULL") {
-            self.skip_whitespace();
-            if self.peek_char() == Some(';') {
-                self.advance();
-            }
+            self.eat_semicolon();
             return Ok(Some(ProceduralStatement::Null));
+        }
+
+        // PERFORM query: run it as a SELECT and discard the result.
+        if self.try_keyword("PERFORM") {
+            self.skip_whitespace();
+            let query = self.scan_fragment(Stops::default());
+            self.eat_semicolon();
+            if query.is_empty() {
+                return Err(Error::sql_parse(format!(
+                    "PERFORM needs a query at line {}, column {}",
+                    self.line, self.col
+                )));
+            }
+            return Ok(Some(ProceduralStatement::Execute {
+                sql: format!("SELECT {}", query),
+                into_variables: Vec::new(),
+            }));
+        }
+
+        // CASE statement (searched or simple). A CASE *expression* never
+        // starts a statement, so this cannot steal SQL.
+        if self.try_keyword("CASE") {
+            return Ok(Some(self.parse_case_statement()?));
         }
 
         // PRINT (T-SQL)
@@ -387,38 +508,53 @@ impl ProceduralParser {
 
         // BEGIN (nested block)
         if self.check_keyword("BEGIN") || self.check_keyword("DECLARE") {
-            let mut nested_parser = ProceduralParser::new(&self.source[self.pos..]);
-            nested_parser.dialect = self.dialect;
-            let block = nested_parser.parse_block()?;
-            self.pos += nested_parser.pos;
-            return Ok(Some(ProceduralStatement::Block(block)));
+            return Ok(Some(self.parse_nested_block()?));
         }
 
         // Assignment or SQL execution
-        if let Some(stmt) = self.try_parse_assignment_or_execute()? {
-            return Ok(Some(stmt));
-        }
+        self.try_parse_assignment_or_execute()
+    }
 
-        Ok(None)
+    /// A nested `[<<label>>] [DECLARE …] BEGIN … END;` block.
+    fn parse_nested_block(&mut self) -> Result<ProceduralStatement> {
+        let mut nested_parser = ProceduralParser::new(self.rest());
+        nested_parser.dialect = self.dialect;
+        let block = nested_parser.parse_block()?;
+        let consumed = nested_parser.pos;
+        self.advance_bytes(consumed);
+        Ok(ProceduralStatement::Block(block))
+    }
+
+    /// `END <kind> [label];` closing a loop, IF or CASE.
+    fn finish_end(&mut self, kind: &str, label: Option<&str>) -> Result<()> {
+        self.expect_keyword("END")?;
+        self.skip_whitespace();
+        self.try_keyword(kind);
+        if let Some(label) = label {
+            self.skip_whitespace();
+            self.try_keyword(label);
+        }
+        self.eat_semicolon();
+        Ok(())
     }
 
     /// Parse IF statement
     fn parse_if_statement(&mut self) -> Result<ProceduralStatement> {
         self.skip_whitespace();
-        let condition = self.parse_expression()?;
+        let condition = self.parse_expression(Stops::keywords(&["THEN"]))?;
 
         self.skip_whitespace();
         self.expect_keyword("THEN")?;
 
-        let then_block = self.parse_statements_until(&["ELSIF", "ELSE", "END"])?;
+        let then_block = self.parse_statements_until(&["ELSIF", "ELSEIF", "ELSE", "END"])?;
 
         let mut elsif_branches = Vec::new();
-        while self.try_keyword("ELSIF") {
+        while self.try_keyword("ELSIF") || self.try_keyword("ELSEIF") {
             self.skip_whitespace();
-            let elsif_cond = self.parse_expression()?;
+            let elsif_cond = self.parse_expression(Stops::keywords(&["THEN"]))?;
             self.skip_whitespace();
             self.expect_keyword("THEN")?;
-            let elsif_stmts = self.parse_statements_until(&["ELSIF", "ELSE", "END"])?;
+            let elsif_stmts = self.parse_statements_until(&["ELSIF", "ELSEIF", "ELSE", "END"])?;
             elsif_branches.push((elsif_cond, elsif_stmts));
         }
 
@@ -428,13 +564,7 @@ impl ProceduralParser {
             None
         };
 
-        self.expect_keyword("END")?;
-        self.skip_whitespace();
-        self.try_keyword("IF");
-        self.skip_whitespace();
-        if self.peek_char() == Some(';') {
-            self.advance();
-        }
+        self.finish_end("IF", None)?;
 
         Ok(ProceduralStatement::If {
             condition,
@@ -445,42 +575,23 @@ impl ProceduralParser {
     }
 
     /// Parse WHILE statement
-    fn parse_while_statement(&mut self) -> Result<ProceduralStatement> {
+    fn parse_while_statement(&mut self, label: Option<String>) -> Result<ProceduralStatement> {
         self.skip_whitespace();
-        let condition = self.parse_expression()?;
+        let condition = self.parse_expression(Stops::keywords(&["LOOP"]))?;
 
         self.skip_whitespace();
         self.expect_keyword("LOOP")?;
 
         let body = self.parse_statements_until(&["END"])?;
+        self.finish_end("LOOP", label.as_deref())?;
 
-        self.expect_keyword("END")?;
-        self.skip_whitespace();
-        self.try_keyword("LOOP");
-        self.skip_whitespace();
-        if self.peek_char() == Some(';') {
-            self.advance();
-        }
-
-        Ok(ProceduralStatement::While {
-            label: None,
-            condition,
-            body,
-        })
+        Ok(ProceduralStatement::While { label, condition, body })
     }
 
     /// Parse simple LOOP statement
     fn parse_loop_statement(&mut self, label: Option<String>) -> Result<ProceduralStatement> {
         let body = self.parse_statements_until(&["END"])?;
-
-        self.expect_keyword("END")?;
-        self.skip_whitespace();
-        self.try_keyword("LOOP");
-        self.skip_whitespace();
-        if self.peek_char() == Some(';') {
-            self.advance();
-        }
-
+        self.finish_end("LOOP", label.as_deref())?;
         Ok(ProceduralStatement::Loop { label, body })
     }
 
@@ -497,18 +608,13 @@ impl ProceduralParser {
         self.skip_whitespace();
 
         // Check if this is a query FOR or numeric FOR
-        if self.check_keyword("SELECT") || self.peek_char() == Some('(') {
+        if !reverse && (self.check_keyword("SELECT") || self.check_keyword("WITH") || self.peek_char() == Some('(')) {
             // Query FOR
-            let query = self.parse_until_loop()?;
+            let query = self.scan_fragment(Stops::keywords(&["LOOP"]));
+            self.skip_whitespace();
+            self.expect_keyword("LOOP")?;
             let body = self.parse_statements_until(&["END"])?;
-
-            self.expect_keyword("END")?;
-            self.skip_whitespace();
-            self.try_keyword("LOOP");
-            self.skip_whitespace();
-            if self.peek_char() == Some(';') {
-                self.advance();
-            }
+            self.finish_end("LOOP", label.as_deref())?;
 
             Ok(ProceduralStatement::ForQuery {
                 label,
@@ -517,19 +623,28 @@ impl ProceduralParser {
                 body,
             })
         } else {
-            // Numeric FOR
-            let lower_bound = self.parse_expression()?;
+            // Numeric FOR: `[REVERSE] first .. last [BY step] LOOP`
+            let lower_bound = self.parse_expression(Stops {
+                dotdot: true,
+                ..Stops::default()
+            })?;
 
             self.skip_whitespace();
-            self.expect_keyword("..")?;
+            if !self.rest().starts_with("..") {
+                return Err(Error::sql_parse(format!(
+                    "Expected '..' in FOR loop at line {}, column {}",
+                    self.line, self.col
+                )));
+            }
+            self.advance_bytes(2);
             self.skip_whitespace();
 
-            let upper_bound = self.parse_expression()?;
+            let upper_bound = self.parse_expression(Stops::keywords(&["LOOP", "BY"]))?;
 
             self.skip_whitespace();
             let step = if self.try_keyword("BY") {
                 self.skip_whitespace();
-                Some(self.parse_expression()?)
+                Some(self.parse_expression(Stops::keywords(&["LOOP"]))?)
             } else {
                 None
             };
@@ -538,14 +653,7 @@ impl ProceduralParser {
             self.expect_keyword("LOOP")?;
 
             let body = self.parse_statements_until(&["END"])?;
-
-            self.expect_keyword("END")?;
-            self.skip_whitespace();
-            self.try_keyword("LOOP");
-            self.skip_whitespace();
-            if self.peek_char() == Some(';') {
-                self.advance();
-            }
+            self.finish_end("LOOP", label.as_deref())?;
 
             Ok(ProceduralStatement::ForNumeric {
                 label,
@@ -559,48 +667,86 @@ impl ProceduralParser {
         }
     }
 
-    /// Parse EXIT statement
-    fn parse_exit_statement(&mut self) -> Result<ProceduralStatement> {
+    /// `EXIT|CONTINUE [label] [WHEN condition];` — the optional label and
+    /// condition. `WHEN` is never a label (it used to be read as one, which
+    /// dropped the condition and made `EXIT WHEN …` an unconditional exit).
+    fn parse_label_and_when(&mut self) -> Result<(Option<String>, Option<PlExpr>)> {
         self.skip_whitespace();
-
-        let label = self.try_parse_identifier();
+        let label = if self.check_keyword("WHEN") || self.peek_char() == Some(';') {
+            None
+        } else {
+            self.try_parse_identifier()
+        };
         self.skip_whitespace();
 
         let when_condition = if self.try_keyword("WHEN") {
             self.skip_whitespace();
-            Some(self.parse_expression()?)
+            Some(self.parse_expression(Stops::default())?)
         } else {
             None
         };
 
-        self.skip_whitespace();
-        if self.peek_char() == Some(';') {
-            self.advance();
-        }
+        self.eat_semicolon();
+        Ok((label, when_condition))
+    }
 
+    /// Parse EXIT statement
+    fn parse_exit_statement(&mut self) -> Result<ProceduralStatement> {
+        let (label, when_condition) = self.parse_label_and_when()?;
         Ok(ProceduralStatement::Exit { label, when_condition })
     }
 
     /// Parse CONTINUE statement
     fn parse_continue_statement(&mut self) -> Result<ProceduralStatement> {
-        self.skip_whitespace();
+        let (label, when_condition) = self.parse_label_and_when()?;
+        Ok(ProceduralStatement::Continue { label, when_condition })
+    }
 
-        let label = self.try_parse_identifier();
+    /// Parse a CASE statement: searched (`CASE WHEN cond THEN …`) or simple
+    /// (`CASE operand WHEN value[, value …] THEN …`), ended by `END CASE`.
+    fn parse_case_statement(&mut self) -> Result<ProceduralStatement> {
         self.skip_whitespace();
+        let operand = if self.check_keyword("WHEN") {
+            None
+        } else {
+            Some(self.parse_expression(Stops::keywords(&["WHEN"]))?)
+        };
 
-        let when_condition = if self.try_keyword("WHEN") {
+        let mut when_branches = Vec::new();
+        while self.try_keyword("WHEN") {
             self.skip_whitespace();
-            Some(self.parse_expression()?)
+            let value = self.parse_expression(Stops::keywords(&["THEN"]))?;
+            self.skip_whitespace();
+            self.expect_keyword("THEN")?;
+            let stmts = self.parse_statements_until(&["WHEN", "ELSE", "END"])?;
+            when_branches.push((value, stmts));
+        }
+        if when_branches.is_empty() {
+            return Err(Error::sql_parse(format!(
+                "CASE statement needs at least one WHEN at line {}, column {}",
+                self.line, self.col
+            )));
+        }
+
+        let else_block = if self.try_keyword("ELSE") {
+            Some(self.parse_statements_until(&["END"])?)
         } else {
             None
         };
 
-        self.skip_whitespace();
-        if self.peek_char() == Some(';') {
-            self.advance();
-        }
+        self.finish_end("CASE", None)?;
 
-        Ok(ProceduralStatement::Continue { label, when_condition })
+        Ok(match operand {
+            None => ProceduralStatement::Case {
+                when_branches,
+                else_block,
+            },
+            Some(operand) => ProceduralStatement::SimpleCase {
+                operand,
+                when_branches,
+                else_block,
+            },
+        })
     }
 
     /// Parse RETURN statement
@@ -608,19 +754,16 @@ impl ProceduralParser {
         self.skip_whitespace();
 
         // Check for semicolon (RETURN without value)
-        if self.peek_char() == Some(';') {
-            self.advance();
+        if self.peek_char() == Some(';') || self.at_eof() || self.check_keyword("END") {
+            self.eat_semicolon();
             return Ok(ProceduralStatement::Return { value: None });
         }
 
         // Check for NEXT (RETURN NEXT)
         if self.try_keyword("NEXT") {
             self.skip_whitespace();
-            let value = self.parse_expression()?;
-            self.skip_whitespace();
-            if self.peek_char() == Some(';') {
-                self.advance();
-            }
+            let value = self.parse_text_literal(Stops::default());
+            self.eat_semicolon();
             return Ok(ProceduralStatement::ReturnNext { value });
         }
 
@@ -632,11 +775,8 @@ impl ProceduralParser {
         }
 
         // Regular RETURN with value
-        let value = self.parse_expression()?;
-        self.skip_whitespace();
-        if self.peek_char() == Some(';') {
-            self.advance();
-        }
+        let value = self.parse_expression(Stops::default())?;
+        self.eat_semicolon();
 
         Ok(ProceduralStatement::Return { value: Some(value) })
     }
@@ -672,10 +812,9 @@ impl ProceduralParser {
         };
 
         // Parse message (usually a string literal)
-        let message = if self.peek_char() == Some('\'') || self.peek_char() == Some('"') {
-            Some(self.parse_expression()?)
-        } else if self.peek_char() != Some(';') {
-            Some(self.parse_expression()?)
+        self.skip_whitespace();
+        let message = if self.peek_char() != Some(';') && !self.check_keyword("USING") {
+            Some(self.parse_text_literal(Stops::keywords(&["USING"])))
         } else {
             None
         };
@@ -695,14 +834,20 @@ impl ProceduralParser {
                         self.advance();
                         self.skip_whitespace();
                     }
-                    detail = Some(self.parse_expression()?);
+                    detail = Some(self.parse_text_literal(Stops {
+                        comma: true,
+                        ..Stops::default()
+                    }));
                 } else if self.try_keyword("HINT") {
                     self.skip_whitespace();
                     if self.peek_char() == Some('=') {
                         self.advance();
                         self.skip_whitespace();
                     }
-                    hint = Some(self.parse_expression()?);
+                    hint = Some(self.parse_text_literal(Stops {
+                        comma: true,
+                        ..Stops::default()
+                    }));
                 } else {
                     break;
                 }
@@ -716,10 +861,7 @@ impl ProceduralParser {
             }
         }
 
-        self.skip_whitespace();
-        if self.peek_char() == Some(';') {
-            self.advance();
-        }
+        self.eat_semicolon();
 
         Ok(ProceduralStatement::Raise {
             level,
@@ -733,47 +875,46 @@ impl ProceduralParser {
     /// Parse PRINT statement (T-SQL)
     fn parse_print_statement(&mut self) -> Result<ProceduralStatement> {
         self.skip_whitespace();
-        let message = self.parse_expression()?;
-        self.skip_whitespace();
-        if self.peek_char() == Some(';') {
-            self.advance();
-        }
+        let message = self.parse_text_literal(Stops::default());
+        self.eat_semicolon();
         Ok(ProceduralStatement::Print { message })
     }
 
     /// Try to parse assignment or SQL execution
     fn try_parse_assignment_or_execute(&mut self) -> Result<Option<ProceduralStatement>> {
-        let start_pos = self.pos;
+        let start = (self.pos, self.line, self.col);
 
         // Try to parse as assignment
         if let Some(target) = self.try_parse_identifier() {
             self.skip_whitespace();
 
-            // Check for := or =
-            if self.source[self.pos..].starts_with(":=") {
-                self.pos += 2;
+            // `:=`, or a lone `=` (PostgreSQL accepts both for assignment).
+            let rest = self.rest();
+            let assign_len = if rest.starts_with(":=") {
+                Some(2)
+            } else if rest.starts_with('=') && !rest.starts_with("==") && !rest.starts_with("=>") {
+                Some(1)
+            } else {
+                None
+            };
+            if let Some(n) = assign_len {
+                self.advance_bytes(n);
                 self.skip_whitespace();
-                let value = self.parse_expression()?;
-                self.skip_whitespace();
-                if self.peek_char() == Some(';') {
-                    self.advance();
-                }
+                let value = self.parse_expression(Stops::default())?;
+                self.eat_semicolon();
                 return Ok(Some(ProceduralStatement::Assignment { target, value }));
             }
 
-            // T-SQL style: SET @var = value
-            if target.to_uppercase() == "SET" {
-                self.skip_whitespace();
+            // T-SQL style: SET @var = value. Only an `@` variable: a SQL
+            // `SET search_path = public` is a statement, not an assignment.
+            if target.eq_ignore_ascii_case("SET") && self.rest().starts_with('@') {
                 if let Some(var_name) = self.try_parse_identifier() {
                     self.skip_whitespace();
                     if self.peek_char() == Some('=') {
                         self.advance();
                         self.skip_whitespace();
-                        let value = self.parse_expression()?;
-                        self.skip_whitespace();
-                        if self.peek_char() == Some(';') {
-                            self.advance();
-                        }
+                        let value = self.parse_expression(Stops::default())?;
+                        self.eat_semicolon();
                         return Ok(Some(ProceduralStatement::Assignment {
                             target: var_name,
                             value,
@@ -784,9 +925,10 @@ impl ProceduralParser {
         }
 
         // Reset and try as SQL execution
-        self.pos = start_pos;
+        (self.pos, self.line, self.col) = start;
 
-        // Parse as SQL statement until semicolon
+        // Parse as SQL statement until its `;` (quote-aware: a `;` inside a
+        // string literal does not end it).
         let sql = self.parse_until_semicolon();
         if sql.trim().is_empty() {
             return Ok(None);
@@ -988,6 +1130,9 @@ impl ProceduralParser {
 
         loop {
             self.skip_whitespace();
+            if self.at_eof() {
+                break;
+            }
 
             // Check for terminating keyword
             for kw in keywords {
@@ -996,10 +1141,17 @@ impl ProceduralParser {
                 }
             }
 
-            if let Some(stmt) = self.try_parse_statement()? {
-                statements.push(stmt);
-            } else {
-                break;
+            let before = self.pos;
+            match self.try_parse_statement()? {
+                Some(stmt) => statements.push(stmt),
+                None => break,
+            }
+            // A statement that consumed nothing (a stray `)`) would loop forever.
+            if self.pos == before {
+                return Err(Error::sql_parse(format!(
+                    "unexpected input at line {}, column {}",
+                    self.line, self.col
+                )));
             }
         }
 
@@ -1054,7 +1206,10 @@ impl ProceduralParser {
                     self.advance();
                 }
                 self.skip_whitespace();
-                Some(self.parse_expression()?)
+                Some(self.parse_text_literal(Stops {
+                    comma: true,
+                    ..Stops::default()
+                }))
             } else {
                 None
             };
@@ -1162,112 +1317,130 @@ impl ProceduralParser {
     }
 
     fn parse_label(&mut self) -> Result<String> {
-        if !self.source[self.pos..].starts_with("<<") {
+        if !self.rest().starts_with("<<") {
             return Err(Error::sql_parse("Expected label <<name>>"));
         }
-        self.pos += 2;
-
-        let start = self.pos;
-        while self.pos < self.source.len() && !self.source[self.pos..].starts_with(">>") {
-            self.pos += 1;
-        }
-
-        let label = self.source[start..self.pos].to_string();
-        if self.source[self.pos..].starts_with(">>") {
-            self.pos += 2;
-        }
-
+        self.advance_bytes(2);
+        let end = self
+            .rest()
+            .find(">>")
+            .ok_or_else(|| Error::sql_parse("Unterminated label <<name>>"))?;
+        let label = self.rest().get(..end).unwrap_or("").trim().to_string();
+        self.advance_bytes(end + 2);
         Ok(label)
     }
 
     fn parse_identifier(&mut self) -> Result<String> {
-        self.try_parse_identifier()
-            .ok_or_else(|| Error::sql_parse("Expected identifier"))
+        self.try_parse_identifier().ok_or_else(|| {
+            Error::sql_parse(format!(
+                "Expected identifier at line {}, column {}",
+                self.line, self.col
+            ))
+        })
     }
 
     fn try_parse_identifier(&mut self) -> Option<String> {
         self.skip_whitespace();
-        let start = self.pos;
+        let rest = self.rest();
 
-        // Handle quoted identifiers
-        if self.peek_char() == Some('"') {
-            self.advance();
-            while self.pos < self.source.len() {
-                let c = self.source.chars().nth(self.pos).unwrap_or('\0');
-                if c == '"' {
-                    self.advance();
-                    break;
-                }
-                self.advance();
-            }
-            return Some(self.source[start + 1..self.pos - 1].to_string());
+        // Quoted identifier ("" escapes a quote)
+        if rest.starts_with('"') {
+            let len = quoted_len(rest, false)?;
+            let raw = rest.get(1..len.saturating_sub(1)).unwrap_or("").replace("\"\"", "\"");
+            self.advance_bytes(len);
+            return Some(raw);
         }
 
-        // Handle T-SQL @variable
-        if self.peek_char() == Some('@') {
-            self.advance();
+        // T-SQL @variable
+        let at = usize::from(rest.starts_with('@'));
+        let body = rest.get(at..).unwrap_or("");
+        if !body.chars().next().is_some_and(is_ident_start) {
+            return None;
         }
-
-        // Regular identifier
-        while self.pos < self.source.len() {
-            let c = self.source.chars().nth(self.pos).unwrap_or('\0');
-            if c.is_alphanumeric() || c == '_' {
-                self.advance();
-            } else {
-                break;
-            }
-        }
-
-        if self.pos > start {
-            Some(self.source[start..self.pos].to_string())
-        } else {
-            None
-        }
+        let len = at
+            + body
+                .char_indices()
+                .find(|&(_, c)| !(c.is_alphanumeric() || c == '_'))
+                .map_or(body.len(), |(i, _)| i);
+        let ident = rest.get(..len)?.to_string();
+        self.advance_bytes(len);
+        Some(ident)
     }
 
-    fn parse_expression(&mut self) -> Result<LogicalExpr> {
-        // For now, return a simple string literal containing the expression text
-        // A full implementation would parse this into LogicalExpr
-        let expr_text = self.parse_simple_expression_text()?;
-
-        // Convert to string literal expression
-        Ok(LogicalExpr::Literal(crate::Value::String(expr_text)))
+    /// Scan one procedural expression, kept as SQL text (see [`PlExpr`]).
+    fn parse_expression(&mut self, stops: Stops) -> Result<PlExpr> {
+        let text = self.scan_fragment(stops);
+        if text.is_empty() {
+            return Err(Error::sql_parse(format!(
+                "Expected an expression at line {}, column {}",
+                self.line, self.col
+            )));
+        }
+        Ok(PlExpr::new(text))
     }
 
-    fn parse_simple_expression_text(&mut self) -> Result<String> {
-        let mut depth = 0;
+    /// The text of a fragment, wrapped as the string literal the statements
+    /// that still carry a `LogicalExpr` (RAISE, PRINT, RETURN NEXT, parameter
+    /// defaults) have always received.
+    fn parse_text_literal(&mut self, stops: Stops) -> LogicalExpr {
+        LogicalExpr::Literal(crate::Value::String(self.scan_fragment(stops)))
+    }
+
+    /// Scan an embedded SQL fragment up to (not including) its terminator and
+    /// return it trimmed. String literals, quoted identifiers, dollar quotes
+    /// and comments are skipped whole, parentheses nest, a `CASE … END` of the
+    /// fragment itself is not ended by its `END`, and stop keywords match whole
+    /// words only — so a literal containing `'THEN'` or a variable named
+    /// `status_end` no longer cuts the expression short. See [`Stops`].
+    fn scan_fragment(&mut self, stops: Stops) -> String {
         let start = self.pos;
-
-        while self.pos < self.source.len() {
-            let c = self.peek_char().unwrap_or('\0');
-
-            if c == '(' {
-                depth += 1;
-            } else if c == ')' {
-                if depth == 0 {
-                    break;
-                }
-                depth -= 1;
-            } else if c == ';' && depth == 0 {
-                break;
-            } else if depth == 0 {
-                // Check for keywords that end expression
-                let rest = &self.source[self.pos..].to_uppercase();
-                if rest.starts_with("THEN")
-                    || rest.starts_with("LOOP")
-                    || rest.starts_with("END")
-                    || rest.starts_with("ELSE")
-                    || rest.starts_with("ELSIF")
-                    || rest.starts_with("WHEN")
-                {
-                    break;
-                }
+        let mut depth = 0usize;
+        let mut case_depth = 0usize;
+        let mut prev: Option<char> = None;
+        while let Some(c) = self.peek_char() {
+            let rest = self.rest();
+            if let Some(n) = quoted_len(rest, matches!(prev, Some('e' | 'E'))) {
+                self.advance_bytes(n);
+                prev = Some(' ');
+                continue;
             }
-
+            match c {
+                '(' | '[' => depth += 1,
+                ')' | ']' => {
+                    if depth == 0 {
+                        break;
+                    }
+                    depth -= 1;
+                }
+                ';' if depth == 0 => break,
+                ',' if depth == 0 && case_depth == 0 && stops.comma => break,
+                '.' if depth == 0 && stops.dotdot && rest.starts_with("..") => break,
+                c if is_ident_start(c) && !prev.is_some_and(is_ident_char) => {
+                    let len = rest
+                        .char_indices()
+                        .find(|&(_, ch)| !is_ident_char(ch))
+                        .map_or(rest.len(), |(i, _)| i);
+                    let word = rest.get(..len).unwrap_or("");
+                    if depth == 0 {
+                        if word.eq_ignore_ascii_case("CASE") {
+                            case_depth += 1;
+                        } else if word.eq_ignore_ascii_case("END") && case_depth > 0 {
+                            case_depth -= 1;
+                        } else if case_depth == 0 && stops.keywords.iter().any(|k| word.eq_ignore_ascii_case(k)) {
+                            break;
+                        }
+                    }
+                    let last = word.chars().last();
+                    self.advance_bytes(len);
+                    prev = last;
+                    continue;
+                }
+                _ => {}
+            }
             self.advance();
+            prev = Some(c);
         }
-
-        Ok(self.source[start..self.pos].trim().to_string())
+        self.source.get(start..self.pos).unwrap_or("").trim().to_string()
     }
 
     fn parse_data_type(&mut self) -> Result<DataType> {
@@ -1293,7 +1466,10 @@ impl ProceduralParser {
             "BIGINT" | "INT8" => DataType::Int8,
             "SMALLINT" | "INT2" => DataType::Int2,
             "FLOAT" | "REAL" | "FLOAT4" => DataType::Float4,
-            "DOUBLE" | "FLOAT8" => DataType::Float8,
+            "DOUBLE" | "FLOAT8" => {
+                self.try_keyword("PRECISION");
+                DataType::Float8
+            }
             "TEXT" | "STRING" => DataType::Text,
             "VARCHAR" => {
                 self.skip_whitespace();
@@ -1321,6 +1497,14 @@ impl ProceduralParser {
             _ => return None,
         };
 
+        // A type modifier the engine does not model (`NUMERIC(10, 2)`,
+        // `TIMESTAMP(3)`) is consumed whole, so it is not read as a default.
+        if self.rest().starts_with('(') {
+            if let Some(close) = self.rest().find(')') {
+                self.advance_bytes(close + 1);
+            }
+        }
+
         // Handle array
         if is_array {
             Some(DataType::Array(Box::new(base_type)))
@@ -1329,53 +1513,30 @@ impl ProceduralParser {
         }
     }
 
+    /// A single-quoted SQL string literal, unescaped (`''` → `'`).
     fn parse_string_literal(&mut self) -> Result<String> {
-        let quote = self
-            .peek_char()
-            .ok_or_else(|| Error::sql_parse("Expected string literal"))?;
-        if quote != '\'' && quote != '"' {
-            return Err(Error::sql_parse("Expected string literal"));
+        self.skip_whitespace();
+        let rest = self.rest();
+        if !rest.starts_with('\'') {
+            return Err(Error::sql_parse(format!(
+                "Expected string literal at line {}, column {}",
+                self.line, self.col
+            )));
         }
-        self.advance();
-
-        let start = self.pos;
-        while self.pos < self.source.len() {
-            let c = self.peek_char().unwrap_or('\0');
-            if c == quote {
-                let s = self.source[start..self.pos].to_string();
-                self.advance();
-                return Ok(s);
-            }
-            self.advance();
+        let len = quoted_len(rest, false).unwrap_or(rest.len());
+        if len < 2 || !rest.get(..len).is_some_and(|s| s.ends_with('\'')) {
+            return Err(Error::sql_parse("Unterminated string literal"));
         }
-
-        Err(Error::sql_parse("Unterminated string literal"))
+        let body = rest.get(1..len - 1).unwrap_or("").replace("''", "'");
+        self.advance_bytes(len);
+        Ok(body)
     }
 
+    /// A SQL statement up to its `;` (quote-aware), consuming the `;`.
     fn parse_until_semicolon(&mut self) -> String {
-        let start = self.pos;
-        while self.pos < self.source.len() {
-            if self.peek_char() == Some(';') {
-                let s = self.source[start..self.pos].to_string();
-                self.advance();
-                return s;
-            }
-            self.advance();
-        }
-        self.source[start..].to_string()
-    }
-
-    fn parse_until_loop(&mut self) -> Result<String> {
-        let start = self.pos;
-        while self.pos < self.source.len() {
-            if self.check_keyword("LOOP") {
-                let s = self.source[start..self.pos].trim().to_string();
-                self.expect_keyword("LOOP")?;
-                return Ok(s);
-            }
-            self.advance();
-        }
-        Err(Error::sql_parse("Expected LOOP"))
+        let sql = self.scan_fragment(Stops::default());
+        self.eat_semicolon();
+        sql
     }
 
     fn parse_number(&mut self) -> Option<i64> {
@@ -1396,50 +1557,70 @@ impl ProceduralParser {
         }
     }
 
+    fn eat_semicolon(&mut self) {
+        self.skip_whitespace();
+        if self.peek_char() == Some(';') {
+            self.advance();
+        }
+    }
+
     fn skip_whitespace(&mut self) {
-        while self.pos < self.source.len() {
-            let c = self.peek_char().unwrap_or('\0');
-            if c.is_whitespace() {
-                if c == '\n' {
-                    self.line += 1;
-                    self.col = 1;
-                } else {
-                    self.col += 1;
+        loop {
+            let rest = self.rest();
+            match rest.chars().next() {
+                Some(c) if c.is_whitespace() => self.advance(),
+                Some('-') if rest.starts_with("--") => {
+                    let n = rest.find('\n').unwrap_or(rest.len());
+                    self.advance_bytes(n);
                 }
-                self.pos += 1;
-            } else if self.source[self.pos..].starts_with("--") {
-                // Line comment
-                while self.pos < self.source.len() && self.peek_char() != Some('\n') {
-                    self.pos += 1;
+                Some('/') if rest.starts_with("/*") => {
+                    let n = rest.find("*/").map_or(rest.len(), |e| e + 2);
+                    self.advance_bytes(n);
                 }
-            } else if self.source[self.pos..].starts_with("/*") {
-                // Block comment
-                self.pos += 2;
-                while self.pos + 1 < self.source.len() && !self.source[self.pos..].starts_with("*/") {
-                    if self.peek_char() == Some('\n') {
-                        self.line += 1;
-                        self.col = 1;
-                    }
-                    self.pos += 1;
-                }
-                if self.pos + 1 < self.source.len() {
-                    self.pos += 2;
-                }
-            } else {
-                break;
+                _ => break,
             }
         }
     }
 
-    fn peek_char(&self) -> Option<char> {
-        self.source.chars().nth(self.pos)
+    /// The unparsed remainder of the source. Positions are BYTE offsets.
+    fn rest(&self) -> &str {
+        self.source.get(self.pos..).unwrap_or("")
     }
 
+    fn at_eof(&self) -> bool {
+        self.pos >= self.source.len()
+    }
+
+    fn peek_char(&self) -> Option<char> {
+        self.rest().chars().next()
+    }
+
+    /// Advance one character.
     fn advance(&mut self) {
-        if self.pos < self.source.len() {
-            self.pos += 1;
-            self.col += 1;
+        if let Some(c) = self.peek_char() {
+            self.pos += c.len_utf8();
+            if c == '\n' {
+                self.line += 1;
+                self.col = 1;
+            } else {
+                self.col += 1;
+            }
         }
+    }
+
+    /// Advance `n` bytes (a whole number of characters), keeping line/column.
+    fn advance_bytes(&mut self, n: usize) {
+        let end = (self.pos + n).min(self.source.len());
+        let chunk = self.source.get(self.pos..end).unwrap_or("");
+        for c in chunk.chars() {
+            if c == '\n' {
+                self.line += 1;
+                self.col = 1;
+            } else {
+                self.col += 1;
+            }
+        }
+        self.pos = end;
     }
 
     fn expect_char(&mut self, expected: char) -> Result<()> {
@@ -1456,41 +1637,29 @@ impl ProceduralParser {
     }
 
     fn expect_keyword(&mut self, keyword: &str) -> Result<()> {
-        if !self.try_keyword(keyword) {
+        if self.try_keyword(keyword) {
+            Ok(())
+        } else {
             Err(Error::sql_parse(format!(
                 "Expected '{}' at line {}, column {}",
                 keyword, self.line, self.col
             )))
-        } else {
-            Ok(())
         }
     }
 
     fn try_keyword(&mut self, keyword: &str) -> bool {
         self.skip_whitespace();
-        let upper_keyword = keyword.to_uppercase();
-        let remaining = &self.source[self.pos..].to_uppercase();
-
-        if remaining.starts_with(&upper_keyword) {
-            let after = remaining.chars().nth(upper_keyword.len());
-            if after.is_none_or(|c| !c.is_alphanumeric()) {
-                self.pos += keyword.len();
-                return true;
-            }
-        }
-        false
-    }
-
-    fn check_keyword(&self, keyword: &str) -> bool {
-        let upper_keyword = keyword.to_uppercase();
-        let remaining = self.source[self.pos..].trim_start().to_uppercase();
-
-        if remaining.starts_with(&upper_keyword) {
-            let after = remaining.chars().nth(upper_keyword.len());
-            after.is_none_or(|c| !c.is_alphanumeric())
+        if starts_with_keyword(self.rest(), keyword) {
+            self.advance_bytes(keyword.len());
+            true
         } else {
             false
         }
+    }
+
+    fn check_keyword(&mut self, keyword: &str) -> bool {
+        self.skip_whitespace();
+        starts_with_keyword(self.rest(), keyword)
     }
 }
 

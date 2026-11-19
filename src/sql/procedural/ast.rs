@@ -7,6 +7,28 @@ use crate::sql::LogicalExpr;
 use crate::DataType;
 use serde::{Deserialize, Serialize};
 
+/// A procedural expression (a condition, an assigned value, a loop bound, a
+/// DECLARE default, a RETURN value), kept as the SQL text the routine was
+/// written with.
+///
+/// It is evaluated at run time as `SELECT <text>`, after the `$`-sigil
+/// interpolation every body statement already goes through (`$name` from the
+/// variable scope, `$N` from the call's arguments). The parser used to wrap
+/// this text in a string literal that the runtime then took at face value, so
+/// every IF condition was false and `x := 1 + 1` stored the text `1 + 1`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlExpr {
+    /// The expression as written (trimmed).
+    pub text: String,
+}
+
+impl PlExpr {
+    /// An expression with the given SQL text.
+    pub fn new(text: impl Into<String>) -> Self {
+        Self { text: text.into() }
+    }
+}
+
 /// Procedural SQL dialect
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProceduralDialect {
@@ -78,7 +100,7 @@ pub struct VariableDeclaration {
     /// Data type (optional for some dialects)
     pub data_type: Option<DataType>,
     /// Default/initial value
-    pub default: Option<LogicalExpr>,
+    pub default: Option<PlExpr>,
     /// Whether this is a constant
     pub is_constant: bool,
     /// NOT NULL constraint
@@ -89,26 +111,26 @@ pub struct VariableDeclaration {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ProceduralStatement {
     /// Variable assignment (SET, :=, =)
-    Assignment { target: String, value: LogicalExpr },
+    Assignment { target: String, value: PlExpr },
 
     /// IF statement
     If {
-        condition: LogicalExpr,
+        condition: PlExpr,
         then_block: Vec<ProceduralStatement>,
-        elsif_branches: Vec<(LogicalExpr, Vec<ProceduralStatement>)>,
+        elsif_branches: Vec<(PlExpr, Vec<ProceduralStatement>)>,
         else_block: Option<Vec<ProceduralStatement>>,
     },
 
     /// CASE statement (searched)
     Case {
-        when_branches: Vec<(LogicalExpr, Vec<ProceduralStatement>)>,
+        when_branches: Vec<(PlExpr, Vec<ProceduralStatement>)>,
         else_block: Option<Vec<ProceduralStatement>>,
     },
 
     /// CASE statement (simple)
     SimpleCase {
-        operand: LogicalExpr,
-        when_branches: Vec<(LogicalExpr, Vec<ProceduralStatement>)>,
+        operand: PlExpr,
+        when_branches: Vec<(PlExpr, Vec<ProceduralStatement>)>,
         else_block: Option<Vec<ProceduralStatement>>,
     },
 
@@ -121,7 +143,7 @@ pub enum ProceduralStatement {
     /// WHILE loop
     While {
         label: Option<String>,
-        condition: LogicalExpr,
+        condition: PlExpr,
         body: Vec<ProceduralStatement>,
     },
 
@@ -129,9 +151,9 @@ pub enum ProceduralStatement {
     ForNumeric {
         label: Option<String>,
         variable: String,
-        lower_bound: LogicalExpr,
-        upper_bound: LogicalExpr,
-        step: Option<LogicalExpr>,
+        lower_bound: PlExpr,
+        upper_bound: PlExpr,
+        step: Option<PlExpr>,
         reverse: bool,
         body: Vec<ProceduralStatement>,
     },
@@ -147,17 +169,17 @@ pub enum ProceduralStatement {
     /// EXIT (break out of loop)
     Exit {
         label: Option<String>,
-        when_condition: Option<LogicalExpr>,
+        when_condition: Option<PlExpr>,
     },
 
     /// CONTINUE (next iteration)
     Continue {
         label: Option<String>,
-        when_condition: Option<LogicalExpr>,
+        when_condition: Option<PlExpr>,
     },
 
     /// RETURN statement
-    Return { value: Option<LogicalExpr> },
+    Return { value: Option<PlExpr> },
 
     /// RETURN NEXT (for set-returning functions)
     ReturnNext { value: LogicalExpr },

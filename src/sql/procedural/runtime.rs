@@ -119,6 +119,21 @@ pub struct ExecutionContext<'a> {
     pub returned: bool,
     /// Call-site arguments, for `$1..$N` in body SQL. Empty outside a routine call.
     pub positional_params: Vec<Value>,
+    /// `[procedural] max_loop_iterations`: the most iterations one loop may run
+    /// before the routine fails (0 = unlimited).
+    pub max_loop_iterations: u64,
+    /// The configured statement timeout (`[storage] statement_timeout_ms`),
+    /// used when the session has not `SET statement_timeout`.
+    pub default_statement_timeout_ms: Option<u64>,
+}
+
+/// What a loop does after one pass over its body.
+enum LoopFlow {
+    /// Run the next iteration.
+    Next,
+    /// Leave the loop (EXIT of this loop, or a RETURN / an EXIT or CONTINUE
+    /// aimed at an enclosing loop, whose flag is still set).
+    Leave,
 }
 
 impl<'a> ExecutionContext<'a> {
@@ -135,7 +150,15 @@ impl<'a> ExecutionContext<'a> {
             return_value: None,
             returned: false,
             positional_params: Vec::new(),
+            max_loop_iterations: 0,
+            default_statement_timeout_ms: None,
         }
+    }
+
+    /// True when statements of the current list must stop running: RETURN,
+    /// EXIT or CONTINUE is in flight.
+    fn interrupted(&self) -> bool {
+        self.returned || self.exit_requested || self.continue_requested
     }
 
     /// Interpolate `$<name>` from the variable scope and `$N` from the call's arguments
@@ -179,20 +202,65 @@ impl<'a> ExecutionContext<'a> {
 pub struct ProceduralExecutor;
 
 impl ProceduralExecutor {
+    /// Run a routine's top-level block, then refuse an EXIT or CONTINUE that
+    /// no enclosing loop or block took (an unknown label, or one used outside
+    /// any loop) instead of letting it silently end the routine.
+    pub fn execute_routine(block: &ProceduralBlock, ctx: &mut ExecutionContext<'_>) -> Result<()> {
+        Self::execute_block(block, ctx)?;
+        if ctx.exit_requested {
+            return Err(Error::query_execution(match ctx.exit_label.as_deref() {
+                Some(label) => format!(
+                    "EXIT names label \"{}\", which is not an enclosing loop or block",
+                    label
+                ),
+                None => "EXIT cannot be used outside a loop, unless it has a label".to_string(),
+            }));
+        }
+        if ctx.continue_requested {
+            return Err(Error::query_execution(match ctx.continue_label.as_deref() {
+                Some(label) => format!("CONTINUE names label \"{}\", which is not an enclosing loop", label),
+                None => "CONTINUE cannot be used outside a loop".to_string(),
+            }));
+        }
+        Ok(())
+    }
+
     /// Execute a procedural block
-    #[allow(clippy::indexing_slicing)]
-    // SAFETY: All indexing is guarded by `.is_empty()` and `.len()` checks
     pub fn execute_block(block: &ProceduralBlock, ctx: &mut ExecutionContext<'_>) -> Result<()> {
         // Push new scope for this block
         ctx.push_scope();
+        let result = Self::execute_block_in_scope(block, ctx);
+        // Pop on every path, so an EXCEPTION handler further out sees its own scope.
+        ctx.pop_scope();
+        result?;
 
+        // `EXIT <block label>` leaves this block and continues after it.
+        if ctx.exit_requested
+            && ctx.exit_label.is_some()
+            && Self::label_matches(ctx.exit_label.as_deref(), block.label.as_deref())
+        {
+            ctx.exit_requested = false;
+            ctx.exit_label = None;
+        }
+        Ok(())
+    }
+
+    fn execute_block_in_scope(block: &ProceduralBlock, ctx: &mut ExecutionContext<'_>) -> Result<()> {
         // Declare variables
         for decl in &block.declarations {
-            let default_value = if let Some(ref expr) = decl.default {
-                ctx.evaluator.evaluate(expr, &crate::Tuple::new(vec![]))?
-            } else {
-                Value::Null
+            let default_value = match decl.default {
+                Some(ref expr) => {
+                    let value = Self::eval_expr(expr, ctx, "DECLARE default")?;
+                    Self::cast_to_declared(ctx, value, decl.data_type.as_ref(), &decl.name)?
+                }
+                None => Value::Null,
             };
+            if decl.not_null && matches!(default_value, Value::Null) {
+                return Err(Error::query_execution(format!(
+                    "variable \"{}\" is declared NOT NULL, so it needs a non-null default value",
+                    decl.name
+                )));
+            }
 
             ctx.scope.declare(
                 decl.name.clone(),
@@ -206,93 +274,174 @@ impl ProceduralExecutor {
         }
 
         // Execute statements with exception handling
-        let execution_result: Result<()> = (|| {
-            for stmt in &block.statements {
-                Self::execute_statement(stmt, ctx)?;
-
-                // Check for control flow changes
-                if ctx.returned || ctx.exit_requested {
-                    break;
-                }
-            }
-            Ok(())
-        })();
-
-        // Handle exception if one occurred
-        match execution_result {
-            Ok(()) => {}
+        match Self::execute_statements(&block.statements, ctx) {
+            Ok(()) => Ok(()),
             Err(err) => {
                 // Check if any exception handler matches
                 if let Some(handler) = Self::find_matching_handler(&block.exception_handlers, &err) {
-                    // Execute the handler's body
-                    for stmt in &handler.body {
-                        Self::execute_statement(stmt, ctx)?;
-                        if ctx.returned || ctx.exit_requested {
-                            break;
-                        }
-                    }
+                    Self::execute_statements(&handler.body, ctx)
                 } else {
                     // No handler matched, re-raise the exception
-                    // Pop scope before returning error
-                    ctx.pop_scope();
-                    return Err(err);
+                    Err(err)
                 }
             }
         }
+    }
 
-        // Pop scope
-        ctx.pop_scope();
-
+    /// Run a statement list, stopping when RETURN, EXIT or CONTINUE is in flight.
+    fn execute_statements(statements: &[ProceduralStatement], ctx: &mut ExecutionContext<'_>) -> Result<()> {
+        for stmt in statements {
+            Self::execute_statement(stmt, ctx)?;
+            if ctx.interrupted() {
+                break;
+            }
+        }
         Ok(())
     }
 
-    /// Evaluate the value of a `RETURN <expr>` statement.
+    /// Evaluate a procedural expression (see [`PlExpr`]).
     ///
-    /// `ProceduralParser::parse_expression` does NOT build an expression tree —
-    /// it captures the expression's RAW SOURCE TEXT and wraps it in
-    /// `LogicalExpr::Literal(Value::String(text))` (its own comment says "A full
-    /// implementation would parse this into LogicalExpr"). Handing that literal
-    /// to `Evaluator::evaluate` therefore returned the TEXT of the expression as
-    /// the routine's return value — so `RETURN x * 10` produced the string
-    /// `"x * 10"`, not a number. That was invisible while user functions were
-    /// uncallable; it became a wrong-answer factory the moment the evaluator
-    /// gained a UDF call path, so the text is now EVALUATED.
+    /// The text goes through `ExecutionContext::interpolate` (the shared
+    /// `$`-sigil scanner — `$name` from the variable scope, `$N` from the
+    /// call's arguments) and is then evaluated by the engine as
+    /// `SELECT <text>`. This is the one rule RETURN has used since UDFs became
+    /// callable; conditions, assignments, loop bounds and DECLARE defaults now
+    /// use it too, instead of taking the expression's TEXT as its value. The
+    /// `$` sigil stays mandatory, so a bare identifier reaches the planner as
+    /// a column reference and errors loudly rather than silently resolving.
     ///
-    /// Evaluation reuses the two mechanisms the rest of a body already uses and
-    /// adds no third rule: the text goes through `ExecutionContext::interpolate`
-    /// (the shared `$`-sigil scanner — `$name` from the variable scope, `$N`
-    /// from the call's arguments) and is then evaluated by the engine as
-    /// `SELECT <text>`. The `$` sigil stays mandatory, exactly as it is for body
-    /// statements, so a bare identifier reaches the planner as a column
-    /// reference and errors loudly rather than silently resolving.
-    ///
-    /// An expression that is not the parser's text literal (no producer today,
-    /// but the AST permits it) is evaluated directly, preserving the old path.
-    fn evaluate_return_value(expr: &crate::sql::LogicalExpr, ctx: &mut ExecutionContext<'_>) -> Result<Value> {
-        let text = match expr {
-            crate::sql::LogicalExpr::Literal(Value::String(text)) => text.trim().to_string(),
-            other => return ctx.evaluator.evaluate(other, &crate::Tuple::new(vec![])),
-        };
+    /// No rows yields NULL, matching `execute_sql_function`'s empty-result
+    /// rule and PostgreSQL's `SELECT (SELECT … WHERE false)`.
+    pub fn eval_expr(expr: &PlExpr, ctx: &mut ExecutionContext<'_>, what: &str) -> Result<Value> {
+        let text = expr.text.trim();
         if text.is_empty() {
             return Ok(Value::Null);
         }
         // Borrow ends before `sql_executor` is borrowed mutably below.
-        let sql = format!("SELECT {}", ctx.interpolate(&text));
-        let results = (ctx.sql_executor)(&sql).map_err(|e| {
-            Error::query_execution(format!(
-                "RETURN could not evaluate `{}`: {}. A routine body evaluates its RETURN \
-                 expression as SQL, and the `$` sigil is mandatory — reference a parameter or \
-                 declared variable as `$name` or `$1`.",
-                text, e
-            ))
-        })?;
-        // No rows -> NULL, matching `execute_sql_function`'s empty-result rule
-        // and PostgreSQL's `SELECT (SELECT … WHERE false)`.
+        let sql = format!("SELECT {}", ctx.interpolate(text));
+        let results = (ctx.sql_executor)(&sql).map_err(|e| Self::explain_eval_error(what, text, e))?;
         Ok(results
             .first()
             .and_then(|row| row.first())
             .cloned()
             .unwrap_or(Value::Null))
+    }
+
+    /// An expression that named an unknown column almost always wrote a
+    /// variable without its `$` sigil: say so. Any other error (a division by
+    /// zero, a RAISE in a called function) passes through unchanged, keeping
+    /// its SQLSTATE.
+    fn explain_eval_error(what: &str, text: &str, e: Error) -> Error {
+        let msg = e.to_string();
+        let lower = msg.to_lowercase();
+        if lower.contains("column") && (lower.contains("not found") || lower.contains("does not exist")) {
+            Error::query_execution(format!(
+                "{} could not evaluate `{}`: {}. A routine body evaluates its expressions as SQL, \
+                 and the `$` sigil is mandatory — reference a parameter or declared variable as \
+                 `$name` or `$1`.",
+                what, text, msg
+            ))
+        } else {
+            e
+        }
+    }
+
+    /// Evaluate a condition: TRUE runs the branch; FALSE and NULL do not; any
+    /// other value is an error rather than a silent "false".
+    pub fn eval_condition(expr: &PlExpr, ctx: &mut ExecutionContext<'_>, what: &str) -> Result<bool> {
+        match Self::eval_expr(expr, ctx, what)? {
+            Value::Boolean(b) => Ok(b),
+            Value::Null => Ok(false),
+            other => Err(Error::query_execution(format!(
+                "{} condition `{}` must be boolean, but it evaluated to {} ({})",
+                what,
+                expr.text.trim(),
+                other,
+                other.data_type()
+            ))),
+        }
+    }
+
+    /// Cast a value assigned to a variable to the variable's declared type.
+    fn cast_to_declared(
+        ctx: &ExecutionContext<'_>,
+        value: Value,
+        data_type: Option<&DataType>,
+        name: &str,
+    ) -> Result<Value> {
+        match data_type {
+            Some(dt) if !matches!(value, Value::Null) => ctx.evaluator.cast_value(value, dt).map_err(|e| {
+                Error::query_execution(format!(
+                    "value assigned to variable \"{}\" does not convert to {}: {}",
+                    name, dt, e
+                ))
+            }),
+            _ => Ok(value),
+        }
+    }
+
+    /// An EXIT/CONTINUE aimed at `requested` applies to a loop or block
+    /// labelled `label`: an unlabelled one applies to the innermost loop.
+    fn label_matches(requested: Option<&str>, label: Option<&str>) -> bool {
+        match requested {
+            None => true,
+            Some(r) => label.is_some_and(|l| l.eq_ignore_ascii_case(r)),
+        }
+    }
+
+    /// One pass over a loop body, resolving EXIT/CONTINUE aimed at this loop
+    /// and leaving the flags set for one aimed further out.
+    fn run_loop_body(
+        body: &[ProceduralStatement],
+        label: Option<&str>,
+        ctx: &mut ExecutionContext<'_>,
+    ) -> Result<LoopFlow> {
+        Self::execute_statements(body, ctx)?;
+        if ctx.returned {
+            return Ok(LoopFlow::Leave);
+        }
+        if ctx.exit_requested {
+            if Self::label_matches(ctx.exit_label.as_deref(), label) {
+                ctx.exit_requested = false;
+                ctx.exit_label = None;
+            }
+            return Ok(LoopFlow::Leave);
+        }
+        if ctx.continue_requested {
+            if Self::label_matches(ctx.continue_label.as_deref(), label) {
+                ctx.continue_requested = false;
+                ctx.continue_label = None;
+                return Ok(LoopFlow::Next);
+            }
+            return Ok(LoopFlow::Leave);
+        }
+        Ok(LoopFlow::Next)
+    }
+
+    /// Count one loop iteration against `[procedural] max_loop_iterations`
+    /// and the statement timeout, so a runaway loop fails instead of hanging.
+    fn loop_tick(ctx: &ExecutionContext<'_>, iterations: &mut u64) -> Result<()> {
+        *iterations += 1;
+        if ctx.max_loop_iterations > 0 && *iterations > ctx.max_loop_iterations {
+            return Err(Error::query_execution(format!(
+                "loop exceeded {} iterations ([procedural] max_loop_iterations); \
+                 raise the setting or set it to 0 for no limit",
+                ctx.max_loop_iterations
+            )));
+        }
+        let timeout_ms = match crate::session_statement_timeout_tls() {
+            Some(ms) => (ms > 0).then_some(ms),
+            None => ctx.default_statement_timeout_ms,
+        };
+        if let (Some(ms), Some(started)) = (timeout_ms, crate::statement_started_tls()) {
+            if started.elapsed() >= std::time::Duration::from_millis(ms) {
+                return Err(Error::query_timeout(format!(
+                    "canceling statement due to statement timeout ({} ms) in a routine loop",
+                    ms
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Execute a single statement
@@ -301,7 +450,14 @@ impl ProceduralExecutor {
     pub fn execute_statement(stmt: &ProceduralStatement, ctx: &mut ExecutionContext<'_>) -> Result<()> {
         match stmt {
             ProceduralStatement::Assignment { target, value } => {
-                let val = ctx.evaluator.evaluate(value, &crate::Tuple::new(vec![]))?;
+                let val = Self::eval_expr(value, ctx, "assignment")?;
+                let declared = ctx
+                    .scope
+                    .get(target)
+                    .ok_or_else(|| Error::query_execution(format!("Variable '{}' not declared", target)))?
+                    .data_type
+                    .clone();
+                let val = Self::cast_to_declared(ctx, val, declared.as_ref(), target)?;
                 ctx.scope.set(target, val)?;
             }
 
@@ -311,106 +467,44 @@ impl ProceduralExecutor {
                 elsif_branches,
                 else_block,
             } => {
-                let cond_val = ctx.evaluator.evaluate(condition, &crate::Tuple::new(vec![]))?;
-                let cond_bool = match cond_val {
-                    Value::Boolean(b) => b,
-                    _ => false,
-                };
-
-                if cond_bool {
-                    for stmt in then_block {
-                        Self::execute_statement(stmt, ctx)?;
-                        if ctx.returned || ctx.exit_requested {
-                            break;
-                        }
-                    }
+                if Self::eval_condition(condition, ctx, "IF")? {
+                    Self::execute_statements(then_block, ctx)?;
                 } else {
                     let mut executed = false;
                     for (elsif_cond, elsif_stmts) in elsif_branches {
-                        let elsif_val = ctx.evaluator.evaluate(elsif_cond, &crate::Tuple::new(vec![]))?;
-                        if matches!(elsif_val, Value::Boolean(true)) {
-                            for stmt in elsif_stmts {
-                                Self::execute_statement(stmt, ctx)?;
-                                if ctx.returned || ctx.exit_requested {
-                                    break;
-                                }
-                            }
+                        if Self::eval_condition(elsif_cond, ctx, "ELSIF")? {
+                            Self::execute_statements(elsif_stmts, ctx)?;
                             executed = true;
                             break;
                         }
                     }
-
                     if !executed {
                         if let Some(else_stmts) = else_block {
-                            for stmt in else_stmts {
-                                Self::execute_statement(stmt, ctx)?;
-                                if ctx.returned || ctx.exit_requested {
-                                    break;
-                                }
-                            }
+                            Self::execute_statements(else_stmts, ctx)?;
                         }
                     }
                 }
             }
 
-            ProceduralStatement::While { label, condition, body } => loop {
-                let cond_val = ctx.evaluator.evaluate(condition, &crate::Tuple::new(vec![]))?;
-                if !matches!(cond_val, Value::Boolean(true)) {
-                    break;
-                }
-
-                for stmt in body {
-                    Self::execute_statement(stmt, ctx)?;
-
-                    if ctx.continue_requested {
-                        if ctx.continue_label.is_none() || ctx.continue_label.as_ref() == label.as_ref() {
-                            ctx.continue_requested = false;
-                            ctx.continue_label = None;
-                            break;
-                        }
-                    }
-
-                    if ctx.exit_requested {
-                        if ctx.exit_label.is_none() || ctx.exit_label.as_ref() == label.as_ref() {
-                            ctx.exit_requested = false;
-                            ctx.exit_label = None;
-                            return Ok(());
-                        }
-                        return Ok(());
-                    }
-
-                    if ctx.returned {
-                        return Ok(());
+            ProceduralStatement::While { label, condition, body } => {
+                let mut iterations = 0u64;
+                while Self::eval_condition(condition, ctx, "WHILE")? {
+                    Self::loop_tick(ctx, &mut iterations)?;
+                    if let LoopFlow::Leave = Self::run_loop_body(body, label.as_deref(), ctx)? {
+                        break;
                     }
                 }
-            },
+            }
 
-            ProceduralStatement::Loop { label, body } => loop {
-                for stmt in body {
-                    Self::execute_statement(stmt, ctx)?;
-
-                    if ctx.continue_requested {
-                        if ctx.continue_label.is_none() || ctx.continue_label.as_ref() == label.as_ref() {
-                            ctx.continue_requested = false;
-                            ctx.continue_label = None;
-                            break;
-                        }
-                    }
-
-                    if ctx.exit_requested {
-                        if ctx.exit_label.is_none() || ctx.exit_label.as_ref() == label.as_ref() {
-                            ctx.exit_requested = false;
-                            ctx.exit_label = None;
-                            return Ok(());
-                        }
-                        return Ok(());
-                    }
-
-                    if ctx.returned {
-                        return Ok(());
+            ProceduralStatement::Loop { label, body } => {
+                let mut iterations = 0u64;
+                loop {
+                    Self::loop_tick(ctx, &mut iterations)?;
+                    if let LoopFlow::Leave = Self::run_loop_body(body, label.as_deref(), ctx)? {
+                        break;
                     }
                 }
-            },
+            }
 
             ProceduralStatement::ForNumeric {
                 label,
@@ -421,74 +515,76 @@ impl ProceduralExecutor {
                 reverse,
                 body,
             } => {
-                let lower = ctx.evaluator.evaluate(lower_bound, &crate::Tuple::new(vec![]))?;
-                let upper = ctx.evaluator.evaluate(upper_bound, &crate::Tuple::new(vec![]))?;
-                let step_val = if let Some(s) = step {
-                    ctx.evaluator.evaluate(s, &crate::Tuple::new(vec![]))?
-                } else {
-                    Value::Int8(1)
+                let first = Self::eval_expr(lower_bound, ctx, "FOR lower bound")?;
+                let last = Self::eval_expr(upper_bound, ctx, "FOR upper bound")?;
+                let step_val = match step {
+                    Some(s) => Self::eval_expr(s, ctx, "FOR BY")?,
+                    None => Value::Int8(1),
+                };
+                if matches!(first, Value::Null) || matches!(last, Value::Null) {
+                    return Err(Error::query_execution(
+                        "lower and upper bounds of FOR loop cannot be null",
+                    ));
+                }
+                if matches!(step_val, Value::Null) {
+                    return Err(Error::query_execution("BY value of FOR loop cannot be null"));
+                }
+                let first = value_to_i64(&first)?;
+                let last = value_to_i64(&last)?;
+                let step = value_to_i64(&step_val)?;
+                if step <= 0 {
+                    return Err(Error::query_execution("BY value of FOR loop must be greater than zero"));
+                }
+                // PostgreSQL's loop variable is an integer local to the loop.
+                let fits_int4 = i32::try_from(first).is_ok() && i32::try_from(last).is_ok();
+                let as_value = |i: i64| -> Value {
+                    match i32::try_from(i) {
+                        Ok(v) if fits_int4 => Value::Int4(v),
+                        _ => Value::Int8(i),
+                    }
                 };
 
-                // Convert to i64 for iteration
-                let lower_i64 = value_to_i64(&lower)?;
-                let upper_i64 = value_to_i64(&upper)?;
-                let step_i64 = value_to_i64(&step_val)?.max(1);
-
-                // Create iterator variable
-                ctx.scope.declare(
-                    variable.clone(),
-                    Variable {
-                        value: Value::Int8(lower_i64),
-                        data_type: Some(DataType::Int8),
-                        is_constant: false,
-                        not_null: false,
-                    },
-                )?;
-
-                let range: Vec<i64> = if *reverse {
-                    (lower_i64..=upper_i64).rev().step_by(step_i64 as usize).collect()
-                } else {
-                    (lower_i64..=upper_i64).step_by(step_i64 as usize).collect()
-                };
-
-                for i in range {
-                    ctx.scope.set(variable, Value::Int8(i))?;
-
-                    for stmt in body {
-                        Self::execute_statement(stmt, ctx)?;
-
-                        if ctx.continue_requested {
-                            if ctx.continue_label.is_none() || ctx.continue_label.as_ref() == label.as_ref() {
-                                ctx.continue_requested = false;
-                                ctx.continue_label = None;
-                                break;
-                            }
+                ctx.push_scope();
+                let result = (|| -> Result<()> {
+                    ctx.scope.declare(
+                        variable.clone(),
+                        Variable {
+                            value: as_value(first),
+                            data_type: None,
+                            is_constant: false,
+                            not_null: false,
+                        },
+                    )?;
+                    let mut iterations = 0u64;
+                    let mut i = first;
+                    // `REVERSE first .. last` counts DOWN from `first` (PostgreSQL).
+                    while if *reverse { i >= last } else { i <= last } {
+                        Self::loop_tick(ctx, &mut iterations)?;
+                        ctx.scope.set(variable, as_value(i))?;
+                        if let LoopFlow::Leave = Self::run_loop_body(body, label.as_deref(), ctx)? {
+                            break;
                         }
-
-                        if ctx.exit_requested {
-                            if ctx.exit_label.is_none() || ctx.exit_label.as_ref() == label.as_ref() {
-                                ctx.exit_requested = false;
-                                ctx.exit_label = None;
-                                return Ok(());
-                            }
-                            return Ok(());
-                        }
-
-                        if ctx.returned {
-                            return Ok(());
+                        let next = if *reverse {
+                            i.checked_sub(step)
+                        } else {
+                            i.checked_add(step)
+                        };
+                        match next {
+                            Some(n) => i = n,
+                            None => break,
                         }
                     }
-                }
+                    Ok(())
+                })();
+                ctx.pop_scope();
+                result?;
             }
 
             ProceduralStatement::Exit { label, when_condition } => {
-                let should_exit = if let Some(cond) = when_condition {
-                    let val = ctx.evaluator.evaluate(cond, &crate::Tuple::new(vec![]))?;
-                    matches!(val, Value::Boolean(true))
-                } else {
-                    true
+                let should_exit = match when_condition {
+                    Some(cond) => Self::eval_condition(cond, ctx, "EXIT WHEN")?,
+                    None => true,
                 };
-
                 if should_exit {
                     ctx.exit_requested = true;
                     ctx.exit_label = label.clone();
@@ -496,13 +592,10 @@ impl ProceduralExecutor {
             }
 
             ProceduralStatement::Continue { label, when_condition } => {
-                let should_continue = if let Some(cond) = when_condition {
-                    let val = ctx.evaluator.evaluate(cond, &crate::Tuple::new(vec![]))?;
-                    matches!(val, Value::Boolean(true))
-                } else {
-                    true
+                let should_continue = match when_condition {
+                    Some(cond) => Self::eval_condition(cond, ctx, "CONTINUE WHEN")?,
+                    None => true,
                 };
-
                 if should_continue {
                     ctx.continue_requested = true;
                     ctx.continue_label = label.clone();
@@ -511,7 +604,7 @@ impl ProceduralExecutor {
 
             ProceduralStatement::Return { value } => {
                 ctx.return_value = match value {
-                    Some(expr) => Some(Self::evaluate_return_value(expr, ctx)?),
+                    Some(expr) => Some(Self::eval_expr(expr, ctx, "RETURN")?),
                     None => None,
                 };
                 ctx.returned = true;
@@ -534,8 +627,8 @@ impl ProceduralExecutor {
                 level,
                 message,
                 sqlstate,
-                detail,
-                hint,
+                detail: _,
+                hint: _,
             } => {
                 let msg = if let Some(expr) = message {
                     let val = ctx.evaluator.evaluate(expr, &crate::Tuple::new(vec![]))?;
@@ -555,21 +648,12 @@ impl ProceduralExecutor {
                             sqlstate_str, msg
                         )));
                     }
-                    RaiseLevel::Warning
-                    | RaiseLevel::Notice
-                    | RaiseLevel::Info
-                    | RaiseLevel::Log
-                    | RaiseLevel::Debug => {
-                        // Log at appropriate tracing level based on RAISE level
-                        match level {
-                            RaiseLevel::Warning => tracing::warn!("[RAISE WARNING] {}", msg),
-                            RaiseLevel::Notice => tracing::info!("[RAISE NOTICE] {}", msg),
-                            RaiseLevel::Info => tracing::info!("[RAISE INFO] {}", msg),
-                            RaiseLevel::Log => tracing::debug!("[RAISE LOG] {}", msg),
-                            RaiseLevel::Debug => tracing::trace!("[RAISE DEBUG] {}", msg),
-                            _ => unreachable!(),
-                        }
-                    }
+                    // Log at appropriate tracing level based on RAISE level
+                    RaiseLevel::Warning => tracing::warn!("[RAISE WARNING] {}", msg),
+                    RaiseLevel::Notice => tracing::info!("[RAISE NOTICE] {}", msg),
+                    RaiseLevel::Info => tracing::info!("[RAISE INFO] {}", msg),
+                    RaiseLevel::Log => tracing::debug!("[RAISE LOG] {}", msg),
+                    RaiseLevel::Debug => tracing::trace!("[RAISE DEBUG] {}", msg),
                 }
             }
 
@@ -590,30 +674,17 @@ impl ProceduralExecutor {
                 when_branches,
                 else_block,
             } => {
-                // Searched CASE: evaluates each condition until one is true
+                // Searched CASE: the first true condition runs.
                 let mut executed = false;
                 for (condition, statements) in when_branches {
-                    let val = ctx.evaluator.evaluate(condition, &crate::Tuple::new(vec![]))?;
-                    if matches!(val, Value::Boolean(true)) {
-                        for stmt in statements {
-                            Self::execute_statement(stmt, ctx)?;
-                            if ctx.returned || ctx.exit_requested {
-                                break;
-                            }
-                        }
+                    if Self::eval_condition(condition, ctx, "CASE WHEN")? {
+                        Self::execute_statements(statements, ctx)?;
                         executed = true;
                         break;
                     }
                 }
                 if !executed {
-                    if let Some(else_stmts) = else_block {
-                        for stmt in else_stmts {
-                            Self::execute_statement(stmt, ctx)?;
-                            if ctx.returned || ctx.exit_requested {
-                                break;
-                            }
-                        }
-                    }
+                    Self::run_case_else(else_block.as_deref(), ctx)?;
                 }
             }
 
@@ -622,31 +693,22 @@ impl ProceduralExecutor {
                 when_branches,
                 else_block,
             } => {
-                // Simple CASE: compares operand against each WHEN value
-                let operand_val = ctx.evaluator.evaluate(operand, &crate::Tuple::new(vec![]))?;
+                // Simple CASE: the operand is evaluated once and compared with
+                // each WHEN list by SQL equality (`operand IN (values)`), so a
+                // NULL operand matches nothing, as in PostgreSQL.
+                let operand_val = Self::eval_expr(operand, ctx, "CASE")?;
+                let operand_sql = crate::sql::interpolate::value_to_sql_literal(&operand_val);
                 let mut executed = false;
-                for (when_val, statements) in when_branches {
-                    let val = ctx.evaluator.evaluate(when_val, &crate::Tuple::new(vec![]))?;
-                    if operand_val == val {
-                        for stmt in statements {
-                            Self::execute_statement(stmt, ctx)?;
-                            if ctx.returned || ctx.exit_requested {
-                                break;
-                            }
-                        }
+                for (when_vals, statements) in when_branches {
+                    let test = PlExpr::new(format!("({}) IN ({})", operand_sql, when_vals.text));
+                    if Self::eval_condition(&test, ctx, "CASE WHEN")? {
+                        Self::execute_statements(statements, ctx)?;
                         executed = true;
                         break;
                     }
                 }
                 if !executed {
-                    if let Some(else_stmts) = else_block {
-                        for stmt in else_stmts {
-                            Self::execute_statement(stmt, ctx)?;
-                            if ctx.returned || ctx.exit_requested {
-                                break;
-                            }
-                        }
-                    }
+                    Self::run_case_else(else_block.as_deref(), ctx)?;
                 }
             }
 
@@ -717,20 +779,52 @@ impl ProceduralExecutor {
                 ));
             }
 
-            // FOR query loops require cursor infrastructure
             ProceduralStatement::ForQuery {
-                record_variable, query, ..
+                label,
+                record_variable,
+                query,
+                body,
             } => {
-                // Simple implementation: execute query and iterate over results
+                // The query runs once; the body runs once per row. Until record
+                // variables exist, the loop variable receives the row's first
+                // column. A variable declared outside the loop keeps the last
+                // row's value afterwards (PostgreSQL); an undeclared one is
+                // local to the loop.
                 let query = ctx.interpolate(query);
-                let results = (ctx.sql_executor)(&query)?;
-                for row in results {
-                    // Store the row as a composite value in the record variable
-                    // For simplicity, store first column value
-                    if !row.is_empty() {
-                        ctx.scope.set(record_variable, row[0].clone())?;
+                let rows = (ctx.sql_executor)(&query)?;
+                let declared = ctx.scope.get(record_variable).map(|v| v.data_type.clone());
+                ctx.push_scope();
+                let result = (|| -> Result<()> {
+                    if declared.is_none() {
+                        ctx.scope.declare(
+                            record_variable.clone(),
+                            Variable {
+                                value: Value::Null,
+                                data_type: None,
+                                is_constant: false,
+                                not_null: false,
+                            },
+                        )?;
                     }
-                }
+                    let mut iterations = 0u64;
+                    for row in rows {
+                        Self::loop_tick(ctx, &mut iterations)?;
+                        let value = row.into_iter().next().unwrap_or(Value::Null);
+                        let value = Self::cast_to_declared(
+                            ctx,
+                            value,
+                            declared.as_ref().and_then(|d| d.as_ref()),
+                            record_variable,
+                        )?;
+                        ctx.scope.set(record_variable, value)?;
+                        if let LoopFlow::Leave = Self::run_loop_body(body, label.as_deref(), ctx)? {
+                            break;
+                        }
+                    }
+                    Ok(())
+                })();
+                ctx.pop_scope();
+                result?;
             }
 
             ProceduralStatement::Call {
@@ -745,6 +839,17 @@ impl ProceduralExecutor {
         }
 
         Ok(())
+    }
+
+    /// The ELSE of a CASE statement; with no ELSE and no matching WHEN,
+    /// PostgreSQL raises `case not found` (SQLSTATE 20000).
+    fn run_case_else(else_block: Option<&[ProceduralStatement]>, ctx: &mut ExecutionContext<'_>) -> Result<()> {
+        match else_block {
+            Some(stmts) => Self::execute_statements(stmts, ctx),
+            None => Err(Error::query_execution(
+                "case not found: no WHEN branch of the CASE statement matched and it has no ELSE",
+            )),
+        }
     }
 
     /// Find a matching exception handler for an error

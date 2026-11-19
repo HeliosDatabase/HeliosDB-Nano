@@ -134,6 +134,10 @@ pub struct FunctionRegistry {
     /// Only unresolved native outcomes populate this cold writer fence.
     /// Read/query paths keep their original map lookup and allocation cost.
     unavailable: RwLock<HashMap<&'static str, HashSet<String>>>,
+    /// `[procedural] max_loop_iterations` (0 = unlimited).
+    max_loop_iterations: std::sync::atomic::AtomicU64,
+    /// `[storage] statement_timeout_ms` for routine loops (0 = none).
+    default_statement_timeout_ms: std::sync::atomic::AtomicU64,
 }
 
 impl FunctionRegistry {
@@ -143,7 +147,26 @@ impl FunctionRegistry {
             functions: Arc::new(RwLock::new(HashMap::new())),
             procedures: Arc::new(RwLock::new(HashMap::new())),
             unavailable: RwLock::new(HashMap::new()),
+            max_loop_iterations: std::sync::atomic::AtomicU64::new(0),
+            default_statement_timeout_ms: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Install the loop limits a PL/pgSQL routine runs under: `[procedural]
+    /// max_loop_iterations` (0 = unlimited) and the configured statement
+    /// timeout, which every loop iteration checks.
+    pub fn set_procedural_limits(&self, max_loop_iterations: u64, statement_timeout_ms: Option<u64>) {
+        use std::sync::atomic::Ordering;
+        self.max_loop_iterations.store(max_loop_iterations, Ordering::Relaxed);
+        self.default_statement_timeout_ms
+            .store(statement_timeout_ms.unwrap_or(0), Ordering::Relaxed);
+    }
+
+    fn apply_procedural_limits(&self, ctx: &mut ExecutionContext<'_>) {
+        use std::sync::atomic::Ordering;
+        ctx.max_loop_iterations = self.max_loop_iterations.load(Ordering::Relaxed);
+        let timeout = self.default_statement_timeout_ms.load(Ordering::Relaxed);
+        ctx.default_statement_timeout_ms = (timeout > 0).then_some(timeout);
     }
 
     fn check_routine_available(&self, kind: &'static str, name: &str) -> Result<()> {
@@ -460,59 +483,32 @@ impl FunctionRegistry {
     }
 
     /// Refuse a PL/pgSQL FUNCTION body that contains a construct this engine
-    /// cannot evaluate, instead of running it and returning a wrong answer.
+    /// cannot run in a function, instead of running it and returning a wrong
+    /// answer.
     ///
-    /// WHY THIS EXISTS (verified at HEAD, and it contradicts the folklore that
-    /// "both languages are fully implemented"):
-    /// `ProceduralParser::parse_expression` (src/sql/procedural/parser.rs) does
-    /// NOT build an expression tree. It captures the RAW SOURCE TEXT of the
-    /// expression and returns `LogicalExpr::Literal(Value::String(text))` — its
-    /// own comment says "A full implementation would parse this into
-    /// LogicalExpr". Every construct whose semantics depend on *evaluating* that
-    /// expression therefore misbehaves SILENTLY:
-    ///
-    /// * `IF <cond> THEN` — `evaluate` yields `Value::String("<cond text>")`,
-    ///   which is not `Boolean(true)`, so the condition is ALWAYS false and the
-    ///   ELSE branch always runs.
-    /// * `WHILE <cond> LOOP` — same: the loop body never runs.
-    /// * `x := <expr>` — assigns the literal TEXT of `<expr>` to `x`.
-    /// * `DECLARE v INT := <expr>` — same, for the initial value.
-    ///
-    /// Those are wrong answers, not errors, and this repo has shipped that class
-    /// of bug before. So the FUNCTION path (which is what UDF invocation newly
-    /// reaches) accepts only the constructs that are genuinely implemented —
-    /// SQL statements, `SELECT … INTO`, `RETURN`, `NULL` and nested blocks, all
-    /// of which route through the `$`-sigil interpolator rather than the
-    /// expression parser — and names anything else in a loud error.
-    ///
-    /// PROCEDURES ARE DELIBERATELY NOT GATED. `execute_plpgsql_procedure` ships
-    /// today and this gate is not applied to it: adding it there would newly
-    /// break bodies that users already run. The underlying parser defect is
-    /// filed (ROADMAP_V5 §2.9) and is the real fix; this gate only stops the
-    /// NEW path from manufacturing wrong answers.
+    /// Control flow, assignments and DECLARE defaults are evaluated (see
+    /// `ProceduralExecutor::eval_expr`: each procedural expression runs as
+    /// `SELECT <text>` after `$`-sigil interpolation), so they are admitted.
+    /// Still refused: RAISE, EXECUTE of dynamic SQL, cursors, RETURN NEXT /
+    /// RETURN QUERY, CALL, PRINT and EXCEPTION handlers. Procedures are not
+    /// gated.
     fn reject_unevaluable_constructs(func_name: &str, block: &ProceduralBlock) -> Result<()> {
         let refuse = |construct: &str| -> Error {
             Error::query_execution(format!(
                 "Function '{}' was NOT executed: its PL/pgSQL body uses {}, which HeliosDB Nano \
-                 cannot evaluate — the procedural expression parser captures expression text \
-                 instead of parsing it, so the construct would silently produce a wrong result. \
-                 Supported in a PL/pgSQL function body today: SQL statements, `SELECT … INTO <var>`, \
-                 `RETURN <expr>` and nested BEGIN/END blocks, with parameters and variables \
-                 referenced through the mandatory `$` sigil (`$name` / `$1`). Rewrite the function \
-                 with LANGUAGE sql, or express the logic in SQL (e.g. CASE inside the RETURN \
-                 expression).",
+                 does not run inside a function. Supported in a PL/pgSQL function body: SQL \
+                 statements, `SELECT … INTO <var>`, PERFORM, `:=` assignments, DECLARE defaults, \
+                 IF/ELSIF/ELSE, CASE, LOOP, WHILE, FOR (numeric and over a query), EXIT, \
+                 CONTINUE, RETURN and nested BEGIN/END blocks, with parameters and variables \
+                 referenced through the mandatory `$` sigil (`$name` / `$1`).",
                 func_name, construct
             ))
         };
+        Self::reject_unevaluable_block(&refuse, block)
+    }
 
-        for decl in &block.declarations {
-            if decl.default.is_some() {
-                return Err(refuse(&format!("a DECLARE default value (`{} … := …`)", decl.name)));
-            }
-        }
-
-        Self::reject_unevaluable_statements(&refuse, &block.statements)?;
-
+    fn reject_unevaluable_block(refuse: &dyn Fn(&str) -> Error, block: &ProceduralBlock) -> Result<()> {
+        Self::reject_unevaluable_statements(refuse, &block.statements)?;
         if !block.exception_handlers.is_empty() {
             return Err(refuse("an EXCEPTION handler"));
         }
@@ -529,38 +525,48 @@ impl FunctionRegistry {
     fn reject_unevaluable_statements(refuse: &dyn Fn(&str) -> Error, statements: &[ProceduralStatement]) -> Result<()> {
         for stmt in statements {
             match stmt {
-                // These three are the interpolator-backed paths: the body SQL is
-                // rendered through `crate::sql::interpolate` and handed to the
-                // executor verbatim, so no expression evaluation is involved.
                 ProceduralStatement::Execute { .. }
                 | ProceduralStatement::SelectInto { .. }
-                | ProceduralStatement::Null => {}
-                // `RETURN` is evaluated as SQL — see
-                // `ProceduralExecutor::evaluate_return_value`.
-                ProceduralStatement::Return { .. } => {}
-                ProceduralStatement::Block(inner) => {
-                    for decl in &inner.declarations {
-                        if decl.default.is_some() {
-                            return Err(refuse(&format!("a DECLARE default value (`{} … := …`)", decl.name)));
-                        }
+                | ProceduralStatement::Null
+                | ProceduralStatement::Return { .. }
+                | ProceduralStatement::Assignment { .. }
+                | ProceduralStatement::Exit { .. }
+                | ProceduralStatement::Continue { .. } => {}
+                ProceduralStatement::Block(inner) => Self::reject_unevaluable_block(refuse, inner)?,
+                ProceduralStatement::If {
+                    then_block,
+                    elsif_branches,
+                    else_block,
+                    ..
+                } => {
+                    Self::reject_unevaluable_statements(refuse, then_block)?;
+                    for (_, branch) in elsif_branches {
+                        Self::reject_unevaluable_statements(refuse, branch)?;
                     }
-                    Self::reject_unevaluable_statements(refuse, &inner.statements)?;
-                    if !inner.exception_handlers.is_empty() {
-                        return Err(refuse("an EXCEPTION handler"));
+                    if let Some(branch) = else_block {
+                        Self::reject_unevaluable_statements(refuse, branch)?;
                     }
                 }
-                ProceduralStatement::Assignment { .. } => return Err(refuse("a `:=` assignment")),
-                ProceduralStatement::If { .. } => return Err(refuse("an IF statement")),
-                ProceduralStatement::Case { .. } | ProceduralStatement::SimpleCase { .. } => {
-                    return Err(refuse("a CASE statement"))
+                ProceduralStatement::Case {
+                    when_branches,
+                    else_block,
                 }
-                ProceduralStatement::Loop { .. } => return Err(refuse("a LOOP")),
-                ProceduralStatement::While { .. } => return Err(refuse("a WHILE loop")),
-                ProceduralStatement::ForNumeric { .. } | ProceduralStatement::ForQuery { .. } => {
-                    return Err(refuse("a FOR loop"))
+                | ProceduralStatement::SimpleCase {
+                    when_branches,
+                    else_block,
+                    ..
+                } => {
+                    for (_, branch) in when_branches {
+                        Self::reject_unevaluable_statements(refuse, branch)?;
+                    }
+                    if let Some(branch) = else_block {
+                        Self::reject_unevaluable_statements(refuse, branch)?;
+                    }
                 }
-                ProceduralStatement::Exit { .. } => return Err(refuse("an EXIT statement")),
-                ProceduralStatement::Continue { .. } => return Err(refuse("a CONTINUE statement")),
+                ProceduralStatement::Loop { body, .. }
+                | ProceduralStatement::While { body, .. }
+                | ProceduralStatement::ForNumeric { body, .. }
+                | ProceduralStatement::ForQuery { body, .. } => Self::reject_unevaluable_statements(refuse, body)?,
                 ProceduralStatement::ReturnNext { .. } | ProceduralStatement::ReturnQuery { .. } => {
                     return Err(refuse("RETURN NEXT / RETURN QUERY (set-returning functions)"))
                 }
@@ -601,6 +607,7 @@ impl FunctionRegistry {
         let schema = Arc::new(crate::Schema { columns: vec![] });
         let evaluator = Evaluator::new(schema);
         let mut ctx = ExecutionContext::new(&evaluator, sql_executor);
+        self.apply_procedural_limits(&mut ctx);
 
         // Bind parameters to context
         for (i, param) in func.params.iter().enumerate() {
@@ -632,7 +639,7 @@ impl FunctionRegistry {
         ctx.positional_params = args.to_vec();
 
         // Execute the block
-        ProceduralExecutor::execute_block(&block, &mut ctx)?;
+        ProceduralExecutor::execute_routine(&block, &mut ctx)?;
 
         // Return the result
         Ok(ctx.return_value.unwrap_or(Value::Null))
@@ -692,6 +699,7 @@ impl FunctionRegistry {
         let schema = Arc::new(crate::Schema { columns: vec![] });
         let evaluator = Evaluator::new(schema);
         let mut ctx = ExecutionContext::new(&evaluator, sql_executor);
+        self.apply_procedural_limits(&mut ctx);
 
         for (i, param) in proc.params.iter().enumerate() {
             if param.mode == ParamMode::Out {
@@ -720,7 +728,7 @@ impl FunctionRegistry {
         // Same as the function variant: make `$1..$N` resolvable inside the body.
         ctx.positional_params = args.to_vec();
 
-        ProceduralExecutor::execute_block(&block, &mut ctx)?;
+        ProceduralExecutor::execute_routine(&block, &mut ctx)?;
         Ok(())
     }
 }

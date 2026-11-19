@@ -15027,3 +15027,84 @@ fn listen_and_unlisten_in_a_block_wait_for_commit() {
         .join()
         .expect("test thread");
 }
+
+/// v04.5: a PL/pgSQL procedure's IF takes the branch its condition selects
+/// when CALLed over the wire, on the simple and the extended protocol (where
+/// the argument arrives as a bound parameter).
+#[tokio::test]
+#[allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    clippy::large_futures
+)]
+async fn wire_call_plpgsql_if_takes_the_selected_branch_on_both_protocols() {
+    use super::messages::FrontendMessage;
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut handler, mut client) = test_handler(db.clone());
+    wire_setup(
+        &mut handler,
+        &mut client,
+        "CREATE TABLE wire_branch (n INT, branch TEXT)",
+    )
+    .await;
+    wire_setup(
+        &mut handler,
+        &mut client,
+        "CREATE PROCEDURE wire_branch_p(n INT) LANGUAGE plpgsql AS $$ BEGIN \
+         IF $n > 0 THEN INSERT INTO wire_branch VALUES ($n, 'positive'); \
+         ELSIF $n = 0 THEN INSERT INTO wire_branch VALUES ($n, 'zero'); \
+         ELSE INSERT INTO wire_branch VALUES ($n, 'negative'); END IF; END $$",
+    )
+    .await;
+
+    let simple = wire_query(&mut handler, &mut client, "CALL wire_branch_p(5)").await;
+    assert!(
+        sqlstates(&simple).is_empty(),
+        "simple CALL failed: {:?}",
+        sqlstates(&simple)
+    );
+
+    handler
+        .dispatch_message(FrontendMessage::Parse {
+            statement_name: "s_branch".into(),
+            query: "CALL wire_branch_p($1)".into(),
+            param_types: vec![23],
+        })
+        .await
+        .expect("parse");
+    handler
+        .dispatch_message(FrontendMessage::Bind {
+            portal_name: "p_branch".into(),
+            statement_name: "s_branch".into(),
+            param_formats: vec![0],
+            params: vec![Some(b"-3".to_vec())],
+            result_formats: vec![],
+        })
+        .await
+        .expect("bind");
+    handler
+        .dispatch_message(FrontendMessage::Execute {
+            portal_name: "p_branch".into(),
+            max_rows: 0,
+        })
+        .await
+        .expect("execute");
+    let extended = drain(&mut client).await;
+    assert!(
+        sqlstates(&extended).is_empty(),
+        "extended CALL failed: {:?}",
+        sqlstates(&extended)
+    );
+
+    let rows = db.query("SELECT n, branch FROM wire_branch ORDER BY n", &[]).unwrap();
+    let got: Vec<(String, String)> = rows
+        .iter()
+        .map(|r| (r.values[0].to_string(), r.values[1].to_string()))
+        .collect();
+    assert_eq!(rows.len(), 2, "one row per CALL, got {got:?}");
+    assert_eq!(rows[0].values[0], crate::Value::Int4(-3));
+    assert_eq!(rows[0].values[1], crate::Value::String("negative".into()));
+    assert_eq!(rows[1].values[0], crate::Value::Int4(5));
+    assert_eq!(rows[1].values[1], crate::Value::String("positive".into()));
+}

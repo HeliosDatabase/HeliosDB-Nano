@@ -7965,6 +7965,13 @@ impl EmbeddedDatabase {
         txn: &storage::Transaction,
     ) -> Result<Vec<Vec<Value>>> {
         let trimmed = body_sql.trim();
+        // `SET search_path = …` (and the other settings) in a body is a
+        // statement: the planner has no arm for it, the setting interceptor does.
+        if starts_with_icase(trimmed, "SET ") || starts_with_icase(trimmed, "RESET ") {
+            if self.try_handle_db_setting_statement_with_schema(trimmed)?.is_some() {
+                return Ok(vec![]);
+            }
+        }
         if starts_with_icase(trimmed, "SELECT") || starts_with_icase(trimmed, "WITH") {
             let tuples = self.query_in_transaction(trimmed, txn)?;
             Ok(tuples.iter().map(|t| t.values.clone()).collect())
@@ -9539,6 +9546,13 @@ impl EmbeddedDatabase {
         // once.
         let handle = self.clone_for_trigger();
         let max_call_depth = self.config.session.udf_max_call_depth;
+        self.function_registry.set_procedural_limits(
+            self.config.procedural.max_loop_iterations,
+            self.config
+                .storage
+                .statement_timeout_ms
+                .or(self.config.storage.query_timeout_ms),
+        );
         let bridge = std::sync::Arc::new(sql::udf_bridge::UdfBridge {
             registry: self.function_registry.clone(),
             max_call_depth,
