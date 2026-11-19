@@ -14831,3 +14831,52 @@ fn gh54_binary_decoders() {
         "short payload"
     );
 }
+
+#[tokio::test]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+async fn gh52_boolean_results_are_boolean_with_bound_parameters() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    db.execute("CREATE TABLE gh52 (id INT PRIMARY KEY, data TEXT)")
+        .expect("create");
+    db.execute("INSERT INTO gh52 VALUES (1, 'x')").expect("insert");
+    let (mut handler, mut client) = test_handler(db);
+    for (sql, types, param) in [
+        ("SELECT pg_try_advisory_lock($1)", vec![20], 72707390i64.to_string()),
+        (
+            "SELECT pg_try_advisory_lock($1) AS got",
+            vec![0],
+            72707391i64.to_string(),
+        ),
+        ("SELECT $1::int = 1", vec![0], "1".to_string()),
+        ("SELECT data = $1 FROM gh52", vec![0], "x".to_string()),
+        ("SELECT data = $1 FROM gh52", vec![25], "x".to_string()),
+        ("SELECT NOT ($1::int = 2)", vec![0], "1".to_string()),
+        ("SELECT data LIKE $1 FROM gh52", vec![0], "x%".to_string()),
+    ] {
+        let out = gh54_extended(
+            &mut handler,
+            &mut client,
+            sql,
+            types,
+            vec![0],
+            vec![Some(param.into_bytes())],
+        )
+        .await;
+        assert!(sqlstates(&out).is_empty(), "{sql}: {:?}", sqlstates(&out));
+        let rd = row_description(&out);
+        assert_eq!(rd.len(), 1, "{sql}");
+        assert_eq!(rd[0].1, 16, "{sql}: the result is boolean (OID 16), not {}", rd[0].1);
+        assert_eq!(first_data_row_text(&out).as_deref(), Some("t"), "{sql}");
+    }
+    let out = gh54_extended(
+        &mut handler,
+        &mut client,
+        "SELECT pg_advisory_unlock($1)",
+        vec![20],
+        vec![1],
+        vec![Some(72707390i64.to_be_bytes().to_vec())],
+    )
+    .await;
+    assert!(sqlstates(&out).is_empty(), "{:?}", sqlstates(&out));
+    assert_eq!(row_description(&out)[0].1, 16);
+}

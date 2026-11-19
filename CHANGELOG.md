@@ -251,6 +251,14 @@ Reports from users of earlier releases (GitHub numbers) and defects found while 
   2000-01-01), TIME (microseconds since midnight) and NUMERIC (`numeric_send` digit groups, to the
   exact decimal text). A DATE of `infinity` is refused rather than guessed. Tests:
   `src/protocol/postgres/wire_tests.rs` (`gh54_*`).
+- **A boolean result was described as `text` (OID 25) when an argument was a bound parameter
+  (GitHub #52).** `SELECT pg_try_advisory_lock($1)`, `SELECT $1::int = 1` and
+  `SELECT data = $1 FROM t` were typed at Parse from their operands, and an operand that is a
+  parameter has no type yet, so the RowDescription fell back to text. Comparison, logical and
+  pattern operators and `NOT` are now boolean whatever their operands, and
+  `pg_try_advisory_lock`, `pg_try_advisory_xact_lock` and `pg_advisory_unlock` carry their declared
+  boolean type. Test: `src/protocol/postgres/wire_tests.rs`
+  (`gh52_boolean_results_are_boolean_with_bound_parameters`).
 
 ### Fixed — six regressions against 4.41.1 found before release
 

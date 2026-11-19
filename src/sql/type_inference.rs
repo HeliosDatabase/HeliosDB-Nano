@@ -68,19 +68,23 @@ impl TypeInference for LogicalExpr {
 
             // Binary expression: apply type coercion rules
             LogicalExpr::BinaryExpr { left, op, right } => {
+                // GitHub #52: a comparison, logical or pattern operator is
+                // boolean whatever its operands are, so an operand that cannot
+                // be typed yet (a bound parameter, `data = $1`) must not turn
+                // the result into the `text` fallback.
+                if operator_is_boolean(op) {
+                    return Ok(DataType::Boolean);
+                }
                 let left_type = left.infer_type(schema)?;
                 let right_type = right.infer_type(schema)?;
                 coerce_binary_types(left_type, right_type, op)
             }
 
             // Unary expression: preserve operand type (with exceptions)
-            LogicalExpr::UnaryExpr { op, expr } => {
-                let expr_type = expr.infer_type(schema)?;
-                match op {
-                    UnaryOperator::Not => Ok(DataType::Boolean),
-                    UnaryOperator::Minus | UnaryOperator::Plus => Ok(expr_type),
-                }
-            }
+            LogicalExpr::UnaryExpr { op, expr } => match op {
+                UnaryOperator::Not => Ok(DataType::Boolean),
+                UnaryOperator::Minus | UnaryOperator::Plus => expr.infer_type(schema),
+            },
 
             // Aggregate function: determine result type based on function
             LogicalExpr::AggregateFunction { fun, args, .. } => {
@@ -550,6 +554,34 @@ fn rounding_result_type(fun: &str, arg_type: Option<DataType>) -> DataType {
         }
         _ => DataType::Float8,
     }
+}
+
+/// GitHub #52: operators whose result is boolean whatever the operand types.
+fn operator_is_boolean(op: &BinaryOperator) -> bool {
+    matches!(
+        op,
+        BinaryOperator::Eq
+            | BinaryOperator::NotEq
+            | BinaryOperator::IsDistinctFrom
+            | BinaryOperator::IsNotDistinctFrom
+            | BinaryOperator::Lt
+            | BinaryOperator::LtEq
+            | BinaryOperator::Gt
+            | BinaryOperator::GtEq
+            | BinaryOperator::And
+            | BinaryOperator::Or
+            | BinaryOperator::Like
+            | BinaryOperator::NotLike
+            | BinaryOperator::ILike
+            | BinaryOperator::NotILike
+            | BinaryOperator::RegexMatch
+            | BinaryOperator::RegexIMatch
+            | BinaryOperator::NotRegexMatch
+            | BinaryOperator::NotRegexIMatch
+            | BinaryOperator::SimilarTo
+            | BinaryOperator::NotSimilarTo
+            | BinaryOperator::TsMatch
+    )
 }
 
 /// Type coercion rules for binary operations
