@@ -112,69 +112,109 @@ impl Parser {
         crate::sql::TimeTravelParser::strip_clauses(sql, &clauses)
     }
 
-    /// Strip SQL comments from input
-    /// Handles both line comments (-- ...) and block comments (/* ... */)
-    fn strip_sql_comments(sql: &str) -> String {
-        let mut result = String::with_capacity(sql.len());
-        let chars: Vec<char> = sql.chars().collect();
-        let mut i = 0;
-        let mut in_single_quote = false;
-        let mut in_double_quote = false;
-
-        // SAFETY: All indexing below is guarded by `while i < chars.len()` and
-        // `i + 1 < chars.len()` checks that structurally guarantee bounds.
-        #[allow(clippy::indexing_slicing)]
-        while i < chars.len() {
-            // Handle string literals (don't strip comments inside strings)
-            if chars[i] == '\'' && !in_double_quote {
-                in_single_quote = !in_single_quote;
-                result.push(chars[i]);
-                i += 1;
-                continue;
-            }
-            if chars[i] == '"' && !in_single_quote {
-                in_double_quote = !in_double_quote;
-                result.push(chars[i]);
-                i += 1;
-                continue;
-            }
-
-            // Skip comments only when not inside a string
-            if !in_single_quote && !in_double_quote {
-                // Line comment: -- until end of line
-                if i + 1 < chars.len() && chars[i] == '-' && chars[i + 1] == '-' {
-                    // Skip to end of line
-                    while i < chars.len() && chars[i] != '\n' {
-                        i += 1;
-                    }
-                    // Keep the newline if it exists
-                    if i < chars.len() {
-                        result.push('\n');
-                        i += 1;
-                    }
-                    continue;
-                }
-                // Block comment: /* ... */
-                if i + 1 < chars.len() && chars[i] == '/' && chars[i + 1] == '*' {
-                    i += 2; // Skip /*
-                            // Find closing */
-                    while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') {
-                        i += 1;
-                    }
-                    if i + 1 < chars.len() {
-                        i += 2; // Skip */
-                    }
-                    // Add a space to prevent tokens from merging
-                    result.push(' ');
-                    continue;
-                }
-            }
-
-            result.push(chars[i]);
-            i += 1;
+    /// Strip SQL comments from input: line comments (`-- …`, the newline is
+    /// kept) and block comments (`/* … */`, replaced by one space so tokens do
+    /// not merge; not nested, because the MySQL wire and the SQLite dialect
+    /// share this parser and neither nests them).
+    ///
+    /// v01.5: text inside a literal is data and is copied as is: `'…'` (with
+    /// `''`), `"…"`, `E'…'` (a backslash escapes the next character) and
+    /// PostgreSQL dollar quotes `$tag$ … $tag$`. A `$` that follows an
+    /// identifier character (`a$$`) or is followed by a digit (`$1`) does not
+    /// open a dollar quote. Text with no `--` and no `/*` is returned borrowed.
+    pub(crate) fn strip_sql_comments(sql: &str) -> std::borrow::Cow<'_, str> {
+        use std::borrow::Cow;
+        if !sql.contains("--") && !sql.contains("/*") {
+            return Cow::Borrowed(sql);
         }
-
-        result
+        let bytes = sql.as_bytes();
+        let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b >= 0x80;
+        let at = |i: usize| bytes.get(i).copied();
+        let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while let Some(b) = at(i) {
+            match b {
+                b'\'' => {
+                    // E'…' when the quote follows a lone e/E.
+                    let escapes =
+                        i >= 1 && matches!(at(i - 1), Some(b'e' | b'E')) && (i < 2 || !at(i - 2).is_some_and(is_ident));
+                    let mut j = i + 1;
+                    loop {
+                        match at(j) {
+                            None => break,
+                            Some(b'\\') if escapes => j += 2,
+                            Some(b'\'') if at(j + 1) == Some(b'\'') => j += 2,
+                            Some(b'\'') => {
+                                j += 1;
+                                break;
+                            }
+                            Some(_) => j += 1,
+                        }
+                    }
+                    let j = j.min(bytes.len());
+                    out.extend_from_slice(bytes.get(i..j).unwrap_or_default());
+                    i = j;
+                }
+                b'"' => {
+                    let j = bytes
+                        .get(i + 1..)
+                        .and_then(|rest| rest.iter().position(|&c| c == b'"'))
+                        .map_or(bytes.len(), |p| i + 1 + p + 1);
+                    out.extend_from_slice(bytes.get(i..j).unwrap_or_default());
+                    i = j;
+                }
+                b'$' if !(i >= 1 && at(i - 1).is_some_and(is_ident)) => {
+                    // `$tag$` with tag empty or [A-Za-z_][A-Za-z0-9_]*.
+                    let mut j = i + 1;
+                    if at(j).is_some_and(|c| c.is_ascii_alphabetic() || c == b'_') {
+                        while at(j).is_some_and(|c| c.is_ascii_alphanumeric() || c == b'_') {
+                            j += 1;
+                        }
+                    }
+                    if at(j) == Some(b'$') {
+                        let delim = bytes.get(i..=j).unwrap_or_default();
+                        let body_start = j + 1;
+                        let end = bytes
+                            .get(body_start..)
+                            .and_then(|rest| rest.windows(delim.len()).position(|w| w == delim))
+                            .map_or(bytes.len(), |p| body_start + p + delim.len());
+                        out.extend_from_slice(bytes.get(i..end).unwrap_or_default());
+                        i = end;
+                    } else {
+                        out.push(b);
+                        i += 1;
+                    }
+                }
+                b'-' if at(i + 1) == Some(b'-') => {
+                    while at(i).is_some_and(|c| c != b'\n') {
+                        i += 1;
+                    }
+                    if at(i).is_some() {
+                        out.push(b'\n');
+                        i += 1;
+                    }
+                }
+                b'/' if at(i + 1) == Some(b'*') => {
+                    i += 2;
+                    while at(i).is_some() && !(at(i) == Some(b'*') && at(i + 1) == Some(b'/')) {
+                        i += 1;
+                    }
+                    if at(i).is_some() {
+                        i += 2;
+                    }
+                    out.push(b' ');
+                }
+                _ => {
+                    out.push(b);
+                    i += 1;
+                }
+            }
+        }
+        // Every cut above is at an ASCII byte, so the result is valid UTF-8.
+        match String::from_utf8(out) {
+            Ok(text) => Cow::Owned(text),
+            Err(_) => Cow::Borrowed(sql),
+        }
     }
 
     /// Parse a SQL statement
@@ -5578,5 +5618,52 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// v01.5: comment stripping leaves literals alone.
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+    fn v015_comment_stripping_keeps_dollar_and_escape_strings() {
+        let strip = |s: &str| Parser::strip_sql_comments(s).into_owned();
+        assert_eq!(strip("SELECT $$a /* b */ c$$"), "SELECT $$a /* b */ c$$");
+        assert_eq!(strip("SELECT $$a -- b$$ AS x -- c"), "SELECT $$a -- b$$ AS x ");
+        assert_eq!(strip("SELECT $t$ -- $t$, 1"), "SELECT $t$ -- $t$, 1");
+        assert_eq!(strip("SELECT $t$ a $$ -- b $t$ /* c */"), "SELECT $t$ a $$ -- b $t$  ");
+        assert_eq!(strip("SELECT E'it\\'s -- here' AS x"), "SELECT E'it\\'s -- here' AS x");
+        assert_eq!(strip("SELECT 'x -- y'"), "SELECT 'x -- y'");
+        assert_eq!(strip("SELECT 'it''s -- y' -- c"), "SELECT 'it''s -- y' ");
+        assert_eq!(strip("SELECT \"a--b\" FROM t"), "SELECT \"a--b\" FROM t");
+        assert_eq!(strip("SELECT 1 -- c"), "SELECT 1 ");
+        assert_eq!(strip("SELECT 1 -- c\nFROM t"), "SELECT 1 \nFROM t");
+        assert_eq!(strip("SELECT a$$ FROM t -- c"), "SELECT a$$ FROM t ");
+        assert_eq!(strip("SELECT $1 -- c"), "SELECT $1 ");
+        assert_eq!(strip("SELECT 1 /* c */ + 2"), "SELECT 1   + 2");
+        // An ordinary string: the backslash does not escape (standard strings).
+        assert_eq!(strip("SELECT 'a\\' -- c"), "SELECT 'a\\' ");
+        // Nothing to strip: borrowed, unchanged.
+        assert!(matches!(
+            Parser::strip_sql_comments("SELECT 'a' FROM t"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        // Multi-byte text around comments survives.
+        assert_eq!(strip("SELECT 'é' /* ü */ -- ß"), "SELECT 'é'   ");
+    }
+
+    /// v01.5: the reproductions, through the parser.
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+    fn v015_dollar_and_escape_strings_with_comment_markers_parse() {
+        let parser = Parser::new();
+        for sql in [
+            "SELECT $$a /* b */ c$$ AS dq2",
+            "SELECT $$a -- b$$ AS dq",
+            "SELECT E'it\\'s -- here' AS esc",
+            "SELECT $t$ -- $t$, 1",
+        ] {
+            let stmts = parser.parse(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+            assert_eq!(stmts.len(), 1, "{sql}");
+        }
+        let stmts = parser.parse("SELECT $$a /* b */ c$$ AS dq2").expect("parse");
+        assert!(stmts[0].to_string().contains("a /* b */ c"), "{}", stmts[0]);
     }
 }

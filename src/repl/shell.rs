@@ -91,70 +91,6 @@ impl ReplShell {
         &self.db
     }
 
-    /// Strip SQL comments from input
-    /// Handles both line comments (-- ...) and block comments (/* ... */)
-    #[allow(clippy::indexing_slicing)]
-    // SAFETY: All `chars[i]` and `chars[i+1]` accesses are guarded by `i < chars.len()` and `i+1 < chars.len()`
-    fn strip_sql_comments(sql: &str) -> String {
-        let mut result = String::with_capacity(sql.len());
-        let chars: Vec<char> = sql.chars().collect();
-        let mut i = 0;
-        let mut in_single_quote = false;
-        let mut in_double_quote = false;
-
-        while i < chars.len() {
-            // Handle string literals (don't strip comments inside strings)
-            if chars[i] == '\'' && !in_double_quote {
-                in_single_quote = !in_single_quote;
-                result.push(chars[i]);
-                i += 1;
-                continue;
-            }
-            if chars[i] == '"' && !in_single_quote {
-                in_double_quote = !in_double_quote;
-                result.push(chars[i]);
-                i += 1;
-                continue;
-            }
-
-            // Skip comments only when not inside a string
-            if !in_single_quote && !in_double_quote {
-                // Line comment: -- until end of line
-                if i + 1 < chars.len() && chars[i] == '-' && chars[i + 1] == '-' {
-                    // Skip to end of line
-                    while i < chars.len() && chars[i] != '\n' {
-                        i += 1;
-                    }
-                    // Keep the newline if it exists
-                    if i < chars.len() {
-                        result.push('\n');
-                        i += 1;
-                    }
-                    continue;
-                }
-                // Block comment: /* ... */
-                if i + 1 < chars.len() && chars[i] == '/' && chars[i + 1] == '*' {
-                    i += 2; // Skip /*
-                            // Find closing */
-                    while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') {
-                        i += 1;
-                    }
-                    if i + 1 < chars.len() {
-                        i += 2; // Skip */
-                    }
-                    // Add a space to prevent tokens from merging
-                    result.push(' ');
-                    continue;
-                }
-            }
-
-            result.push(chars[i]);
-            i += 1;
-        }
-
-        result
-    }
-
     /// Create a new REPL shell
     pub fn new(db: EmbeddedDatabase, config: ReplConfig) -> Result<Self> {
         let mut completer = SqlCompleter::new();
@@ -278,7 +214,7 @@ impl ReplShell {
                     }
 
                     // Strip comments from the line for proper semicolon detection
-                    let stripped_line = Self::strip_sql_comments(trimmed);
+                    let stripped_line = crate::sql::Parser::strip_sql_comments(trimmed);
                     let stripped_trimmed = stripped_line.trim();
 
                     // Skip comment-only lines entirely - don't add to buffer

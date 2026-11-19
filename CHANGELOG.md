@@ -259,6 +259,14 @@ Reports from users of earlier releases (GitHub numbers) and defects found while 
   `pg_try_advisory_lock`, `pg_try_advisory_xact_lock` and `pg_advisory_unlock` carry their declared
   boolean type. Test: `src/protocol/postgres/wire_tests.rs`
   (`gh52_boolean_results_are_boolean_with_bound_parameters`).
+- **A `--` or `/* */` inside a dollar-quoted or `E''` string was deleted as a comment.**
+  `SELECT $$a /* b */ c$$` returned `a   c` (so an INSERT stored altered text), `SELECT $$a -- b$$`
+  failed "Unterminated dollar-quoted string" and `SELECT E'it\'s -- here'` failed "Unterminated
+  encoded string literal", on every route and in the shell. The one comment stripper (the shell now
+  uses the parser's) copies `'…'`, `"…"`, `E'…'` with backslash escapes and `$tag$ … $tag$`
+  through untouched; a `$` after an identifier character (`a$$`) or before a digit (`$1`) does not
+  open a dollar quote, so MySQL and SQLite statements are unchanged. Text with no comment marker is
+  no longer copied. Tests: `src/sql/parser.rs` (`v015_*`).
 
 ### Fixed — six regressions against 4.41.1 found before release
 
