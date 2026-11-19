@@ -234,9 +234,8 @@ fn self_referencing_dedupe_delete() {
             .unwrap();
         // Every row with a duplicate key goes, as in PostgreSQL: the verdicts
         // are taken against the table as it was before the statement.
-        // The outer table is aliased: written unaliased (`… b.k = d.k`), the
-        // planner resolves `d` to the inner `d AS b` (the 4.42.0 known limit
-        // on a correlated subquery over its own outer table, SELECT included).
+        // Outer table aliased; the unaliased spelling is pinned in
+        // `self_referencing_unaliased_target`.
         assert_eq!(
             run(
                 &db,
@@ -246,6 +245,60 @@ fn self_referencing_dedupe_delete() {
             4
         );
         assert_eq!(ints(&db, "SELECT id FROM d"), vec![3]);
+    }
+}
+
+/// The target written WITHOUT an alias while the subquery reads the same
+/// table under one: `d.k` inside `FROM d AS b` is the outer row (the alias
+/// hides `d` in the subquery, as in PostgreSQL). Before the fix the inner
+/// `d AS b` captured the name and the statement silently matched no row.
+#[test]
+fn self_referencing_unaliased_target() {
+    for p in FAMILIES {
+        let fresh = || {
+            let db = EmbeddedDatabase::new_in_memory().unwrap();
+            db.execute("CREATE TABLE d (id INT PRIMARY KEY, k INT, n INT)").unwrap();
+            db.execute("INSERT INTO d VALUES (1, 10, 0), (2, 10, 0), (3, 20, 0), (4, 30, 0), (5, 30, 0)")
+                .unwrap();
+            db
+        };
+        let db = fresh();
+        assert_eq!(
+            run(
+                &db,
+                p,
+                "DELETE FROM d WHERE EXISTS (SELECT 1 FROM d AS b WHERE b.k = d.k AND b.id < d.id)"
+            ),
+            2
+        );
+        assert_eq!(ints(&db, "SELECT id FROM d ORDER BY id"), vec![1, 3, 4]);
+
+        let db = fresh();
+        assert_eq!(
+            run(
+                &db,
+                p,
+                "UPDATE d SET n = 1 WHERE EXISTS (SELECT 1 FROM d AS b WHERE b.k = d.k AND b.id <> d.id)"
+            ),
+            4
+        );
+        assert_eq!(ints(&db, "SELECT id FROM d WHERE n = 1 ORDER BY id"), vec![1, 2, 4, 5]);
+
+        let db = fresh();
+        assert_eq!(
+            run(
+                &db,
+                p,
+                "UPDATE d SET n = (SELECT count(*) FROM d AS b WHERE b.k = d.k) WHERE d.id IN (SELECT b.id FROM d AS b WHERE b.k = d.k AND b.id > 1)"
+            ),
+            4
+        );
+        assert_eq!(ints(&db, "SELECT n FROM d ORDER BY id"), vec![0, 2, 1, 2, 2]);
+
+        // The subquery's own unaliased `d` still names the subquery's relation.
+        let db = fresh();
+        assert_eq!(run(&db, p, "DELETE FROM d WHERE k = (SELECT max(d.k) FROM d)"), 2);
+        assert_eq!(ints(&db, "SELECT id FROM d ORDER BY id"), vec![1, 2, 3]);
     }
 }
 
