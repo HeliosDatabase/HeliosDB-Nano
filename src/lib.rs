@@ -26112,6 +26112,14 @@ impl EmbeddedDatabase {
                 }
             }
             "EXECUTE" => self.execute_prepared_outcome(sql, text),
+            // DDL and transaction control change no rows; the engine's count
+            // for them is not a row count. `CREATE TABLE ... AS` keeps its count.
+            "CREATE" | "DROP" | "ALTER" | "BEGIN" | "START" | "COMMIT" | "END" | "ROLLBACK"
+            | "SAVEPOINT" | "RELEASE"
+                if !(head == "CREATE" && text.to_ascii_uppercase().contains(" AS ")) =>
+            {
+                self.execute(sql).map(|_| StatementOutcome::Affected(0))
+            }
             _ => self.execute(sql).map(StatementOutcome::Affected),
         }
     }

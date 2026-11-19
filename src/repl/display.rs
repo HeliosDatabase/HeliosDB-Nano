@@ -471,7 +471,7 @@ pub fn render_table(settings: &DisplaySettings, columns: &[String], rows: &[Tupl
                 }
                 match settings.border {
                     0 => parts.join(" "),
-                    1 => parts.join(" | "),
+                    1 => format!(" {} ", parts.join(" | ")).trim_end().to_string(),
                     _ => format!("│ {} │", parts.join(" │ ")),
                 }
             })

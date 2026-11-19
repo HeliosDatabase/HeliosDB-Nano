@@ -293,21 +293,10 @@ mod truthful {
     /// The names of the backslash commands the help advertises, with a line
     /// that exercises each (`<x>` becomes a word, `[x]` is left out).
     fn advertised_commands() -> Vec<(String, String)> {
-        let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/repl/help_manager.rs"))
-            .expect("help_manager.rs");
+        // Help is written from the command registry.
         let mut found = Vec::new();
-        let mut rest = source.as_str();
-        while let Some(at) = rest.find("print_command(") {
-            rest = &rest[at + "print_command(".len()..];
-            let Some(open) = rest.find('"') else { break };
-            let literal_start = open + 1;
-            let mut end = literal_start;
-            let bytes = rest.as_bytes();
-            while end < bytes.len() && bytes[end] != b'"' {
-                end += if bytes[end] == b'\\' { 2 } else { 1 };
-            }
-            let literal = rest[literal_start..end].replace("\\\\", "\\").replace("\\\"", "\"");
-            rest = &rest[end..];
+        for spec in heliosdb_nano::repl::registry::all() {
+            let literal = spec.display_form();
             if !literal.starts_with('\\') {
                 continue;
             }
