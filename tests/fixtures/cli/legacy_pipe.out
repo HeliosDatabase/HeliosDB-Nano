@@ -1,0 +1,108 @@
+Starting REPL with in-memory database...
+  Note: Data will be lost when you exit.
+
+╔═══════════════════════════════════════════════════════════════╗
+║  HeliosDB Nano vVERSION
+║  PostgreSQL-compatible database with enterprise features  ║
+╚═══════════════════════════════════════════════════════════════╝
+
+Key Features:
+  • PostgreSQL wire protocol compatible
+  • Multi-tenancy with Row-Level Security (RLS)
+  • Change Data Capture (CDC) for migrations
+  • Database branching & time-travel queries
+  • Vector search with Product Quantization
+  • Encryption at rest (AES-256-GCM)
+
+Mode: REPL (single-user, direct access)
+      For multi-user access, use: heliosdb-nano start --help
+
+Commands: \h help | \d list tables | \dS system views | \q quit
+
+Query OK
+(TIMING)
+Query OK, 2 row(s) affected
+(TIMING)
+
+┌────┬───┐
+│ id │ v │
+├────┼───┤
+│ 1  │ a │
+├────┼───┤
+│ 2  │ b │
+└────┴───┘
+
+(2 rows)
+(TIMING)
+Query OK, 1 row(s) affected
+(TIMING)
+Query OK, 1 row(s) affected
+(TIMING)
+
+┌────┬───┐
+│ id │ v │
+├────┼───┤
+│ 2  │ z │
+└────┴───┘
+
+(1 row)
+(TIMING)
+
+┌───┐
+│ n │
+├───┤
+│ 1 │
+└───┘
+
+(1 row)
+(TIMING)
+
+┌───────┐
+│ 1 + 1 │
+├───────┤
+│ 2     │
+└───────┘
+
+(1 row)
+(TIMING)
+
+┌─────┬──────┬──────┬─────────┬────────────┬────┐
+│ cid │ name │ type │ notnull │ dflt_value │ pk │
+├─────┼──────┼──────┼─────────┼────────────┼────┤
+│ 0   │ id   │ INT4 │ 1       │ NULL       │ 1  │
+├─────┼──────┼──────┼─────────┼────────────┼────┤
+│ 1   │ v    │ TEXT │ 0       │ NULL       │ 0  │
+└─────┴──────┴──────┴─────────┴────────────┴────┘
+
+(2 rows)
+(TIMING)
+
+┌───────┐
+│ seven │
+├───────┤
+│ 7     │
+└───────┘
+
+(1 row)
+(TIMING)
+
+Tables:
+────────────────────────────────────────────────────────────
+Name                           Columns
+────────────────────────────────────────────────────────────
+t                              2
+
+
+Table: t
+──────────────────────────────────────────────────
+Column               Type            Nullable   Primary Key
+──────────────────────────────────────────────────
+id                   Int4            NO         YES
+v                    Text            YES        
+
+Query OK
+(TIMING)
+Goodbye!
+---- stderr ----
+ERROR: Query execution error: Table 'missing_table' does not exist
+ERROR: SQL parse error: Failed to parse SQL: sql parser error: Expected: an SQL statement, found: SELEC at Line: 1, Column: 1

@@ -3,6 +3,7 @@
 //! Provides feature-based help categories with responsive terminal layout.
 //! Automatically detects terminal width and adjusts layout accordingly.
 
+use super::registry::{self, Category};
 use colored::Colorize;
 
 /// Help system manager for the REPL
@@ -140,24 +141,19 @@ impl HelpManager {
         Self::print_category_header("Basics", "Fundamental REPL Operations");
 
         println!("\n{}", "Exit Commands:".yellow());
-        Self::print_command("\\q, \\quit, \\exit", "Quit REPL");
-        Self::print_example("\\q");
+        Self::print_entries(Category::Basics, "Exit Commands");
 
         println!("\n{}", "Help Commands:".yellow());
-        Self::print_command("\\h, \\help, \\?", "Show help menu");
-        Self::print_command("\\h <category>", "Show category-specific help");
-        Self::print_example("\\h vectors");
-        Self::print_example("\\h branching");
+        Self::print_entries(Category::Basics, "Help Commands");
 
         println!("\n{}", "Display Toggles:".yellow());
-        Self::print_command("\\timing", "Toggle query execution timing");
-        Self::print_example("\\timing");
-        Self::print_command("\\show lsn", "Toggle LSN (Log Sequence Number) display");
-        Self::print_command("\\show branch", "Show current active branch");
+        Self::print_entries(Category::Basics, "Display Toggles");
+
+        println!("\n{}", "Display Settings:".yellow());
+        Self::print_entries(Category::Basics, "Display Settings");
 
         println!("\n{}", "Information:".yellow());
-        Self::print_command("\\version", "Display HeliosDB version");
-        Self::print_command("\\status", "Show database status");
+        Self::print_entries(Category::Basics, "Information");
 
         println!();
     }
@@ -167,25 +163,16 @@ impl HelpManager {
         Self::print_category_header("Schema", "Table and View Exploration");
 
         println!("\n{}", "List Objects:".yellow());
-        Self::print_command("\\d", "List all tables");
-        Self::print_command("\\dt", "List tables only");
-        Self::print_command("\\dv", "List views only");
-        Self::print_command("\\di", "List indexes");
+        Self::print_entries(Category::Schema, "List Objects");
 
         println!("\n{}", "Describe Objects:".yellow());
-        Self::print_command("\\d <table>", "Describe table schema");
-        Self::print_example("\\d users");
-        Self::print_command("\\dS <table>", "Show detailed table statistics");
-        Self::print_example("\\dS orders");
+        Self::print_entries(Category::Schema, "Describe Objects");
 
         println!("\n{}", "Compression:".yellow());
-        Self::print_command("\\compression <table>", "Show compression info for table");
-        Self::print_example("\\compression events");
-        Self::print_command("\\compression", "Show compression for all tables");
+        Self::print_entries(Category::Schema, "Compression");
 
         println!("\n{}", "Indexes:".yellow());
-        Self::print_command("\\di <table>", "Show indexes for specific table");
-        Self::print_example("\\di products");
+        Self::print_entries(Category::Schema, "Indexes");
 
         println!();
     }
@@ -195,10 +182,7 @@ impl HelpManager {
         Self::print_category_header("Branching", "Database Branching Workflows");
 
         println!("\n{}", "List and Switch:".yellow());
-        Self::print_command("\\branches", "List all branches");
-        Self::print_command("\\use <branch>", "Switch to branch");
-        Self::print_example("\\use dev");
-        Self::print_command("\\show branch", "Show current branch");
+        Self::print_entries(Category::Branching, "List and Switch");
 
         println!("\n{}", "Branch Management:".yellow());
         Self::print_command("CREATE BRANCH <name>", "Create new branch from current point");
@@ -244,7 +228,7 @@ impl HelpManager {
             "  {}",
             "(Coming in v3.2.0 - Named snapshots for point-in-time recovery)".dimmed()
         );
-        Self::print_command("\\snapshots", "List available snapshots (v3.2.0+)");
+        Self::print_entries(Category::TimeTravel, "Snapshots");
         Self::print_command(
             "CREATE SNAPSHOT <name> [AT TIMESTAMP <ts>]",
             "Create named snapshot (v3.2.0+)",
@@ -270,15 +254,7 @@ impl HelpManager {
         Self::print_category_header("Vectors", "Vector Search and Indexing");
 
         println!("\n{}", "Vector Store Commands:".yellow());
-        Self::print_command("\\vectors", "List all vector stores");
-        Self::print_command("\\vector <name>", "Show store details");
-        Self::print_example("\\vector embeddings");
-        Self::print_command("\\vector create <name> <dims> [metric]", "Create new store");
-        Self::print_example("\\vector create mystore 384 cosine");
-        Self::print_command("\\vector delete <name>", "Delete vector store");
-        Self::print_example("\\vector delete old_embeddings");
-        Self::print_command("\\vector stats <name>", "Show detailed statistics");
-        Self::print_example("\\vector stats embeddings");
+        Self::print_entries(Category::Vectors, "Vector Store Commands");
 
         println!("\n{}", "SQL Vector Operations:".yellow());
         Self::print_command("CREATE TABLE t (embedding VECTOR(384))", "Define vector column");
@@ -288,10 +264,6 @@ impl HelpManager {
             "  {}",
             "Operators: <-> (L2), <#> (inner product), <=> (cosine)".dimmed()
         );
-
-        println!("\n{}", "Search:".yellow());
-        Self::print_command("\\vector search <store> <query>", "Search vectors");
-        Self::print_example("\\vector search embeddings [0.1, 0.2, ..., 0.9]");
 
         println!("\n{}", "Supported Metrics:".green().bold());
         println!("  {}", "• cosine    - Cosine similarity (default)".dimmed());
@@ -306,20 +278,9 @@ impl HelpManager {
         Self::print_category_header("Documents", "Document Storage and RAG");
 
         println!("\n{}", "Collection Commands:".yellow());
-        Self::print_command("\\collections", "List all collections");
-        Self::print_command("\\collection <name>", "Show collection details");
-        Self::print_example("\\collection articles");
-        Self::print_command("\\docs <collection>", "List documents");
-        Self::print_example("\\docs my-rag-docs");
-        Self::print_command("\\doc <coll> <id>", "Get document details");
-        Self::print_example("\\doc articles doc-123");
-        Self::print_command("\\search-docs <query>", "Search across collections");
-        Self::print_example("\\search-docs machine learning");
+        Self::print_entries(Category::Documents, "Collection Commands");
 
         println!("\n{}", "Import/Export:".yellow());
-        Self::print_command("\\import-docs <file>", "Import documents from JSON/JSONL");
-        Self::print_example("\\import-docs data/articles.jsonl");
-        Self::print_command("\\export-docs <coll> <file>", "Export collection to file");
 
         println!("\n{}", "SQL Integration:".yellow());
         Self::print_command("INSERT INTO documents (collection, data) VALUES (...)", "Add document");
@@ -328,15 +289,13 @@ impl HelpManager {
         );
 
         println!("\n{}", "Advanced Document Operations:".yellow());
-        Self::print_command("\\doc chunks <collection> <id>", "Show document chunks");
-        Self::print_example("\\doc chunks articles doc-123");
-        Self::print_command("\\doc rechunk <coll> <id> <size>", "Re-chunk document");
-        Self::print_example("\\doc rechunk articles doc-123 512");
-        Self::print_command("\\rag <collection> <query> [k]", "RAG-style search with context");
-        Self::print_example("\\rag articles \"What is machine learning?\" 5");
+        Self::print_entries(Category::Documents, "Advanced Document Operations");
 
         println!("\n{}", "RAG Workflow:".green().bold());
-        println!("  {}", "1. Import documents: \\import-docs data.jsonl".dimmed());
+        println!(
+            "  {}",
+            "1. Store documents with the SQL INSERT or the library API".dimmed()
+        );
         println!("  {}", "2. Search semantically: \\search-docs \"query\"".dimmed());
         println!("  {}", "3. RAG search for context: \\rag <coll> <query>".dimmed());
         println!("  {}", "4. Use with AI agents for context-aware responses".dimmed());
@@ -349,33 +308,12 @@ impl HelpManager {
         Self::print_category_header("Agents", "AI Agent Sessions");
 
         println!("\n{}", "Session Commands:".yellow());
-        Self::print_command("\\sessions", "List all agent sessions");
-        Self::print_command("\\session-new <name>", "Create new session");
-        Self::print_example("\\session-new my-chat");
-        Self::print_command("\\session <id>", "Show session details");
-        Self::print_example("\\session chat-1");
-        Self::print_command("\\session-delete <id>", "Delete session");
-        Self::print_example("\\session-delete old-chat");
-        Self::print_command("\\chat <id>", "Interactive chat mode");
-        Self::print_example("\\chat abc123");
+        Self::print_entries(Category::Agents, "Session Commands");
         println!("  {}", "Type 'exit' or 'quit' to end chat".dimmed());
-        Self::print_command("\\session-clear <id>", "Clear session messages");
-        Self::print_example("\\session-clear chat-1");
+        Self::print_entries(Category::Agents, "Session Commands #2");
 
         println!("\n{}", "Advanced Session Operations:".yellow());
-        Self::print_command("\\session fork <id> <name>", "Fork session with history");
-        Self::print_example("\\session fork abc123 new-branch");
-        Self::print_command("\\session context <id>", "Show session context/state");
-        Self::print_example("\\session context abc123");
-        Self::print_command("\\session memory <id> <query>", "Semantic search in session");
-        Self::print_example("\\session memory abc123 \"database optimization\"");
-        Self::print_command("\\session summarize <id>", "Generate session summary");
-        Self::print_example("\\session summarize abc123");
-
-        println!("\n{}", "Agent Configuration:".yellow());
-        Self::print_command("\\session-config <id> <key> <value>", "Configure session");
-        Self::print_example("\\session-config analytics model gpt-4");
-        Self::print_example("\\session-config analytics temperature 0.7");
+        Self::print_entries(Category::Agents, "Advanced Session Operations");
 
         println!("\n{}", "Usage Example:".green().bold());
         println!("  {}", "\\session-new data-analyst".dimmed());
@@ -393,38 +331,21 @@ impl HelpManager {
         Self::print_category_header("AI", "AI Inference and Generation");
 
         println!("\n{}", "Templates:".yellow());
-        Self::print_command("\\ai templates", "List available AI templates");
-        Self::print_command("\\ai template <name>", "Show template details");
-        Self::print_example("\\ai template summarize");
+        Self::print_entries(Category::Ai, "Templates");
 
         println!("\n{}", "Inference:".yellow());
-        Self::print_command("\\ai infer <prompt>", "Run AI inference");
-        Self::print_example("\\ai infer Explain vector databases in simple terms");
-        Self::print_command("\\ai infer -t <template> <input>", "Use template");
-        Self::print_example("\\ai infer -t summarize \"Long text here...\"");
+        Self::print_entries(Category::Ai, "Inference");
 
         println!("\n{}", "Generation:".yellow());
-        Self::print_command("\\ai generate schema <description>", "Generate schema from description");
-        Self::print_example("\\ai generate schema User table with email and profile");
-        Self::print_command("\\ai generate query <question>", "Generate SQL from question");
-        Self::print_example("\\ai generate query What are top 10 users by activity?");
+        Self::print_entries(Category::Ai, "Generation");
 
         println!("\n{}", "Embeddings & Models:".yellow());
-        Self::print_command("\\ai models", "List available AI models");
-        Self::print_command("\\ai embed <text>", "Generate embedding for text");
-        Self::print_example("\\ai embed \"Hello world\"");
-        Self::print_command("\\ai compare-schema <s1> <s2>", "Compare two table schemas");
-        Self::print_example("\\ai compare-schema users_v1 users_v2");
+        Self::print_entries(Category::Ai, "Embeddings & Models");
 
         println!("\n{}", "Chat Mode:".yellow());
-        Self::print_command("\\ai chat", "Start AI chat session");
         println!("  {}", "Interactive mode for multi-turn conversations".dimmed());
 
         println!("\n{}", "Configuration:".yellow());
-        Self::print_command("\\ai config model <name>", "Set AI model");
-        Self::print_example("\\ai config model gpt-4");
-        Self::print_command("\\ai config temperature <value>", "Set temperature (0.0-2.0)");
-        Self::print_example("\\ai config temperature 0.7");
 
         println!();
     }
@@ -434,57 +355,28 @@ impl HelpManager {
         Self::print_category_header("Multi-Tenancy", "Tenant Isolation and Management");
 
         println!("\n{}", "Tenant Management:".yellow());
-        Self::print_command("\\tenant list", "List all tenants");
-        Self::print_command("\\tenant create <name> [plan]", "Create new tenant");
-        Self::print_example("\\tenant create acme-corp free");
-        Self::print_example("\\tenant create big-co enterprise");
-        Self::print_command("\\tenant delete <tenant>", "Delete tenant");
-        Self::print_example("\\tenant delete old-tenant");
-        Self::print_command("\\tenant info <tenant>", "Show tenant details");
-        Self::print_example("\\tenant info acme-corp");
+        Self::print_entries(Category::Tenants, "Tenant Management");
 
         println!("\n{}", "Context Switching:".yellow());
-        Self::print_command("\\tenant use <tenant>", "Switch to tenant context");
-        Self::print_example("\\tenant use acme-corp");
-        Self::print_command("\\tenant current", "Show current tenant");
-        Self::print_command("\\tenant clear", "Clear tenant context (admin mode)");
+        Self::print_entries(Category::Tenants, "Context Switching");
 
         println!("\n{}", "Plan Management:".yellow());
-        Self::print_command("\\tenant plans", "List available plans");
-        Self::print_command("\\tenant plan <tenant> <plan>", "Change tenant plan");
-        Self::print_example("\\tenant plan acme-corp pro");
+        Self::print_entries(Category::Tenants, "Plan Management");
         println!("  {}", "Plans: free, starter, pro, enterprise".dimmed());
 
         println!("\n{}", "Quota Management:".yellow());
-        Self::print_command("\\tenant quota <tenant>", "Show quota usage");
-        Self::print_example("\\tenant quota acme-corp");
-        Self::print_command(
-            "\\tenant quota-set <tenant> <storage_mb> <conns> <qps>",
-            "Set custom quotas",
-        );
-        Self::print_example("\\tenant quota-set acme-corp 5000 25 10000");
+        Self::print_entries(Category::Tenants, "Quota Management");
         println!("  {}", "Arguments: storage_mb, max_connections, max_qps".dimmed());
 
         println!("\n{}", "Row-Level Security (RLS):".yellow());
-        Self::print_command("\\tenant rls create <table> <policy> <expr> <cmd>", "Create RLS policy");
-        Self::print_example("\\tenant rls create customers isolation tenant_id=current_tenant() ALL");
-        Self::print_command("\\tenant rls list <table>", "List policies for table");
-        Self::print_example("\\tenant rls list customers");
-        Self::print_command("\\tenant rls delete <table> <policy>", "Delete RLS policy");
-        Self::print_example("\\tenant rls delete customers isolation");
+        Self::print_entries(Category::Tenants, "Row-Level Security (RLS)");
         println!("  {}", "Commands: ALL, SELECT, INSERT, UPDATE, DELETE".dimmed());
 
         println!("\n{}", "Change Data Capture (CDC):".yellow());
-        Self::print_command("\\tenant cdc-show [limit]", "Show CDC events");
-        Self::print_example("\\tenant cdc-show 20");
-        Self::print_command("\\tenant cdc-export <file>", "Export CDC to JSON");
-        Self::print_example("\\tenant cdc-export changes.json");
+        Self::print_entries(Category::Tenants, "Change Data Capture (CDC)");
 
         println!("\n{}", "Tenant Migration:".yellow());
-        Self::print_command("\\tenant migrate-to <target>", "Start migration to target tenant");
-        Self::print_example("\\tenant migrate-to new-tenant");
-        Self::print_command("\\tenant migrate-status [tenant]", "Check migration status");
-        Self::print_example("\\tenant migrate-status acme-corp");
+        Self::print_entries(Category::Tenants, "Tenant Migration");
 
         println!("\n{}", "Isolation Modes:".green().bold());
         println!("  {}", "• SharedSchema - Tables shared with RLS (default)".dimmed());
@@ -513,26 +405,10 @@ impl HelpManager {
         Self::print_category_header("Settings", "Configuration and Tuning");
 
         println!("\n{}", "View Configuration:".yellow());
-        Self::print_command("\\config", "Show all configuration settings");
-        Self::print_command("\\config <key>", "Show specific setting");
-        Self::print_example("\\config max_connections");
-
-        println!("\n{}", "Modify Settings:".yellow());
-        Self::print_command("\\set <key> <value>", "Set configuration value");
-        Self::print_example("\\set max_connections 100");
-        Self::print_example("\\set cache_size 512MB");
+        Self::print_entries(Category::Settings, "View Configuration");
 
         println!("\n{}", "Performance Commands:".yellow());
-        Self::print_command(
-            "\\explain <query>",
-            "Show query execution plan with storage layer analysis",
-        );
-        Self::print_example("\\explain SELECT * FROM users WHERE id = 1");
-        Self::print_command(
-            "\\explain analyze <query>",
-            "Execute query and show actual timing and row counts",
-        );
-        Self::print_example("\\explain analyze SELECT * FROM users");
+        Self::print_entries(Category::Settings, "Performance Commands");
         println!(
             "  {}",
             "EXPLAIN shows: plan tree, filter pushdown, index usage, compression info".dimmed()
@@ -541,26 +417,10 @@ impl HelpManager {
             "  {}",
             "EXPLAIN ANALYZE also shows: actual execution time, row count accuracy".dimmed()
         );
-        Self::print_command("\\profile <query>", "Profile query with timing");
-        Self::print_example("\\profile SELECT * FROM orders WHERE total > 1000");
-        Self::print_command("\\telemetry", "Show database statistics");
-        Self::print_command("\\optimize", "Run query optimizer analysis");
-        Self::print_command("\\optimize <table>", "Optimize specific table");
-        Self::print_example("\\optimize users");
-        Self::print_command("\\analyze", "Update table statistics");
-        Self::print_command("\\vacuum", "Reclaim storage space");
+        Self::print_entries(Category::Settings, "Performance Commands #2");
 
         println!("\n{}", "Statistics:".yellow());
-        Self::print_command("\\stats", "Show database statistics");
-        Self::print_command("\\stats queries", "Show query performance stats");
-        Self::print_command("\\stats cache", "Show cache statistics");
-        Self::print_command("\\stats io", "Show I/O statistics");
-
-        println!("\n{}", "Common Settings:".green().bold());
-        println!("  {}", "• max_connections    - Connection limit".dimmed());
-        println!("  {}", "• cache_size         - Memory cache size".dimmed());
-        println!("  {}", "• wal_level          - Write-ahead log level".dimmed());
-        println!("  {}", "• compression_level  - Data compression (0-9)".dimmed());
+        Self::print_entries(Category::Settings, "Statistics");
 
         println!();
     }
@@ -616,8 +476,6 @@ impl HelpManager {
         println!("  {}", "SELECT * FROM text_results UNION vector_results".dimmed());
 
         println!("\n{}", "Document RAG Pattern:".yellow());
-        println!("  {}", "-- Import knowledge base".dimmed());
-        println!("  {}", "\\import-docs knowledge/docs.jsonl".dimmed());
         println!("  {}", "-- Search for context".dimmed());
         println!("  {}", "\\search-docs \"How does authentication work?\"".dimmed());
         println!("  {}", "-- Use with agent".dimmed());
@@ -690,6 +548,18 @@ impl HelpManager {
         let header = format!("╔═══ {} - {} ", category, description);
         let padding = "═".repeat(80_usize.saturating_sub(header.len() + 1));
         println!("\n{}{}{}", header.cyan(), padding.cyan(), "╗".cyan());
+    }
+
+    /// The commands the registry lists under one part of a category's help.
+    fn print_entries(category: Category, section: &str) {
+        for spec in registry::entries(category, section) {
+            Self::print_command(&spec.display_form(), spec.summary);
+            if spec.show_examples {
+                for example in spec.examples {
+                    Self::print_example(example);
+                }
+            }
+        }
     }
 
     fn print_command(cmd: &str, desc: &str) {

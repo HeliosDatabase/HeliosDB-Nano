@@ -62,11 +62,24 @@ heliosdb-nano repl --memory                      # ephemeral
 Inside the REPL:
 ```
 heliosdb> \d              -- list tables
-heliosdb> \timing          -- toggle timing
+heliosdb> \timing          -- toggle timing (\timing on / \timing off set it)
+heliosdb> \x               -- one block per row (\x on|off|auto)
+heliosdb> \pset null '(null)'   -- shell display settings; \conninfo shows the connection
 heliosdb> SELECT 1+1;
 heliosdb> \q
 ```
 Full meta-command reference: `\help` inside the REPL.
+
+**Scripts and CI** (no banner, no history file, errors on stderr, exit code 3 when a statement fails):
+```bash
+heliosdb-nano sql --data-dir ./mydata -f schema.sql             # `sql` is an alias of `repl`
+heliosdb-nano sql --data-dir ./mydata -c "SELECT * FROM t" --format json   # csv | tsv | json | jsonl | vertical | markdown
+cat schema.sql | heliosdb-nano sql --data-dir ./mydata -f -     # standard input
+heliosdb-nano sql --memory -1 -f load.sql                       # one transaction (DML only: DDL is not transactional)
+```
+Exit codes: 0 every statement ran, 1 usage or an unreadable file, 2 the database could not be opened, 3 a
+statement failed (`--on-error-stop=false` runs on and still exits 3). With `--format json` each failed
+statement is one JSON object on stderr.
 
 ### Recipe 3: PG wire (TCP)
 **Server** (terminal A):

@@ -6,37 +6,65 @@ use prettytable::{format, Cell, Row, Table};
 
 /// Format query results as a pretty table
 pub fn format_results(tuples: &[Tuple], schema: &Schema) -> String {
+    format_results_with(tuples, schema, None, true, true)
+}
+
+/// [`format_results`] with the parts script mode can turn off: `null` is the
+/// text a NULL is shown as (`None` keeps the dimmed `NULL`), `header` the
+/// column-name row, `footer` the `(N rows)` line.
+pub fn format_results_with(
+    tuples: &[Tuple],
+    schema: &Schema,
+    null: Option<&str>,
+    header: bool,
+    footer: bool,
+) -> String {
     if tuples.is_empty() {
         return format!("{}", "(0 rows)".dimmed());
     }
 
     let mut table = Table::new();
 
-    // Use a clean format
-    table.set_format(*format::consts::FORMAT_BOX_CHARS);
+    // Use a clean format; rows alone (no header) get no box
+    if header {
+        table.set_format(*format::consts::FORMAT_BOX_CHARS);
+    } else {
+        table.set_format(*format::consts::FORMAT_NO_BORDER);
+    }
 
     // Add header row
-    let header: Vec<Cell> = schema
-        .columns
-        .iter()
-        .map(|col| Cell::new(&col.name).style_spec("Fb"))
-        .collect();
-    table.add_row(Row::new(header));
+    if header {
+        let header: Vec<Cell> = schema
+            .columns
+            .iter()
+            .map(|col| Cell::new(&col.name).style_spec("Fb"))
+            .collect();
+        table.add_row(Row::new(header));
+    }
 
     // Add data rows
     for tuple in tuples {
-        let cells: Vec<Cell> = tuple.values.iter().map(|val| Cell::new(&format_value(val))).collect();
+        let cells: Vec<Cell> = tuple
+            .values
+            .iter()
+            .map(|val| match (val, null) {
+                (Value::Null, Some(text)) => Cell::new(text),
+                _ => Cell::new(&format_value(val)),
+            })
+            .collect();
         table.add_row(Row::new(cells));
     }
 
     let mut output = String::new();
     output.push_str(&table.to_string());
-    output.push('\n');
-    output.push_str(
-        &format!("({} row{})", tuples.len(), if tuples.len() == 1 { "" } else { "s" })
-            .dimmed()
-            .to_string(),
-    );
+    if footer {
+        output.push('\n');
+        output.push_str(
+            &format!("({} row{})", tuples.len(), if tuples.len() == 1 { "" } else { "s" })
+                .dimmed()
+                .to_string(),
+        );
+    }
 
     output
 }

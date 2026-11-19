@@ -9,14 +9,25 @@
 
 mod commands;
 mod completer;
+pub mod display;
 mod formatter;
 mod help_manager;
+mod lexer;
+pub mod registry;
+pub mod runner;
 mod shell;
+mod status;
+mod writers;
 
 pub use commands::MetaCommand;
 pub use commands::MetaCommandResult;
+pub use formatter::format_results;
 pub use help_manager::HelpManager;
 pub use shell::ReplShell;
+pub use status::{
+    render_config, render_conninfo, render_replication, render_replication_state, render_status, render_telemetry,
+    ReplicationState, RoleRecordSummary,
+};
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -84,12 +95,18 @@ fn default_max_column_width() -> usize {
 pub enum OutputFormat {
     /// ASCII table format (default)
     Table,
-    /// JSON format
+    /// JSON: one array of objects per statement
     Json,
-    /// CSV format
+    /// JSON lines: one object per row
+    Jsonl,
+    /// CSV (RFC 4180)
     Csv,
-    /// Vertical format (one row per line)
+    /// Tab-separated, `COPY` text escapes
+    Tsv,
+    /// Vertical format (one block per row)
     Vertical,
+    /// A Markdown table
+    Markdown,
 }
 
 impl Default for ReplConfig {

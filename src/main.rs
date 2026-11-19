@@ -1706,7 +1706,14 @@ enum Commands {
         data_dir: PathBuf,
     },
 
-    /// Run embedded mode (REPL)
+    /// Run embedded mode: the interactive shell, or a script with -c / -f
+    ///
+    /// With -c or -f the statements run one after another, results go to stdout in
+    /// the chosen --format, errors to stderr, nothing else is printed and no history
+    /// file is written. Exit codes: 0 every statement ran, 1 usage or a fatal error
+    /// (such as an unreadable file), 2 the database could not be opened, 3 a
+    /// statement failed.
+    #[command(visible_alias = "sql")]
     Repl {
         /// Data directory (default: ./heliosdb-data)
         #[arg(short, long, default_value = "./heliosdb-data")]
@@ -1723,6 +1730,57 @@ enum Commands {
         /// Dump output file (used with --dump-on-shutdown)
         #[arg(long)]
         dump_file: Option<PathBuf>,
+
+        /// Run this SQL and exit (repeatable; run before any -f file)
+        #[arg(short = 'c', long = "command", value_name = "SQL")]
+        command: Vec<String>,
+
+        /// Run the statements of this file and exit; `-` reads standard input
+        /// (repeatable)
+        #[arg(short = 'f', long = "file", value_name = "FILE")]
+        file: Vec<String>,
+
+        /// Output format for -c / -f: table (default), csv, tsv, json (one array
+        /// per statement), jsonl, vertical, markdown
+        #[arg(long, value_name = "FORMAT", value_parser = parse_repl_format)]
+        format: Option<heliosdb_nano::repl::OutputFormat>,
+
+        /// Print nothing but results and errors (implied by -c and -f)
+        #[arg(short = 'q', long)]
+        quiet: bool,
+
+        /// With -c / -f: no header row and no row-count footer
+        #[arg(short = 't', long)]
+        tuples_only: bool,
+
+        /// With -c / -f: the text a NULL is written as (the format's own by default)
+        #[arg(long, value_name = "TEXT")]
+        null: Option<String>,
+
+        /// With -c / -f: run everything in one transaction, rolled back at the first
+        /// failure. DDL is not transactional in Nano, so a CREATE or DROP is not
+        /// undone, and CALL or a user-defined function inside a transaction is
+        /// refused: the rollback is complete for data changes only
+        #[arg(short = '1', long)]
+        single_transaction: bool,
+
+        /// With -c / -f: stop at the first failing statement (the default);
+        /// --on-error-stop=false runs on and still exits 3 at the end
+        #[arg(
+            long,
+            value_name = "BOOL",
+            default_value_t = true,
+            action = clap::ArgAction::Set,
+            num_args = 0..=1,
+            require_equals = true,
+            default_missing_value = "true"
+        )]
+        on_error_stop: bool,
+
+        /// Read shell settings (output_format, null_display, show_timing, ...) from
+        /// this TOML file; \config reload re-reads it
+        #[arg(long, value_name = "FILE")]
+        config: Option<PathBuf>,
     },
 
     /// Dump database to file
@@ -2333,7 +2391,30 @@ async fn run(cli: Cli) -> Result<()> {
             memory,
             dump_on_shutdown,
             dump_file,
-        } => run_repl(data_dir, memory, dump_on_shutdown, dump_file),
+            command,
+            file,
+            format,
+            quiet,
+            tuples_only,
+            null,
+            single_transaction,
+            on_error_stop,
+            config,
+        } => run_repl(ReplArgs {
+            data_dir,
+            memory,
+            dump_on_shutdown,
+            dump_file,
+            command,
+            file,
+            format,
+            quiet,
+            tuples_only,
+            null,
+            single_transaction,
+            on_error_stop,
+            config,
+        }),
         Commands::Dump {
             output,
             data_dir,
@@ -4096,26 +4177,147 @@ fn init_database(data_dir: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn run_repl(data_dir: PathBuf, memory: bool, dump_on_shutdown: bool, dump_file: Option<PathBuf>) -> Result<()> {
+/// The `repl` / `sql` command line.
+struct ReplArgs {
+    data_dir: PathBuf,
+    memory: bool,
+    dump_on_shutdown: bool,
+    dump_file: Option<PathBuf>,
+    command: Vec<String>,
+    file: Vec<String>,
+    format: Option<heliosdb_nano::repl::OutputFormat>,
+    quiet: bool,
+    tuples_only: bool,
+    null: Option<String>,
+    single_transaction: bool,
+    on_error_stop: bool,
+    config: Option<PathBuf>,
+}
+
+/// `--format` of `repl`.
+fn parse_repl_format(name: &str) -> std::result::Result<heliosdb_nano::repl::OutputFormat, String> {
+    heliosdb_nano::repl::display::parse_format(name)
+}
+
+/// Print `message` as an error on stderr and exit with `code` (script mode).
+fn exit_with_error(message: &str, code: i32) -> ! {
+    eprintln!("ERROR: {message}");
+    std::process::exit(code)
+}
+
+fn run_repl(args: ReplArgs) -> Result<()> {
     use colored::Colorize;
     use heliosdb_nano::repl::{ReplConfig, ReplShell};
     use heliosdb_nano::storage::{DumpCompressionType, DumpManager, DumpMode, DumpOptions};
 
-    // Open database with user-friendly output
-    let db = if memory {
-        println!("Starting REPL with in-memory database...");
-        println!("  Note: Data will be lost when you exit.");
-        EmbeddedDatabase::new_in_memory()?
-    } else {
-        println!("Starting REPL with persistent storage at {}...", data_dir.display());
-        EmbeddedDatabase::new(&data_dir)?
-    };
+    let ReplArgs {
+        data_dir,
+        memory,
+        dump_on_shutdown,
+        dump_file,
+        command,
+        file,
+        format,
+        quiet,
+        tuples_only,
+        null,
+        single_transaction,
+        on_error_stop,
+        config: config_path,
+    } = args;
+
+    // `-c` / `-f` run a script; without either the shell is interactive.
+    let batch = !command.is_empty() || !file.is_empty();
+    if !batch && (format.is_some() || tuples_only || null.is_some() || single_transaction) {
+        exit_with_error(
+            "--format, --tuples-only, --null and --single-transaction apply to a script: give -c SQL or -f FILE",
+            1,
+        );
+    }
 
     // Create REPL configuration
-    let config = ReplConfig::default();
+    let config = match &config_path {
+        Some(path) => match ReplConfig::from_file(path) {
+            Ok(config) => config,
+            Err(e) if batch => exit_with_error(&e.to_string(), 1),
+            Err(e) => return Err(e),
+        },
+        None => ReplConfig::default(),
+    };
+
+    // Open database with user-friendly output
+    let quiet = quiet || batch;
+    let opened = if memory {
+        if !quiet {
+            println!("Starting REPL with in-memory database...");
+            println!("  Note: Data will be lost when you exit.");
+        }
+        EmbeddedDatabase::new_in_memory()
+    } else {
+        if !quiet {
+            println!("Starting REPL with persistent storage at {}...", data_dir.display());
+        }
+        EmbeddedDatabase::new(&data_dir)
+    };
+    let db = match opened {
+        Ok(db) => db,
+        // A script that cannot open its database says so and exits 2.
+        Err(e) if batch => exit_with_error(&format!("cannot open the database: {e}"), 2),
+        Err(e) => return Err(e),
+    };
+
+    if batch {
+        use heliosdb_nano::repl::runner::{run_batch, BatchOptions};
+        // The format flag wins over the file; so does --null over `null_display`.
+        let null = null.or_else(|| (config.null_display != "NULL").then(|| config.null_display.clone()));
+        let options = BatchOptions {
+            commands: command,
+            files: file,
+            format: format.unwrap_or(config.output_format),
+            null,
+            tuples_only,
+            single_transaction,
+            on_error_stop,
+        };
+        let code = {
+            let stdin = std::io::stdin();
+            let mut stdin = stdin.lock();
+            let stdout = std::io::stdout();
+            let mut stdout = std::io::BufWriter::new(stdout.lock());
+            let stderr = std::io::stderr();
+            let mut stderr = stderr.lock();
+            let code = run_batch(&db, &options, &mut stdin, &mut stdout, &mut stderr);
+            let _ = std::io::Write::flush(&mut stdout);
+            code
+        };
+        if dump_on_shutdown {
+            let dump_path = dump_file.unwrap_or_else(|| PathBuf::from("heliosdb_dump.heliodump"));
+            let dump_manager = DumpManager::new(data_dir, DumpCompressionType::Zstd);
+            let dump_options = DumpOptions {
+                output_path: dump_path.clone(),
+                mode: DumpMode::Full,
+                compression: DumpCompressionType::Zstd,
+                append: false,
+                tables: None,
+                verbose: false,
+                connection: None,
+                format: heliosdb_nano::storage::DumpOutputFormat::Binary,
+            };
+            if let Err(e) = dump_manager.dump(&dump_options, &db) {
+                eprintln!("ERROR: cannot dump the database: {e}");
+            }
+        }
+        // The handle is closed before the process ends with the script's status.
+        drop(db);
+        if code != 0 {
+            std::process::exit(code);
+        }
+        return Ok(());
+    }
 
     // Create and run REPL
     let mut shell = ReplShell::new(db, config)?;
+    shell.set_quiet(quiet);
 
     // If dump_on_shutdown is requested, handle the shutdown dump after REPL exits
     let result = shell.run();

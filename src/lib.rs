@@ -353,8 +353,8 @@ pub use error::{
 };
 pub use storage::StorageEngine;
 pub use types::{
-    AgentMessage, AgentSession, Column, ColumnStorageMode, DataType, DocumentData, DocumentMetadata, Schema, Tuple,
-    Value, VectorStoreInfo,
+    AgentMessage, AgentSession, Column, ColumnStorageMode, DataType, DocumentData, DocumentMetadata, Schema,
+    StatementOutcome, Tuple, Value, VectorStoreInfo,
 };
 
 // sprinter ccebc95977f1: every per-statement entry point below runs its body
@@ -26008,11 +26008,7 @@ impl EmbeddedDatabase {
             if trimmed.is_empty() {
                 continue;
             }
-            let outcome = if Self::script_statement_returns_rows(trimmed) {
-                self.query(trimmed, &[]).map(|_| 0)
-            } else {
-                self.execute(trimmed)
-            };
+            let outcome = self.run_statement(trimmed);
             outcome.map_err(|e| {
                 Error::query_execution(format!(
                     "SQL script failed at statement {} ({}): {}",
@@ -26026,18 +26022,262 @@ impl EmbeddedDatabase {
         Ok(executed)
     }
 
-    /// True for the statement shapes that produce a result set, which
-    /// `execute()` does not serve. A dump contains none of them; this is the
-    /// tolerance clause for a hand-edited script.
-    fn script_statement_returns_rows(statement: &str) -> bool {
-        let head = statement
-            .split(|c: char| c.is_whitespace() || c == '(')
+    /// Run one statement and report what it produced: its rows, or the number
+    /// of rows it affected.
+    ///
+    /// The engine decides, not the first keyword: a parenthesised query, a set
+    /// operation, `VALUES`, a `WITH ... SELECT`, `EXPLAIN`, `SHOW` (including
+    /// `SHOW BRANCHES` and the cluster-status family), `PRAGMA`, an `EXECUTE` of
+    /// a prepared query, and an `INSERT` / `UPDATE` / `DELETE` that has a
+    /// `RETURNING` clause all give [`StatementOutcome::Rows`] with the names the
+    /// engine gives the columns (a `RETURNING` clause that is only a word inside
+    /// a string literal does not). Everything else runs as
+    /// [`execute`](Self::execute) and gives [`StatementOutcome::Affected`].
+    ///
+    /// The statement is classified by its first keyword, after leading
+    /// comments, and only where that keyword leaves a question open is it
+    /// parsed: `INSERT` / `UPDATE` / `DELETE` are parsed (only when the text
+    /// contains the word `RETURNING`) to see whether the clause is real, and
+    /// `EXECUTE` asks the prepared-statement registry what was prepared. A
+    /// statement the parser cannot read is run by the same keyword rule as
+    /// before, so nothing that ran starts to fail.
+    ///
+    /// Entry points it delegates to apply their own admission: a write is
+    /// refused on a physical standby exactly as [`execute`](Self::execute) refuses
+    /// it, and a read inside an open transaction sees that transaction's writes.
+    ///
+    /// # Errors
+    ///
+    /// The error of the statement itself.
+    pub fn run_statement(&self, sql: &str) -> Result<StatementOutcome> {
+        let text = crate::protocol::postgres::handler::pg_skip_leading_comments(sql).trim();
+        let head: String = text
+            .split(|c: char| c.is_whitespace() || c == '(' || c == ';')
             .find(|word| !word.is_empty())
-            .unwrap_or("");
-        matches!(
-            head.to_ascii_uppercase().as_str(),
-            "SELECT" | "WITH" | "VALUES" | "TABLE" | "SHOW" | "EXPLAIN"
-        )
+            .unwrap_or("")
+            .to_ascii_uppercase();
+        let parenthesised = text.starts_with('(');
+
+        if parenthesised {
+            return self.rows_outcome(sql);
+        }
+        match head.as_str() {
+            "PRAGMA" => {
+                // `table_info(t)` has a fixed shape; the other pragmas answer
+                // with rows of no schema (or none).
+                let names: Vec<String> = match sql::sqlite_compat::parse_pragma(sql) {
+                    Some((name, _)) if name.eq_ignore_ascii_case("table_info") => {
+                        ["cid", "name", "type", "notnull", "dflt_value", "pk"]
+                            .iter()
+                            .map(|n| (*n).to_string())
+                            .collect()
+                    }
+                    Some(_) => Vec::new(),
+                    None => return self.rows_outcome(sql),
+                };
+                let rows = self.query(sql, &[])?;
+                Ok(StatementOutcome::Rows { columns: names, rows })
+            }
+            "SHOW" | "DESCRIBE" | "HA" | "SWITCHOVER" => {
+                if let Some(outcome) = self.try_run_ha_statement(sql)? {
+                    return Ok(outcome);
+                }
+                // `HA ...`, `SWITCHOVER ...` and `DESCRIBE ...` that are not a
+                // read of the cluster keep their way of running.
+                if head == "SHOW" {
+                    self.rows_outcome(sql)
+                } else {
+                    self.execute(sql).map(StatementOutcome::Affected)
+                }
+            }
+            "SELECT" | "VALUES" | "WITH" | "TABLE" | "EXPLAIN" => self.rows_outcome(sql),
+            "MERGE" => {
+                // `MERGE BRANCH x ABORT` answers with the tables it may have
+                // left partially changed.
+                if sql::Parser::parse_merge_branch_abort(sql).is_some() {
+                    self.rows_outcome(sql)
+                } else {
+                    self.execute(sql).map(StatementOutcome::Affected)
+                }
+            }
+            "INSERT" | "UPDATE" | "DELETE" => {
+                let mentions_returning = text
+                    .as_bytes()
+                    .windows("RETURNING".len())
+                    .any(|window| window.eq_ignore_ascii_case(b"RETURNING"));
+                if mentions_returning && self.statement_has_returning(sql) {
+                    self.returning_outcome(sql)
+                } else {
+                    self.execute(sql).map(StatementOutcome::Affected)
+                }
+            }
+            "EXECUTE" => self.execute_prepared_outcome(sql, text),
+            _ => self.execute(sql).map(StatementOutcome::Affected),
+        }
+    }
+
+    /// The rows of a statement that returns rows, with the engine's column names.
+    fn rows_outcome(&self, sql: &str) -> Result<StatementOutcome> {
+        let (rows, columns) = self.rows_with_names(sql)?;
+        Ok(StatementOutcome::Rows { columns, rows })
+    }
+
+    /// Run a row-returning statement the way `query` does and return the names
+    /// of its columns. Where the engine's `query_with_columns` is not what
+    /// `query` runs (an open transaction, whose own writes a read must see; the
+    /// trace and graph-RAG statements), the rows come from `query` and the names
+    /// from planning the statement under this handle's session and branch.
+    fn rows_with_names(&self, sql: &str) -> Result<(Vec<Tuple>, Vec<String>)> {
+        let needs_query = self.global_txn_visible() || {
+            let lower = sql.to_ascii_lowercase();
+            lower.contains("helios.trace_") || lower.contains("with context")
+        };
+        if needs_query {
+            let rows = self.query(sql, &[])?;
+            let names = self.planned_column_names(sql, rows.first());
+            return Ok((rows, names));
+        }
+        // The code-graph `lsp_*` calls are rewritten to plain queries first, as
+        // the wire does, and an `ON BRANCH` directive is scoped for the statement.
+        #[cfg(feature = "code-graph")]
+        {
+            let (rewritten, _branch_guard) = self.rewrite_and_scope(sql, false)?;
+            self.query_with_columns(&rewritten)
+        }
+        #[cfg(not(feature = "code-graph"))]
+        {
+            self.query_with_columns(sql)
+        }
+    }
+
+    /// The column names of `sql`'s plan, read under this handle's session and
+    /// branch (the catalog is read directly, outside the engine). Falls back to
+    /// the shape of `first_row` when the statement does not plan to a schema.
+    fn planned_column_names(&self, sql: &str, first_row: Option<&Tuple>) -> Vec<String> {
+        let planned = self.parse_cached(sql).ok().and_then(|(statement, _)| {
+            let _catalog_scope = self.embedded_catalog_scope();
+            let catalog = self.storage.catalog();
+            let planner = sql::Planner::with_catalog(&catalog)
+                .with_sql(sql.to_string())
+                .with_current_schema(self.current_schema())
+                .with_search_path(self.current_search_path());
+            planner
+                .statement_to_plan(statement)
+                .ok()
+                .map(|plan| Self::column_names(&plan.schema()))
+        });
+        match (planned, first_row) {
+            (Some(names), Some(row)) if names.len() == row.values.len() => names,
+            (Some(names), None) => names,
+            (_, Some(row)) => Self::column_names(&row.schema()),
+            (None, None) => Vec::new(),
+        }
+    }
+
+    /// Whether `sql` is an `INSERT` / `UPDATE` / `DELETE` that has a real
+    /// `RETURNING` clause (not the word inside a string literal or a comment).
+    fn statement_has_returning(&self, sql: &str) -> bool {
+        let Ok((statement, _)) = self.parse_cached(sql) else {
+            return false;
+        };
+        match statement {
+            sqlparser::ast::Statement::Insert(insert) => insert.returning.is_some(),
+            sqlparser::ast::Statement::Update { returning, .. } => returning.is_some(),
+            sqlparser::ast::Statement::Delete(delete) => delete.returning.is_some(),
+            _ => false,
+        }
+    }
+
+    /// Run a DML statement with a `RETURNING` clause: its rows, under the
+    /// names the clause gives them (`RETURNING id AS the_id`, `RETURNING *`).
+    fn returning_outcome(&self, sql: &str) -> Result<StatementOutcome> {
+        let (_, rows) = self.execute_returning(sql)?;
+        let names = self
+            .returning_column_names(sql)
+            .filter(|names| rows.first().is_none_or(|row| row.values.len() == names.len()));
+        let columns = match (names, rows.first()) {
+            (Some(names), _) => names,
+            (None, Some(row)) => Self::column_names(&row.schema()),
+            (None, None) => Vec::new(),
+        };
+        Ok(StatementOutcome::Rows { columns, rows })
+    }
+
+    /// The names of the `RETURNING` list of a DML statement, planned under this
+    /// handle's session and branch.
+    fn returning_column_names(&self, sql: &str) -> Option<Vec<String>> {
+        let (statement, _) = self.parse_cached(sql).ok()?;
+        let _catalog_scope = self.embedded_catalog_scope();
+        let catalog = self.storage.catalog();
+        let planner = sql::Planner::with_catalog(&catalog)
+            .with_sql(sql.to_string())
+            .with_current_schema(self.current_schema())
+            .with_search_path(self.current_search_path());
+        let plan = planner.statement_to_plan(statement).ok()?;
+        let (table_name, items) = match &plan {
+            sql::LogicalPlan::Insert {
+                table_name, returning, ..
+            }
+            | sql::LogicalPlan::InsertSelect {
+                table_name, returning, ..
+            }
+            | sql::LogicalPlan::Update {
+                table_name, returning, ..
+            }
+            | sql::LogicalPlan::Delete {
+                table_name, returning, ..
+            } => (table_name.as_str(), returning.as_ref()?),
+            _ => return None,
+        };
+        let table_schema = catalog.get_table_schema(table_name).ok()?;
+        let schema = Self::returning_schema(&table_schema, items).ok()?;
+        Some(Self::column_names(&schema))
+    }
+
+    /// `EXECUTE name ...`: rows when the prepared statement reads, a count when it writes.
+    fn execute_prepared_outcome(&self, sql: &str, text: &str) -> Result<StatementOutcome> {
+        let rest = text.get("EXECUTE".len()..).unwrap_or("").trim().trim_end_matches(';');
+        let Some((name, _)) = Self::split_fast_execute(rest) else {
+            return self.execute(sql).map(StatementOutcome::Affected);
+        };
+        // An unknown name is the same error `EXECUTE` itself gives.
+        let stored = self.prepared_plan_or_lazy_fast_plan(&name)?;
+        if Self::plan_may_write(&stored) {
+            self.execute(sql).map(StatementOutcome::Affected)
+        } else {
+            self.rows_outcome(sql)
+        }
+    }
+
+    /// The cluster-status family (`SHOW CLUSTER STATUS`, `SHOW REPLICATION
+    /// STATUS`, `SHOW TOPOLOGY`, `SWITCHOVER CHECK`) answers with rows on the
+    /// embedded path: the plan is run for its result set, which `execute`
+    /// would discard.
+    #[cfg(feature = "ha-tier1")]
+    fn try_run_ha_statement(&self, sql: &str) -> Result<Option<StatementOutcome>> {
+        if !(sql::Parser::is_cluster_status(sql)
+            || sql::Parser::is_show_topology(sql)
+            || sql::Parser::is_switchover_check(sql))
+        {
+            return Ok(None);
+        }
+        let _standby = self.admit_on_physical_standby(sql)?;
+        let Some(plan) = Self::try_parse_ha_command(sql)? else {
+            return Ok(None);
+        };
+        let mut executor =
+            sql::Executor::with_storage(&self.storage).with_timeout(self.effective_statement_timeout_ms());
+        let (rows, schema) = executor.execute_with_schema(&plan)?;
+        Ok(Some(StatementOutcome::Rows {
+            columns: Self::column_names(&schema),
+            rows,
+        }))
+    }
+
+    /// Without `ha-tier1` there is no cluster-status family.
+    #[cfg(not(feature = "ha-tier1"))]
+    fn try_run_ha_statement(&self, _sql: &str) -> Result<Option<StatementOutcome>> {
+        Ok(None)
     }
 
     /// First 60 characters of a statement, single-line, for an error message.

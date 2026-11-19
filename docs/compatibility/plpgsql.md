@@ -63,6 +63,10 @@ SELECT id FROM t WHERE dbl(id) = 2;        -- filters
 SELECT dbl($1);                            -- 42 with $1 = 21
 ```
 
+In the `heliosdb-nano repl` shell a body can be typed over several lines or piped from a file:
+the shell cuts its input at the semicolons outside quotes, dollar quotes and comments (the rule
+the PostgreSQL wire uses), so the `END;` inside `$$ ... $$` does not end the statement.
+
 **The `$` sigil is mandatory**, exactly as it is for procedure bodies: `$1` / `$name`.
 A bare parameter name is a column reference and fails with
 `Column 'x' not found in schema`. That is deliberate — a variable must never silently

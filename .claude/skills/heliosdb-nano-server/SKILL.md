@@ -42,10 +42,9 @@ allowed-tools: Bash(heliosdb-nano *), Bash(psql *), Bash(systemctl *), Read
 | Unix socket (MySQL) | CLI | `--mysql-socket /tmp/heliosdb-mysql.sock` |
 | HTTP health port | CLI | `--http-port 8080` |
 | TOML config | CLI | `--config ./config.toml` |
-| user management | REPL | `\user list`, `\user add <n>`, `\user remove <n>`, `\password <n>` |
-| server status (REPL) | REPL | `\server status` / `\server start` / `\server stop` |
-| TLS status | REPL | `\ssl status` |
-| reload config | REPL | `\config reload` |
+| roles (catalog records, not logins) | REPL | `\user list`, `\user add <n>`, `\user remove <n>` run `CREATE ROLE` / `DROP ROLE`; `\password <n>` only says where server passwords come from |
+| what the shell is connected to | REPL | `\conninfo` (the shell opens the database itself: no port, no TLS) |
+| reload shell settings | REPL | `\config reload` (the shell was started with `--config <file>`) |
 
 ## TOML configuration sections
 
@@ -300,22 +299,19 @@ SWITCHOVER TO '3f2a…';         -- new_primary | epoch | final_sequence | this_
 No release contains multi-primary replication or sharding. The `ha-tier2` / `ha-tier3`
 feature names are deprecated and select nothing beyond `ha-tier1` (physical standby).
 
-### Recipe 6: User management (REPL)
+### Recipe 6: Roles (REPL)
 ```
-heliosdb> \user list
-heliosdb> \user add reportreader
-heliosdb> \password reportreader
-   New password: ********
-   Re-type:      ********
-heliosdb> \user remove olduser
+heliosdb> \user list                -- SELECT rolname, rolsuper, rolcanlogin FROM pg_roles
+heliosdb> \user add reportreader    -- CREATE ROLE "reportreader"
+heliosdb> \user remove olduser      -- DROP ROLE "olduser"
 ```
-Or via SQL:
-```sql
-CREATE USER reportreader WITH PASSWORD 'changeme';
-ALTER USER reportreader WITH PASSWORD 'newsecret';
-DROP USER olduser;
-GRANT SELECT ON ALL TABLES IN SCHEMA public TO reportreader;
-```
+**A role made this way (or with `CREATE ROLE ... PASSWORD`) is a catalog record, not a login.** It
+does not become a connectable account, and no privilege is enforced from it (`GRANT` records
+privileges; it does not restrict a connection). `\password <name>` changes nothing: it prints where
+the accounts a server accepts come from, which is the server's own authentication settings
+(`heliosdb-nano start --auth ... --password ...` seeds the admin account; see Recipe 1).
+
+`GRANT ... ON ALL TABLES IN SCHEMA` is not accepted by the planner; grant on a named table.
 
 ### Recipe 7: systemd unit (template — not pre-baked)
 ```ini

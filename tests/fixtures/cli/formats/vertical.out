@@ -1,0 +1,11 @@
+-[ RECORD 1 ]
+n      | NULL
+b      | \xdeadbeef
+j      | {"a":[1,2]}
+ts     | 2026-01-02 03:04:05 UTC
+v      | [1.0,2.5]
+u      | héllo ✓ 日本
+tricky | a,"b"
+c|d	e
+f      | 1.5
+i      | 9007199254740993

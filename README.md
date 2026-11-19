@@ -224,6 +224,19 @@ heliosdb> SELECT * FROM products WHERE price < 15;
 (1 row)
 ```
 
+For scripts and CI the same command runs SQL without a prompt (`sql` is an alias of `repl`):
+
+```bash
+$ heliosdb-nano sql --data-dir ./mydata -c "SELECT id, name FROM products" --format json
+[{"id":1,"name":"Widget"},{"id":2,"name":"Gadget"}]
+$ heliosdb-nano sql --data-dir ./mydata -f schema.sql      # `-f -` reads standard input
+```
+
+`--format` is `table` (the default), `csv`, `tsv`, `json`, `jsonl`, `vertical` or `markdown`. Results go to
+stdout and errors to stderr; the exit code is 0 when every statement ran, 1 for a usage error, 2 when the
+database cannot be opened and 3 when a statement failed. `-1` runs everything in one transaction (data
+changes only: DDL is not transactional), `-t` drops headers, `--null TEXT` sets how NULL is written.
+
 ### PostgreSQL Client (`psql`)
 
 ```bash

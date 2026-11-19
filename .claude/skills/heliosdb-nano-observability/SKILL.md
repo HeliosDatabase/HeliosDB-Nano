@@ -1,6 +1,6 @@
 ---
 name: heliosdb-nano-observability
-description: Tracing, slow-query logging, health checks, statistics, and metrics in HeliosDB-Nano. Covers `RUST_LOG` filters, the WARN-level slow-query log (1 s default threshold), the `GET /health` HTTP endpoint, REPL diagnostic commands (`\stats`, `\compression`, `\optimize`, `\indexes`), and Prometheus integration where wired. Use this when the user is debugging performance, asking "why is this slow", monitoring uptime, or wiring Nano into Grafana / their alerting stack.
+description: Tracing, slow-query logging, health checks, statistics, and metrics in HeliosDB-Nano. Covers `RUST_LOG` filters, the WARN-level slow-query log (1 s default threshold), the `GET /health` HTTP endpoint, REPL diagnostic commands (`\stats`, `\compression`, `\indexes`, `\timing`), and Prometheus integration where wired. Use this when the user is debugging performance, asking "why is this slow", monitoring uptime, or wiring Nano into Grafana / their alerting stack.
 allowed-tools: Bash(heliosdb-nano *), Bash(curl *), Bash(psql *), Read
 ---
 
@@ -23,9 +23,8 @@ allowed-tools: Bash(heliosdb-nano *), Bash(curl *), Bash(psql *), Read
 | slow-query log | (auto) | logged at `WARN` for any statement > 1 s |
 | stats (REPL) | REPL | `\stats` |
 | compression stats | REPL | `\compression [<table>]` |
-| optimize hints | REPL | `\optimize <table>` |
 | index recommendations | REPL | `\indexes <table>` |
-| toggle query timing | REPL | `\timing` |
+| query timing | REPL | `\timing` toggles, `\timing on` / `\timing off` set it |
 | EXPLAIN | SQL | `EXPLAIN [ANALYZE] SELECT …` |
 
 ## Recipes
@@ -70,11 +69,10 @@ Then implement (`CREATE INDEX …`) and re-`EXPLAIN` to confirm.
 ### Recipe 6: Stats / compression
 ```
 heliosdb> \stats
-   tables:        12
-   total rows:    8 312 405
-   data size:     1.2 GiB
-   wal size:      48 MiB
-   cache hit:     94.3 %
+   Tables: 12
+   Branches:                  (the rows of pg_database_branches())
+   Materialized view staleness: (the rows of pg_mv_staleness())
+   Vector indexes:            (the rows of pg_vector_index_stats())
 
 heliosdb> \compression orders
    compressed: 78.4 % of raw

@@ -430,12 +430,14 @@ PRAGMA table_info(posts);
 ```
 **Nano REPL meta-commands:**
 ```
-\dt              -- list user tables (size, row count)
-\d posts         -- columns, indexes, constraints, FKs of one table
-\dS              -- list system dictionary views
-\dmv             -- list materialized views
-\indexes posts   -- index recommendations
+\d               -- list the tables
+\dt              -- list the tables with their details
+\d posts         -- describe one table (`\d "My Table"` for a name with spaces)
+\dS [view]       -- list the system dictionary views, or describe one
+\dmv [view]      -- list materialized views, or describe one
+\indexes posts   -- the indexes of a table
 ```
+The shell's command list (`\h`, `\h schema`) is rendered from one table in `src/repl/registry.rs`.
 
 ### Recipe 8: Drop with safety
 ```sql

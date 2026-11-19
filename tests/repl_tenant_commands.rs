@@ -10,14 +10,16 @@
 //! - \tenant delete - Delete tenant
 //! - \tenant current - Show current context
 //! - \tenant clear - Clear tenant context
-//!
-//! NOTE: These tests are disabled because they use internal APIs that are not
-//! publicly exposed. They need to be rewritten to use the public API.
-//! Enable with: cargo test --features internal-tests
 
-#![cfg(feature = "internal-tests")]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::many_single_char_names
+)]
 
-// `commands` is private; MetaCommand is publicly re-exported from `repl` (src/repl/mod.rs:16).
+// `commands` is private; MetaCommand is publicly re-exported from `repl` (src/repl/mod.rs).
 use heliosdb_nano::repl::MetaCommand;
 
 // ============================================================================

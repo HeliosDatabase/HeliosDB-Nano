@@ -1,9 +1,11 @@
 //! REPL shell implementation
 
 use super::completer::SqlCompleter;
+use super::display::{self, DisplaySettings, Terminal};
 use super::formatter;
+use super::lexer::StatementScanner;
 use super::{commands::MetaCommandResult, MetaCommand, ReplConfig};
-use crate::{EmbeddedDatabase, Error, Result};
+use crate::{EmbeddedDatabase, Error, Result, StatementOutcome};
 use colored::Colorize;
 use rustyline::error::ReadlineError;
 use rustyline::highlight::Highlighter;
@@ -12,6 +14,7 @@ use rustyline::history::FileHistory;
 use rustyline::validate::Validator;
 use rustyline::Editor;
 use rustyline::Helper;
+use std::io::IsTerminal;
 use std::time::Instant;
 
 /// REPL shell
@@ -21,46 +24,15 @@ pub struct ReplShell {
     editor: Editor<ReplHelper, FileHistory>,
     show_timing: bool,
     show_lsn: bool,
+    /// Print no banner and no farewell (`repl -q`).
+    quiet: bool,
+    /// `\x`, `\pset`, `\t`, `\a`: how rows are drawn.
+    display: DisplaySettings,
 }
 
 /// Helper for rustyline
 struct ReplHelper {
     completer: SqlCompleter,
-}
-
-/// Whether the shell runs `sql` on the query route, for its rows, rather than as
-/// a command, which only shows a row count.
-/// v07.1: run a `SHOW` statement and format its rows under the column names
-/// the engine gives (`SHOW work_mem` -> one `work_mem` column; `SHOW ALL` ->
-/// `name`, `setting`, `description`).
-fn render_show(db: &crate::EmbeddedDatabase, sql: &str) -> crate::Result<String> {
-    let (results, columns) = db.query_with_columns(sql)?;
-    let schema = crate::Schema::new(
-        columns
-            .iter()
-            .map(|name| crate::Column::new(name, crate::DataType::Text))
-            .collect(),
-    );
-    Ok(formatter::format_results(&results, &schema))
-}
-
-fn sql_returns_rows(sql: &str) -> bool {
-    let sql_upper = sql.trim().to_uppercase();
-    sql_upper.starts_with("SELECT")
-        || sql_upper.starts_with("WITH")
-        || sql_upper.starts_with("TABLE")
-        || sql_upper.starts_with("VALUES")
-        || sql_upper.starts_with("EXPLAIN")
-        || sql_upper.starts_with("PRAGMA")
-        // SHOW BRANCHES / SHOW DATABASE BRANCHES / SHOW <var> all
-        // produce result rows; without this the executor still
-        // returns the tuples but `db.execute()` discards them and
-        // only the row count surfaces ("Query OK, N row(s) affected").
-        || sql_upper.starts_with("SHOW")
-        // `MERGE BRANCH x ABORT` answers with the tables it may have left
-        // partially changed.
-        || crate::sql::Parser::parse_merge_branch_abort(sql).is_some()
-        || sql_upper.contains(" RETURNING ")
 }
 
 impl Helper for ReplHelper {}
@@ -111,6 +83,7 @@ impl ReplShell {
         }
 
         let show_timing = config.show_timing;
+        let display = DisplaySettings::from_config(&config);
 
         Ok(Self {
             db,
@@ -118,18 +91,31 @@ impl ReplShell {
             editor,
             show_timing,
             show_lsn: false,
+            quiet: false,
+            display,
         })
+    }
+
+    /// Print no banner and no farewell.
+    pub fn set_quiet(&mut self, quiet: bool) {
+        self.quiet = quiet;
     }
 
     /// Run the REPL
     pub fn run(&mut self) -> Result<()> {
-        self.print_banner();
+        if !self.quiet {
+            self.print_banner();
+        }
 
-        let mut multi_line_buffer = String::new();
+        // One scanner reads the terminal and the pipe alike: it keeps the raw
+        // lines of the open statement, cuts them at the semicolons outside a
+        // quote, dollar quote or comment, and runs every statement it completes.
+        let mut scanner = StatementScanner::new();
+        let interactive = std::io::stdin().is_terminal();
 
         loop {
-            // Determine prompt based on whether we're in multi-line mode
-            let prompt = if multi_line_buffer.is_empty() {
+            // Determine prompt based on whether a statement is open
+            let prompt = if !scanner.is_open() {
                 format!(
                     "{} {} ",
                     "heliosdb".green().bold(),
@@ -139,7 +125,11 @@ impl ReplShell {
                     format!("[{}]", self.db.current_branch()).cyan()
                 ) + ">"
             } else {
-                "       -> ".yellow().to_string()
+                // The prompt names the open construct: `->` a statement,
+                // `'>` a string, `$>` a dollar quote, `*>` a comment.
+                format!("       {} ", scanner.continuation_prompt())
+                    .yellow()
+                    .to_string()
             };
 
             // Read line
@@ -147,120 +137,63 @@ impl ReplShell {
                 Ok(line) => {
                     let trimmed = line.trim();
 
-                    // Skip empty lines
-                    if trimmed.is_empty() {
-                        continue;
-                    }
-
-                    // Add to history
-                    let _ = self.editor.add_history_entry(&line);
-
-                    // Check for meta commands (only when not in multi-line mode)
-                    if multi_line_buffer.is_empty() && trimmed.starts_with('\\') {
-                        if let Some(meta_cmd) = MetaCommand::parse(trimmed) {
-                            match meta_cmd.execute(&self.db, self.show_timing, Some(&self.config)) {
-                                Ok(MetaCommandResult::Quit) => {
-                                    println!("Goodbye!");
-                                    break;
-                                }
-                                Ok(MetaCommandResult::ToggleTiming(new_state)) => {
-                                    self.show_timing = new_state;
-                                }
-                                Ok(MetaCommandResult::SwitchBranch(branch_name)) => {
-                                    // sprinter 6bc4a4040eb7 (B1): `\use` has already
-                                    // bound THIS REPL's session (`switch_branch`,
-                                    // which refuses a branch that is not active);
-                                    // the prompt reads that binding.
-                                    // Branch data isolation is now active
-                                    if branch_name != "main" {
-                                        println!(
-                                            "{}",
-                                            format!(
-                                                "Switched to branch '{}' with data isolation enabled.",
-                                                branch_name
-                                            )
-                                            .green()
-                                        );
-                                        println!(
-                                            "{}",
-                                            "  Data changes on this branch are isolated from main.".dimmed()
-                                        );
-                                    }
-                                }
-                                Ok(MetaCommandResult::ToggleLsn(_)) => {
-                                    self.show_lsn = !self.show_lsn;
-                                }
-                                Ok(MetaCommandResult::ConfigReloaded(new_config)) => {
-                                    // Apply the new configuration
-                                    self.show_timing = new_config.show_timing;
-                                    self.config = new_config;
-                                }
-                                Ok(MetaCommandResult::Continue) => {}
-                                Err(e) => {
-                                    eprintln!("{}", formatter::format_error(&e.to_string()));
-                                }
-                            }
+                    if !scanner.is_open() {
+                        // Skip empty lines
+                        if trimmed.is_empty() {
                             continue;
-                        } else {
-                            eprintln!(
-                                "{}",
-                                formatter::format_error(&format!(
-                                    "Unknown meta command: {}. Type \\h for help.",
-                                    trimmed
-                                ))
-                            );
+                        }
+
+                        // Meta commands are recognised only when no statement is open
+                        if trimmed.starts_with('\\') {
+                            scanner.reset();
+                            if interactive {
+                                let _ = self.editor.add_history_entry(&line);
+                            }
+                            if self.run_meta_command(trimmed) {
+                                break;
+                            }
                             continue;
                         }
                     }
 
-                    // Strip comments from the line for proper semicolon detection
-                    let stripped_line = crate::sql::Parser::strip_sql_comments(trimmed);
-                    let stripped_trimmed = stripped_line.trim();
-
-                    // Skip comment-only lines entirely - don't add to buffer
-                    if stripped_trimmed.is_empty() {
-                        continue;
+                    // The raw line, newline included, goes to the scanner:
+                    // whitespace inside a literal is part of the statement.
+                    let completed = scanner.feed(&format!("{line}\n"));
+                    if !scanner.is_open() {
+                        // Only whitespace and comments are left; drop them.
+                        scanner.reset();
                     }
-
-                    // Add stripped content to multi-line buffer
-                    if !multi_line_buffer.is_empty() {
-                        multi_line_buffer.push('\n');
-                    }
-                    multi_line_buffer.push_str(stripped_trimmed);
-
-                    // Check if statement is complete (ends with semicolon after stripping comments)
-                    if stripped_trimmed.ends_with(';') {
-                        // Execute the statement
-                        self.execute_sql(&multi_line_buffer);
-
-                        // Clear buffer
-                        multi_line_buffer.clear();
-
-                        // Update table names for completion — the tables of
-                        // the branch the REPL is on (sprinter 6bc4a4040eb7, B3).
-                        let tables = {
-                            let _catalog_scope = self.db.embedded_catalog_scope();
-                            self.db.storage.catalog().list_tables()
-                        };
-                        if let Ok(tables) = tables {
-                            if let Some(helper) = self.editor.helper_mut() {
-                                helper.completer.set_table_names(tables);
-                            }
-                        }
+                    if !completed.is_empty() {
+                        self.run_statements(&completed, interactive);
                     }
                 }
                 Err(ReadlineError::Interrupted) => {
-                    // Ctrl-C - clear multi-line buffer
-                    if !multi_line_buffer.is_empty() {
+                    // Ctrl-C - clear the open statement
+                    if scanner.is_open() {
                         println!("^C");
-                        multi_line_buffer.clear();
+                        scanner.reset();
                     } else {
                         println!("Use \\q or Ctrl-D to exit");
                     }
                 }
                 Err(ReadlineError::Eof) => {
+                    // End of input. A statement left without its terminator is
+                    // run; an open quote or comment is an error.
+                    if let Some(open) = scanner.open_construct() {
+                        eprintln!(
+                            "{}",
+                            formatter::format_error(&format!(
+                                "unterminated {open} at end of input; the statement was not run"
+                            ))
+                        );
+                    } else {
+                        let last = scanner.finish();
+                        self.run_statements(&last, interactive);
+                    }
                     // Ctrl-D - exit
-                    println!("Goodbye!");
+                    if !self.quiet {
+                        println!("Goodbye!");
+                    }
                     break;
                 }
                 Err(err) => {
@@ -271,14 +204,125 @@ impl ReplShell {
         }
 
         // Save history
-        if let Some(history_path) = &self.config.history_path {
-            let _ = self.editor.save_history(history_path);
+        if interactive {
+            if let Some(history_path) = &self.config.history_path {
+                let _ = self.editor.save_history(history_path);
+            }
         }
 
         Ok(())
     }
 
-    /// Execute a SQL statement (expects comments already stripped)
+    /// Run the statements the scanner completed, in order, then refresh the
+    /// table names completion offers.
+    fn run_statements(&mut self, statements: &[String], interactive: bool) {
+        for statement in statements {
+            // Leading comments are dropped so the keyword checks see the
+            // keyword; comments inside the statement go through untouched.
+            let sql = crate::protocol::postgres::handler::pg_skip_leading_comments(statement).trim();
+            if sql.is_empty() {
+                continue;
+            }
+            if interactive {
+                let _ = self.editor.add_history_entry(sql);
+            }
+            self.execute_sql(sql);
+        }
+
+        // Update table names for completion — the tables of
+        // the branch the REPL is on (sprinter 6bc4a4040eb7, B3).
+        let tables = {
+            let _catalog_scope = self.db.embedded_catalog_scope();
+            self.db.storage.catalog().list_tables()
+        };
+        if let Ok(tables) = tables {
+            if let Some(helper) = self.editor.helper_mut() {
+                helper.completer.set_table_names(tables);
+            }
+        }
+    }
+
+    /// `\x`, `\pset`, `\t`, `\a`: change how rows are drawn. Returns whether
+    /// `command` was one of them.
+    fn apply_display_command(&mut self, command: &MetaCommand) -> bool {
+        let outcome = match command {
+            MetaCommand::Expanded(value) => {
+                display::parse_expanded(value.as_deref(), self.display.expanded).map(|mode| {
+                    self.display.expanded = mode;
+                    self.display.touched = true;
+                    format!("Expanded display is {}.", display::expanded_name(mode))
+                })
+            }
+            MetaCommand::Pset { option, value } => self.display.pset(option, value.as_deref()),
+            MetaCommand::TuplesOnly(state) => {
+                let value = state.map(|on| if on { "on" } else { "off" });
+                self.display.pset("tuples_only", value)
+            }
+            MetaCommand::Aligned => self.display.pset("aligned", None),
+            _ => return false,
+        };
+        match outcome {
+            Ok(message) => println!("{message}"),
+            Err(message) => eprintln!("{}", formatter::format_error(&message)),
+        }
+        true
+    }
+
+    /// Run one backslash command. Returns true when the shell is to quit.
+    fn run_meta_command(&mut self, trimmed: &str) -> bool {
+        let Some(meta_cmd) = MetaCommand::parse(trimmed) else {
+            eprintln!(
+                "{}",
+                formatter::format_error(&format!("Unknown meta command: {}. Type \\h for help.", trimmed))
+            );
+            return false;
+        };
+        // The display commands change the shell's own settings.
+        if self.apply_display_command(&meta_cmd) {
+            return false;
+        }
+        match meta_cmd.execute(&self.db, self.show_timing, Some(&self.config)) {
+            Ok(MetaCommandResult::Quit) => {
+                if !self.quiet {
+                    println!("Goodbye!");
+                }
+                return true;
+            }
+            Ok(MetaCommandResult::ToggleTiming(new_state)) => {
+                self.show_timing = new_state;
+            }
+            Ok(MetaCommandResult::SwitchBranch(branch_name)) => {
+                // sprinter 6bc4a4040eb7 (B1): `\use` has already
+                // bound THIS REPL's session (`switch_branch`,
+                // which refuses a branch that is not active);
+                // the prompt reads that binding.
+                // Branch data isolation is now active
+                if branch_name != "main" {
+                    println!(
+                        "{}",
+                        format!("Switched to branch '{}' with data isolation enabled.", branch_name).green()
+                    );
+                    println!("{}", "  Data changes on this branch are isolated from main.".dimmed());
+                }
+            }
+            Ok(MetaCommandResult::ToggleLsn(_)) => {
+                self.show_lsn = !self.show_lsn;
+            }
+            Ok(MetaCommandResult::ConfigReloaded(new_config)) => {
+                // Apply the new configuration
+                self.show_timing = new_config.show_timing;
+                self.display = DisplaySettings::from_config(&new_config);
+                self.config = new_config;
+            }
+            Ok(MetaCommandResult::Continue) => {}
+            Err(e) => {
+                eprintln!("{}", formatter::format_error(&e.to_string()));
+            }
+        }
+        false
+    }
+
+    /// Execute one SQL statement (leading comments already dropped)
     fn execute_sql(&mut self, sql: &str) {
         // Skip whitespace-only input (comments already stripped before calling this)
         if sql.trim().is_empty() {
@@ -317,138 +361,42 @@ impl ReplShell {
             }
         }
 
-        // Try to determine if this is a query (SELECT) or a command (INSERT, UPDATE, etc.)
-        // Also treat UPDATE/DELETE/INSERT with RETURNING as queries.
-        // EXPLAIN also returns results, so treat it as a query.
-        // PRAGMA table_info(...) returns rows; route it through the query path.
-        let sql_upper = sql.trim().to_uppercase();
-
-        if sql_returns_rows(sql) {
-            // PRAGMA short-circuit: sqlparser doesn't recognise PRAGMA, so
-            // we synthesise a fixed schema for `table_info(t)` and an empty
-            // result schema for connection-tunable PRAGMAs (foreign_keys,
-            // journal_mode, …) — everything still goes through `db.query`.
-            if sql_upper.starts_with("PRAGMA") {
-                if let Some((name, _arg)) = crate::sql::sqlite_compat::parse_pragma(sql) {
-                    let schema = if name.eq_ignore_ascii_case("table_info") {
-                        crate::Schema::new(vec![
-                            crate::Column::new("cid", crate::DataType::Int4),
-                            crate::Column::new("name", crate::DataType::Text),
-                            crate::Column::new("type", crate::DataType::Text),
-                            crate::Column::new("notnull", crate::DataType::Int4),
-                            crate::Column::new("dflt_value", crate::DataType::Text),
-                            crate::Column::new("pk", crate::DataType::Int4),
-                        ])
-                    } else {
-                        crate::Schema::new(vec![])
-                    };
-                    match self.db.query(sql, &[]) {
-                        Ok(results) => {
-                            let duration = start.elapsed();
-                            println!("\n{}", formatter::format_results(&results, &schema));
-                            if self.show_timing {
-                                println!("{}", formatter::format_timing(duration.as_secs_f64()));
-                            }
-                        }
-                        Err(e) => eprintln!("{}", formatter::format_error(&e.to_string())),
+        // The engine decides whether the statement returned rows or only an
+        // affected count, and names the columns of the rows it returned.
+        match self.db.run_statement(sql) {
+            Ok(StatementOutcome::Rows { columns, rows }) => {
+                let duration = start.elapsed();
+                // At a terminal (or once the user has asked) the rows are drawn by
+                // the display settings; through a pipe the table is the old one.
+                let terminal = Terminal::detect();
+                let rendered = display::render(&self.display, &columns, &rows, terminal);
+                println!();
+                display::print_paged(&rendered.text, &self.display, terminal);
+                if self.show_timing {
+                    println!("{}", formatter::format_timing(duration.as_secs_f64()));
+                }
+                if self.show_lsn {
+                    if let Some(lsn) = self.db.current_lsn() {
+                        println!("{}", format!("LSN: {}", lsn).dimmed());
                     }
-                    return;
                 }
             }
+            Ok(StatementOutcome::Affected(affected)) => {
+                let duration = start.elapsed();
+                let message = super::runner::affected_message(sql, affected);
 
-            // v07.1: `SHOW <name>` / `SHOW ALL` have no plan to take headers
-            // from (the planner does not plan SHOW), so the shell used to print
-            // only "Query returned 1 row(s)". The engine names the columns.
-            if sql_upper.starts_with("SHOW ") && !crate::sql::Parser::is_show_branches(sql.trim()) {
-                match render_show(&self.db, sql) {
-                    Ok(text) => {
-                        let duration = start.elapsed();
-                        println!("\n{}", text);
-                        if self.show_timing {
-                            println!("{}", formatter::format_timing(duration.as_secs_f64()));
-                        }
-                    }
-                    Err(e) => eprintln!("{}", formatter::format_error(&e.to_string())),
+                println!("{}", message.green());
+                if self.show_timing {
+                    println!("{}", formatter::format_timing(duration.as_secs_f64()));
                 }
-                return;
-            }
-
-            // Execute query
-            match self.db.query(sql, &[]) {
-                Ok(results) => {
-                    let duration = start.elapsed();
-
-                    // The headers come from planning the statement again. That plan
-                    // reads the catalog directly, outside the engine, so the
-                    // shell's session and its branch are published first, as the
-                    // `\d` family does. Without the scope a SELECT on a branch
-                    // was planned against main: a table that exists only on the
-                    // branch printed "Query returned N row(s)" and no rows, and a
-                    // column added on the branch had no header.
-                    if let Ok(parser) = crate::sql::Parser::new().parse_one(sql) {
-                        let planned = {
-                            let _catalog_scope = self.db.embedded_catalog_scope();
-                            let catalog = self.db.storage.catalog();
-                            let planner = crate::sql::Planner::with_catalog(&catalog);
-                            planner.statement_to_plan(parser)
-                        };
-                        if let Ok(plan) = planned {
-                            let schema = plan.schema();
-                            println!("\n{}", formatter::format_results(&results, &schema));
-                            if self.show_timing {
-                                println!("{}", formatter::format_timing(duration.as_secs_f64()));
-                            }
-                            if self.show_lsn {
-                                if let Some(lsn) = self.db.current_lsn() {
-                                    println!("{}", format!("LSN: {}", lsn).dimmed());
-                                }
-                            }
-                            return;
-                        }
+                if self.show_lsn {
+                    if let Some(lsn) = self.db.current_lsn() {
+                        println!("{}", format!("LSN: {}", lsn).dimmed());
                     }
-
-                    // Fallback: just show tuple count
-                    println!("{}", format!("Query returned {} row(s)", results.len()).dimmed());
-                    if self.show_timing {
-                        println!("{}", formatter::format_timing(duration.as_secs_f64()));
-                    }
-                    if self.show_lsn {
-                        if let Some(lsn) = self.db.current_lsn() {
-                            println!("{}", format!("LSN: {}", lsn).dimmed());
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!("{}", formatter::format_error(&e.to_string()));
                 }
             }
-        } else {
-            // Execute command
-            match self.db.execute(sql) {
-                Ok(affected) => {
-                    let duration = start.elapsed();
-
-                    let message = if sql_upper.starts_with("CREATE") {
-                        "Query OK".to_string()
-                    } else if sql_upper.starts_with("DROP") {
-                        "Query OK".to_string()
-                    } else {
-                        format!("Query OK, {} row(s) affected", affected)
-                    };
-
-                    println!("{}", message.green());
-                    if self.show_timing {
-                        println!("{}", formatter::format_timing(duration.as_secs_f64()));
-                    }
-                    if self.show_lsn {
-                        if let Some(lsn) = self.db.current_lsn() {
-                            println!("{}", format!("LSN: {}", lsn).dimmed());
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!("{}", formatter::format_error(&e.to_string()));
-                }
+            Err(e) => {
+                eprintln!("{}", formatter::format_error(&e.to_string()));
             }
         }
     }
@@ -496,37 +444,5 @@ impl ReplShell {
             "\\q".cyan()
         );
         println!();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::sql_returns_rows;
-
-    /// sprinter 6bc4a4040eb7 (B3 third fix pass): the REPL shows what an ABORT
-    /// reports (the tables it may have left partially changed), and an ordinary
-    /// merge stays a command.
-    #[test]
-    fn the_shell_runs_a_merge_abort_for_its_rows() {
-        assert!(sql_returns_rows("MERGE BRANCH r ABORT"));
-        assert!(sql_returns_rows("merge database branch r abort;"));
-        assert!(!sql_returns_rows("MERGE BRANCH r INTO main"));
-        assert!(sql_returns_rows("SELECT 1"));
-        assert!(sql_returns_rows("DELETE FROM t RETURNING id"));
-        assert!(!sql_returns_rows("DELETE FROM t"));
-    }
-
-    /// v07.1: the shell prints the VALUE of a SHOW (it used to print only
-    /// "Query returned 1 row(s)"), and SHOW ALL works as `\set` suggests.
-    #[test]
-    #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
-    fn the_shell_prints_show_values() {
-        let db = crate::EmbeddedDatabase::new_in_memory().unwrap();
-        let text = super::render_show(&db, "SHOW work_mem").unwrap();
-        assert!(text.contains("work_mem") && text.contains("4096"), "{text}");
-        let text = super::render_show(&db, "SHOW server_version").unwrap();
-        assert!(text.contains(&crate::sql::params::pg_server_version_string()), "{text}");
-        let text = super::render_show(&db, "SHOW ALL").unwrap();
-        assert!(text.contains("description") && text.contains("row_security"), "{text}");
     }
 }

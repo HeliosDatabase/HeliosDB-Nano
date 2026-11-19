@@ -113,8 +113,12 @@ heliosdb-nano start --data-dir ./mydata --port 5432 --listen 127.0.0.1 --auth sc
 **Schema export from existing Postgres** (one-time):
 ```bash
 pg_dump --schema-only --no-owner mydb > schema.sql
-heliosdb-nano repl --data-dir ./mydata < schema.sql
+heliosdb-nano sql --data-dir ./mydata -f schema.sql
 ```
+(`heliosdb-nano repl --data-dir ./mydata < schema.sql` also works.) The shell reads the file with the same statement rules as the server (dollar-quoted function
+bodies, multi-line literals and comments, several statements on a line, a last statement without
+`;`), so a `pg_dump` schema runs as written. A statement that fails prints its error on stderr and
+the load continues (`sql -f` stops at the first failure and exits 3; add `--on-error-stop=false` to run on, or `-1` to roll back DML).
 
 ### Recipe 3: MySQL/MariaDB → HeliosDB-Nano
 1. Start with `--mysql`:

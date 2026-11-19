@@ -21,32 +21,129 @@ heliosdb>
 ```sql
 heliosdb> \h
 
-HeliosDB Nano REPL Commands
-════════════════════════════════════════════════════════════
+╔══════════════════════════════════════════════════════════════════════════════╗
+║              HeliosDB Nano - Interactive SQL REPL Help                      ║
+╚══════════════════════════════════════════════════════════════════════════════╝
 
-Meta Commands:
-  \q, \quit, \exit  - Quit the REPL
-  \h, \help, \?        - Show this help
-  \d                - List all tables
-  \d <table>          - Describe table schema
-  \dt               - List tables with details
-  \timing           - Toggle query timing
-  \e, \edit          - Edit query in $EDITOR (not yet implemented)
+Quick Start:
+  \h  Show this help
+  \h <category>  Show category help (e.g., \h vectors)
+  \q  Exit REPL
 
-SQL Commands:
-  End SQL statements with semicolon (;)
-  Multi-line statements are supported
-  Press Ctrl-C to cancel current input
-  Press Ctrl-D to exit
+Help Categories:
+  basics  Fundamental REPL operations
+  schema  Table and view exploration
+  branching  Database branching workflows
+  time-travel  Query historical data
+  vectors  Vector search and indexing
+  documents  Document storage and RAG
+  agents  AI agent sessions
+  ai  AI inference and generation
+  tenants  Multi-tenant isolation
+  settings  Configuration and tuning
+  examples  Practical SQL examples
+  sql  SQL syntax reference
 
-Examples:
-  CREATE TABLE users (id INT, name TEXT);
-  INSERT INTO users VALUES (1, 'Alice');
-  SELECT * FROM users;
-  \d users
-
-heliosdb>
+heliosdb> \h basics
 ```
+
+The backslash commands of every category come from one table
+(`src/repl/registry.rs`), so the help lists exactly the commands the shell accepts and nothing
+else. The basics:
+
+```
+  \q, \quit, \exit              Quit REPL
+  \h, \help, \?                 Show help menu
+  \h <category>                 Show category-specific help
+  \timing [on|off]              Show or set query execution timing (bare \timing toggles)
+  \x [on|off|auto]              Expanded output: one block per row
+  \pset <option> [value]        Set a display option: format, null, border, maxrows, maxwidth, ...
+  \d, \d <table>, \dt           List tables, describe a table
+  \conninfo                     Show what this shell is connected to
+```
+
+A statement ends at a semicolon that is outside a quote, a `$$` body and a comment; an open
+construct continues on the next line (see "Multi-line bodies and schema files"). Ctrl-C cancels
+the open statement and Ctrl-D exits.
+
+### Multi-line bodies and schema files
+
+The shell cuts its input at the semicolons that are outside a quote, a
+dollar-quoted body and a comment, by the same rules the PostgreSQL wire uses, so
+a function body can be typed over several lines and a schema file can be piped in:
+
+```sql
+heliosdb> CREATE FUNCTION inc(x INT) RETURNS INT AS $$
+       $> BEGIN
+       $>   RETURN $1 + 1;
+       $> END;
+       $> $$ LANGUAGE plpgsql;
+Query OK
+heliosdb> SELECT inc(1);
+```
+
+```bash
+heliosdb-nano repl --data-dir ./mydata < schema.sql
+```
+
+A statement that is open when the input ends (a string or comment never closed)
+is reported on stderr and not run; a final statement that only lacks its
+semicolon is run.
+
+### Scripting
+
+`repl` (alias `sql`) runs SQL without a prompt when given `-c` or `-f`: no banner, no history file,
+results on stdout in the chosen `--format`, errors on stderr.
+
+```bash
+heliosdb-nano sql --memory -c "SELECT 1 AS a" --format json        # [{"a":1}]
+heliosdb-nano sql --data-dir ./db -f schema.sql                     # a file; `-f -` is standard input
+heliosdb-nano sql --data-dir ./db -1 -f load.sql                    # one transaction (data changes only)
+heliosdb-nano sql --data-dir ./db --config repl.toml -c "SELECT 1"  # shell settings from a file
+```
+
+| Flag | Meaning |
+|------|---------|
+| `-c SQL` / `-f FILE` | run this SQL / this file (repeatable; commands first, then files) |
+| `--format F` | `table`, `csv`, `tsv`, `json` (one array per statement), `jsonl`, `vertical`, `markdown` |
+| `-t` | no header row and no row count |
+| `--null TEXT` | how NULL is written (empty for csv/tsv/markdown, `NULL` for table/vertical, `null` in JSON) |
+| `-1` | one transaction: `COMMIT` at the end, `ROLLBACK` at the first failure. DDL is not transactional in Nano, and `CALL` or a user-defined function inside a transaction is refused, so the rollback is complete for data changes only |
+| `--on-error-stop=false` | run on after a failure (still exits 3 at the end) |
+| `--config FILE` | `output_format`, `null_display`, `show_timing`, ... for the shell; `\config reload` re-reads it |
+
+Exit codes: 0 every statement ran, 1 usage or a fatal error (an unreadable file), 2 the database could
+not be opened, 3 a statement failed. With `--format json` a failed statement is one JSON object
+(`error`, `statement`, `sql`) on stderr.
+
+### Reading wide and long results
+
+At a terminal results are drawn for reading: one rule under the header and none between rows,
+numbers right-aligned, a cell wider than `max_column_width` cut with `…`, columns that do not fit the
+window left out with a marker and a footer saying how many, and a result taller than the screen sent
+through `$PAGER` (default `less -FRSX`). Through a pipe the output is the plain table, unchanged.
+
+| Command | Effect |
+|---------|--------|
+| `\x [on\|off\|auto]` | one block per row (`-[ RECORD n ]`); `auto` does it only when the table is wider than the window |
+| `\pset format F` | `table`, `csv`, `tsv`, `json`, `jsonl`, `vertical`, `markdown` |
+| `\pset null TEXT` | how NULL is shown (`\pset null '(null)'`) |
+| `\pset border 0\|1\|2` | no lines, a rule under the header, a full box |
+| `\pset maxrows N` | show the first and last N/2 rows with a footer; `0` (the default) shows all |
+| `\pset maxwidth N` | cut cells at N columns; `0` shows them whole |
+| `\pset pager on\|off` | use `$PAGER` for a result taller than the screen |
+| `\t [on\|off]` | no header and no row count |
+| `\a` | toggle aligned and unaligned (`\|`-separated) output |
+
+A setting you change applies to a pipe as well; nothing you did not ask for does.
+
+### What a statement prints
+
+Whether a statement shows rows or an affected count is decided by the engine, not
+by its first word: `(SELECT 1) UNION (SELECT 2)`, `EXECUTE` of a prepared query,
+`SHOW ...`, `INSERT ... RETURNING` (with the names the clause gives the columns)
+and the `SHOW CLUSTER STATUS` family print rows; `INSERT INTO t VALUES ('x returning y')`
+prints `Query OK, 1 row(s) affected`.
 
 ### 2. Create Tables
 ```sql

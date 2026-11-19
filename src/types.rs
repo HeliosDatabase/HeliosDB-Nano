@@ -446,6 +446,29 @@ pub struct Tuple {
     pub branch_id: Option<u64>,
 }
 
+/// What running one statement produced: the rows it returned, or the number of
+/// rows it changed.
+///
+/// [`EmbeddedDatabase::run_statement`](crate::EmbeddedDatabase::run_statement)
+/// decides which, from the statement and not from its first keyword, so a caller
+/// that shows results (the shell, a script runner) needs no classifier of its
+/// own.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StatementOutcome {
+    /// The statement returned a result set. `columns` holds the names the
+    /// engine gives the columns; it can be empty for a result without a schema
+    /// (a `PRAGMA` that only sets a connection option).
+    Rows {
+        /// Column names, in result order.
+        columns: Vec<String>,
+        /// The rows.
+        rows: Vec<Tuple>,
+    },
+    /// The statement returned no rows; this is the number of rows it affected
+    /// (0 for DDL and transaction control).
+    Affected(u64),
+}
+
 impl Default for Tuple {
     fn default() -> Self {
         Self {

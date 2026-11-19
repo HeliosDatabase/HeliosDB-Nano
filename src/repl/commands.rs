@@ -32,6 +32,14 @@ fn print_query_table(db: &EmbeddedDatabase, title: &str, sql: &str, empty_msg: &
     Ok(())
 }
 
+/// What a role made in the shell is and is not.
+const ROLE_NOTICE: &str = "A role made here is a catalog record, not a login: it cannot connect, and no privilege is\nenforced from it. The accounts a server accepts come from the server's own authentication settings.";
+
+/// `name` as an SQL identifier: double-quoted, with embedded quotes doubled.
+fn quote_identifier(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
 /// Meta command types
 #[derive(Debug, Clone, PartialEq)]
 pub enum MetaCommand {
@@ -53,12 +61,12 @@ pub enum MetaCommand {
     DescribeSystemView(String),
     /// \timing - Toggle timing display
     ToggleTiming,
+    /// \timing on|off - Set timing display
+    SetTiming(bool),
     /// \show lsn - Toggle LSN/transaction number display
     ShowLsn,
     /// \show branch - Show current branch ID
     ShowBranch,
-    /// \e - Edit query in $EDITOR
-    EditQuery,
 
     // v2.0 Feature Commands
     /// \branches - List database branches
@@ -77,18 +85,25 @@ pub enum MetaCommand {
     ShowCompressionTable(String),
 
     // v2.1 Feature Commands
-    /// \set `<var>` `<value>` - Set REPL variable
+    /// \set `<var>` `<value>` - REPL variables are not supported; says so
     SetVariable(String, String),
-    /// \set - Show all variables
+    /// \set - REPL variables are not supported; says so
     ShowVariables,
-    /// \server start - Start server mode
-    ServerStart,
-    /// \server stop - Stop server mode
-    ServerStop,
-    /// \server status - Show server status
-    ServerStatus,
-    /// \ssl status - Show SSL/TLS status
-    SslStatus,
+    /// \conninfo - Show what this shell is connected to
+    ConnInfo,
+    /// \x [on|off|auto] - Expanded output
+    Expanded(Option<String>),
+    /// \pset `<option>` [`<value>`] - Display setting
+    Pset {
+        /// The option (`format`, `null`, `border`, `maxrows`, `maxwidth`, `pager`, ...)
+        option: String,
+        /// Its value; none toggles an on/off option and clears `null`
+        value: Option<String>,
+    },
+    /// \t [on|off] - Tuples only
+    TuplesOnly(Option<bool>),
+    /// \a - Toggle aligned and unaligned output
+    Aligned,
     /// \user list - List users
     UserList,
     /// \user add `<name>` - Add user
@@ -101,8 +116,6 @@ pub enum MetaCommand {
     ShowConfig,
     /// \config reload - Reload configuration from file
     ConfigReload,
-    /// \optimize `<table>` - Show optimization recommendations
-    OptimizeTable(String),
     /// \indexes `<table>` - Show index recommendations
     ShowIndexes(String),
     /// \stats - Show database statistics
@@ -313,10 +326,21 @@ impl MetaCommand {
             return None;
         }
 
-        let parts: Vec<&str> = trimmed.get(1..).unwrap_or("").split_whitespace().collect();
+        let rest = trimmed.get(1..).unwrap_or("");
+        let parts: Vec<&str> = rest.split_whitespace().collect();
         if parts.is_empty() {
             return None;
         }
+        // The commands that take names and settings read their arguments
+        // quote-aware (`\d "My Table"`, `\pset null '(null)'`); the ones that take
+        // free text or SQL keep the words as typed.
+        let quoted = || match super::registry::split_args(rest) {
+            Ok(args) => Some(args),
+            Err(message) => {
+                eprintln!("{message}");
+                None
+            }
+        };
 
         match parts.first().copied() {
             // Basic commands
@@ -332,25 +356,29 @@ impl MetaCommand {
                 }
             }
             Some("d") => {
-                if parts.len() > 1 {
-                    Some(MetaCommand::DescribeTable(
-                        parts.get(1).copied().unwrap_or("").to_string(),
-                    ))
-                } else {
-                    Some(MetaCommand::ListTables)
+                let args = quoted()?;
+                match args.get(1) {
+                    Some(table) => Some(MetaCommand::DescribeTable(table.clone())),
+                    None => Some(MetaCommand::ListTables),
                 }
             }
             Some("dt") => Some(MetaCommand::ListTablesDetailed),
             Some("dS") => {
-                if parts.len() > 1 {
-                    Some(MetaCommand::DescribeSystemView(
-                        parts.get(1).copied().unwrap_or("").to_string(),
-                    ))
-                } else {
-                    Some(MetaCommand::ListSystemViews)
+                let args = quoted()?;
+                match args.get(1) {
+                    Some(view) => Some(MetaCommand::DescribeSystemView(view.clone())),
+                    None => Some(MetaCommand::ListSystemViews),
                 }
             }
-            Some("timing") => Some(MetaCommand::ToggleTiming),
+            Some("timing") => match parts.get(1).copied() {
+                None => Some(MetaCommand::ToggleTiming),
+                Some(arg) if arg.eq_ignore_ascii_case("on") => Some(MetaCommand::SetTiming(true)),
+                Some(arg) if arg.eq_ignore_ascii_case("off") => Some(MetaCommand::SetTiming(false)),
+                Some(_) => {
+                    eprintln!("Usage: \\timing [on|off]");
+                    None
+                }
+            },
 
             // v3.4 Information Commands
             Some("version") => Some(MetaCommand::Version),
@@ -390,13 +418,13 @@ impl MetaCommand {
                 }
             }
             Some("lsn") => Some(MetaCommand::ShowLsn), // Keep for backward compatibility
-            Some("e" | "edit") => Some(MetaCommand::EditQuery),
 
             // v2.0 Feature commands
             Some("branches") => Some(MetaCommand::ListBranches),
             Some("use" | "switch") => {
-                if parts.len() > 1 {
-                    Some(MetaCommand::UseBranch(parts.get(1).copied().unwrap_or("").to_string()))
+                let args = quoted()?;
+                if let Some(branch) = args.get(1) {
+                    Some(MetaCommand::UseBranch(branch.clone()))
                 } else {
                     eprintln!("Usage: \\use <branch_name>");
                     None
@@ -434,25 +462,31 @@ impl MetaCommand {
                     Some(MetaCommand::ShowVariables)
                 }
             }
-            Some("server") => {
-                if parts.len() > 1 {
-                    match parts.get(1).copied() {
-                        Some("start") => Some(MetaCommand::ServerStart),
-                        Some("stop") => Some(MetaCommand::ServerStop),
-                        Some("status") => Some(MetaCommand::ServerStatus),
-                        _ => None,
-                    }
-                } else {
-                    Some(MetaCommand::ServerStatus)
-                }
+            Some("conninfo") => Some(MetaCommand::ConnInfo),
+
+            // Display settings
+            Some("x") => {
+                let args = quoted()?;
+                Some(MetaCommand::Expanded(args.get(1).cloned()))
             }
-            Some("ssl") => {
-                if parts.len() > 1 && parts.get(1).copied() == Some("status") {
-                    Some(MetaCommand::SslStatus)
-                } else {
-                    Some(MetaCommand::SslStatus)
-                }
+            Some("pset") => {
+                let args = quoted()?;
+                let option = args.get(1)?.clone();
+                Some(MetaCommand::Pset {
+                    option,
+                    value: args.get(2).cloned(),
+                })
             }
+            Some("t") => match parts.get(1).copied() {
+                None => Some(MetaCommand::TuplesOnly(None)),
+                Some(arg) if arg.eq_ignore_ascii_case("on") => Some(MetaCommand::TuplesOnly(Some(true))),
+                Some(arg) if arg.eq_ignore_ascii_case("off") => Some(MetaCommand::TuplesOnly(Some(false))),
+                Some(_) => {
+                    eprintln!("Usage: \\t [on|off]");
+                    None
+                }
+            },
+            Some("a") => Some(MetaCommand::Aligned),
             Some("user") => {
                 if parts.len() > 1 {
                     match parts.get(1).copied() {
@@ -491,15 +525,6 @@ impl MetaCommand {
                     Some(MetaCommand::ConfigReload)
                 } else {
                     Some(MetaCommand::ShowConfig)
-                }
-            }
-            Some("optimize") => {
-                if parts.len() > 1 {
-                    Some(MetaCommand::OptimizeTable(
-                        parts.get(1).copied().unwrap_or("").to_string(),
-                    ))
-                } else {
-                    None
                 }
             }
             Some("indexes") => {
@@ -1418,6 +1443,11 @@ impl MetaCommand {
                 Ok(MetaCommandResult::ToggleTiming(new_state))
             }
 
+            MetaCommand::SetTiming(new_state) => {
+                println!("Timing is {}", if *new_state { "on".green() } else { "off".red() });
+                Ok(MetaCommandResult::ToggleTiming(*new_state))
+            }
+
             MetaCommand::ShowLsn => {
                 // We don't know the current state here, so we return true (enable)
                 // The shell will handle toggling based on current state
@@ -1523,11 +1553,6 @@ impl MetaCommand {
                 println!("  SELECT * FROM {}();", view_name.cyan());
                 println!();
 
-                Ok(MetaCommandResult::Continue)
-            }
-
-            MetaCommand::EditQuery => {
-                println!("{}", "Query editing not yet implemented".yellow());
                 Ok(MetaCommandResult::Continue)
             }
 
@@ -1673,171 +1698,72 @@ impl MetaCommand {
             }
 
             // v2.1 Feature commands
-            MetaCommand::SetVariable(name, value) => {
-                println!("Set {} = {}", name.cyan(), value.yellow());
-                println!("{}", "Note: Use SQL SET command for persistent settings".dimmed());
-                println!("  {}", format!("SET {} = {};", name, value).cyan());
+            MetaCommand::SetVariable(name, _) => {
+                println!(
+                    "{}",
+                    format!("\\set: shell variables are not supported, so '{name}' was not stored.").yellow()
+                );
+                println!("{}", "Use the SQL statement for a session setting:".dimmed());
+                println!("  {}", format!("SET {name} = ...;").cyan());
                 Ok(MetaCommandResult::Continue)
             }
 
             MetaCommand::ShowVariables => {
-                println!("\n{}", "REPL Variables:".bold());
-                println!("{}", "─".repeat(70));
-                println!("{}", "Use SQL SHOW command to view session settings:".dimmed());
+                println!(
+                    "{}",
+                    "\\set: shell variables are not supported. Session settings are shown with SQL:".yellow()
+                );
                 println!("  {}", "SHOW ALL;".cyan());
-                println!("  {}", "SHOW optimizer;".cyan());
                 println!("  {}", "SHOW statement_timeout;".cyan());
-                println!();
                 Ok(MetaCommandResult::Continue)
             }
 
-            MetaCommand::ServerStart => {
-                println!("{}", "Server mode not available in REPL".yellow());
-                println!("{}", "Use: heliosdb-nano start --config config.toml".dimmed());
+            // The shell applies these to its own settings before it gets here.
+            MetaCommand::Expanded(_) | MetaCommand::Pset { .. } | MetaCommand::TuplesOnly(_) | MetaCommand::Aligned => {
                 Ok(MetaCommandResult::Continue)
             }
 
-            MetaCommand::ServerStop => {
-                println!("{}", "Server mode not available in REPL".yellow());
-                Ok(MetaCommandResult::Continue)
-            }
-
-            MetaCommand::ServerStatus => {
-                println!("\n{}", "Server Status:".bold());
-                println!("{}", "─".repeat(70));
-                println!("  Mode: {}", "Embedded REPL".cyan());
-                println!("  Server: {}", "Not running".dimmed());
-                println!();
-                println!("{}", "To start server:".dimmed());
-                println!("  {}", "heliosdb-nano start --port 5432".cyan());
-                println!();
-                Ok(MetaCommandResult::Continue)
-            }
-
-            MetaCommand::SslStatus => {
-                println!("\n{}", "SSL/TLS Status:".bold());
-                println!("{}", "─".repeat(70));
-                println!("  Enabled: {}", "No (REPL mode)".dimmed());
-                println!();
-                println!("{}", "Configure in config.toml:".dimmed());
-                println!("  [server]");
-                println!("  tls_enabled = true");
-                println!("  tls_cert_path = \"/path/to/cert.pem\"");
-                println!("  tls_key_path = \"/path/to/key.pem\"");
-                println!();
+            MetaCommand::ConnInfo => {
+                println!("{}", super::status::render_conninfo(db));
                 Ok(MetaCommandResult::Continue)
             }
 
             MetaCommand::UserList => {
-                println!("\n{}", "Users:".bold());
-                println!("{}", "─".repeat(70));
-                println!("{}", "User management not available in REPL mode".yellow());
-                println!("{}", "Configure authentication in config.toml".dimmed());
+                print_query_table(
+                    db,
+                    "Roles:",
+                    "SELECT rolname, rolsuper, rolcanlogin FROM pg_roles",
+                    "(no roles)",
+                )?;
+                println!("{}", ROLE_NOTICE.dimmed());
                 println!();
                 Ok(MetaCommandResult::Continue)
             }
 
             MetaCommand::UserAdd(name) => {
-                println!(
-                    "{}",
-                    format!("User management not available in REPL mode. User '{}' not added.", name).yellow()
-                );
+                db.execute(&format!("CREATE ROLE {}", quote_identifier(name)))?;
+                println!("{}", format!("Role '{name}' created.").green());
+                println!("{}", ROLE_NOTICE.yellow());
                 Ok(MetaCommandResult::Continue)
             }
 
             MetaCommand::UserRemove(name) => {
-                println!(
-                    "{}",
-                    format!(
-                        "User management not available in REPL mode. User '{}' not removed.",
-                        name
-                    )
-                    .yellow()
-                );
+                db.execute(&format!("DROP ROLE {}", quote_identifier(name)))?;
+                println!("{}", format!("Role '{name}' dropped.").green());
                 Ok(MetaCommandResult::Continue)
             }
 
             MetaCommand::ChangePassword(user) => {
+                println!("{}", format!("\\password: nothing changed for '{user}'.").yellow());
                 println!(
                     "{}",
-                    format!("Password change not available in REPL mode for user '{}'.", user).yellow()
+                    "The accounts a server accepts come from the server's own authentication settings\n(heliosdb-nano start --auth ... / its password options); a role made in this shell is a\ncatalog record and has no login to change.".dimmed()
                 );
                 Ok(MetaCommandResult::Continue)
             }
 
             MetaCommand::ShowConfig => {
-                println!("\n{}", "Current Configuration:".bold());
-                println!("{}", "─".repeat(70));
-
-                // REPL configuration
-                println!("{}", "REPL Settings:".bold());
-                if let Some(cfg) = config {
-                    println!(
-                        "  Timing display:  {}",
-                        if cfg.show_timing {
-                            "enabled".green()
-                        } else {
-                            "disabled".yellow()
-                        }
-                    );
-                    println!("  Output format:   {}", format!("{:?}", cfg.output_format).cyan());
-                    println!(
-                        "  Show row count:  {}",
-                        if cfg.show_row_count {
-                            "enabled".green()
-                        } else {
-                            "disabled".yellow()
-                        }
-                    );
-                    println!(
-                        "  Auto-commit:     {}",
-                        if cfg.auto_commit {
-                            "enabled".green()
-                        } else {
-                            "disabled".yellow()
-                        }
-                    );
-                    println!("  Null display:    \"{}\"", cfg.null_display);
-                    println!("  Max col width:   {}", cfg.max_column_width);
-                    println!("  Max history:     {}", cfg.max_history);
-                    if let Some(path) = &cfg.history_path {
-                        println!("  History file:    {}", path);
-                    }
-                    if let Some(path) = &cfg.config_path {
-                        println!("  Config file:     {}", path.display());
-                    } else {
-                        println!("  Config file:     {}", "(none - reload disabled)".yellow());
-                    }
-                } else {
-                    println!("  {}", "(configuration context not available)".yellow());
-                }
-                println!();
-
-                // Storage configuration
-                println!("{}", "Storage:".bold());
-                println!("  WAL: {}", "enabled".green());
-                println!("  Compression: {}", "zstd".cyan());
-                println!("  Time-Travel: {}", "enabled".green());
-                println!();
-
-                // Performance configuration
-                println!("{}", "Performance:".bold());
-                println!(
-                    "  Workers: {}",
-                    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
-                );
-                println!("  SIMD: {}", "enabled".green());
-                println!();
-
-                if config.map(|c| c.config_path.is_some()).unwrap_or(false) {
-                    println!("{}", "Use \\config reload to reload from file".dimmed());
-                } else {
-                    println!(
-                        "{}",
-                        "Start REPL with --config to enable reload: heliosdb-nano repl --config config.toml".dimmed()
-                    );
-                }
-                println!();
+                println!("{}", super::status::render_config(db, config));
                 Ok(MetaCommandResult::Continue)
             }
 
@@ -1891,21 +1817,6 @@ impl MetaCommand {
                 }
             }
 
-            MetaCommand::OptimizeTable(table_name) => {
-                println!("\n{}: {}", "Optimization Recommendations".bold(), table_name.cyan());
-                println!("{}", "─".repeat(70));
-                println!("{}", "Use EXPLAIN to analyze queries:".dimmed());
-                println!("  {}", format!("EXPLAIN SELECT * FROM {};", table_name).cyan());
-                println!();
-                println!("{}", "Run index recommender:".dimmed());
-                println!(
-                    "  {}",
-                    format!("SELECT * FROM recommend_indexes('{}');", table_name).cyan()
-                );
-                println!();
-                Ok(MetaCommandResult::Continue)
-            }
-
             MetaCommand::ShowIndexes(table_name) => {
                 // Walk the in-memory ART manager filtered to this
                 // table — no embedded-path system view exposes per-table
@@ -1953,15 +1864,19 @@ impl MetaCommand {
                 if let Ok(tables) = catalog.list_tables() {
                     println!("  Tables: {}", tables.len().to_string().cyan());
                 }
-
-                println!();
-                println!("{}", "Detailed statistics:".dimmed());
-                println!("  {}", "SELECT * FROM pg_database_branches();".cyan());
-                println!("  {}", "SELECT * FROM pg_mv_staleness();".cyan());
-                println!("  {}", "SELECT * FROM pg_vector_index_stats();".cyan());
-                println!("  {}", "SELECT * FROM heliosdb_lock_census();".cyan());
-                println!("  {}", "SELECT * FROM heliosdb_write_volume();".cyan());
-                println!("  {}", "SELECT * FROM heliosdb_copy_phase_stats();".cyan());
+                print_query_table(db, "Branches:", "SELECT * FROM pg_database_branches()", "(no branches)")?;
+                print_query_table(
+                    db,
+                    "Materialized view staleness:",
+                    "SELECT * FROM pg_mv_staleness()",
+                    "(no materialized views)",
+                )?;
+                print_query_table(
+                    db,
+                    "Vector indexes:",
+                    "SELECT * FROM pg_vector_index_stats()",
+                    "(no vector indexes)",
+                )?;
                 println!();
                 Ok(MetaCommandResult::Continue)
             }
@@ -3239,85 +3154,7 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
             }
 
             MetaCommand::Telemetry => {
-                println!("\n{}", "Database Telemetry:".bold());
-                println!("{}", "═".repeat(60));
-
-                // Storage stats
-                println!("\n{}", "Storage:".bold());
-                let catalog = db.storage.catalog();
-                match catalog.list_tables() {
-                    Ok(tables) => {
-                        println!("  Tables: {}", tables.len().to_string().cyan());
-                    }
-                    Err(_) => {
-                        println!("  Tables: {}", "unknown".dimmed());
-                    }
-                }
-
-                // System info
-                println!("\n{}", "System:".bold());
-                println!(
-                    "  Workers: {}",
-                    std::thread::available_parallelism()
-                        .map(|n| n.get().to_string())
-                        .unwrap_or_else(|_| "unknown".to_string())
-                        .cyan()
-                );
-
-                // Memory info using sysinfo crate
-                {
-                    use sysinfo::System;
-                    let sys = System::new_all();
-                    println!("  Memory Used: {} MB", sys.used_memory() / 1024 / 1024);
-                    println!("  Memory Total: {} MB", sys.total_memory() / 1024 / 1024);
-                }
-
-                // Configuration
-                println!("\n{}", "Configuration:".bold());
-                println!("  WAL: {}", "enabled".green());
-                println!("  Compression: {}", "zstd".cyan());
-                println!("  Time-Travel: {}", "enabled".green());
-                println!("  SIMD: {}", "enabled".green());
-
-                // Vector stores
-                println!("\n{}", "Vector Stores:".bold());
-                match db.list_vector_stores() {
-                    Ok(stores) => {
-                        if stores.is_empty() {
-                            println!("  {}", "None configured".dimmed());
-                        } else {
-                            for store in stores {
-                                println!(
-                                    "  {} ({} dims, {} vectors)",
-                                    store.name.cyan(),
-                                    store.dimensions,
-                                    store.vector_count
-                                );
-                            }
-                        }
-                    }
-                    Err(_) => {
-                        println!("  {}", "Unable to retrieve".dimmed());
-                    }
-                }
-
-                // Agent sessions
-                println!("\n{}", "Agent Sessions:".bold());
-                match db.list_agent_sessions() {
-                    Ok(sessions) => {
-                        println!("  Active: {}", sessions.len().to_string().cyan());
-                    }
-                    Err(_) => {
-                        println!("  Active: {}", "unknown".dimmed());
-                    }
-                }
-
-                println!();
-                println!("{}", "For detailed stats, use:".dimmed());
-                println!("  {}", "SELECT * FROM pg_database_branches();".cyan());
-                println!("  {}", "SELECT * FROM pg_mv_staleness();".cyan());
-                println!("  {}", "SELECT * FROM pg_vector_index_stats();".cyan());
-                println!();
+                println!("{}", super::status::render_telemetry(db));
                 Ok(MetaCommandResult::Continue)
             }
 
@@ -4726,52 +4563,7 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
             }
 
             MetaCommand::Status => {
-                println!("\n{}", "Database Status".bold());
-                println!("{}", "═".repeat(50));
-
-                // Connection info
-                println!("\n{}", "Connection:".cyan());
-                println!("  Mode: REPL (embedded)");
-                println!("  State: {}", "Connected".green());
-
-                // Current branch
-                let current_branch = db.current_branch();
-                println!("  Branch: {}", current_branch.cyan());
-
-                // Schema info
-                let catalog = db.storage.catalog();
-                let tables = catalog.list_tables().unwrap_or_default();
-                println!("\n{}", "Schema:".cyan());
-                println!("  Tables: {}", tables.len());
-
-                // Storage info
-                if let Some(stats) = db.storage.get_storage_stats() {
-                    println!("\n{}", "Storage:".cyan());
-                    println!("  Approximate size: {} bytes", stats.approximate_size);
-                    println!("  Keys: {}", stats.key_count);
-                }
-
-                // Features
-                println!("\n{}", "Features:".cyan());
-                println!(
-                    "  WAL: {}",
-                    if db.config.storage.wal_enabled {
-                        "Enabled".green()
-                    } else {
-                        "Disabled".yellow()
-                    }
-                );
-                println!("  Compression: {}", "Enabled (zstd)".green());
-                println!(
-                    "  Time-Travel: {}",
-                    if db.config.storage.time_travel_enabled {
-                        "Enabled".green()
-                    } else {
-                        "Disabled".yellow()
-                    }
-                );
-
-                println!();
+                println!("{}", super::status::render_status(db));
                 Ok(MetaCommandResult::Continue)
             }
 
@@ -4891,58 +4683,7 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
             }
 
             MetaCommand::ReplicationStatus => {
-                println!(
-                    "\n{}",
-                    "╔═══════════════════════════════════════════════════════════════╗".cyan()
-                );
-                println!(
-                    "{}",
-                    "║                    REPLICATION STATUS                         ║".cyan()
-                );
-                println!(
-                    "{}",
-                    "╚═══════════════════════════════════════════════════════════════╝".cyan()
-                );
-                println!();
-
-                // Check WAL status
-                if db.storage.is_wal_enabled() {
-                    println!("{}: {}", "WAL Status".bold(), "Enabled".green());
-                    if let Some(lsn) = db.storage.wal_lsn() {
-                        println!("  Current LSN: {}", lsn);
-                    }
-                } else {
-                    println!("{}: {}", "WAL Status".bold(), "Disabled".yellow());
-                }
-
-                // Show feature status
-                println!();
-                println!("{}:", "Replication Features".bold());
-                #[cfg(feature = "ha-tier1")]
-                {
-                    println!("  {}: {} (physical standby)", "Replication".cyan(), "Enabled".green());
-                }
-                #[cfg(not(feature = "ha-tier1"))]
-                {
-                    println!(
-                        "  {}: {} (enable with --features ha-tier1)",
-                        "Replication".cyan(),
-                        "Disabled".dimmed()
-                    );
-                }
-                println!();
-                println!("{}:", "Configuration".bold());
-                println!("  Mode: {} (standalone)", "Single Node".yellow());
-                println!("  Role: {}", "Primary".green());
-
-                println!();
-                println!("{}:", "To enable replication".dimmed());
-                println!("  1. Build with: cargo build --features ha-tier1");
-                println!("  2. Configure replication in config.toml");
-                println!("  3. Start primary: heliosdb-nano start --role primary");
-                println!("  4. Start standby: heliosdb-nano start --role standby --primary <host:port>");
-                println!();
-
+                println!("{}", super::status::render_replication(db));
                 Ok(MetaCommandResult::Continue)
             }
         }
@@ -5692,139 +5433,6 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
             bar_char.to_string().repeat(filled),
             "░".dimmed().to_string().repeat(empty)
         )
-    }
-
-    /// Print help text
-    fn print_help() {
-        println!(
-            "\n{}",
-            format!("HeliosDB Nano v{} REPL Commands", env!("CARGO_PKG_VERSION")).bold()
-        );
-        println!("{}", "═".repeat(70));
-
-        println!("\n{}", "Basic Meta Commands:".bold());
-        println!("  {}  - Quit the REPL", "\\q, \\quit, \\exit".cyan());
-        println!("  {}        - Show this help", "\\h, \\help, \\?".cyan());
-        println!("  {}                - List all tables", "\\d".cyan());
-        println!("  {}          - Describe table schema", "\\d <table>".cyan());
-        println!("  {}               - List tables with details", "\\dt".cyan());
-        println!("  {}               - List system views", "\\dS".cyan());
-        println!("  {}          - Describe system view", "\\dS <view>".cyan());
-        println!("  {}          - Toggle query timing", "\\timing".cyan());
-
-        println!("\n{}", "v2.0 Feature Commands:".bold());
-        println!("  {}         - List database branches", "\\branches".cyan());
-        println!("  {}        - List time-travel snapshots", "\\snapshots".cyan());
-        println!("  {}              - List materialized views", "\\dmv".cyan());
-        println!("  {}         - Describe materialized view", "\\dmv <view>".cyan());
-        println!("  {}      - Show compression statistics", "\\compression".cyan());
-        println!("  {} - Show compression for table", "\\compression <table>".cyan());
-
-        println!("\n{}", "v2.1 Feature Commands:".bold());
-        println!("  {}               - Show all settings", "\\set".cyan());
-        println!(
-            "  {}    - Set REPL variable (use SQL SET for persistent)",
-            "\\set <var> <value>".cyan()
-        );
-        println!("  {}      - Show server status", "\\server [status]".cyan());
-        println!("  {}   - Start server (use CLI)", "\\server start".cyan());
-        println!("  {}    - Stop server (use CLI)", "\\server stop".cyan());
-        println!("  {}      - Show SSL/TLS status", "\\ssl [status]".cyan());
-        println!("  {}        - List users", "\\user [list]".cyan());
-        println!("  {}     - Add user", "\\user add <name>".cyan());
-        println!("  {}  - Remove user", "\\user remove <name>".cyan());
-        println!("  {}  - Change password", "\\password <user>".cyan());
-        println!("  {}           - Show configuration", "\\config".cyan());
-        println!("  {}      - Reload configuration", "\\config reload".cyan());
-        println!("  {} - Optimization recommendations", "\\optimize <table>".cyan());
-        println!("  {}   - Index recommendations", "\\indexes <table>".cyan());
-        println!("  {}            - Database statistics", "\\stats".cyan());
-
-        println!("\n{}", "v2.6 AI Feature Commands:".bold());
-        println!("  {}    - List AI schema templates", "\\ai templates".cyan());
-        println!("  {} - Show template details", "\\ai template <name>".cyan());
-        println!("  {}   - Infer schema from data", "\\ai infer [format]".cyan());
-        println!("  {} - Generate schema from description", "\\ai generate <desc>".cyan());
-        println!("  {} - AI optimization suggestions", "\\ai optimize <table>".cyan());
-
-        println!("\n{}", "v3.2 Multi-Tenancy Commands:".bold());
-        println!("  {}         - List all tenants", "\\tenants".cyan());
-        println!("  {}       - List all tenants", "\\tenant list".cyan());
-        println!(
-            "  {} - Create tenant",
-            "\\tenant create <name> [plan] [isolation]".cyan()
-        );
-        println!("  {}      - Set current tenant context", "\\tenant use <name>".cyan());
-        println!("  {}     - Show tenant details", "\\tenant info <name>".cyan());
-        println!("  {}    - Show quota usage", "\\tenant quota [name]".cyan());
-        println!("  {}   - Delete tenant", "\\tenant delete <name>".cyan());
-        println!("  {}      - Show current context", "\\tenant current".cyan());
-        println!("  {}        - Clear tenant context", "\\tenant clear".cyan());
-
-        println!("\n{}", "v3.3 Plan Management Commands:".bold());
-        println!("  {}        - List available plans", "\\tenant plans".cyan());
-        println!("  {} - Show plan details", "\\tenant plan info <id>".cyan());
-        println!(
-            "  {} - Create plan (ID auto-generated)",
-            "\\tenant plan create <name> <tier> <storage_mb> <conn> <qps>".cyan()
-        );
-        println!(
-            "  {} - Edit plan field",
-            "\\tenant plan edit <id> <field> <value>".cyan()
-        );
-        println!("  {} - Enable plan", "\\tenant plan enable <id>".cyan());
-        println!("  {} - Disable plan", "\\tenant plan disable <id>".cyan());
-        println!(
-            "  {} - Delete plan (tenants downgraded)",
-            "\\tenant plan delete <id>".cyan()
-        );
-        println!("  {} - Change tenant's plan", "\\tenant plan <tenant> <plan>".cyan());
-        println!("  {}  - Real-time usage with HWM/Avg", "\\tenant usage [name]".cyan());
-        println!();
-        println!(
-            "  {} free, starter, pro, enterprise, unlimited",
-            "Default plans:".dimmed()
-        );
-
-        println!("\n{}", "Database Export Commands:".bold());
-        println!("  {}  - Dump database to SQL file", "\\dump [file]".cyan());
-        println!("       {} - Default: dump.sql", "if no file specified".dimmed());
-
-        println!("\n{}", "SQL Commands:".bold());
-        println!("  End SQL statements with semicolon (;)");
-        println!("  Multi-line statements are supported");
-        println!("  Press {} to cancel current input", "Ctrl-C".yellow());
-        println!("  Press {} to exit", "Ctrl-D".yellow());
-
-        println!("\n{}", "SQL Settings Commands:".bold());
-        println!("  {}", "SET optimizer = on;".cyan());
-        println!("  {}", "SET statement_timeout = 30000;  -- milliseconds".cyan());
-        println!("  {}", "SET work_mem = 8192;  -- KB".cyan());
-        println!("  {}", "SHOW ALL;".cyan());
-        println!("  {}", "SHOW optimizer;".cyan());
-
-        println!("\n{}", "Basic SQL Examples:".bold());
-        println!("  CREATE TABLE users (id INT, name TEXT);");
-        println!("  INSERT INTO users VALUES (1, 'Alice');");
-        println!("  SELECT * FROM users;");
-
-        println!("\n{}", "v2.0 Feature Examples:".bold());
-        println!("  {}", "-- Database Branching".dimmed());
-        println!("  CREATE DATABASE BRANCH dev FROM main AS OF NOW;");
-        println!("  MERGE DATABASE BRANCH dev INTO main;");
-        println!();
-        println!("  {}", "-- Time-Travel Queries".dimmed());
-        println!("  SELECT * FROM orders AS OF TIMESTAMP '2025-11-23 10:00:00';");
-        println!();
-        println!("  {}", "-- Materialized Views".dimmed());
-        println!("  CREATE MATERIALIZED VIEW user_stats AS");
-        println!("    SELECT user_id, COUNT(*) FROM orders GROUP BY user_id");
-        println!("    WITH (auto_refresh = true, max_cpu_percent = 15);");
-        println!();
-        println!("  {}", "-- System Views".dimmed());
-        println!("  SELECT * FROM pg_database_branches();");
-        println!("  SELECT * FROM pg_vector_index_stats();");
-        println!();
     }
 }
 
