@@ -1,8 +1,8 @@
 //! Implementation of dump/restore traits for EmbeddedDatabase
 
 use crate::storage::dump::{
-    DatabaseInterface, DatabaseRestoreInterface, IndexDump, IndexMetadata, RestoreValidation, SchemaObjects, SequenceDump,
-    ViewDump,
+    DatabaseInterface, DatabaseRestoreInterface, IndexDump, IndexMetadata, RestoreValidation, SchemaObjects,
+    SequenceDump, ViewDump,
 };
 use crate::{EmbeddedDatabase, Error, Result, Schema, Tuple, Value};
 
@@ -358,10 +358,8 @@ impl DatabaseInterface for EmbeddedDatabase {
             }
             match crate::storage::index_family(tag) {
                 Some(crate::storage::IndexFamily::Art) => {
-                    let unique = crate::sql::executor::ddl::unique_index_columns(
-                        &definition.options,
-                        &definition.column_name,
-                    );
+                    let unique =
+                        crate::sql::executor::ddl::unique_index_columns(&definition.options, &definition.column_name);
                     let columns = unique.clone().unwrap_or_else(|| vec![definition.column_name.clone()]);
                     let key: Vec<String> = columns.iter().map(|c| quote_ident(c)).collect();
                     objects.indexes.push(IndexDump {

@@ -558,7 +558,7 @@ impl DumpManager {
                 "{}",
                 sql_text::table_ddl_with_identity(table, &schema, &constraints, objects.identity_for(table))?
             )
-                .map_err(|e| Error::storage(format!("Failed to write create table: {}", e)))?;
+            .map_err(|e| Error::storage(format!("Failed to write create table: {}", e)))?;
 
             for fk in &constraints.foreign_keys {
                 deferred_foreign_keys.push(sql_text::foreign_key_ddl(table, fk));
@@ -632,7 +632,8 @@ impl DumpManager {
         }
         for index in &objects.indexes {
             if !wrote_index_header {
-                writeln!(writer, "-- Indexes").map_err(|e| Error::storage(format!("Failed to write comment: {}", e)))?;
+                writeln!(writer, "-- Indexes")
+                    .map_err(|e| Error::storage(format!("Failed to write comment: {}", e)))?;
                 wrote_index_header = true;
             }
             writeln!(writer, "{}", sql_text::index_dump_ddl(index))

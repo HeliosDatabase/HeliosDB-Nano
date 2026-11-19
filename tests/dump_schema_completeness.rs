@@ -108,18 +108,16 @@ fn as_i64(v: &Value) -> i64 {
 fn unique_index_survives_and_rejects_a_duplicate() {
     for format in FORMATS {
         let r = round_trip(format);
-        let err = r
-            .db
-            .execute("INSERT INTO orders (order_no, customer) VALUES (101, 'dup')")
-            .expect_err("a duplicate order_no must be rejected after restore");
+        let err =
+            r.db.execute("INSERT INTO orders (order_no, customer) VALUES (101, 'dup')")
+                .expect_err("a duplicate order_no must be rejected after restore");
         assert!(
             err.to_string().to_lowercase().contains("unique") || err.to_string().contains("duplicate"),
             "{format:?}: {err}"
         );
         // Through the parameter family as well.
-        let err = r
-            .db
-            .execute_params(
+        let err =
+            r.db.execute_params(
                 "INSERT INTO orders (order_no, customer) VALUES ($1, $2)",
                 &[Value::Int8(102), Value::String("dup".into())],
             )
@@ -132,9 +130,11 @@ fn unique_index_survives_and_rejects_a_duplicate() {
 fn ordinary_index_survives() {
     for format in FORMATS {
         let r = round_trip(format);
-        let rows = r
-            .db
-            .query("SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'orders'", &[])
+        let rows =
+            r.db.query(
+                "SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'orders'",
+                &[],
+            )
             .unwrap();
         let defs: Vec<String> = rows.iter().map(|t| text(&t.values[1])).collect();
         let names: Vec<String> = rows.iter().map(|t| text(&t.values[0])).collect();
@@ -195,14 +195,8 @@ fn view_survives_and_returns_rows() {
 fn hnsw_metric_survives() {
     for format in FORMATS {
         let r = round_trip(format);
-        let def = scalar(
-            &r.db,
-            "SELECT indexdef FROM pg_indexes WHERE indexname = 'docs_emb'",
-        );
-        assert!(
-            format!("{def}").contains("vector_cosine_ops"),
-            "{format:?}: {def}"
-        );
+        let def = scalar(&r.db, "SELECT indexdef FROM pg_indexes WHERE indexname = 'docs_emb'");
+        assert!(format!("{def}").contains("vector_cosine_ops"), "{format:?}: {def}");
     }
 }
 
@@ -213,11 +207,17 @@ fn sql_dump_lists_objects_in_postgres_spelling() {
     let path = dir.path().join("d.sql");
     src.dump_sql(&path).unwrap();
     let script = std::fs::read_to_string(&path).unwrap();
-    assert!(script.contains("CREATE SEQUENCE IF NOT EXISTS \"order_no\""), "{script}");
+    assert!(
+        script.contains("CREATE SEQUENCE IF NOT EXISTS \"order_no\""),
+        "{script}"
+    );
     assert!(script.contains("SELECT setval('order_no', 102, true);"), "{script}");
     assert!(script.contains("\"id\" SERIAL PRIMARY KEY"), "{script}");
     assert!(script.contains("\"id\" BIGSERIAL PRIMARY KEY"), "{script}");
-    assert!(script.contains("CREATE UNIQUE INDEX \"orders_order_no_uq\""), "{script}");
+    assert!(
+        script.contains("CREATE UNIQUE INDEX \"orders_order_no_uq\""),
+        "{script}"
+    );
     assert!(script.contains("CREATE VIEW \"big_orders\" AS SELECT"), "{script}");
     // Views come last, after the indexes, which come after the data.
     let insert = script.find("INSERT INTO \"orders\"").unwrap();
@@ -256,6 +256,11 @@ fn a_dump_of_a_unique_violation_is_refused_on_restore() {
     src.dump_sql(&path).unwrap();
     let script = std::fs::read_to_string(&path).unwrap().replace("101", "100");
     let db = EmbeddedDatabase::new_in_memory().unwrap();
-    let err = db.execute_sql_script(&script).expect_err("duplicate rows under a unique index");
-    assert!(err.to_string().contains("orders_order_no_uq") || err.to_string().to_lowercase().contains("unique"), "{err}");
+    let err = db
+        .execute_sql_script(&script)
+        .expect_err("duplicate rows under a unique index");
+    assert!(
+        err.to_string().contains("orders_order_no_uq") || err.to_string().to_lowercase().contains("unique"),
+        "{err}"
+    );
 }

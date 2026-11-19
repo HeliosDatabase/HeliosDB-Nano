@@ -20,7 +20,7 @@
 
 use super::settings::{default_value, is_server_level, is_user_settable, render_value, SessionSettings};
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock, RwLock, Weak};
+use std::sync::{OnceLock, RwLock, Weak};
 
 /// The PostgreSQL major version this server reports, on every surface.
 pub const PG_COMPAT_VERSION: &str = "16.0";

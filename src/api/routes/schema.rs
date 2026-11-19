@@ -56,7 +56,9 @@ mod tests {
                     .method("POST")
                     .uri("/compare")
                     .header("content-type", "application/json")
-                    .body(Body::from(r#"{"source":"CREATE TABLE a (x INT)","target":"CREATE TABLE b (y TEXT)"}"#))
+                    .body(Body::from(
+                        r#"{"source":"CREATE TABLE a (x INT)","target":"CREATE TABLE b (y TEXT)"}"#,
+                    ))
                     .unwrap(),
             )
             .await

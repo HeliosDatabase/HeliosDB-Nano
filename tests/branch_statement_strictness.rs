@@ -130,7 +130,8 @@ fn trailing_semicolon_and_comment_still_accepted() {
     let db = seeded();
     db.execute("CREATE BRANCH c1 AS OF NOW").unwrap();
     db.execute("DROP BRANCH c1; -- done").expect("drop with ; and comment");
-    db.execute("MERGE BRANCH dev INTO main /* go */ ;").expect("merge with comment");
+    db.execute("MERGE BRANCH dev INTO main /* go */ ;")
+        .expect("merge with comment");
     assert_eq!(main_ids(&db), 2);
 }
 

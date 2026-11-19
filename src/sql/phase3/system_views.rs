@@ -4399,7 +4399,10 @@ impl SystemViewRegistry {
                 Value::Int8(branch.parent_id.map(|id| id as i64).unwrap_or(0)),
                 // v10.2: wall-clock creation time, NULL when not recorded
                 // (`created_at` is a logical counter, not a time).
-                branch.created_at_wall_clock().map(Value::Timestamp).unwrap_or(Value::Null),
+                branch
+                    .created_at_wall_clock()
+                    .map(Value::Timestamp)
+                    .unwrap_or(Value::Null),
                 Value::Int8(branch.created_from_snapshot as i64),
                 // Storage size is not measured: NULL, never 0-as-fact.
                 Value::Null,
@@ -4520,7 +4523,10 @@ impl SystemViewRegistry {
                 Value::Null,
                 Value::Null,
                 Value::Null,
-                branch.created_at_wall_clock().map(Value::Timestamp).unwrap_or(Value::Null),
+                branch
+                    .created_at_wall_clock()
+                    .map(Value::Timestamp)
+                    .unwrap_or(Value::Null),
                 Value::Null,
             ]);
             results.push(tuple);

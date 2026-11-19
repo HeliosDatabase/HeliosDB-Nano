@@ -207,7 +207,9 @@ impl BranchingParser {
             }
         }
         if quote.is_some() {
-            return Err(Error::sql_parse(format!("{statement}: unterminated quoted option value")));
+            return Err(Error::sql_parse(format!(
+                "{statement}: unterminated quoted option value"
+            )));
         }
         pieces.push(current);
 

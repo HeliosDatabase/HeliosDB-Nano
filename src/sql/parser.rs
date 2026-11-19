@@ -4120,7 +4120,12 @@ impl Parser {
         let with_options = match tail.get(..4) {
             Some(word)
                 if word.eq_ignore_ascii_case("WITH")
-                    && tail.get(4..).unwrap_or("").chars().next().is_none_or(|c| c.is_whitespace() || c == '(') =>
+                    && tail
+                        .get(4..)
+                        .unwrap_or("")
+                        .chars()
+                        .next()
+                        .is_none_or(|c| c.is_whitespace() || c == '(') =>
             {
                 let options = Self::skip_branch_blanks(tail.get(4..).unwrap_or(""));
                 let end = if options.starts_with('(') {
