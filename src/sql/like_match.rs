@@ -120,6 +120,7 @@ pub fn like_match(text: &str, pattern: &str, escape: Option<char>, case_insensit
 mod tests {
     use super::*;
 
+    #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
     fn m(text: &str, pattern: &str) -> bool {
         like_match(text, pattern, Some('\\'), false).expect("valid pattern")
     }

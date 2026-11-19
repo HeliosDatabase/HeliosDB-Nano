@@ -14479,7 +14479,13 @@ async fn show_all_follows_set_reset_and_discard_all() {
 // ---------------------------------------------------------------------------
 
 /// Parse one named statement through the dispatcher and Sync.
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::large_futures
+)]
 async fn v014_parse(handler: &mut PgConnectionHandler<DuplexStream>, client: &mut DuplexStream, name: &str, sql: &str) {
     use super::messages::FrontendMessage;
     handler
@@ -14496,7 +14502,13 @@ async fn v014_parse(handler: &mut PgConnectionHandler<DuplexStream>, client: &mu
 }
 
 /// Bind + Execute + Sync of a stored statement; the wire bytes.
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::large_futures
+)]
 async fn v014_bind_execute(
     handler: &mut PgConnectionHandler<DuplexStream>,
     client: &mut DuplexStream,
@@ -14525,7 +14537,13 @@ async fn v014_bind_execute(
 }
 
 #[tokio::test]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::large_futures
+)]
 async fn v014_deallocate_drops_a_protocol_level_statement() {
     for (spelling, name) in [
         ("DEALLOCATE s1", "s1"),
@@ -14555,7 +14573,13 @@ async fn v014_deallocate_drops_a_protocol_level_statement() {
 }
 
 #[tokio::test]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::large_futures
+)]
 async fn v014_unknown_statement_is_26000_everywhere() {
     use super::messages::{DescribeTarget, FrontendMessage};
     let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
@@ -14581,7 +14605,13 @@ async fn v014_unknown_statement_is_26000_everywhere() {
 }
 
 #[tokio::test]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::large_futures
+)]
 async fn v014_deallocate_all_through_the_extended_protocol_keeps_its_portal() {
     use super::messages::FrontendMessage;
     let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
@@ -14624,7 +14654,13 @@ async fn v014_deallocate_all_through_the_extended_protocol_keeps_its_portal() {
 }
 
 #[tokio::test]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::large_futures
+)]
 async fn v014_sql_prepare_deallocate_and_failed_block_recovery() {
     let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
     let (mut handler, mut client) = test_handler(db);
@@ -14655,7 +14691,13 @@ async fn v014_sql_prepare_deallocate_and_failed_block_recovery() {
 
 /// Parse (declared types) / Bind (per-parameter formats) / Describe(portal) /
 /// Execute / Sync through the dispatcher; the wire bytes after Parse.
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::large_futures
+)]
 async fn gh54_extended(
     handler: &mut PgConnectionHandler<DuplexStream>,
     client: &mut DuplexStream,
@@ -14706,7 +14748,13 @@ fn gh54_numeric(ndigits: i16, weight: i16, sign: u16, dscale: i16, groups: &[u16
 }
 
 #[tokio::test]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::large_futures
+)]
 async fn gh54_binary_date_and_friends_are_decoded_by_their_type() {
     let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
     db.execute(
@@ -14785,7 +14833,13 @@ async fn gh54_binary_date_and_friends_are_decoded_by_their_type() {
 }
 
 #[test]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::large_futures
+)]
 fn gh54_binary_decoders() {
     use super::prepared::decode_parameter;
     use crate::Value;
@@ -14833,7 +14887,13 @@ fn gh54_binary_decoders() {
 }
 
 #[tokio::test]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::large_futures
+)]
 async fn gh52_boolean_results_are_boolean_with_bound_parameters() {
     let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
     db.execute("CREATE TABLE gh52 (id INT PRIMARY KEY, data TEXT)")
@@ -14865,7 +14925,8 @@ async fn gh52_boolean_results_are_boolean_with_bound_parameters() {
         assert!(sqlstates(&out).is_empty(), "{sql}: {:?}", sqlstates(&out));
         let rd = row_description(&out);
         assert_eq!(rd.len(), 1, "{sql}");
-        assert_eq!(rd[0].1, 16, "{sql}: the result is boolean (OID 16), not {}", rd[0].1);
+        let oid = rd.first().map(|(_, oid)| *oid);
+        assert_eq!(oid, Some(16), "{sql}: the result is boolean (OID 16), not {oid:?}");
         assert_eq!(first_data_row_text(&out).as_deref(), Some("t"), "{sql}");
     }
     let out = gh54_extended(
@@ -14878,5 +14939,5 @@ async fn gh52_boolean_results_are_boolean_with_bound_parameters() {
     )
     .await;
     assert!(sqlstates(&out).is_empty(), "{:?}", sqlstates(&out));
-    assert_eq!(row_description(&out)[0].1, 16);
+    assert_eq!(row_description(&out).first().map(|(_, oid)| *oid), Some(16));
 }
