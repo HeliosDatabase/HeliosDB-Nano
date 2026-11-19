@@ -175,7 +175,7 @@ pub(crate) fn mask_non_code(s: &str) -> Vec<u8> {
 }
 
 /// Byte positions of every occurrence of `needle` in `hay`.
-fn find_all(hay: &[u8], needle: &[u8]) -> impl Iterator<Item = usize> + '_ {
+fn find_all<'a>(hay: &'a [u8], needle: &'a [u8]) -> impl Iterator<Item = usize> + 'a {
     let needle = needle.to_vec();
     (0..hay.len().saturating_sub(needle.len() - 1)).filter(move |&i| hay.get(i..i + needle.len()) == Some(&needle[..]))
 }
