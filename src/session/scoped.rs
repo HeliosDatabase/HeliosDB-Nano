@@ -282,6 +282,10 @@ pub struct BranchBinding {
     /// session then re-checks that ITS branch is still active, and refuses
     /// (3D000) when it is not. Unchanged generation = one atomic compare.
     pub validated_generation: AtomicU64,
+    /// v10.7: the branch's expiry in Unix ms, `0` for none, `-1` not yet
+    /// read. Refreshed with every re-validation, so an expiry that changes
+    /// (which bumps the generation) is seen on the next statement.
+    pub expires_at_ms: AtomicI64,
 }
 
 impl BranchBinding {
@@ -294,6 +298,7 @@ impl BranchBinding {
             branch_id,
             chain,
             validated_generation: AtomicU64::new(generation),
+            expires_at_ms: AtomicI64::new(-1),
         }
     }
 

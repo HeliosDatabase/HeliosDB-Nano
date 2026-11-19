@@ -506,6 +506,12 @@ pub struct BranchStats {
 /// creation time, in Unix milliseconds.
 pub const BRANCH_CREATED_AT_UNIX_MS: &str = "created_at_unix_ms";
 
+/// v10.7: the metadata key of a branch's wall-clock expiry, Unix ms.
+pub const BRANCH_EXPIRES_AT_UNIX_MS: &str = "expires_at_unix_ms";
+
+/// v10.7: the metadata key of a branch's free-text label.
+pub const BRANCH_LABEL: &str = "label";
+
 impl BranchMetadata {
     /// The wall-clock creation time, or `None` for a branch created before it
     /// was recorded (and for `main`). `created_at` itself is a logical counter
@@ -516,6 +522,32 @@ impl BranchMetadata {
             .get(BRANCH_CREATED_AT_UNIX_MS)
             .and_then(|ms| ms.parse::<i64>().ok())
             .and_then(chrono::DateTime::from_timestamp_millis)
+    }
+
+    /// v10.7: when the branch expires, Unix ms; `None` = never.
+    pub fn expires_at_unix_ms(&self) -> Option<i64> {
+        self.options
+            .metadata
+            .get(BRANCH_EXPIRES_AT_UNIX_MS)
+            .and_then(|ms| ms.parse::<i64>().ok())
+    }
+
+    /// v10.7: the branch's label, if any.
+    pub fn label(&self) -> Option<&str> {
+        self.options.metadata.get(BRANCH_LABEL).map(String::as_str)
+    }
+
+    /// v10.7: has the branch expired at `now_ms`? Never before its own
+    /// creation stamp (a clock that went backwards expires nothing).
+    pub fn is_expired_at(&self, now_ms: i64) -> bool {
+        let Some(expires) = self.expires_at_unix_ms() else {
+            return false;
+        };
+        let created = self.created_at_wall_clock().map(|t| t.timestamp_millis());
+        if created.is_some_and(|c| now_ms < c) {
+            return false;
+        }
+        now_ms >= expires
     }
 }
 

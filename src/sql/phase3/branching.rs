@@ -8,6 +8,10 @@
 use super::super::logical_plan::{AsOfClause, BranchOption, ConflictResolution, LogicalPlan, MergeOption};
 use crate::{Error, Result};
 
+/// v10.7: the metadata key a parsed `expires_in` travels under, in
+/// milliseconds, until CREATE BRANCH turns it into an absolute deadline.
+pub const EXPIRES_IN_MS: &str = "expires_in_ms";
+
 /// Parser for database branching SQL
 pub struct BranchingParser;
 
@@ -116,6 +120,18 @@ impl BranchingParser {
                 }
                 "region" => {
                     options.push(BranchOption::Region(value.to_string()));
+                }
+                // v10.7: a lifetime. Stored relative here and turned into an
+                // absolute wall-clock deadline when the branch is created.
+                "expires_in" => {
+                    let ms = Self::parse_expires_in(value)?;
+                    options.push(BranchOption::Metadata(EXPIRES_IN_MS.to_string(), ms.to_string()));
+                }
+                "label" => {
+                    options.push(BranchOption::Metadata(
+                        crate::storage::BRANCH_LABEL.to_string(),
+                        value.to_string(),
+                    ));
                 }
                 _ => {
                     return Err(Error::query_execution(format!("Unknown branch option: {}", key)));
@@ -263,6 +279,35 @@ impl BranchingParser {
                 "invalid value for boolean option {key}: \"{value}\" (expected true or false)"
             ))),
         }
+    }
+
+    /// v10.7: `expires_in = '<n>s|m|h|d'` in milliseconds; positive, or a
+    /// 42601 error (a typo must never create a branch that never expires).
+    fn parse_expires_in(value: &str) -> Result<i64> {
+        let bad = || {
+            Error::sql_parse(format!(
+                "invalid expires_in '{value}': expected a positive number followed by s, m, h or d (e.g. '2h')"
+            ))
+        };
+        let value = value.trim();
+        let unit = value.chars().last().ok_or_else(bad)?;
+        let factor: i64 = match unit.to_ascii_lowercase() {
+            's' => 1_000,
+            'm' => 60_000,
+            'h' => 3_600_000,
+            'd' => 86_400_000,
+            _ => return Err(bad()),
+        };
+        let number: i64 = value
+            .get(..value.len() - unit.len_utf8())
+            .unwrap_or("")
+            .trim()
+            .parse()
+            .map_err(|_| bad())?;
+        if number <= 0 {
+            return Err(bad());
+        }
+        number.checked_mul(factor).ok_or_else(bad)
     }
 
     /// Parse merge options

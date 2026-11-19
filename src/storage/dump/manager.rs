@@ -440,7 +440,13 @@ impl DumpManager {
                 DumpMode::Full => self.create_full_dump(&opts.output_path, db)?,
                 DumpMode::Incremental => self.create_incremental_dump(&opts.output_path, db, opts.append)?,
             },
-            DumpOutputFormat::Sql => self.create_sql_dump(&opts.output_path, db)?,
+            DumpOutputFormat::Sql => {
+                let mut sql = opts.sql.clone();
+                if sql.tables.is_none() {
+                    sql.tables = opts.tables.clone();
+                }
+                self.create_sql_dump_with(&opts.output_path, db, &sql)?
+            }
         };
 
         let duration_ms = start_time.elapsed().as_millis() as u64;
@@ -498,15 +504,84 @@ impl DumpManager {
     /// naming the column. A partially written file is left on disk in both
     /// cases; it is not a dump and must not be used as one.
     pub fn create_sql_dump<D: DatabaseInterface>(&self, output_path: &Path, db: &D) -> Result<DumpMetadata> {
+        self.create_sql_dump_with(output_path, db, &SqlDumpOptions::default())
+    }
+
+    /// [`Self::create_sql_dump`] with a dialect, a table filter and the
+    /// schema-only / data-only switches (v10.13).
+    ///
+    /// Atomic: the file is written to a temporary file in the target's
+    /// directory and renamed over the target only when complete; on any error
+    /// the temporary file is removed and the target is left as it was.
+    pub fn create_sql_dump_with<D: DatabaseInterface>(
+        &self,
+        output_path: &Path,
+        db: &D,
+        options: &SqlDumpOptions,
+    ) -> Result<DumpMetadata> {
+        if options.schema_only && options.data_only {
+            return Err(Error::config("--schema-only and --data-only cannot be used together"));
+        }
         let start_time = Instant::now();
         let dump_id = self.get_next_dump_id();
         let mut metadata = DumpMetadata::new(dump_id, DumpType::Full);
 
         info!("Starting SQL dump {} to {}", dump_id, output_path.display());
 
+        let file_name = output_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "dump.sql".to_string());
+        let temp_path = output_path.with_file_name(format!(".{}.partial-{}", file_name, std::process::id()));
         let file =
-            File::create(output_path).map_err(|e| Error::storage(format!("Failed to create SQL dump file: {}", e)))?;
+            File::create(&temp_path).map_err(|e| Error::storage(format!("Failed to create SQL dump file: {}", e)))?;
         let mut writer = BufWriter::new(file);
+
+        let written = Self::write_sql_dump(&mut writer, db, options, &mut metadata).and_then(|()| {
+            let file = writer
+                .into_inner()
+                .map_err(|e| Error::storage(format!("Failed to flush writer: {}", e)))?;
+            file.sync_all()
+                .map_err(|e| Error::storage(format!("Failed to sync SQL dump: {}", e)))?;
+            std::fs::rename(&temp_path, output_path)
+                .map_err(|e| Error::storage(format!("Failed to move SQL dump into place: {}", e)))
+        });
+        if let Err(e) = written {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(e);
+        }
+
+        let file_size = std::fs::metadata(output_path)
+            .map_err(|e| Error::storage(format!("Failed to get file metadata: {}", e)))?
+            .len();
+        metadata.compressed_size = file_size;
+        metadata.uncompressed_size = file_size; // SQL is uncompressed text
+
+        // Add to history
+        self.dump_history.write().push(metadata.clone());
+
+        debug!(
+            "SQL dump {} wrote {} tables / {} rows in {} ms",
+            dump_id,
+            metadata.table_count,
+            metadata.total_rows,
+            start_time.elapsed().as_millis()
+        );
+
+        Ok(metadata)
+    }
+
+    /// The body of [`Self::create_sql_dump_with`], into any writer.
+    fn write_sql_dump<D: DatabaseInterface, W: Write>(
+        writer: &mut W,
+        db: &D,
+        options: &SqlDumpOptions,
+        metadata: &mut DumpMetadata,
+    ) -> Result<()> {
+        let postgres = options.dialect == SqlDialect::Postgres;
+        let write_ddl = !options.data_only;
+        let write_data = !options.schema_only;
+        let w = |e: std::io::Error| Error::storage(format!("Failed to write SQL dump: {}", e));
 
         // Header. Every line is a `--` comment, so the whole block is attached
         // to the first statement by the script splitter and stripped off again
@@ -521,34 +596,111 @@ impl DumpManager {
             chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
         )
         .map_err(|e| Error::storage(format!("Failed to write header: {}", e)))?;
+        if postgres {
+            writeln!(
+                writer,
+                "-- Dialect: postgres. Load with: psql -v ON_ERROR_STOP=1 -f <file>, into an EMPTY database."
+            )
+            .map_err(w)?;
+        }
 
-        let tables = db.list_tables()?;
+        let all_tables = db.list_tables()?;
+        let filtered = options.tables.is_some();
+        let tables: Vec<String> = match &options.tables {
+            None => all_tables,
+            Some(wanted) => {
+                let mut picked = Vec::with_capacity(wanted.len());
+                for name in wanted {
+                    match all_tables.iter().find(|t| t.eq_ignore_ascii_case(name)) {
+                        Some(t) => picked.push(t.clone()),
+                        None => return Err(Error::storage(format!("dump: table \"{name}\" does not exist"))),
+                    }
+                }
+                picked
+            }
+        };
         metadata.table_count = tables.len() as u32;
+        let in_dump = |t: &str| tables.iter().any(|x| x == t);
 
         // v10.12: sequences, identity columns, user indexes and views.
-        let objects = db.get_schema_objects()?;
-        for line in &objects.not_carried {
-            writeln!(writer, "-- NOT CARRIED: {}", sql_text::sanitize_comment(line))
-                .map_err(|e| Error::storage(format!("Failed to write comment: {}", e)))?;
-        }
-        if !objects.sequences.is_empty() {
-            writeln!(writer, "-- Sequences").map_err(|e| Error::storage(format!("Failed to write comment: {}", e)))?;
-            for seq in &objects.sequences {
-                writeln!(writer, "{}", sql_text::sequence_ddl(seq))
-                    .map_err(|e| Error::storage(format!("Failed to write sequence: {}", e)))?;
+        let mut objects = db.get_schema_objects()?;
+        if filtered {
+            if !objects.sequences.is_empty() || !objects.views.is_empty() {
+                objects
+                    .not_carried
+                    .push("sequences and views: not written by a dump restricted with --tables".to_string());
             }
-            writeln!(writer).map_err(|e| Error::storage(format!("Failed to write separator: {}", e)))?;
+            objects.sequences.clear();
+            objects.views.clear();
+            objects.indexes.retain(|i| in_dump(&i.table));
+            objects.identity_columns.retain(|(t, _)| in_dump(t));
+        }
+        // Postgres: anything without a portable spelling is a comment.
+        let mut unportable_indexes: Vec<String> = Vec::new();
+        if postgres {
+            objects.indexes.retain(|i| {
+                let portable = !matches!(i.method.as_str(), "gin" | "gist") || i.key.contains('(');
+                if !portable {
+                    unportable_indexes.push(format!(
+                        "-- NOT PORTABLE: {} (a {} index on a plain column needs an operator class PostgreSQL cannot infer)",
+                        sql_text::sanitize_comment(&sql_text::index_dump_ddl(i)),
+                        i.method
+                    ));
+                }
+                portable
+            });
+            for line in &unportable_indexes {
+                objects
+                    .not_carried
+                    .push(line.trim_start_matches("-- NOT PORTABLE: ").to_string());
+            }
+        }
+        for line in &objects.not_carried {
+            writeln!(writer, "-- NOT CARRIED: {}", sql_text::sanitize_comment(line)).map_err(w)?;
+        }
+
+        let mut schemas: Vec<(String, Schema)> = Vec::with_capacity(tables.len());
+        for table in &tables {
+            schemas.push((table.clone(), db.get_table_schema(table)?));
+        }
+
+        if postgres && write_ddl {
+            let has_vector = schemas.iter().any(|(_, s)| {
+                s.columns
+                    .iter()
+                    .any(|c| matches!(c.data_type, crate::DataType::Vector(_)))
+            });
+            if has_vector {
+                writeln!(writer, "CREATE EXTENSION IF NOT EXISTS vector;").map_err(w)?;
+            }
+        }
+
+        if write_ddl && !objects.sequences.is_empty() {
+            writeln!(writer, "-- Sequences").map_err(w)?;
+            for seq in &objects.sequences {
+                writeln!(writer, "{}", sql_text::sequence_ddl(seq)).map_err(w)?;
+            }
+            writeln!(writer).map_err(w)?;
         }
 
         // Phase 1 — schemas. Collected FKs are held back for phase 3.
         let mut deferred_foreign_keys: Vec<String> = Vec::new();
-        let mut schemas: Vec<(String, Schema)> = Vec::with_capacity(tables.len());
-        for table in &tables {
-            let schema = db.get_table_schema(table)?;
+        for (table, schema) in &schemas {
             let constraints = db.get_table_constraints(table)?;
-
-            writeln!(writer, "-- Table: {}", sql_text::sanitize_comment(table))
-                .map_err(|e| Error::storage(format!("Failed to write comment: {}", e)))?;
+            for fk in &constraints.foreign_keys {
+                if in_dump(&fk.references_table) {
+                    deferred_foreign_keys.push(sql_text::foreign_key_ddl(table, fk));
+                } else {
+                    deferred_foreign_keys.push(format!(
+                        "-- NOT CARRIED (references a table outside --tables): {}",
+                        sql_text::sanitize_comment(&sql_text::foreign_key_ddl(table, fk))
+                    ));
+                }
+            }
+            if !write_ddl {
+                continue;
+            }
+            writeln!(writer, "-- Table: {}", sql_text::sanitize_comment(table)).map_err(w)?;
             // `table_ddl` FAILS rather than writing a CHECK body or a DEFAULT
             // it cannot spell: a dump whose first statement does not parse
             // restores nothing at all, so the export must stop here, naming
@@ -556,60 +708,69 @@ impl DumpManager {
             writeln!(
                 writer,
                 "{}",
-                sql_text::table_ddl_with_identity(table, &schema, &constraints, objects.identity_for(table))?
+                sql_text::table_ddl_with_identity(table, schema, &constraints, objects.identity_for(table))?
             )
-            .map_err(|e| Error::storage(format!("Failed to write create table: {}", e)))?;
-
-            for fk in &constraints.foreign_keys {
-                deferred_foreign_keys.push(sql_text::foreign_key_ddl(table, fk));
-            }
-            schemas.push((table.clone(), schema));
+            .map_err(w)?;
         }
-        writeln!(writer).map_err(|e| Error::storage(format!("Failed to write separator: {}", e)))?;
+        if write_ddl {
+            writeln!(writer).map_err(w)?;
+        }
 
         // Phase 2 — data.
         let mut total_rows = 0u64;
-        for (table, schema) in &schemas {
-            // `DatabaseInterface::scan_table` returns MATERIALIZED values: the
-            // embedded implementation goes through
-            // `StorageEngine::scan_table_with_schema`, whose decode step already
-            // resolves every per-column storage reference (DICTIONARY / CAS /
-            // columnar) back to the stored value. `sql_text::value_literal`
-            // still refuses a `DictRef`/`CasRef`/`ColumnarRef` outright rather
-            // than emitting a `dict:7` placeholder, so a future scan path that
-            // skipped that resolution fails the export loudly.
-            let rows = db.scan_table(table)?;
-            if rows.is_empty() {
-                continue;
+        if write_data {
+            for (table, schema) in &schemas {
+                // `DatabaseInterface::scan_table` returns MATERIALIZED values:
+                // the embedded implementation goes through
+                // `StorageEngine::scan_table_with_schema`, whose decode step
+                // already resolves every per-column storage reference
+                // (DICTIONARY / CAS / columnar) back to the stored value.
+                // `sql_text::value_literal` still refuses a `DictRef`/`CasRef`/
+                // `ColumnarRef` outright rather than emitting a placeholder.
+                let rows = db.scan_table(table)?;
+                if rows.is_empty() {
+                    continue;
+                }
+                total_rows += rows.len() as u64;
+                writeln!(writer, "-- Data: {}", sql_text::sanitize_comment(table)).map_err(w)?;
+                for chunk in rows.chunks(sql_text::INSERT_BATCH_ROWS) {
+                    let statement = sql_text::insert_statement_batch(table, schema, chunk)?;
+                    writeln!(writer, "{}", statement).map_err(w)?;
+                }
+                writeln!(writer).map_err(w)?;
             }
-            total_rows += rows.len() as u64;
-            writeln!(writer, "-- Data: {}", sql_text::sanitize_comment(table))
-                .map_err(|e| Error::storage(format!("Failed to write comment: {}", e)))?;
-            for chunk in rows.chunks(sql_text::INSERT_BATCH_ROWS) {
-                let statement = sql_text::insert_statement_batch(table, schema, chunk)?;
-                writeln!(writer, "{}", statement)
-                    .map_err(|e| Error::storage(format!("Failed to write insert: {}", e)))?;
-            }
-            writeln!(writer).map_err(|e| Error::storage(format!("Failed to write separator: {}", e)))?;
         }
+        metadata.total_rows = total_rows;
 
         // Phase 3 — foreign keys, once every table and row exists.
-        if !deferred_foreign_keys.is_empty() {
-            writeln!(writer, "-- Foreign keys")
-                .map_err(|e| Error::storage(format!("Failed to write comment: {}", e)))?;
+        if write_ddl && !deferred_foreign_keys.is_empty() {
+            writeln!(writer, "-- Foreign keys").map_err(w)?;
             for statement in &deferred_foreign_keys {
-                writeln!(writer, "{}", statement)
-                    .map_err(|e| Error::storage(format!("Failed to write foreign key: {}", e)))?;
+                writeln!(writer, "{}", statement).map_err(w)?;
             }
-            writeln!(writer).map_err(|e| Error::storage(format!("Failed to write separator: {}", e)))?;
+            writeln!(writer).map_err(w)?;
         }
 
         // Phase 4 — sequence positions, now that the data is in.
-        for seq in &objects.sequences {
-            if let Some(statement) = sql_text::sequence_setval(seq) {
-                writeln!(writer, "{}", statement)
-                    .map_err(|e| Error::storage(format!("Failed to write setval: {}", e)))?;
+        if write_data {
+            for seq in &objects.sequences {
+                if let Some(statement) = sql_text::sequence_setval(seq) {
+                    writeln!(writer, "{}", statement).map_err(w)?;
+                }
             }
+            // PostgreSQL's SERIAL sequence does not move when a row brings its
+            // own key: move it past the loaded keys.
+            if postgres {
+                for (table, columns) in &objects.identity_columns {
+                    for column in columns {
+                        writeln!(writer, "{}", sql_text::postgres_serial_catch_up(table, column)).map_err(w)?;
+                    }
+                }
+            }
+        }
+
+        if !write_ddl {
+            return Ok(());
         }
 
         // Phase 5 — indexes, after the data so a UNIQUE index validates the
@@ -618,61 +779,40 @@ impl DumpManager {
         let mut wrote_index_header = false;
         for (table, _) in &schemas {
             for index in db.get_table_indexes(table)? {
-                if objects.indexes.iter().any(|i| i.name == index.name) {
+                if objects.indexes.iter().any(|i| i.name == index.name)
+                    || unportable_indexes
+                        .iter()
+                        .any(|l| l.contains(&sql_text::quote_ident(&index.name)))
+                {
                     continue;
                 }
                 if !wrote_index_header {
-                    writeln!(writer, "-- Indexes")
-                        .map_err(|e| Error::storage(format!("Failed to write comment: {}", e)))?;
+                    writeln!(writer, "-- Indexes").map_err(w)?;
                     wrote_index_header = true;
                 }
-                writeln!(writer, "{}", sql_text::index_ddl(table, &index))
-                    .map_err(|e| Error::storage(format!("Failed to write index: {}", e)))?;
+                writeln!(writer, "{}", sql_text::index_ddl(table, &index)).map_err(w)?;
             }
         }
         for index in &objects.indexes {
             if !wrote_index_header {
-                writeln!(writer, "-- Indexes")
-                    .map_err(|e| Error::storage(format!("Failed to write comment: {}", e)))?;
+                writeln!(writer, "-- Indexes").map_err(w)?;
                 wrote_index_header = true;
             }
-            writeln!(writer, "{}", sql_text::index_dump_ddl(index))
-                .map_err(|e| Error::storage(format!("Failed to write index: {}", e)))?;
+            writeln!(writer, "{}", sql_text::index_dump_ddl(index)).map_err(w)?;
+        }
+        for line in &unportable_indexes {
+            writeln!(writer, "{}", line).map_err(w)?;
         }
 
         // Phase 6 — views, last: they read the tables (and earlier views).
         if !objects.views.is_empty() {
-            writeln!(writer, "\n-- Views").map_err(|e| Error::storage(format!("Failed to write comment: {}", e)))?;
+            writeln!(writer, "\n-- Views").map_err(w)?;
             for view in &objects.views {
-                writeln!(writer, "{}", sql_text::view_ddl(view))
-                    .map_err(|e| Error::storage(format!("Failed to write view: {}", e)))?;
+                writeln!(writer, "{}", sql_text::view_ddl(view)).map_err(w)?;
             }
         }
 
-        writer
-            .flush()
-            .map_err(|e| Error::storage(format!("Failed to flush writer: {}", e)))?;
-
-        let file_size = std::fs::metadata(output_path)
-            .map_err(|e| Error::storage(format!("Failed to get file metadata: {}", e)))?
-            .len();
-
-        metadata.total_rows = total_rows;
-        metadata.compressed_size = file_size;
-        metadata.uncompressed_size = file_size; // SQL is uncompressed text
-
-        // Add to history
-        self.dump_history.write().push(metadata.clone());
-
-        debug!(
-            "SQL dump {} wrote {} tables / {} rows in {} ms",
-            dump_id,
-            metadata.table_count,
-            total_rows,
-            start_time.elapsed().as_millis()
-        );
-
-        Ok(metadata)
+        Ok(())
     }
 
     /// Restore database (CLI-compatible wrapper)
@@ -1720,6 +1860,33 @@ pub enum DumpOutputFormat {
     Sql,
 }
 
+/// v10.13: which SQL a `--format sql` dump is written in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SqlDialect {
+    /// Today's output, restored with `EmbeddedDatabase::execute_sql_script`.
+    #[default]
+    Nano,
+    /// Loadable by PostgreSQL's `psql -v ON_ERROR_STOP=1`: the pgvector
+    /// extension is created when a VECTOR column exists, SERIAL counters are
+    /// moved past the loaded keys, and anything with no portable form is
+    /// written as a comment and listed in the header — never dropped silently.
+    Postgres,
+}
+
+/// v10.13: what a SQL dump writes.
+#[derive(Debug, Clone, Default)]
+pub struct SqlDumpOptions {
+    /// Output dialect.
+    pub dialect: SqlDialect,
+    /// Only these tables (then views and sequences are not written, and a
+    /// foreign key to a table outside the set is written as a comment).
+    pub tables: Option<Vec<String>>,
+    /// DDL only, no rows and no sequence positions.
+    pub schema_only: bool,
+    /// Rows and sequence positions only, no DDL.
+    pub data_only: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct DumpOptions {
     pub output_path: PathBuf,
@@ -1730,6 +1897,9 @@ pub struct DumpOptions {
     pub verbose: bool,
     pub connection: Option<String>,
     pub format: DumpOutputFormat,
+    /// v10.13: dialect and section switches of a `--format sql` dump.
+    /// `tables` above is the table filter for both.
+    pub sql: SqlDumpOptions,
 }
 
 impl Default for DumpOptions {
@@ -1743,6 +1913,7 @@ impl Default for DumpOptions {
             verbose: false,
             connection: None,
             format: DumpOutputFormat::Binary,
+            sql: SqlDumpOptions::default(),
         }
     }
 }

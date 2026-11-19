@@ -42,6 +42,11 @@ fn dump_cmd(data: &Path, out: &Path, config: Option<&Path>) -> DumpCommand {
         data_dir: Some(data.to_path_buf()),
         memory: false,
         config: config.map(Path::to_path_buf),
+        format: "binary".into(),
+        dialect: "nano".into(),
+        tables: None,
+        schema_only: false,
+        data_only: false,
     }
 }
 

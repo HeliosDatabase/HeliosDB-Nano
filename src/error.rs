@@ -564,6 +564,17 @@ impl Error {
         Error::QueryExecution(format!("branch \"{name}\" was {how}; {BRANCH_BINDING_GONE_MARKER}"))
     }
 
+    /// v10.7: a statement on a branch whose lifetime ended. 3D000, like a
+    /// dropped branch: the session must move to another branch.
+    pub fn branch_expired(name: &str, expired_at_ms: i64) -> Self {
+        let at = chrono::DateTime::from_timestamp_millis(expired_at_ms)
+            .map(|t| t.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+            .unwrap_or_else(|| expired_at_ms.to_string());
+        Error::QueryExecution(format!(
+            "branch \"{name}\" expired at {at}; {BRANCH_BINDING_GONE_MARKER}"
+        ))
+    }
+
     /// sprinter 6bc4a4040eb7 (phase B1): `DROP BRANCH name` on the session
     /// bound to `name`. SQLSTATE 55006.
     pub fn branch_in_use(name: &str) -> Self {

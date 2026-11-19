@@ -163,7 +163,7 @@ impl SystemViewRegistry {
                     Column {
                         name: "created_at".to_string(),
                         data_type: DataType::Timestamp,
-                        nullable: false,
+                        nullable: true,
                         primary_key: false,
                         source_table: None,
                         source_table_name: None,
@@ -185,7 +185,7 @@ impl SystemViewRegistry {
                     Column {
                         name: "size_mb".to_string(),
                         data_type: DataType::Int8,
-                        nullable: false,
+                        nullable: true,
                         primary_key: false,
                         source_table: None,
                         source_table_name: None,
@@ -197,6 +197,28 @@ impl SystemViewRegistry {
                         name: "status".to_string(),
                         data_type: DataType::Text,
                         nullable: false,
+                        primary_key: false,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
+                    },
+                    Column {
+                        name: "expires_at".to_string(),
+                        data_type: DataType::Timestamp,
+                        nullable: true,
+                        primary_key: false,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
+                    },
+                    Column {
+                        name: "label".to_string(),
+                        data_type: DataType::Text,
+                        nullable: true,
                         primary_key: false,
                         source_table: None,
                         source_table_name: None,
@@ -4407,6 +4429,16 @@ impl SystemViewRegistry {
                 // Storage size is not measured: NULL, never 0-as-fact.
                 Value::Null,
                 Value::String(format!("{:?}", branch.state)),
+                // v10.7: trailing, so the existing columns keep their positions.
+                branch
+                    .expires_at_unix_ms()
+                    .and_then(chrono::DateTime::from_timestamp_millis)
+                    .map(Value::Timestamp)
+                    .unwrap_or(Value::Null),
+                branch
+                    .label()
+                    .map(|l| Value::String(l.to_string()))
+                    .unwrap_or(Value::Null),
             ]);
             results.push(tuple);
         }
@@ -6850,7 +6882,7 @@ mod tests {
     fn test_get_schema() {
         let registry = SystemViewRegistry::new();
         let schema = registry.get_schema("pg_database_branches").unwrap();
-        assert_eq!(schema.columns.len(), 7);
+        assert_eq!(schema.columns.len(), 9);
         assert_eq!(schema.columns[0].name, "branch_name");
     }
 
@@ -6881,7 +6913,7 @@ mod tests {
         assert!(results.len() >= 2);
 
         // Verify first result has correct number of columns
-        assert_eq!(results[0].values.len(), 7);
+        assert_eq!(results[0].values.len(), 9);
     }
 
     #[test]

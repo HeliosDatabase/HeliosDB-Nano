@@ -390,6 +390,16 @@ fn handle_create_branch(
                 BranchOption::Region(region) => {
                     branch_opts.region = Some(region.clone());
                 }
+                BranchOption::Metadata(key, value) if key == crate::sql::phase3::branching::EXPIRES_IN_MS => {
+                    // v10.7: the deadline is wall-clock, fixed at creation.
+                    let ms: i64 = value
+                        .parse()
+                        .map_err(|_| Error::query_execution(format!("invalid expires_in: {value}")))?;
+                    let at = chrono::Utc::now().timestamp_millis().saturating_add(ms);
+                    branch_opts
+                        .metadata
+                        .insert(crate::storage::BRANCH_EXPIRES_AT_UNIX_MS.to_string(), at.to_string());
+                }
                 BranchOption::Metadata(key, value) => {
                     branch_opts.metadata.insert(key.clone(), value.clone());
                 }
@@ -442,6 +452,20 @@ fn handle_create_branch(
             branch_id,
             snapshot_id
         );
+
+        // v10.7: an embedded database needs no background thread — expired
+        // branches are reaped here and at open. A reap failure never fails the
+        // CREATE that triggered it; what was kept is logged.
+        let _ = storage.reap_expired_branches();
+        if let Ok(live) = storage.list_branches() {
+            let live = live.iter().filter(|b| b.name != "main").count();
+            if live > WARN_LIVE_BRANCHES {
+                tracing::warn!(
+                    "{live} live branches: every write to a parent is slower for each live branch; \
+                     drop the ones you no longer need or create them WITH (expires_in = '…')"
+                );
+            }
+        }
     } else {
         return Err(Error::execution("No storage engine available"));
     }
@@ -462,6 +486,9 @@ fn empty_phase3_result(executor: &Executor) -> Box<dyn PhysicalOperator> {
         .with_timeout(executor.timeout_ctx()),
     )
 }
+
+/// v10.7: above this many live branches, CREATE BRANCH logs a warning.
+const WARN_LIVE_BRANCHES: usize = 16;
 
 /// Handle DROP BRANCH
 fn handle_drop_branch(executor: &Executor, branch_name: &str, if_exists: bool) -> Result<Box<dyn PhysicalOperator>> {

@@ -1607,6 +1607,27 @@ enum Commands {
         /// Verbose output
         #[arg(short, long)]
         verbose: bool,
+
+        /// Output format: binary (restore with `restore`) or sql (a script)
+        #[arg(long, default_value = "binary", value_name = "binary|sql")]
+        format: String,
+
+        /// SQL dialect for --format sql: nano (execute_sql_script) or
+        /// postgres (psql -v ON_ERROR_STOP=1)
+        #[arg(long, default_value = "nano", value_name = "nano|postgres")]
+        dialect: String,
+
+        /// Only these tables (comma-separated); --format sql only
+        #[arg(long, value_delimiter = ',', value_name = "T1,T2")]
+        tables: Option<Vec<String>>,
+
+        /// Write the DDL only; --format sql only
+        #[arg(long)]
+        schema_only: bool,
+
+        /// Write the rows only; --format sql only
+        #[arg(long)]
+        data_only: bool,
     },
 
     /// Restore database from dump file
@@ -2120,6 +2141,11 @@ async fn run(cli: Cli) -> Result<()> {
             connection,
             config,
             verbose,
+            format,
+            dialect,
+            tables,
+            schema_only,
+            data_only,
         } => {
             use heliosdb_nano::cli::DumpCommand;
             let cmd = DumpCommand {
@@ -2131,6 +2157,11 @@ async fn run(cli: Cli) -> Result<()> {
                 data_dir,
                 memory: false,
                 config,
+                format,
+                dialect,
+                tables,
+                schema_only,
+                data_only,
             };
             cmd.execute()
         }
@@ -3803,6 +3834,7 @@ async fn start_server(
             verbose: false,
             connection: None,
             format: heliosdb_nano::storage::DumpOutputFormat::Binary,
+            sql: Default::default(),
         };
 
         let dumped = match dump_db.as_ref() {
@@ -3896,6 +3928,7 @@ fn run_repl(data_dir: PathBuf, memory: bool, dump_on_shutdown: bool, dump_file: 
             verbose: false,
             connection: None,
             format: heliosdb_nano::storage::DumpOutputFormat::Binary,
+            sql: Default::default(),
         };
 
         // Perform dump using the shell's database reference

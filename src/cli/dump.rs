@@ -1,6 +1,8 @@
 //! Dump command implementation
 
-use crate::storage::{DumpCompressionType, DumpManager, DumpMode, DumpOptions};
+use crate::storage::{
+    DumpCompressionType, DumpManager, DumpMode, DumpOptions, DumpOutputFormat, DumpSqlDialect, SqlDumpOptions,
+};
 use crate::{Config, EmbeddedDatabase, Error, Result};
 use colored::Colorize;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -25,6 +27,62 @@ pub struct DumpCommand {
     /// Config file (`-c/--config`): its `[encryption]` section opens a data
     /// directory written with encryption at rest.
     pub config: Option<PathBuf>,
+    /// v10.13: `binary` (default) or `sql`.
+    pub format: String,
+    /// v10.13: `nano` (default) or `postgres`; `--format sql` only.
+    pub dialect: String,
+    /// v10.13: only these tables; `--format sql` only.
+    pub tables: Option<Vec<String>>,
+    /// v10.13: DDL only; `--format sql` only.
+    pub schema_only: bool,
+    /// v10.13: rows only; `--format sql` only.
+    pub data_only: bool,
+}
+
+impl DumpCommand {
+    /// v10.13: the output format and SQL options the flags ask for, refused
+    /// before the database is opened when they do not fit together.
+    fn output_settings(&self) -> Result<(DumpOutputFormat, SqlDumpOptions)> {
+        let format = match self.format.to_ascii_lowercase().as_str() {
+            "binary" => DumpOutputFormat::Binary,
+            "sql" => DumpOutputFormat::Sql,
+            other => {
+                return Err(Error::config(format!(
+                    "unknown --format '{other}': expected binary or sql"
+                )))
+            }
+        };
+        let dialect = match self.dialect.to_ascii_lowercase().as_str() {
+            "nano" => DumpSqlDialect::Nano,
+            "postgres" | "postgresql" => DumpSqlDialect::Postgres,
+            other => {
+                return Err(Error::config(format!(
+                    "unknown --dialect '{other}': expected nano or postgres"
+                )))
+            }
+        };
+        if format == DumpOutputFormat::Binary {
+            if dialect != DumpSqlDialect::Nano || self.tables.is_some() || self.schema_only || self.data_only {
+                return Err(Error::config(
+                    "--dialect, --tables, --schema-only and --data-only apply to --format sql only",
+                ));
+            }
+        } else if self.append {
+            return Err(Error::config("--append applies to --format binary only"));
+        }
+        if self.schema_only && self.data_only {
+            return Err(Error::config("--schema-only and --data-only cannot be used together"));
+        }
+        Ok((
+            format,
+            SqlDumpOptions {
+                dialect,
+                tables: self.tables.clone(),
+                schema_only: self.schema_only,
+                data_only: self.data_only,
+            },
+        ))
+    }
 }
 
 impl DumpCommand {
@@ -37,6 +95,7 @@ impl DumpCommand {
 
         // Parse compression type
         let compression = DumpCompressionType::from_str(&self.compression)?;
+        let (format, sql) = self.output_settings()?;
 
         // Determine data directory
         let data_dir = if self.memory {
@@ -85,10 +144,11 @@ impl DumpCommand {
             mode,
             compression,
             append: self.append,
-            tables: None, // Table filtering not yet implemented in CLI
+            tables: self.tables.clone(),
             verbose: self.verbose,
             connection: self.connection.clone(),
-            format: crate::storage::DumpOutputFormat::Binary, // Default to binary for now
+            format,
+            sql,
         };
 
         if self.verbose {

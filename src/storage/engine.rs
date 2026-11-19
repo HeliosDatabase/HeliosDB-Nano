@@ -21425,11 +21425,26 @@ impl StorageEngine {
     /// since the binding was last validated.
     pub fn validate_branch_binding(&self, binding: &crate::session::BranchBinding) -> Result<()> {
         let generation = self.branch_registry_generation();
-        if binding.validated_generation() == generation {
+        let expires = binding.expires_at_ms.load(std::sync::atomic::Ordering::Acquire);
+        if binding.validated_generation() == generation && expires >= 0 {
+            // v10.7: one atomic load when the branch has no expiry.
+            if expires > 0 && chrono::Utc::now().timestamp_millis() >= expires {
+                return Err(Error::branch_expired(&binding.name, expires));
+            }
             return Ok(());
         }
         match self.get_branch(&binding.name) {
             Ok(meta) if meta.branch_id == binding.branch_id && meta.state == super::BranchState::Active => {
+                if meta.is_expired_at(chrono::Utc::now().timestamp_millis()) {
+                    return Err(Error::branch_expired(
+                        &binding.name,
+                        meta.expires_at_unix_ms().unwrap_or(0),
+                    ));
+                }
+                binding.expires_at_ms.store(
+                    meta.expires_at_unix_ms().unwrap_or(0),
+                    std::sync::atomic::Ordering::Release,
+                );
                 binding.note_validated(generation);
                 Ok(())
             }
@@ -21510,14 +21525,51 @@ impl StorageEngine {
             Ok(meta) if meta.state == super::BranchState::Active && meta.name != "main" => meta,
             _ => return Err(Error::branch_not_active(name)),
         };
+        // v10.7: an expired branch cannot be bound, even before it is reaped.
+        if meta.is_expired_at(chrono::Utc::now().timestamp_millis()) {
+            return Err(Error::branch_expired(name, meta.expires_at_unix_ms().unwrap_or(0)));
+        }
+        let expires = meta.expires_at_unix_ms().unwrap_or(0);
         let chain = self.get_branch_chain(meta.branch_id)?;
-        Ok(crate::session::BranchBinding::new(
-            self.instance_id,
-            meta.name,
-            meta.branch_id,
-            chain,
-            generation,
-        ))
+        let binding =
+            crate::session::BranchBinding::new(self.instance_id, meta.name, meta.branch_id, chain, generation);
+        binding
+            .expires_at_ms
+            .store(expires, std::sync::atomic::Ordering::Release);
+        Ok(binding)
+    }
+
+    /// v10.7: drop every ACTIVE branch whose lifetime has ended, through the
+    /// ordinary DROP path, and say what happened to each.
+    ///
+    /// Only on a writable primary (the write gate refuses a physical standby
+    /// and a read-only open; their drops arrive by replication). A branch is
+    /// kept, and reported, when it has a child branch (2BP01), an unfinished
+    /// merge, or the drop otherwise fails; the next reap tries again. Never
+    /// reaps when the wall clock is earlier than the branch's creation stamp.
+    pub fn reap_expired_branches(&self) -> Result<Vec<String>> {
+        if self.branch_manager().is_none() || !self.engine_may_write() || !self.write_gate().is_open() {
+            return Ok(Vec::new());
+        }
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut report = Vec::new();
+        for meta in self.list_branches()? {
+            if meta.name == "main" || !meta.is_expired_at(now) {
+                continue;
+            }
+            if let Err(e) = self.refuse_drop_of_branch_with_child(&meta.name) {
+                report.push(format!("expired branch \"{}\" kept: {e}", meta.name));
+                continue;
+            }
+            match self.drop_branch(&meta.name, true) {
+                Ok(()) => report.push(format!("expired branch \"{}\" dropped", meta.name)),
+                Err(e) => report.push(format!("expired branch \"{}\" kept: {e}", meta.name)),
+            }
+        }
+        for line in &report {
+            tracing::info!("branch expiry: {line}");
+        }
+        Ok(report)
     }
 
     /// Is `name` an ACTIVE branch? The existence test `CREATE BRANCH … IF NOT

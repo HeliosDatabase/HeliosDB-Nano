@@ -126,6 +126,7 @@ pub use branch::{
     MergeConflict, MergeResult, MergeStrategy, BRANCH_DRAIN_TIMEOUT, GIT_COMMIT_PREFIX, GIT_CONFIG_KEY,
     GIT_DDL_HISTORY_PREFIX, GIT_LINK_PREFIX, GIT_PR_PREFIX, GIT_SCHEMA_SNAPSHOT_PREFIX,
 };
+pub use branch::{BRANCH_CREATED_AT_UNIX_MS, BRANCH_EXPIRES_AT_UNIX_MS, BRANCH_LABEL};
 pub(crate) use branch_view::OverlayCacheScope;
 pub use branch_view::{
     branch_row_key, branch_tombstone_key, BranchArbitration, BranchKeyClaim, BranchStagedWrites, BranchUniqueConflict,
@@ -136,7 +137,8 @@ pub use ddl_batch::DdlBatch;
 pub use dirty_tracker::{Change, ChangeType, DirtyTracker, DirtyTrackerError};
 pub use dump::{
     CompressionType as DumpCompressionType, DumpManager, DumpMetadata, DumpMode, DumpOptions, DumpOutputFormat,
-    DumpReport, DumpType, RestoreOptions, RestoreReport, RestoreValidation,
+    DumpReport, DumpType, RestoreOptions, RestoreReport, RestoreValidation, SqlDialect as DumpSqlDialect,
+    SqlDumpOptions,
 };
 pub use engine::{
     is_rocksdb_name, DirectBulkLoadResult, LogicalCatchup, StorageEngine, StorageStats, SynchronousCommitOverrideGuard,

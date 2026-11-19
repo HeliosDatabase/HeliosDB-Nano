@@ -757,6 +757,20 @@ pub fn sequence_setval(seq: &super::SequenceDump) -> Option<String> {
         .map(|v| format!("SELECT setval({}, {}, true);", quote_literal(&seq.name), v))
 }
 
+/// v10.13, PostgreSQL dialect: move a SERIAL column's sequence past the keys
+/// the dump loaded (PostgreSQL's sequence does not advance when a row brings
+/// its own key, so the next generated key would collide).
+pub(crate) fn postgres_serial_catch_up(table: &str, column: &str) -> String {
+    format!(
+        "SELECT setval(pg_get_serial_sequence({}, {}), COALESCE(MAX({}), 1), MAX({}) IS NOT NULL) FROM {};",
+        quote_literal(&quote_table_name(table)),
+        quote_literal(column),
+        quote_ident(column),
+        quote_ident(column),
+        quote_table_name(table)
+    )
+}
+
 /// `CREATE [UNIQUE] INDEX "i" ON "t" USING m (key) [WITH (…)];`
 pub fn index_dump_ddl(index: &super::IndexDump) -> String {
     let with = if index.with_options.is_empty() {

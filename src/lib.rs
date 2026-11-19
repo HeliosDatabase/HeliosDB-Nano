@@ -13296,6 +13296,8 @@ impl EmbeddedDatabase {
         // Sprinter 6bc4a4040eb7 (B4): then whatever a crash left of a level that is
         // gone. A source with an unfinished merge stays.
         let _ = storage.reclaim_dead_branches();
+        // v10.7: branches whose lifetime ended while the database was closed.
+        let _ = storage.reap_expired_branches();
         // Sprinter 6bc4a4040eb7 (B4 fix pass): a history purge a crash stopped.
         let _ = storage.catalog().finish_pending_history_purges();
 
@@ -13758,6 +13760,8 @@ impl EmbeddedDatabase {
                 // engine does not get here: its primary's completion replicates.
                 let _ = storage.finish_pending_branch_merges();
                 let _ = storage.reclaim_dead_branches();
+                // v10.7: see `new`.
+                let _ = storage.reap_expired_branches();
                 // Sprinter 6bc4a4040eb7 (B4 fix pass): a history purge a crash stopped.
                 let _ = storage.catalog().finish_pending_history_purges();
             }
