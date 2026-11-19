@@ -27,6 +27,15 @@ changes.
 Reports from users of earlier releases (GitHub numbers) and defects found while the work after
 4.42.0 was being prepared. Each has a test file.
 
+- **Code graph and graph RAG: faster lookups, honest caching, a benchmark.** The code-graph and
+  graph-RAG tables get indexes for their lookups (on `main`; a store written by an earlier release
+  gains them when opened), with the same LSP answers. Re-index removes the rows of changed and
+  deleted files by key, once per chunk, and leaves one graph node per symbol. A graph search
+  issues a bounded number of statements per hop. The MCP result cache never serves an answer
+  computed before the last write to its database (`HELIOS_MCP_CACHE_CAPACITY=0` turns it off).
+  `examples/code_graph_bench.rs` measures cold index, re-index after edits, LSP percentiles,
+  graph search and MCP calls. Test files: `tests/code_graph_reindex_by_key.rs`,
+  `tests/mcp_result_cache_staleness.rs`, `tests/graph_rag_phase3.rs`, `tests/code_graph_phase2.rs`.
 - **`ALTER TABLE … ADD [CONSTRAINT name] PRIMARY KEY (cols)` on a table with rows** (the statement
   every pg_dump emits) was refused. It now checks that the rows are unique and not NULL, and builds
   the key. Test file: `tests/alter_table_add_primary_key.rs`.
