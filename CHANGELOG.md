@@ -27,6 +27,15 @@ changes.
 Reports from users of earlier releases (GitHub numbers) and defects found while the work after
 4.42.0 was being prepared. Each has a test file.
 
+- **`ALTER TABLE … ADD [CONSTRAINT name] PRIMARY KEY (cols)` on a table with rows** (the statement
+  every pg_dump emits) was refused. It now checks that the rows are unique and not NULL, and builds
+  the key. Test file: `tests/alter_table_add_primary_key.rs`.
+- **`AS OF TIMESTAMP` takes an expression:** `now()`, `now() - interval '5 minutes'`,
+  `CURRENT_TIMESTAMP` and a bound parameter, not only a literal. Test file:
+  `tests/as_of_timestamp_expression.rs`.
+- **`WHERE pk = v` and `WHERE pk = v AND …` change the same rows on every route** (autocommit, inside
+  `BEGIN`, bound parameters, after an `INSERT` of that key in the same transaction). Test file:
+  `tests/transaction_pk_in_contract.rs`.
 - **A branch can expire.** `CREATE BRANCH b FROM main WITH (expires_in = '2h', label = 'agent-42')`
   used to answer "Unknown branch option". The branch now records when it expires and a label; an
   expired branch refuses new statements, and it is dropped at the next open or branch operation
@@ -434,7 +443,10 @@ candidate's binary beside the 4.41.1 binary. None of them was in a released vers
   again, whenever a write cannot be followed exactly: an encrypted store, a record that does not
   decode, a range delete, a failed write, two such writes at once. What a `DROP TABLE` reads
   under its locks before it refuses (`RESTRICT`) or removes a child's foreign key (`CASCADE`) is
-  unchanged. `src/fk_owner_list_tests.rs`.
+  unchanged. `src/fk_owner_list_tests.rs`. The rest of the cost, the walk of every table's
+  index definitions, is gone too: the write gate keeps a map from each `meta:index:` record to its
+  table, kept under the same rules and checked against a full walk in tests, and `DROP TABLE`
+  reads that table's entries only. `src/index_definition_map_tests.rs`.
 
 ### Fixed — a key-moving UPDATE waits for a key an open transaction took out
 
