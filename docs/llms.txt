@@ -411,7 +411,7 @@ Verb lookup (every CLI flag / REPL command / Rust API / MCP tool):
 - README.md — full feature tour, ORM/driver matrix, HA, deploy templates.
 - config.example.toml — every config key, annotated.
 - docs/guides/ — auth, upgrades, HA tutorial, SQLite drop-in, audit.
-- docs/release-notes/v4.42.0.md — latest release (4.42.0, 2026-11-17): what
+- docs/release-notes/v4.42.0.md — latest release (4.42.0, 2026-11-20): what
   changed, what breaks, upgrade steps, benchmark summary, FAQ. Structured
   data: docs/release-notes/v4.42.0.jsonld.
 - docs/benchmarks/RELEASE_4_42_0.md — release benchmark against 4.41.1 and

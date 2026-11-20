@@ -29,12 +29,12 @@ A handful of categories are where Nano is *ahead but not by much* — these are 
 current focus, and we'd rather name them than hide them:
 
 - **Joins** (INNER / LEFT / 4-table) — the margins here are the suite's smallest
-  after top-k. In the 4.42.0 release run they are 10.5×, 14.8× and 8.9×.
+  after top-k. In the 4.42.0 release run they are 9.7×, 13.7× and 8.9×.
   The 4-table join was slower than PostgreSQL up to 4.41.1 (about 0.8×): a `WHERE`
   term pushed below the joins lost the index lookups of the joins above it, which
   4.42.0 fixes. Join ordering, build-side selection, and a streaming
   (non-materializing) join operator are on the roadmap.
-- **`ORDER BY … LIMIT` (top-k)** — 2.9× in the 4.42.0 release run, the smallest
+- **`ORDER BY … LIMIT` (top-k)** — 3.0× in the 4.42.0 release run, the smallest
   margin of the 35 categories; we're hardening the ordered-index top-k fast path.
 - **One-row writes since 4.42.0** — still far ahead of a networked PostgreSQL, but
   slower than 4.41.1 was, because every one-row `UPDATE` and `DELETE` now records the

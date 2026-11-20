@@ -18,7 +18,7 @@ the per-category history lives in
 > not a measurement artifact. With that fixed it is a decisive Nano win (~157×).
 > See *The category that found a real bug* below.
 
-## Current release — v4.42.0 (2026-11-17)
+## Current release — v4.42.0 (2026-11-20)
 
 The run of the current release, beside 4.41.1 and with every binary identified, is in
 [`RELEASE_4_42_0.md`](RELEASE_4_42_0.md). With the strict harness (every result checked, exactly
