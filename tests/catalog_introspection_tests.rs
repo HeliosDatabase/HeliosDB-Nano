@@ -161,7 +161,11 @@ fn pg_class_and_pg_attribute_describe_views() {
         .unwrap_or_else(|| panic!("pg_class must contain the view; got {rows:?}"));
     assert_eq!(view_row[kind_idx], "v", "a view must report relkind='v'");
     let view_oid: i64 = view_row[oid_idx].parse().expect("oid is an integer");
-    assert!(view_oid >= 7000, "view OIDs come from the 7000 base, got {view_oid}");
+    // Identifiers are derived from names now, above the built-in range (they were 7000 + position).
+    assert!(
+        view_oid >= 16384,
+        "a view identifier is above the built-in range, got {view_oid}"
+    );
 
     // Disjointness: no non-view relation may share the view's OID.
     for r in &rows {

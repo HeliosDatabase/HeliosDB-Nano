@@ -300,3 +300,50 @@ async fn wire_engine_tables_refuse_user_ddl_with_42501() {
     assert_eq!(super::handler::sqlstate_for_error(&refusal), "42501");
     assert!(crate::sql::dict::reserved::engine_table_refusal("_hdb_graph_nodes", "DROP TABLE", false).is_none());
 }
+
+// ---------------------------------------------------------------------------
+// Item 4: stable object identifiers
+// ---------------------------------------------------------------------------
+
+/// The identifier psql gets from its `\d <name>` lookup is the one `pg_class`
+/// reports, and it does not move when another table is created.
+#[tokio::test]
+async fn wire_psql_describe_uses_the_pg_class_identifier() {
+    let db = new_db();
+    let (mut handler, mut client) = connect(&db);
+    setup(
+        &mut handler,
+        &mut client,
+        "CREATE TABLE dw_target (id INTEGER PRIMARY KEY, v TEXT)",
+    )
+    .await;
+    let lookup = "SELECT c.oid,\n  n.nspname,\n  c.relname\nFROM pg_catalog.pg_class c\n     \
+                  LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace\n\
+                  WHERE c.relname OPERATOR(pg_catalog.~) '^(dw_target)$' COLLATE pg_catalog.default\n  \
+                  AND pg_catalog.pg_table_is_visible(c.oid)\nORDER BY 2, 3;";
+    let out = simple(&mut handler, &mut client, lookup).await;
+    assert!(sqlstates(&out).is_empty(), "{:?}", sqlstates(&out));
+    let described = data_rows(&out);
+    assert_eq!(described.len(), 1, "{described:?}");
+    let class = rows(
+        &mut handler,
+        &mut client,
+        "SELECT oid FROM pg_class WHERE relname = 'dw_target'",
+    )
+    .await;
+    assert_eq!(described[0][0], class[0][0], "psql's lookup and pg_class must agree");
+    assert!(described[0][0].parse::<i64>().unwrap() >= 16384);
+
+    setup(
+        &mut handler,
+        &mut client,
+        "CREATE TABLE aaa_dw_before (id INTEGER PRIMARY KEY)",
+    )
+    .await;
+    let out = simple(&mut handler, &mut client, lookup).await;
+    assert_eq!(
+        data_rows(&out),
+        described,
+        "the identifier must not move when another table is created"
+    );
+}

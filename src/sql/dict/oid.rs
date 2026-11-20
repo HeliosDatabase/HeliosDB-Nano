@@ -51,6 +51,8 @@ pub enum OidClass {
     Schema,
     /// A function or procedure, by kind letter, NUL, name.
     Routine,
+    /// A column default, by `table`, NUL, `column`.
+    ColumnDefault,
 }
 
 impl OidClass {
@@ -64,6 +66,7 @@ impl OidClass {
             Self::Constraint => b'c',
             Self::Schema => b'n',
             Self::Routine => b'p',
+            Self::ColumnDefault => b'd',
         }
     }
 }
@@ -281,7 +284,13 @@ impl DictOids {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::assert_is_empty
+)]
 mod tests {
     use super::*;
 

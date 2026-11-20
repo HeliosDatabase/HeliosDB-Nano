@@ -12,6 +12,7 @@
 #[path = "../../catalog_columns_scope_tests.rs"]
 mod catalog_columns_scope_tests;
 
+use crate::sql::dict::oid::{DictOids, OidClass, OidScope};
 use crate::sql::dict::DictContext;
 use crate::storage::internal_relations::{is_internal_relation, materialized_view_of, InternalKind};
 use crate::storage::{art_index::ArtIndexType, StorageEngine};
@@ -3790,44 +3791,17 @@ fn builtin_type_namespace(name: &str) -> i32 {
     }
 }
 
-const PG_TABLE_OID_BASE: i32 = 1000;
-const PG_INDEX_OID_BASE: i32 = 5000;
-const PG_CONSTRAINT_OID_BASE: i32 = 4000;
-/// Distinct OID base for sequence relations (pg_class relkind='S'). Kept clear
-/// of the table (1000) and index (5000) bases so sequence OIDs never collide.
-const PG_SEQ_OID_BASE: i32 = 6000;
-/// Distinct OID base for VIEW relations (pg_class relkind='v'). Kept clear of
-/// the table (1000), constraint (4000), index (5000) and sequence (6000) bases.
-/// Like its siblings this is a deterministic wire-protocol constant, not a
-/// tunable: clients JOIN `pg_class.oid` to `pg_attribute.attrelid`, so the two
-/// surfaces must derive the value the same way, every process, forever.
-const PG_VIEW_OID_BASE: i32 = 7000;
-/// Distinct OID base for VECTOR (HNSW) index relations (pg_class relkind='i').
-/// Kept clear of the table (1000), constraint (4000), ART-index (5000),
-/// sequence (6000) and view (7000) bases. Vector indexes need their OWN base
-/// rather than continuing the 5000 one because the two index registries are
-/// enumerated independently: sharing a counter would make an HNSW index's OID
-/// move whenever an unrelated ART index was created or dropped, and
-/// `pg_index.indexrelid` would stop resolving to the same `pg_class.oid`
-/// (sprinter cec8ab163448).
-const PG_VECTOR_INDEX_OID_BASE: i32 = 8000;
+// Relation, index, sequence, view and constraint identifiers are derived
+// from names by `sql::dict::oid` (`DictOids`), the same in every producer:
+// clients JOIN `pg_class.oid` to `pg_attribute.attrelid`, `pg_index.indrelid`
+// and `pg_constraint.conrelid`, and an identifier must not move when another
+// object is created or dropped.
 const PG_PUBLIC_NAMESPACE_OID: i32 = 2200;
 
 /// The catalogue (database) name every introspection surface reports. One
 /// constant so `pg_database.datname`, `information_schema.catalog_name` and the
 /// `*_catalog` columns can never drift apart.
 const HELIOS_CATALOG_NAME: &str = "heliosdb";
-
-fn pg_table_oid(table_idx: usize) -> i32 {
-    PG_TABLE_OID_BASE + table_idx as i32
-}
-
-fn pg_table_oid_by_name(tables: &[String], table_name: &str) -> Option<i32> {
-    tables
-        .iter()
-        .position(|name| name.eq_ignore_ascii_case(table_name))
-        .map(pg_table_oid)
-}
 
 /// Spec R5.3 (review F11): how many more builds `pg_indexes` makes looking for two
 /// consecutive ones that agree before it answers with the last.
@@ -3885,30 +3859,6 @@ pub(crate) fn vector_indexdef(metadata: &crate::storage::VectorIndexMetadata) ->
         metadata.column_name,
         vector_index_opclass(metadata)
     )
-}
-
-fn pg_index_oid(index_idx: usize) -> i32 {
-    PG_INDEX_OID_BASE + index_idx as i32
-}
-
-fn pg_index_oid_by_name(indexes: &[(String, String, ArtIndexType, Vec<String>)], index_name: &str) -> i32 {
-    indexes
-        .iter()
-        .position(|(name, _, _, _)| name.eq_ignore_ascii_case(index_name))
-        .map(pg_index_oid)
-        .unwrap_or(0)
-}
-
-fn pg_vector_index_oid(index_idx: usize) -> i32 {
-    PG_VECTOR_INDEX_OID_BASE + index_idx as i32
-}
-
-fn pg_sequence_oid(seq_idx: usize) -> i32 {
-    PG_SEQ_OID_BASE + seq_idx as i32
-}
-
-fn pg_view_oid(view_idx: usize) -> i32 {
-    PG_VIEW_OID_BASE + view_idx as i32
 }
 
 /// Every schema name the catalogue surfaces: the three namespaces PostgreSQL
@@ -4026,8 +3976,9 @@ fn pg_fk_action_code(action: crate::sql::ReferentialAction) -> &'static str {
 #[allow(clippy::too_many_arguments)]
 fn push_pg_constraint_row(
     rows: &mut Vec<Tuple>,
-    next_oid: &mut i32,
+    oids: &mut DictOids,
     seen: &mut HashSet<String>,
+    table: &str,
     name: String,
     contype: &str,
     conrelid: i32,
@@ -4046,8 +3997,9 @@ fn push_pg_constraint_row(
         return;
     }
 
+    let oid = oids.claim_constraint(table, &name);
     rows.push(Tuple::new(vec![
-        Value::Int4(*next_oid),
+        Value::Int4(oid),
         Value::String(name),
         Value::Int4(PG_PUBLIC_NAMESPACE_OID),
         Value::String(contype.to_string()),
@@ -4073,7 +4025,6 @@ fn push_pg_constraint_row(
         Value::Boolean(deferred),
         Value::Boolean(validated),
     ]));
-    *next_oid += 1;
 }
 
 impl SystemViewRegistry {
@@ -4593,10 +4544,13 @@ impl SystemViewRegistry {
         let storage = ctx.storage();
         let catalog = storage.catalog();
         let tables = catalog.list_tables()?;
+        let oids = DictOids::load(storage, OidScope::Relations)?;
         let mut results = Vec::new();
 
-        for (idx, table_name) in tables.iter().enumerate() {
-            let oid = pg_table_oid(idx);
+        for table_name in &tables {
+            let Some(oid) = oids.table(table_name) else {
+                continue;
+            };
             // Schema namespacing: the storage key is `schema.table` for a
             // non-`public` table; `relname` is the BARE table (PostgreSQL keeps
             // the schema in `relnamespace`, not `relname`), so two coexisting
@@ -4632,8 +4586,10 @@ impl SystemViewRegistry {
             results.push(tuple);
         }
 
-        for (idx, (index_name, _table_name, _index_type, _columns)) in sorted_art_indexes(storage).iter().enumerate() {
-            let oid = pg_index_oid(idx);
+        for (index_name, table_name, _index_type, _columns) in &sorted_art_indexes(storage) {
+            let Some(oid) = oids.index(table_name, index_name) else {
+                continue;
+            };
             results.push(Tuple::new(vec![
                 Value::Int4(oid),
                 Value::String(index_name.clone()),
@@ -4654,8 +4610,10 @@ impl SystemViewRegistry {
         // through pg_class reported that the index did not exist. Their OIDs
         // come from the dedicated 8000 base so they can never collide with an
         // ART index's.
-        for (idx, metadata) in sorted_vector_indexes(storage).iter().enumerate() {
-            let oid = pg_vector_index_oid(idx);
+        for metadata in &sorted_vector_indexes(storage) {
+            let Some(oid) = oids.vector_index(&metadata.table_name, &metadata.name) else {
+                continue;
+            };
             let (index_schema, _) = crate::sql::Planner::split_schema_key(&metadata.table_name);
             results.push(Tuple::new(vec![
                 Value::Int4(oid),
@@ -4671,16 +4629,16 @@ impl SystemViewRegistry {
 
         // Sequences (relkind='S'): real CREATE SEQUENCE defs first, then
         // SERIAL/IDENTITY synthetic owned-sequence names, deduped by name so
-        // pg_class never reports a sequence twice. A monotonic `seq_idx` keeps
-        // OIDs stable for a given catalog ordering.
-        let mut seq_idx = 0usize;
+        // pg_class never reports a sequence twice. A sequence's identifier
+        // comes from its name.
         let mut seen_seq: HashSet<String> = HashSet::new();
         for def in catalog.list_sequences()? {
             if !seen_seq.insert(def.name.to_lowercase()) {
                 continue;
             }
-            let oid = pg_sequence_oid(seq_idx);
-            seq_idx += 1;
+            let Some(oid) = oids.sequence(&def.name) else {
+                continue;
+            };
             results.push(Tuple::new(vec![
                 Value::Int4(oid),                     // oid
                 Value::String(def.name.clone()),      // relname
@@ -4698,8 +4656,9 @@ impl SystemViewRegistry {
                 if !seen_seq.insert(seq_name.to_lowercase()) {
                     continue;
                 }
-                let oid = pg_sequence_oid(seq_idx);
-                seq_idx += 1;
+                let Some(oid) = oids.sequence(&seq_name) else {
+                    continue;
+                };
                 results.push(Tuple::new(vec![
                     Value::Int4(oid),
                     Value::String(seq_name),
@@ -4718,8 +4677,10 @@ impl SystemViewRegistry {
         // drizzle — cannot see a single view. `sorted_views` fixes the
         // enumeration order so the OIDs here match the `attrelid`s
         // `execute_pg_attribute` emits for the same views.
-        for (idx, (view_schema, view_name, _metadata)) in sorted_views(storage)?.into_iter().enumerate() {
-            let oid = pg_view_oid(idx);
+        for (view_schema, view_name, _metadata) in sorted_views(storage)? {
+            let Some(oid) = oids.view(&view_schema, &view_name) else {
+                continue;
+            };
             let nsp_oid = crate::sql::Planner::schema_name_to_oid(&view_schema);
             results.push(Tuple::new(vec![
                 Value::Int4(oid),               // oid
@@ -4780,11 +4741,13 @@ impl SystemViewRegistry {
         let storage = ctx.storage();
         let catalog = storage.catalog();
         let tables = catalog.list_tables()?;
+        let oids = DictOids::load(storage, OidScope::Views)?;
         let mut results = Vec::new();
-        let oid_counter = 1000i32;
 
-        for (table_idx, table_name) in tables.iter().enumerate() {
-            let table_oid = oid_counter + (table_idx as i32);
+        for table_name in &tables {
+            let Some(table_oid) = oids.table(table_name) else {
+                continue;
+            };
             // KanttBan #23 phase 2.4: cache the IDENTITY column list
             // for this table so we can set attidentity = 'd' on the
             // right rows. Empty / missing record → no identity cols
@@ -4826,13 +4789,15 @@ impl SystemViewRegistry {
             }
         }
 
-        // Columns of regular views. `attrelid` uses the SAME `pg_view_oid(idx)`
-        // over the SAME `sorted_views` order that `execute_pg_class` uses, so
+        // Columns of regular views. `attrelid` is the identifier `execute_pg_class`
+        // gives the same view (both derive it from the view's schema and name), so
         // `pg_class ⨝ pg_attribute ON oid = attrelid` resolves. Without these
         // rows the relkind='v' entries above would describe a column-less
         // relation and psql `\d v` / SQLAlchemy column reflection would break.
-        for (idx, (_view_schema, _view_name, metadata)) in sorted_views(storage)?.into_iter().enumerate() {
-            let view_oid = pg_view_oid(idx);
+        for (view_schema, view_name, metadata) in sorted_views(storage)? {
+            let Some(view_oid) = oids.view(&view_schema, &view_name) else {
+                continue;
+            };
             for (col_idx, column) in metadata.schema.columns.iter().enumerate() {
                 let type_oid = Self::get_type_oid(&column.data_type);
                 let ndims: i32 = match &column.data_type {
@@ -5060,9 +5025,11 @@ impl SystemViewRegistry {
         let storage = ctx.storage();
         let catalog = storage.catalog();
         let mut rows = Vec::new();
-        let mut oid_counter: i32 = 7000;
-        for (table_idx, table_name) in catalog.list_tables()?.iter().enumerate() {
-            let adrelid = 1000_i32 + table_idx as i32;
+        let mut oids = DictOids::load(storage, OidScope::Tables)?;
+        for table_name in &catalog.list_tables()? {
+            let Some(adrelid) = oids.table(table_name) else {
+                continue;
+            };
             if let Ok(schema) = catalog.get_table_schema(table_name) {
                 let identity_cols = catalog.list_identity_columns(table_name)?;
                 for (col_idx, col) in schema.columns.iter().enumerate() {
@@ -5080,14 +5047,14 @@ impl SystemViewRegistry {
                     } else {
                         continue;
                     };
+                    let default_oid = oids.claim(OidClass::ColumnDefault, &format!("{table_name}\u{0}{}", col.name));
                     rows.push(Tuple::new(vec![
-                        Value::Int4(oid_counter),          // oid
+                        Value::Int4(default_oid),          // oid
                         Value::Int4(adrelid),              // adrelid
                         Value::Int2((col_idx + 1) as i16), // adnum (1-indexed)
                         Value::String(adsrc.clone()),      // adbin (node-tree text; same as adsrc for our purposes)
                         Value::String(adsrc),              // adsrc
                     ]));
-                    oid_counter += 1;
                 }
             }
         }
@@ -5739,11 +5706,12 @@ impl SystemViewRegistry {
     fn execute_pg_index(ctx: &DictContext<'_>) -> Result<Vec<Tuple>> {
         let storage = ctx.storage();
         let catalog = storage.catalog();
-        let tables = catalog.list_tables()?;
+        let oids = DictOids::load(storage, OidScope::Indexes)?;
         let mut results = Vec::new();
 
-        for (idx, (_index_name, table_name, index_type, columns)) in sorted_art_indexes(storage).iter().enumerate() {
-            let Some(table_oid) = pg_table_oid_by_name(&tables, table_name) else {
+        for (index_name, table_name, index_type, columns) in &sorted_art_indexes(storage) {
+            let (Some(table_oid), Some(index_oid)) = (oids.table(table_name), oids.index(table_name, index_name))
+            else {
                 continue;
             };
             let schema = match catalog.get_table_schema(table_name) {
@@ -5753,7 +5721,7 @@ impl SystemViewRegistry {
             let indkey = pg_indkey(&schema, columns);
             let column_count = columns.len() as i16;
             results.push(Tuple::new(vec![
-                Value::Int4(pg_index_oid(idx)),                          // indexrelid
+                Value::Int4(index_oid),                                  // indexrelid
                 Value::Int4(table_oid),                                  // indrelid
                 Value::Boolean(*index_type == ArtIndexType::PrimaryKey), // indisprimary
                 Value::Boolean(matches!(*index_type, ArtIndexType::PrimaryKey | ArtIndexType::Unique)), // indisunique
@@ -5775,8 +5743,11 @@ impl SystemViewRegistry {
         // client that JOINs pg_index to pg_class (which is how psql's `\d`
         // resolves an index's name) lands on the right row. An HNSW index is
         // neither primary nor unique and indexes exactly one column.
-        for (idx, metadata) in sorted_vector_indexes(storage).iter().enumerate() {
-            let Some(table_oid) = pg_table_oid_by_name(&tables, &metadata.table_name) else {
+        for metadata in &sorted_vector_indexes(storage) {
+            let (Some(table_oid), Some(index_oid)) = (
+                oids.table(&metadata.table_name),
+                oids.vector_index(&metadata.table_name, &metadata.name),
+            ) else {
                 continue;
             };
             let Ok(schema) = catalog.get_table_schema(&metadata.table_name) else {
@@ -5784,20 +5755,20 @@ impl SystemViewRegistry {
             };
             let indkey = pg_indkey(&schema, std::slice::from_ref(&metadata.column_name));
             results.push(Tuple::new(vec![
-                Value::Int4(pg_vector_index_oid(idx)), // indexrelid
-                Value::Int4(table_oid),                // indrelid
-                Value::Boolean(false),                 // indisprimary
-                Value::Boolean(false),                 // indisunique
-                Value::Boolean(false),                 // indisexclusion
-                Value::String(indkey),                 // indkey
-                Value::Int2(1),                        // indnatts
-                Value::Int2(1),                        // indnkeyatts
-                Value::Boolean(false),                 // indisclustered
-                Value::Boolean(true),                  // indisvalid
-                Value::Boolean(true),                  // indisready
-                Value::Boolean(false),                 // indisreplident
-                Value::Null,                           // indexprs
-                Value::Null,                           // indpred
+                Value::Int4(index_oid), // indexrelid
+                Value::Int4(table_oid), // indrelid
+                Value::Boolean(false),  // indisprimary
+                Value::Boolean(false),  // indisunique
+                Value::Boolean(false),  // indisexclusion
+                Value::String(indkey),  // indkey
+                Value::Int2(1),         // indnatts
+                Value::Int2(1),         // indnkeyatts
+                Value::Boolean(false),  // indisclustered
+                Value::Boolean(true),   // indisvalid
+                Value::Boolean(true),   // indisready
+                Value::Boolean(false),  // indisreplident
+                Value::Null,            // indexprs
+                Value::Null,            // indpred
             ]));
         }
 
@@ -5811,13 +5782,14 @@ impl SystemViewRegistry {
         let storage = ctx.storage();
         let catalog = storage.catalog();
         let tables = catalog.list_tables()?;
-        let indexes = sorted_art_indexes(storage);
+        let mut oids = DictOids::load(storage, OidScope::Indexes)?;
         let mut results = Vec::new();
-        let mut constraint_oid = PG_CONSTRAINT_OID_BASE;
         let mut seen = HashSet::new();
 
-        for (table_idx, table_name) in tables.iter().enumerate() {
-            let table_oid = pg_table_oid(table_idx);
+        for table_name in &tables {
+            let Some(table_oid) = oids.table(table_name) else {
+                continue;
+            };
             let schema = match catalog.get_table_schema(table_name) {
                 Ok(schema) => schema,
                 Err(_) => continue,
@@ -5833,13 +5805,14 @@ impl SystemViewRegistry {
                 let constraint_name = format!("{}_pkey", table_name);
                 push_pg_constraint_row(
                     &mut results,
-                    &mut constraint_oid,
+                    &mut oids,
                     &mut seen,
+                    table_name,
                     constraint_name.clone(),
                     "p",
                     table_oid,
                     None,
-                    pg_index_oid_by_name(&indexes, &constraint_name),
+                    oids.index_named(&constraint_name),
                     pg_conkey(&schema, &pk_columns),
                     Value::Null,
                     None,
@@ -5855,13 +5828,14 @@ impl SystemViewRegistry {
                     let constraint_name = format!("{}_{}_key", table_name, col.name);
                     push_pg_constraint_row(
                         &mut results,
-                        &mut constraint_oid,
+                        &mut oids,
                         &mut seen,
+                        table_name,
                         constraint_name.clone(),
                         "u",
                         table_oid,
                         None,
-                        pg_index_oid_by_name(&indexes, &constraint_name),
+                        oids.index_named(&constraint_name),
                         pg_conkey(&schema, std::slice::from_ref(&col.name)),
                         Value::Null,
                         None,
@@ -5881,13 +5855,14 @@ impl SystemViewRegistry {
             for unique in constraints.unique_constraints {
                 push_pg_constraint_row(
                     &mut results,
-                    &mut constraint_oid,
+                    &mut oids,
                     &mut seen,
+                    table_name,
                     unique.name.clone(),
                     if unique.is_primary_key { "p" } else { "u" },
                     table_oid,
                     None,
-                    pg_index_oid_by_name(&indexes, &unique.name),
+                    oids.index_named(&unique.name),
                     pg_conkey(&schema, &unique.columns),
                     Value::Null,
                     None,
@@ -5901,8 +5876,9 @@ impl SystemViewRegistry {
             for check in constraints.check_constraints {
                 push_pg_constraint_row(
                     &mut results,
-                    &mut constraint_oid,
+                    &mut oids,
                     &mut seen,
+                    table_name,
                     check.name,
                     "c",
                     table_oid,
@@ -5919,15 +5895,16 @@ impl SystemViewRegistry {
             }
 
             for fk in constraints.foreign_keys {
-                let ref_oid = pg_table_oid_by_name(&tables, &fk.references_table);
+                let ref_oid = oids.table(&fk.references_table);
                 let ref_key = match catalog.get_table_schema(&fk.references_table) {
                     Ok(ref_schema) => pg_conkey(&ref_schema, &fk.references_columns),
                     Err(_) => Value::Null,
                 };
                 push_pg_constraint_row(
                     &mut results,
-                    &mut constraint_oid,
+                    &mut oids,
                     &mut seen,
+                    table_name,
                     fk.name.clone(),
                     "f",
                     table_oid,

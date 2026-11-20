@@ -1597,25 +1597,12 @@ impl<'a> Planner<'a> {
     /// schema's `pg_namespace.oid`. Built-in namespaces use PostgreSQL's fixed
     /// OIDs (`pg_catalog`=11, `information_schema`=13183, `public`=2200); a user
     /// schema hashes to a deterministic OID above PG's FirstNormalObjectId
-    /// (16384). The hash is derived from the name alone (fixed-key
-    /// `DefaultHasher`, deterministic across restarts) so a schema keeps the
+    /// (16384). The hash is derived from the name alone (`sql::dict::oid`, the
+    /// same in every build and every process) so a schema keeps the
     /// SAME oid regardless of which OTHER schemas exist — unlike sequential
     /// assignment, which renumbers survivors when a schema is added or dropped.
     pub(crate) fn schema_name_to_oid(schema: &str) -> i32 {
-        match schema {
-            "pg_catalog" => 11,
-            "information_schema" => 13_183,
-            "public" => 2200,
-            other => {
-                use std::collections::hash_map::DefaultHasher;
-                use std::hash::{Hash, Hasher};
-                let mut hasher = DefaultHasher::new();
-                other.hash(&mut hasher);
-                // 0..=999_999 fits i32; the +16_384 base keeps it clear of the
-                // reserved built-in OIDs above (max here ≈ 1_016_383).
-                16_384 + (hasher.finish() % 1_000_000) as i32
-            }
-        }
+        super::dict::oid::schema_oid(schema)
     }
 
     /// Resolve a table REFERENCE (read / DML / FK target / DROP) to its storage

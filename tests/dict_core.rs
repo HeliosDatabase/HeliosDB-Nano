@@ -310,3 +310,114 @@ fn engine_tables_are_protected_while_their_feature_is_compiled_in() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Item 4: stable object identifiers
+// ---------------------------------------------------------------------------
+
+fn oid_snapshot(db: &EmbeddedDatabase) -> Vec<Vec<String>> {
+    let mut out = rows(
+        db,
+        "SELECT relkind, relname, oid FROM pg_class WHERE relname IN \
+         ('dc_parent', 'dc_child', 'dc_child_tag', 'dc_view', 'dc_seq') ORDER BY relkind, relname",
+    );
+    out.extend(rows(
+        db,
+        "SELECT k.contype, k.conname, k.oid FROM pg_constraint k JOIN pg_class c ON c.oid = k.conrelid \
+         WHERE c.relname = 'dc_child' ORDER BY k.contype, k.conname",
+    ));
+    out.extend(rows(
+        db,
+        "SELECT 'n', nspname, oid FROM pg_namespace WHERE nspname = 'dc_app'",
+    ));
+    out
+}
+
+#[test]
+fn object_identifiers_are_stable_across_ddl_and_join() {
+    let db = db();
+    db.execute("CREATE SCHEMA dc_app").unwrap();
+    db.execute("CREATE TABLE dc_parent (id INTEGER PRIMARY KEY, name TEXT UNIQUE)")
+        .unwrap();
+    db.execute(
+        "CREATE TABLE dc_child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES dc_parent(id), tag TEXT, \
+         CONSTRAINT dc_child_tag_ck CHECK (tag <> ''))",
+    )
+    .unwrap();
+    db.execute("CREATE INDEX dc_child_tag ON dc_child (tag)").unwrap();
+    db.execute("CREATE VIEW dc_view AS SELECT id FROM dc_child").unwrap();
+    db.execute("CREATE SEQUENCE dc_seq").unwrap();
+
+    let before = oid_snapshot(&db);
+    assert!(
+        before.len() >= 7,
+        "tables, index, view, sequence, constraints and schema: {before:?}"
+    );
+    for row in &before {
+        let oid: i64 = row[2].parse().unwrap();
+        assert!(
+            oid >= 16384,
+            "{row:?}: an object identifier is above the built-in range"
+        );
+    }
+
+    // Names that sort before, between and after the existing ones, and a drop.
+    db.execute("CREATE TABLE aaa_dc_first (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    db.execute("CREATE TABLE dc_between (id INTEGER PRIMARY KEY, v TEXT UNIQUE)")
+        .unwrap();
+    db.execute("CREATE INDEX aaa_dc_idx ON dc_between (v)").unwrap();
+    db.execute("CREATE VIEW aaa_dc_view AS SELECT id FROM dc_between")
+        .unwrap();
+    db.execute("CREATE SEQUENCE aaa_dc_seq").unwrap();
+    db.execute("CREATE TABLE zzz_dc_last (id INTEGER PRIMARY KEY)").unwrap();
+    db.execute("DROP TABLE aaa_dc_first").unwrap();
+    assert_eq!(
+        oid_snapshot(&db),
+        before,
+        "identifiers must not move when other objects come and go"
+    );
+
+    // The joins clients write.
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT a.attname FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid \
+             WHERE c.relname = 'dc_child' AND a.attnum > 0 ORDER BY a.attnum"
+        ),
+        vec![vec!["id"], vec!["parent_id"], vec!["tag"]]
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT ic.relname FROM pg_index i JOIN pg_class c ON c.oid = i.indrelid \
+             JOIN pg_class ic ON ic.oid = i.indexrelid WHERE c.relname = 'dc_child' AND ic.relname = 'dc_child_tag'"
+        ),
+        vec![vec!["dc_child_tag"]]
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT p.relname FROM pg_constraint k JOIN pg_class c ON c.oid = k.conrelid \
+             JOIN pg_class p ON p.oid = k.confrelid WHERE c.relname = 'dc_child' AND k.contype = 'f'"
+        ),
+        vec![vec!["dc_parent"]]
+    );
+    // One identifier names one relation.
+    let (total, distinct) = (
+        one(&db, "SELECT count(*) FROM pg_class"),
+        one(&db, "SELECT count(DISTINCT oid) FROM pg_class"),
+    );
+    assert_eq!(total, distinct, "pg_class.oid must be unique");
+    let (total, distinct) = (
+        one(&db, "SELECT count(*) FROM pg_constraint"),
+        one(&db, "SELECT count(DISTINCT oid) FROM pg_constraint"),
+    );
+    assert_eq!(total, distinct, "pg_constraint.oid must be unique");
+    // No relation identifier is also a type identifier.
+    assert_eq!(
+        one(&db, "SELECT count(*) FROM pg_class c JOIN pg_type t ON t.oid = c.oid"),
+        "0",
+        "a relation identifier must not collide with a type identifier"
+    );
+}

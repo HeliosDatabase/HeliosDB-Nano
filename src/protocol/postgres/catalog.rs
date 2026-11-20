@@ -1032,9 +1032,11 @@ impl PgCatalog {
         let table_names = catalog.list_tables()?;
 
         let mut rows = Vec::new();
-        for (i, name) in table_names.iter().enumerate() {
+        // The identifier `pg_class` reports for the table: derived from its name.
+        let table_oids = crate::sql::dict::oid::DictOids::load(&db.storage, crate::sql::dict::oid::OidScope::Tables)?;
+        for name in table_names.iter() {
             rows.push(Tuple::new(vec![
-                Value::Int4((16384 + i) as i32), // Start OIDs at 16384 (user tables)
+                Value::Int4(table_oids.table(name).unwrap_or(0)), // derived from the table name
                 Value::String(name.clone()),
                 Value::Int4(2200),              // public namespace
                 Value::String("r".to_string()), // regular table
@@ -1127,8 +1129,10 @@ impl PgCatalog {
         let table_names = storage_catalog.list_tables()?;
 
         let mut rows = Vec::new();
-        for (ti, table_name) in table_names.iter().enumerate() {
-            let oid = (16384 + ti) as i32;
+        // The identifier `pg_class` reports for the table: derived from its name.
+        let table_oids = crate::sql::dict::oid::DictOids::load(&db.storage, crate::sql::dict::oid::OidScope::Tables)?;
+        for table_name in table_names.iter() {
+            let oid = table_oids.table(table_name).unwrap_or(0);
             if let Ok(table_schema) = storage_catalog.get_table_schema(table_name) {
                 for (ci, col) in table_schema.columns.iter().enumerate() {
                     let type_oid = Self::datatype_to_oid(&col.data_type);
@@ -1219,14 +1223,17 @@ impl PgCatalog {
             ]);
             let pat = Self::extract_psql_regex_relname(q);
             let mut rows = Vec::new();
-            for (ti, name) in catalog.list_tables()?.iter().enumerate() {
+            // The identifier `pg_class` reports for the table: derived from its name.
+            let table_oids =
+                crate::sql::dict::oid::DictOids::load(&db.storage, crate::sql::dict::oid::OidScope::Tables)?;
+            for name in catalog.list_tables()?.iter() {
                 if let Some(ref p) = pat {
                     if name != p {
                         continue;
                     }
                 }
                 rows.push(Tuple::new(vec![
-                    Value::Int4((16384 + ti) as i32),
+                    Value::Int4(table_oids.table(name).unwrap_or(0)),
                     Value::String("public".into()),
                     Value::String(name.clone()),
                 ]));
@@ -1382,8 +1389,11 @@ impl PgCatalog {
             let target_oid = Self::extract_relchecks_oid(q);
             let table_names = catalog.list_tables()?;
             let mut rows = Vec::new();
-            for (ti, name) in table_names.iter().enumerate() {
-                let table_oid = (16384 + ti) as i32;
+            // The identifier `pg_class` reports for the table: derived from its name.
+            let table_oids =
+                crate::sql::dict::oid::DictOids::load(&db.storage, crate::sql::dict::oid::OidScope::Tables)?;
+            for name in table_names.iter() {
+                let table_oid = table_oids.table(name).unwrap_or(0);
                 if let Some(t) = target_oid {
                     if t != table_oid {
                         continue;
@@ -1469,8 +1479,11 @@ impl PgCatalog {
             let oid_literal = Self::extract_attrelid(q);
             let table_names = catalog.list_tables()?;
             let mut rows = Vec::new();
-            for (ti, table_name) in table_names.iter().enumerate() {
-                let table_oid = (16384 + ti) as i32;
+            // The identifier `pg_class` reports for the table: derived from its name.
+            let table_oids =
+                crate::sql::dict::oid::DictOids::load(&db.storage, crate::sql::dict::oid::OidScope::Tables)?;
+            for table_name in table_names.iter() {
+                let table_oid = table_oids.table(table_name).unwrap_or(0);
                 if let Some(target_oid) = oid_literal {
                     if target_oid != table_oid {
                         continue;
@@ -1533,8 +1546,11 @@ impl PgCatalog {
             ]);
             let target_oid = Self::extract_relchecks_oid(q);
             let mut rows = Vec::new();
-            for (ti, name) in catalog.list_tables()?.iter().enumerate() {
-                let table_oid = (16384 + ti) as i32;
+            // The identifier `pg_class` reports for the table: derived from its name.
+            let table_oids =
+                crate::sql::dict::oid::DictOids::load(&db.storage, crate::sql::dict::oid::OidScope::Tables)?;
+            for name in catalog.list_tables()?.iter() {
+                let table_oid = table_oids.table(name).unwrap_or(0);
                 if let Some(t) = target_oid {
                     if t != table_oid {
                         continue;
@@ -2003,8 +2019,10 @@ impl PgCatalog {
         let catalog = db.storage.catalog();
         let tables = catalog.list_tables()?;
         let mut rows = Vec::new();
-        for (ti, name) in tables.iter().enumerate() {
-            let table_oid = (16384 + ti) as i32;
+        // The identifier `pg_class` reports for the table: derived from its name.
+        let table_oids = crate::sql::dict::oid::DictOids::load(&db.storage, crate::sql::dict::oid::OidScope::Tables)?;
+        for name in tables.iter() {
+            let table_oid = table_oids.table(name).unwrap_or(0);
             if let Ok(tschema) = catalog.get_table_schema(name) {
                 // Primary key: any column flagged primary_key
                 let pk_cols: Vec<String> = tschema
@@ -2085,8 +2103,10 @@ impl PgCatalog {
         let catalog = db.storage.catalog();
         let tables = catalog.list_tables()?;
         let mut rows = Vec::new();
-        for (ti, name) in tables.iter().enumerate() {
-            let table_oid = (16384 + ti) as i32;
+        // The identifier `pg_class` reports for the table: derived from its name.
+        let table_oids = crate::sql::dict::oid::DictOids::load(&db.storage, crate::sql::dict::oid::OidScope::Tables)?;
+        for name in tables.iter() {
+            let table_oid = table_oids.table(name).unwrap_or(0);
             if let Ok(tschema) = catalog.get_table_schema(name) {
                 let pk_cols: Vec<String> = tschema
                     .columns
