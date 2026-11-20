@@ -1,4 +1,5 @@
-//! v07.6: what this binary really contains — the `heliosdb_features` view and
+//! v07.6: what this binary really contains — the `hdb_features` view (alias
+//! `heliosdb_features`) and
 //! the REPL's `\version` print the same table.
 //!
 //! `compiled` is `cfg!(feature = …)` for the build; `source` says what the

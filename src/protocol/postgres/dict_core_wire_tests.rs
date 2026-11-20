@@ -414,3 +414,41 @@ async fn wire_pg_tables_has_one_shape() {
     .await;
     assert_eq!(got, vec![vec!["dw_keyed"], vec!["dw_plain"]]);
 }
+
+// ---------------------------------------------------------------------------
+// Item 6: aliases
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn wire_alias_reads_through_its_canonical_view() {
+    let db = new_db();
+    let (mut handler, mut client) = connect(&db);
+    let canonical = rows(
+        &mut handler,
+        &mut client,
+        "SELECT name, compiled, source FROM hdb_features ORDER BY name",
+    )
+    .await;
+    assert!(!canonical.is_empty());
+    let alias = rows(
+        &mut handler,
+        &mut client,
+        "SELECT * FROM heliosdb_features ORDER BY name",
+    )
+    .await;
+    assert_eq!(alias, canonical);
+    let joined = rows(
+        &mut handler,
+        &mut client,
+        "SELECT count(*) FROM heliosdb_features a JOIN hdb.features c ON c.name = a.name",
+    )
+    .await;
+    assert_eq!(joined, vec![vec![canonical.len().to_string()]]);
+    let listed = rows(
+        &mut handler,
+        &mut client,
+        "SELECT kind, canonical, family FROM hdb_dictionary WHERE name = 'heliosdb_features'",
+    )
+    .await;
+    assert_eq!(listed, vec![vec!["alias", "hdb_features", "legacy"]]);
+}

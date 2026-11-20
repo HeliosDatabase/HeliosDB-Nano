@@ -258,7 +258,7 @@ impl<'a> Planner<'a> {
     /// set-if-true: the item's own answer is the last word, whatever a factor
     /// nested inside its body left behind. Called only on a success path, so
     /// an error cannot leave the flag set for the next factor.
-    fn set_written_select_list_of_factor(&self, written_select_list: bool) {
+    pub(crate) fn set_written_select_list_of_factor(&self, written_select_list: bool) {
         self.written_select_list_of_last_factor.set(written_select_list);
     }
 
@@ -589,7 +589,7 @@ impl<'a> Planner<'a> {
     /// AUTHOR-WRITTEN select list named both of them (GH#29 c12, M1/M3); a
     /// duplicate a wildcard expanded reads the first slot, as v4.31.1
     /// answered. Every other column of the entry resolves through the alias.
-    fn stamp_derived_plan(plan: LogicalPlan, alias: &str, column_list: &[String]) -> Result<LogicalPlan> {
+    pub(crate) fn stamp_derived_plan(plan: LogicalPlan, alias: &str, column_list: &[String]) -> Result<LogicalPlan> {
         let schema = plan.schema();
         let inner_names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
         if column_list.len() > inner_names.len() {
@@ -1937,6 +1937,11 @@ impl<'a> Planner<'a> {
         // here funnels both forms to the same registry entry.
         if let Some(rest) = name.strip_prefix("pg_catalog.") {
             return Some(rest.to_string());
+        }
+        // `hdb.<view>` is the schema-qualified spelling of the dictionary view
+        // `hdb_<view>`.
+        if let Some(rest) = name.strip_prefix("hdb.") {
+            return Some(format!("hdb_{rest}"));
         }
         None
     }
@@ -4377,6 +4382,12 @@ impl<'a> Planner<'a> {
                 // user tables.
                 use crate::sql::phase3::SystemViewRegistry;
                 let registry = SystemViewRegistry::shared();
+
+                // An alias of a dictionary view plans as its projection over
+                // the canonical view's scan.
+                if let Some(plan) = self.dictionary_alias_to_plan(&table_name, name, alias.as_ref(), self.catalog)? {
+                    return Ok(plan);
+                }
 
                 if registry.is_system_view(&table_name)
                     && super::dict::reserved::names_dictionary_view(&table_name, self.catalog)

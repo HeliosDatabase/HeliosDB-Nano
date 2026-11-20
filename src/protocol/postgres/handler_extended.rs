@@ -1208,9 +1208,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
             if let Ok(schema) = catalog.get_table_schema(&key) {
                 return Some((schema, false));
             }
-            crate::sql::phase3::SystemViewRegistry::shared()
-                .get_schema(&key)
-                .map(|schema| (schema.clone(), true))
+            crate::sql::dict::alias::dictionary_schema(&key).map(|schema| (schema, true))
         };
         let oids = super::param_infer::infer_parameter_oids(statement, param_count, &lookup);
         tracing::debug!("Inferred {} parameter type OIDs: {:?}", oids.len(), oids);

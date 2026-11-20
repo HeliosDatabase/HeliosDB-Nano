@@ -2993,23 +2993,23 @@ impl SystemViewRegistry {
             description: "Run-time parameters: one row per setting SHOW and current_setting() know".to_string(),
         });
 
-        // v07.6: heliosdb_features — the Cargo features this binary contains.
-        self.register_view(SystemViewSchema {
-            name: "heliosdb_features".to_string(),
-            schema: Schema {
-                columns: vec![
-                    sv_col("name", DataType::Text),
-                    sv_col("compiled", DataType::Boolean),
-                    sv_col("source", DataType::Text),
-                ],
-            },
-            description: "The Cargo features compiled into this binary, and what each provides".to_string(),
-        });
+        // The canonical `hdb_*` views of the dictionary foundation:
+        // `hdb_dictionary`, and `hdb_features` (v07.6: the Cargo features this
+        // binary contains; `heliosdb_features` is its alias).
+        crate::sql::dict::dictionary::register(self);
     }
 
     /// Register a system view
-    fn register_view(&mut self, view: SystemViewSchema) {
+    pub(crate) fn register_view(&mut self, view: SystemViewSchema) {
         self.views.insert(view.name.clone(), view);
+    }
+
+    /// Every registered view with its description, in no particular order.
+    pub fn described_views(&self) -> Vec<(&str, &str)> {
+        self.views
+            .values()
+            .map(|view| (view.name.as_str(), view.description.as_str()))
+            .collect()
     }
 }
 
@@ -4293,17 +4293,10 @@ impl SystemViewRegistry {
             "heliosdb_copy_phase_stats" => Self::execute_heliosdb_copy_phase_stats(),
             // Code-graph track grammar inventory.
             "hdb_code_languages" => Self::execute_hdb_code_languages(),
+            // The dictionary's own listing, and the compiled features.
+            "hdb_dictionary" => Ok(crate::sql::dict::dictionary::dictionary_rows(self)),
+            "hdb_features" => Ok(crate::sql::dict::dictionary::features_rows()),
             // v07.2: the one parameter registry.
-            "heliosdb_features" => Ok(crate::sql::features::features()
-                .into_iter()
-                .map(|f| {
-                    Tuple::new(vec![
-                        Value::String(f.name.to_string()),
-                        Value::Boolean(f.compiled),
-                        Value::String(f.source.to_string()),
-                    ])
-                })
-                .collect()),
             "pg_settings" => Ok(crate::sql::params::pg_settings_rows()
                 .into_iter()
                 .map(Tuple::new)

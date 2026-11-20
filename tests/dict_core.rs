@@ -462,3 +462,113 @@ fn pg_tables_has_the_postgresql_shape_and_real_values() {
         ]
     );
 }
+
+// ---------------------------------------------------------------------------
+// Item 6: the dictionary of the dictionary, and aliases
+// ---------------------------------------------------------------------------
+
+#[test]
+fn hdb_dictionary_lists_every_system_view() {
+    let db = db();
+    assert_eq!(
+        both(&db, "SELECT * FROM hdb_dictionary").1,
+        ["name", "kind", "canonical", "family", "description"]
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT name, kind, canonical, family FROM hdb_dictionary WHERE name IN \
+             ('hdb_dictionary', 'hdb_features', 'heliosdb_features', 'pg_class', 'information_schema.tables', \
+              'sqlite_master', 'heliosdb_config') ORDER BY name"
+        ),
+        vec![
+            vec!["hdb_dictionary", "view", "NULL", "hdb"],
+            vec!["hdb_features", "view", "NULL", "hdb"],
+            vec!["heliosdb_config", "view", "NULL", "legacy"],
+            vec!["heliosdb_features", "alias", "hdb_features", "legacy"],
+            vec!["information_schema.tables", "view", "NULL", "information_schema"],
+            vec!["pg_class", "view", "NULL", "postgresql"],
+            vec!["sqlite_master", "view", "NULL", "sqlite"],
+        ]
+    );
+    let total: i64 = one(&db, "SELECT count(*) FROM hdb_dictionary").parse().unwrap();
+    assert!(total >= 78, "every registered view is listed, got {total}");
+    assert_eq!(
+        one(
+            &db,
+            "SELECT count(*) FROM hdb_dictionary WHERE description IS NULL OR description = ''"
+        ),
+        "0",
+        "every entry is described"
+    );
+    assert_eq!(
+        one(
+            &db,
+            "SELECT count(*) FROM hdb_dictionary WHERE family NOT IN \
+             ('hdb', 'postgresql', 'information_schema', 'sqlite', 'mysql', 'legacy')"
+        ),
+        "0"
+    );
+    assert_eq!(
+        one(
+            &db,
+            "SELECT count(*) FROM hdb_dictionary WHERE (kind = 'alias' AND canonical IS NULL) \
+             OR (kind = 'view' AND canonical IS NOT NULL) OR kind NOT IN ('view', 'alias')"
+        ),
+        "0",
+        "an alias names its canonical view and a view names none"
+    );
+    // The schema-qualified spelling.
+    assert_eq!(one(&db, "SELECT count(*) FROM hdb.dictionary"), total.to_string());
+}
+
+#[test]
+fn an_alias_is_a_projection_over_its_canonical_view() {
+    let db = db();
+    let (canonical, canonical_columns) = both(&db, "SELECT * FROM hdb_features ORDER BY name");
+    let (alias, alias_columns) = both(&db, "SELECT * FROM heliosdb_features ORDER BY name");
+    assert_eq!(canonical_columns, ["name", "compiled", "source"]);
+    assert_eq!(alias_columns, canonical_columns);
+    assert!(!canonical.is_empty());
+    assert_eq!(alias, canonical, "the alias answers exactly as its canonical view");
+    assert_eq!(rows(&db, "SELECT * FROM hdb.features ORDER BY name"), canonical);
+
+    // Filterable, with and without a table alias.
+    let first = canonical[0][0].clone();
+    assert_eq!(
+        rows(
+            &db,
+            &format!("SELECT name FROM heliosdb_features WHERE name = '{first}'")
+        ),
+        vec![vec![first.clone()]]
+    );
+    assert_eq!(
+        rows(
+            &db,
+            &format!("SELECT f.name, f.compiled FROM heliosdb_features f WHERE f.name = '{first}'")
+        ),
+        vec![vec![first.clone(), canonical[0][1].clone()]]
+    );
+    assert_eq!(
+        one(&db, "SELECT count(*) FROM heliosdb_features WHERE compiled"),
+        one(&db, "SELECT count(*) FROM hdb_features WHERE compiled")
+    );
+    // Joinable, to its canonical view and to the dictionary.
+    assert_eq!(
+        one(
+            &db,
+            "SELECT count(*) FROM heliosdb_features a JOIN hdb_features c ON c.name = a.name"
+        ),
+        canonical.len().to_string()
+    );
+    assert_eq!(
+        one(
+            &db,
+            &format!(
+                "SELECT d.canonical FROM hdb_dictionary d JOIN heliosdb_features f ON f.name <> d.name \
+                 WHERE d.name = 'heliosdb_features' AND f.name = '{first}'"
+            )
+        ),
+        "hdb_features"
+    );
+}

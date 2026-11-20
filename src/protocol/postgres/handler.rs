@@ -9342,10 +9342,7 @@ pub(crate) fn standby_statement_reads_data(sql: &str, is_user_function: impl Fn(
         let parts: Vec<String> = name.0.iter().map(|part| part.value.to_lowercase()).collect();
         match parts.as_slice() {
             [schema, _] if schema == "pg_catalog" || schema == "information_schema" => true,
-            [bare] => {
-                crate::sql::phase3::SystemViewRegistry::shared().is_system_view(bare)
-                    || WIRE_CATALOG.contains(&bare.as_str())
-            }
+            [bare] => crate::sql::dict::is_dictionary_name(bare) || WIRE_CATALOG.contains(&bare.as_str()),
             _ => false,
         }
     }

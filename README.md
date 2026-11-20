@@ -833,7 +833,7 @@ Optional HA features (opt-in at compile time):
 | `ha-tier2`, `ha-tier3`, `ha-dedup`, `ha-branch-replication` | Deprecated: select nothing beyond `ha-tier1`; kept so existing builds work |
 
 Multi-primary replication and sharding are on the roadmap; no release contains
-them. `SELECT * FROM heliosdb_features` (or `\version` in the shell) lists what a
+them. `SELECT * FROM hdb_features` (also under its older name `heliosdb_features`, or `\version` in the shell) lists what a
 binary really contains.
 
 ```bash
