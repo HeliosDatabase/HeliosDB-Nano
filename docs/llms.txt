@@ -346,8 +346,8 @@ automatically after `git clone`; install globally with
   restart. Same `$`-sigil rule as procedures; depth-bounded by
   `[session] udf_max_call_depth` (default 32). Still absent: `SELECT *
   FROM f()` (set-returning), overloading, `CALL f()` for a function,
-  non-`public` qualifiers, `pg_proc` / `information_schema.routines`
-  population, and `/rest/v1/rpc/<fn>` (HTTP 501). PL/pgSQL FUNCTION
+  non-`public` qualifiers, `information_schema.routines`
+  population (`pg_proc` lists routines), and `/rest/v1/rpc/<fn>` (HTTP 501). PL/pgSQL FUNCTION
   bodies support DECLARE + SQL + `SELECT … INTO` + `RETURN`; `IF`,
   `CASE`, loops and `:=` inside a function body are refused with an
   explicit error rather than silently mis-branching. Stored procedures

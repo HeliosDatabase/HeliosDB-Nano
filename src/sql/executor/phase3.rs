@@ -1226,7 +1226,7 @@ fn handle_system_view(executor: &Executor, name: &str) -> Result<Box<dyn Physica
     let registry = SystemViewRegistry::new();
 
     // Execute the system view and get results
-    let tuples = registry.execute(name, storage)?;
+    let tuples = registry.execute(name, &crate::sql::dict::DictContext::for_engine(storage))?;
 
     // Get schema for the view
     let schema = registry

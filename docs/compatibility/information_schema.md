@@ -76,10 +76,10 @@ statement about the two wire protocols only.
 | `information_schema.routines` | **Always empty** (PG + MySQL wire) | Resolves and reports the full SQL-standard column list, but returns **zero rows**, including when functions and procedures have been registered via `CREATE FUNCTION` / `CREATE PROCEDURE`. Nano does not expose its runtime routine catalog through this view. ORM probes see "no user-defined routines" |
 | `information_schema.parameters` | **Always empty** (PG + MySQL wire) | Same: correct column list, zero rows, always. No per-routine parameter rows are ever produced |
 
-A registered routine is invisible to every catalog client. `pg_proc` is empty for
-the same reason — see [`pg_catalog`](#pairs-with-pg_catalog) below. The function
+A registered routine is invisible through these two views. `pg_proc` does list it —
+see [`pg_catalog`](#pairs-with-pg_catalog) below. The function
 itself *is* callable (`SELECT f(x)` in scalar position, with `$`-sigil
-parameters); only its introspection is missing. See the `heliosdb-nano-schema`
+parameters); only its `information_schema` introspection is missing. See the `heliosdb-nano-schema`
 skill (Recipe 6) for the exact boundaries.
 
 ### Views and views-on-views
@@ -200,11 +200,11 @@ These `pg_catalog` views are populated on every route:
 | `pg_matviews` | Populated | One row per materialised view with its `definition`. Previously empty on every route while a working implementation sat unreachable in a dead registry |
 | `pg_class` | Populated | Tables (`r`), indexes (`i`), sequences (`S`) and views (`v`) |
 
-`pg_proc` is still **empty** with a function registered, for the same
-reason `information_schema.routines` is: the function registry hangs off
-`EmbeddedDatabase`, which the system-view executor cannot reach. Same for
-`pg_policies` / `pg_policy` (RLS policies live in the tenant manager).
-Widening that context is a named follow-up.
+`pg_proc` lists every user function (`prokind` `f`) and procedure (`p`):
+`proname`, `pronamespace`, `prolang`, `prorettype`, `proargtypes`, `pronargs`
+and `prosrc`, on the embedded route and both wires.
+`pg_policies` / `pg_policy` are still **empty** (RLS policies live in the
+tenant manager and are not yet read into these views).
 
 See also:
 

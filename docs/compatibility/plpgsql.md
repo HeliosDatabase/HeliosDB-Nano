@@ -127,9 +127,9 @@ on `StoredFunction`, which is a bincode-positional WAL/`meta:` payload. There is
 overload resolution: the registry keys on the lowercase name alone, so
 `f(int)` and `f(text)` collide with `Function 'f' already exists`.
 
-A registered function is still invisible to introspection: `information_schema.routines`,
-`information_schema.parameters` and `pg_proc` return zero rows (see
-[`information_schema` compatibility](information_schema.md)), and
+A registered function or procedure is listed in `pg_proc` (name, schema, language, argument
+and return types, body). `information_schema.routines` and `information_schema.parameters`
+still return zero rows (see [`information_schema` compatibility](information_schema.md)), and
 `POST /rest/v1/rpc/<fn>` is still HTTP 501.
 
 ### `CREATE PROCEDURE`: works, with one rule

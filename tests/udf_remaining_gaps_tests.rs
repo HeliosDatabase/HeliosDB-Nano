@@ -113,29 +113,6 @@ fn the_returns_return_expr_form_registers_but_cannot_execute() {
     );
 }
 
-// ===========================================================================
-// GAP: introspection. `pg_proc` is still a registered empty stub on the
-// embedded path — populating it needs a `FunctionRegistry` handle inside
-// `SystemViewRegistry::execute(&StorageEngine)` (filed as HC3).
-// ===========================================================================
-
-#[test]
-fn pg_proc_is_still_empty_with_a_function_and_a_procedure_registered() {
-    let db = db();
-    db.execute("CREATE TABLE g_audit (id INTEGER)").unwrap();
-    db.execute("CREATE FUNCTION g_visible(x INTEGER) RETURNS INTEGER AS $$ SELECT $1 $$ LANGUAGE sql")
-        .unwrap();
-    db.execute("CREATE PROCEDURE g_proc(p INTEGER) LANGUAGE sql AS $$INSERT INTO g_audit VALUES ($p)$$")
-        .unwrap();
-    assert!(db.function_registry.function_exists("g_visible"), "precondition");
-    assert!(db.function_registry.procedure_exists("g_proc"), "precondition");
-
-    let rows = db
-        .query("SELECT * FROM pg_proc", &[])
-        .expect("pg_proc must resolve as a system view");
-    assert_eq!(
-        rows.len(),
-        0,
-        "pg_proc is still an empty stub even with routines registered"
-    );
-}
+// Introspection: `pg_proc` now lists functions and procedures. The pin that
+// asserted it empty was deleted, as this file's header asks; `tests/dict_core.rs`
+// covers the rows.

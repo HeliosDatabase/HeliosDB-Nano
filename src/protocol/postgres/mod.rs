@@ -79,6 +79,8 @@ pub mod sessions;
 pub mod ssl;
 pub mod timeouts;
 #[cfg(test)]
+mod dict_core_wire_tests;
+#[cfg(test)]
 mod wire_tests;
 
 // Re-exports

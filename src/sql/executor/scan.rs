@@ -2297,7 +2297,7 @@ pub(super) fn handle_scan(executor: &Executor, plan: &LogicalPlan) -> Result<Box
                 col.source_table = Some(source_name.clone());
                 col.source_table_name = Some(table_name.clone());
             }
-            let tuples = registry.execute(table_name, storage)?;
+            let tuples = registry.execute(table_name, &crate::sql::dict::DictContext::for_engine(storage))?;
             return Ok(Box::new(
                 ScanOperator::new(
                     table_name.clone(),
@@ -2703,9 +2703,12 @@ pub(super) fn handle_filtered_scan(executor: &Executor, plan: &LogicalPlan) -> R
             } else {
                 None
             };
+            let dict_context = crate::sql::dict::DictContext::for_engine(storage);
             let tuples = match filtered_columns_table.as_deref() {
-                Some(table_filter) => registry.execute_information_schema_columns_for_table(storage, table_filter)?,
-                None => registry.execute(table_name, storage)?,
+                Some(table_filter) => {
+                    registry.execute_information_schema_columns_for_table(&dict_context, table_filter)?
+                }
+                None => registry.execute(table_name, &dict_context)?,
             };
             let tuples = if let Some(pred) = &materialized_predicate {
                 filter_tuples_with_evaluator(tuples, schema_arc.clone(), pred, executor.parameters())?

@@ -9618,6 +9618,13 @@ impl EmbeddedDatabase {
             ));
         }
         sql::udf_bridge::install_on(&self.storage, &bridge);
+        // What the system views read besides storage: routines, triggers, tenants.
+        sql::dict::context::install_sources(
+            &self.storage,
+            &self.function_registry,
+            &self.trigger_registry,
+            &self.tenant_manager,
+        );
         Ok(self)
     }
 

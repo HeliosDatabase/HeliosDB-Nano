@@ -22,7 +22,7 @@ Any DDL operation: `CREATE`, `ALTER`, `DROP` against tables/indexes/views/functi
 | create view | SQL | `CREATE VIEW v AS SELECT …` |
 | create materialized view | SQL | `CREATE MATERIALIZED VIEW mv AS SELECT … WITH (auto_refresh = true)` |
 | create trigger | SQL | ⚠️ **registered, persisted, but the BODY never runs** — see "Triggers" below before writing any `CREATE TRIGGER` |
-| create function | SQL | ✅ scalar calls work — `CREATE FUNCTION f(x INT) RETURNS INT AS $$ SELECT $1 * 2 $$ LANGUAGE sql` + `SELECT f(1)`. The `$` sigil is MANDATORY (a bare `x` is a column ref). No `SELECT * FROM f()`, no overloading, no `pg_proc` row. See Recipe 6 |
+| create function | SQL | ✅ scalar calls work — `CREATE FUNCTION f(x INT) RETURNS INT AS $$ SELECT $1 * 2 $$ LANGUAGE sql` + `SELECT f(1)`. The `$` sigil is MANDATORY (a bare `x` is a column ref). No `SELECT * FROM f()`, no overloading. Listed in `pg_proc`. See Recipe 6 |
 | create procedure | SQL | ✅ works — `CREATE PROCEDURE p(a INT) LANGUAGE sql AS $$…$a…$$` + `CALL p(1)`. Either language (sql or plpgsql); params need the `$` sigil. See Recipe 6 |
 | list tables | REPL / SQL | `\dt` / `SELECT * FROM pg_tables` |
 | describe table | REPL / SQL | `\d t` / `PRAGMA table_info(t)` / `SELECT * FROM information_schema.columns WHERE table_name='t'` |
@@ -305,9 +305,10 @@ CREATE FUNCTION g(x INT) RETURNS INT RETURN x * 2;   -- registers, but the store
                                                      -- SQL: calling it errors. Use the AS $$…$$ form.
 ```
 
-**No introspection.** `information_schema.routines`, `information_schema.parameters` and
-`pg_proc` still return zero rows with a function registered, so a function is invisible to
-ORM probes and catalog clients. `POST /rest/v1/rpc/<fn>` is still HTTP 501.
+**Introspection through `pg_proc` only.** `pg_proc` lists a registered function or procedure
+(name, schema, language, argument and return types, body). `information_schema.routines` and
+`information_schema.parameters` still return zero rows, so an ORM that probes only those does
+not see it. `POST /rest/v1/rpc/<fn>` is still HTTP 501.
 
 #### Procedures DO work — in either language, with `$`-sigil parameters
 
@@ -459,9 +460,9 @@ DROP TRIGGER IF EXISTS posts_audit ON posts;   -- works; `ON <table>` is mandato
 - **`PRAGMA foreign_keys = ON;` is a no-op-with-ack** — Nano enforces FKs by default; the PRAGMA exists only for sqlite3 source compatibility.
 - **HNSW indexes require explicit `dim`** in `WITH (...)`. Mismatched embedding dimensions will fail at insert time, not at index creation.
 - **Trigger BODIES never execute** — row-level *and* statement-level, every timing, every event, every interface. `CREATE TRIGGER` returning `OK` only means it was registered and persisted. The sole exception is the `BEFORE INSERT … FOR EACH ROW` `NEW.<col> = <expr>` / `RETURN NULL` row rewrite. See Recipe 5; never rely on a trigger body for correctness.
-- **User-defined functions are SCALAR-only, and the `$` sigil is mandatory** — `SELECT f(x)` works in a `SELECT` list, a `WHERE` clause and through bound parameters, on the embedded API and both wires, and survives a restart. But `SELECT * FROM f()` fails as a missing table, `CALL f()` fails (`Procedure 'f' does not exist`), there is no `PERFORM`, no overloading, no non-`public` qualifier, and `pg_proc` / `information_schema.routines` stay empty. A body that writes `x` instead of `$1` fails with a column error. PL/pgSQL `IF`/loops/`:=` inside a FUNCTION body are refused with an explicit error. See Recipe 6.
+- **User-defined functions are SCALAR-only, and the `$` sigil is mandatory** — `SELECT f(x)` works in a `SELECT` list, a `WHERE` clause and through bound parameters, on the embedded API and both wires, and survives a restart. But `SELECT * FROM f()` fails as a missing table, `CALL f()` fails (`Procedure 'f' does not exist`), there is no `PERFORM`, no overloading, no non-`public` qualifier, and `information_schema.routines` stays empty (`pg_proc` lists the function). A body that writes `x` instead of `$1` fails with a column error. PL/pgSQL `IF`/loops/`:=` inside a FUNCTION body are refused with an explicit error. See Recipe 6.
 - **Procedures work in either language, but the `$` sigil is mandatory** — a *bare* parameter name fails with `Column 'n' not found in schema` in both `LANGUAGE sql` and `LANGUAGE plpgsql`, deliberately, so a variable can never shadow a column. (plpgsql binding is new; through 4.10.2 a plpgsql body substituted nothing at all.) An argument a body never mentions is silently discarded, and a `$`-token inside a string literal, comment or `$tag$…$tag$` block is data, not a placeholder. `CALL` now runs the body on every client path and reports 0 rows affected — through 4.11.0 it was a silent no-op (returning 1 row affected, and "succeeding" for a missing procedure) over the PG extended protocol and the REST layer. On the embedded API / REPL only, `CALL` inside an explicit `BEGIN` is refused with an error. See Recipe 6.
-- **`information_schema.routines`, `information_schema.parameters` and `pg_proc` never report a user-defined routine** — so no ORM or catalog client can discover one. `pg_proc` is registered everywhere and returns zero rows. `routines` and `parameters` return zero rows over the PostgreSQL and MySQL wires, but on the embedded API / REPL / Python binding they are *unknown relations* and raise an error — they are not registered in the phase-3 view registry.
+- **`information_schema.routines` and `information_schema.parameters` never report a user-defined routine** — a catalog client must read `pg_proc`, which lists every function (`prokind` `f`) and procedure (`p`) with its language, argument and return types and body. `routines` and `parameters` return zero rows over the PostgreSQL and MySQL wires, but on the embedded API / REPL / Python binding they are *unknown relations* and raise an error — they are not registered in the phase-3 view registry.
 - **Materialized view auto-refresh** competes for CPU with foreground queries. Tune `max_cpu_percent`.
 - **A table name cannot hold `:`** (`42602`, on `CREATE TABLE`, `RENAME TO`, `CREATE MATERIALIZED VIEW` and `CREATE SCHEMA`, since 4.42.0): a row's key ends the name with one, so `SELECT * FROM "we"` read the rows of `"we:ird"`. A store that already holds such a table keeps opening, and that table keeps that problem until it is renamed (`DROP TABLE "we"` also removes `"we:ird"`'s rows, as it always did). A restore of a dump of one stops at that table with an error, with the tables before it already restored.
 

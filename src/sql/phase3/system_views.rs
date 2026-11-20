@@ -12,6 +12,7 @@
 #[path = "../../catalog_columns_scope_tests.rs"]
 mod catalog_columns_scope_tests;
 
+use crate::sql::dict::DictContext;
 use crate::storage::{art_index::ArtIndexType, StorageEngine};
 use crate::{Column, ColumnStorageMode, DataType, Error, Result, Schema, Tuple, Value};
 use std::collections::{HashMap, HashSet};
@@ -2698,9 +2699,12 @@ impl SystemViewRegistry {
                     sv_col("prorettype", DataType::Int4),
                     sv_col("proargtypes", DataType::Text),
                     sv_col("prosrc", DataType::Text),
+                    sv_col("prokind", DataType::Text),
+                    sv_col("pronargs", DataType::Int4),
                 ],
             },
-            description: "PG-compat procedures catalogue (empty stub)".to_string(),
+            description: "User functions and procedures: name, schema, language, argument and return types, body"
+                .to_string(),
         });
 
         self.register_view(SystemViewSchema {
@@ -3828,7 +3832,7 @@ fn pg_table_oid_by_name(tables: &[String], table_name: &str) -> Option<i32> {
 /// consecutive ones that agree before it answers with the last.
 const PG_INDEXES_READ_ATTEMPTS: usize = 3;
 
-fn sorted_art_indexes(storage: &StorageEngine) -> Vec<(String, String, ArtIndexType, Vec<String>)> {
+pub(crate) fn sorted_art_indexes(storage: &StorageEngine) -> Vec<(String, String, ArtIndexType, Vec<String>)> {
     let mut indexes = storage.art_indexes().list_indexes();
     // sprinter 6bc4a4040eb7 (B3 fix pass): main's index of a table the session's
     // branch defined or dropped does not serve the branch's rows (a definition's
@@ -3848,7 +3852,7 @@ fn sorted_art_indexes(storage: &StorageEngine) -> Vec<(String, String, ArtIndexT
 /// Sorted by (table, index name) exactly like `sorted_art_indexes`, because
 /// `list_all_metadata` walks a `HashMap` and would otherwise hand pg_class a
 /// different OID to the same index on every call.
-fn sorted_vector_indexes(storage: &StorageEngine) -> Vec<crate::storage::VectorIndexMetadata> {
+pub(crate) fn sorted_vector_indexes(storage: &StorageEngine) -> Vec<crate::storage::VectorIndexMetadata> {
     let mut indexes = storage.vector_indexes().list_all_metadata();
     // sprinter 6bc4a4040eb7 (B3 fix pass): main's vector index of a table the
     // session's branch defined or dropped does not serve the branch's rows.
@@ -3940,7 +3944,7 @@ fn all_schema_names(storage: &StorageEngine) -> Result<std::collections::BTreeSe
 /// key split (defensive) and then `public`. A pre-namespacing blob deserialises
 /// with `creator_schema = None` via `LegacyViewMetadata` and therefore reports
 /// `public`, which is exactly the schema it was created under.
-fn sorted_views(storage: &StorageEngine) -> Result<Vec<(String, String, crate::storage::ViewMetadata)>> {
+pub(crate) fn sorted_views(storage: &StorageEngine) -> Result<Vec<(String, String, crate::storage::ViewMetadata)>> {
     let view_catalog = storage.view_catalog();
     let mut names = view_catalog.list_views()?;
     names.sort();
@@ -4127,7 +4131,8 @@ impl SystemViewRegistry {
     ///   query text is being withheld when there is none to withhold.
     /// * `datid` / `usesysid` are constants: this build reports no database or
     ///   role OIDs.
-    fn execute_pg_stat_activity(storage: &StorageEngine) -> Vec<Tuple> {
+    fn execute_pg_stat_activity(ctx: &DictContext<'_>) -> Vec<Tuple> {
+        let storage = ctx.storage();
         // The backend performing this scan. `session_scoped_state_tls` is the
         // per-statement handle the engine's `_for_session` entry points AND the
         // embedded funnels install (`SessionScopedStateGuard::install_if_absent`),
@@ -4210,20 +4215,25 @@ impl SystemViewRegistry {
     /// Execute a system view query
     ///
     /// Queries storage metadata and returns results based on the view type
-    pub fn execute(&self, view_name: &str, storage: &StorageEngine) -> Result<Vec<Tuple>> {
+    ///
+    /// `ctx` carries the storage engine and whatever else the database gave
+    /// its producers: the routine and trigger registries, the tenant manager,
+    /// the session running the statement.
+    pub fn execute(&self, view_name: &str, ctx: &DictContext<'_>) -> Result<Vec<Tuple>> {
         if !self.is_system_view(view_name) {
             return Err(Error::query_execution(format!("Unknown system view: {}", view_name)));
         }
+        let storage = ctx.storage();
 
         match view_name {
-            "pg_database_branches" => Self::execute_pg_database_branches(storage),
+            "pg_database_branches" => Self::execute_pg_database_branches(ctx),
             // sprinter f4f5d450e816: not catalog state — live connections are
             // process state. It takes `storage` all the same (sprinter
             // 32ed4b9e0002): the engine serving this query is what says WHICH
             // open database's backends the scan may see.
-            "pg_stat_activity" => Ok(Self::execute_pg_stat_activity(storage)),
-            "pg_mv_staleness" => Self::execute_pg_mv_staleness(storage),
-            "pg_vector_index_stats" => Self::execute_pg_vector_index_stats(storage),
+            "pg_stat_activity" => Ok(Self::execute_pg_stat_activity(ctx)),
+            "pg_mv_staleness" => Self::execute_pg_mv_staleness(ctx),
+            "pg_vector_index_stats" => Self::execute_pg_vector_index_stats(ctx),
             // v10.2: this view never compared anything; it could only error,
             // with or without arguments, and the message suggested a call
             // that also failed. It now says plainly that nothing is compared.
@@ -4232,11 +4242,11 @@ impl SystemViewRegistry {
                  There is no SQL branch diff in this release; MERGE BRANCH moves the branch's own changes \
                  without conflict detection",
             )),
-            "pg_branch_stats" => Self::execute_pg_branch_stats(storage),
-            "pg_class" => Self::execute_pg_class(storage),
-            "pg_attribute" => Self::execute_pg_attribute(storage),
-            "pg_type" => Self::execute_pg_type(storage),
-            "pg_namespace" => Self::execute_pg_namespace(storage),
+            "pg_branch_stats" => Self::execute_pg_branch_stats(ctx),
+            "pg_class" => Self::execute_pg_class(ctx),
+            "pg_attribute" => Self::execute_pg_attribute(ctx),
+            "pg_type" => Self::execute_pg_type(ctx),
+            "pg_namespace" => Self::execute_pg_namespace(ctx),
             // HC4: role/privilege views are built by `sql::acl_views`, the
             // single row-builder shared with the PG-wire surface. They report
             // the persisted role/ACL catalog. They do NOT report enforcement —
@@ -4257,73 +4267,76 @@ impl SystemViewRegistry {
             | "information_schema.applicable_roles"
             | "information_schema.enabled_roles"
             | "information_schema.administrable_role_authorizations" => Ok(vec![]),
-            "information_schema.tables" => Self::execute_information_schema_tables(storage),
-            "information_schema.schemata" => Self::execute_information_schema_schemata(storage),
+            "information_schema.tables" => Self::execute_information_schema_tables(ctx),
+            "information_schema.schemata" => Self::execute_information_schema_schemata(ctx),
             "information_schema.catalog_name" => Self::execute_information_schema_catalog_name(),
-            "information_schema.views" => Self::execute_information_schema_views(storage),
-            "information_schema.check_constraints" => Self::execute_information_schema_check_constraints(storage),
-            "pg_views" => Self::execute_pg_views(storage),
-            "pg_indexes" => Self::execute_pg_indexes(storage),
-            "information_schema.sequences" => Self::execute_information_schema_sequences(storage),
-            "information_schema.table_constraints" => Self::execute_information_schema_table_constraints(storage),
-            "information_schema.key_column_usage" => Self::execute_information_schema_key_column_usage(storage),
+            "information_schema.views" => Self::execute_information_schema_views(ctx),
+            "information_schema.check_constraints" => Self::execute_information_schema_check_constraints(ctx),
+            "pg_views" => Self::execute_pg_views(ctx),
+            "pg_indexes" => Self::execute_pg_indexes(ctx),
+            "information_schema.sequences" => Self::execute_information_schema_sequences(ctx),
+            "information_schema.table_constraints" => Self::execute_information_schema_table_constraints(ctx),
+            "information_schema.key_column_usage" => Self::execute_information_schema_key_column_usage(ctx),
             "information_schema.constraint_column_usage" => {
-                Self::execute_information_schema_constraint_column_usage(storage)
+                Self::execute_information_schema_constraint_column_usage(ctx)
             }
             "information_schema.referential_constraints" => {
-                Self::execute_information_schema_referential_constraints(storage)
+                Self::execute_information_schema_referential_constraints(ctx)
             }
-            "pg_database" => Self::execute_pg_database(storage),
+            "pg_database" => Self::execute_pg_database(ctx),
             // Empty-stub catalogue tables (v3.31.0 slice 5). Schema
             // already registered; rows are always empty because Nano
             // doesn't model these concepts.
-            "pg_sequences" => Self::execute_pg_sequences(storage),
-            "pg_attrdef" => Self::execute_pg_attrdef(storage),
-            "pg_matviews" => Self::execute_pg_matviews(storage),
-            // Still empty BY CONSTRUCTION: every one of these needs state that
-            // `execute(&StorageEngine)` cannot reach — FunctionRegistry and
-            // TenantManager hang off `EmbeddedDatabase`, not `StorageEngine`.
-            // Populating them requires widening this signature (named follow-up),
-            // NOT another wire-side fixed-shape copy.
-            "pg_proc" | "pg_description" | "pg_policies" | "pg_policy" | "pg_inherits" | "pg_publication"
-            | "pg_statistic_ext" => Ok(vec![]),
+            "pg_sequences" => Self::execute_pg_sequences(ctx),
+            "pg_attrdef" => Self::execute_pg_attrdef(ctx),
+            "pg_matviews" => Self::execute_pg_matviews(ctx),
+            // Still empty: comments on objects are not stored, there is no
+            // inheritance, publication or extended statistics, and the policy
+            // views are not yet read from the tenant manager the context now
+            // carries.
+            "pg_description" | "pg_policies" | "pg_policy" | "pg_inherits" | "pg_publication" | "pg_statistic_ext" => {
+                Ok(vec![])
+            }
+            // User functions and procedures, from the routine registry the
+            // context carries.
+            "pg_proc" => crate::sql::dict::routines::pg_proc_rows(ctx),
             // Empty for the reasons given at registration (HDB-011): no range
             // subtypes are registered, and enum types cannot be enumerated
             // from the catalog. A driver's `LEFT OUTER JOIN pg_range` / enum
             // introspection needs the RELATION to exist, not rows in it.
             "pg_range" | "pg_enum" => Ok(vec![]),
-            "sqlite_master" => Self::execute_sqlite_master(storage),
-            "pg_index" => Self::execute_pg_index(storage),
-            "pg_constraint" => Self::execute_pg_constraint(storage),
-            "information_schema.columns" => Self::execute_information_schema_columns(storage, None),
+            "sqlite_master" => Self::execute_sqlite_master(ctx),
+            "pg_index" => Self::execute_pg_index(ctx),
+            "pg_constraint" => Self::execute_pg_constraint(ctx),
+            "information_schema.columns" => Self::execute_information_schema_columns(ctx, None),
             // Compression monitoring views
-            "heliosdb_compression_stats" => Self::execute_heliosdb_compression_stats(storage),
-            "heliosdb_pattern_stats" => Self::execute_heliosdb_pattern_stats(storage),
-            "heliosdb_compression_events" => Self::execute_heliosdb_compression_events(storage),
-            "heliosdb_config" => Self::execute_heliosdb_config(storage),
+            "heliosdb_compression_stats" => Self::execute_heliosdb_compression_stats(ctx),
+            "heliosdb_pattern_stats" => Self::execute_heliosdb_pattern_stats(ctx),
+            "heliosdb_compression_events" => Self::execute_heliosdb_compression_events(ctx),
+            "heliosdb_config" => Self::execute_heliosdb_config(ctx),
             // HA Replication monitoring views
             "pg_replication_status" => Self::execute_pg_replication_status(),
             "pg_replication_standbys" => Self::execute_pg_replication_standbys(),
             "pg_replication_primary" => Self::execute_pg_replication_primary(),
             "pg_replication_metrics" => Self::execute_pg_replication_metrics(),
             // Spec P1.3: this node's replication posture and control data.
-            "heliosdb_standby_status" => Ok(vec![Self::execute_heliosdb_standby_status(storage)]),
-            "pg_control_checkpoint" => Ok(vec![Self::execute_pg_control_checkpoint(storage)]),
+            "heliosdb_standby_status" => Ok(vec![Self::execute_heliosdb_standby_status(ctx)]),
+            "pg_control_checkpoint" => Ok(vec![Self::execute_pg_control_checkpoint(ctx)]),
             // Spec P3.1: this node's archived WAL.
             "heliosdb_archived_wal" => Ok(Self::execute_heliosdb_archived_wal()),
             "heliosdb_archive_gaps" => Ok(Self::execute_heliosdb_archive_gaps()),
             "heliosdb_recovery_window" => Ok(vec![Self::execute_heliosdb_recovery_window()]),
             // ART index monitoring
-            "heliosdb_art_indexes" => Self::execute_heliosdb_art_indexes(storage),
+            "heliosdb_art_indexes" => Self::execute_heliosdb_art_indexes(ctx),
             // SIMD capabilities
             "heliosdb_simd_capabilities" => Self::execute_heliosdb_simd_capabilities(),
             // Row cache stats
-            "heliosdb_row_cache_stats" => Self::execute_heliosdb_row_cache_stats(storage),
+            "heliosdb_row_cache_stats" => Self::execute_heliosdb_row_cache_stats(ctx),
             // Read-hot-path lock-contention census (W3.1)
             "heliosdb_lock_census" => Self::execute_heliosdb_lock_census(),
             // Advisory locks currently held (spec 03), scoped to the open
             // database serving this query (sprinter 564e9ac1d762).
-            "pg_advisory_locks" => Self::execute_pg_advisory_locks(storage),
+            "pg_advisory_locks" => Self::execute_pg_advisory_locks(ctx),
             // Per-statement-class write-volume census (W3.2)
             "heliosdb_write_volume" => Self::execute_heliosdb_write_volume(),
             // COPY fast-path phase-timing census (W3.4)
@@ -4347,7 +4360,7 @@ impl SystemViewRegistry {
                 .collect()),
             // pg_tables — delegate to the legacy SystemViewRegistry
             // which has the schema-namespacing split we want.
-            "pg_tables" => Self::execute_pg_tables_compat(storage),
+            "pg_tables" => Self::execute_pg_tables_compat(ctx),
             _ => {
                 // Other system views not yet implemented
                 Ok(vec![])
@@ -4361,16 +4374,17 @@ impl SystemViewRegistry {
     /// the system view.
     pub(crate) fn execute_information_schema_columns_for_table(
         &self,
-        storage: &StorageEngine,
+        ctx: &DictContext<'_>,
         table_name: &str,
     ) -> Result<Vec<Tuple>> {
-        Self::execute_information_schema_columns(storage, Some(table_name))
+        Self::execute_information_schema_columns(ctx, Some(table_name))
     }
 
     /// Bridge to the legacy SystemViewRegistry's pg_tables
     /// implementation so SELECT * FROM pg_tables works over SQL
     /// (the planner only consults the phase-3 registry).
-    fn execute_pg_tables_compat(storage: &StorageEngine) -> Result<Vec<Tuple>> {
+    fn execute_pg_tables_compat(ctx: &DictContext<'_>) -> Result<Vec<Tuple>> {
+        let storage = ctx.storage();
         let legacy = crate::sql::SystemViewRegistry::new();
         legacy.execute("pg_tables", storage)
     }
@@ -4410,7 +4424,8 @@ impl SystemViewRegistry {
     /// Execute pg_database_branches() system view
     ///
     /// Returns information about all database branches
-    fn execute_pg_database_branches(storage: &StorageEngine) -> Result<Vec<Tuple>> {
+    fn execute_pg_database_branches(ctx: &DictContext<'_>) -> Result<Vec<Tuple>> {
+        let storage = ctx.storage();
         let branches = storage.list_branches_for_catalog()?;
         let mut results = Vec::new();
 
@@ -4449,7 +4464,8 @@ impl SystemViewRegistry {
     /// Execute pg_mv_staleness() system view
     ///
     /// Returns staleness information for all materialized views
-    fn execute_pg_mv_staleness(storage: &StorageEngine) -> Result<Vec<Tuple>> {
+    fn execute_pg_mv_staleness(ctx: &DictContext<'_>) -> Result<Vec<Tuple>> {
+        let storage = ctx.storage();
         let mv_catalog = storage.mv_catalog();
         let view_names = mv_catalog.list_views()?;
         let mut results = Vec::new();
@@ -4508,7 +4524,8 @@ impl SystemViewRegistry {
     /// Execute pg_vector_index_stats() system view
     ///
     /// Returns statistics for all vector indexes
-    fn execute_pg_vector_index_stats(storage: &StorageEngine) -> Result<Vec<Tuple>> {
+    fn execute_pg_vector_index_stats(ctx: &DictContext<'_>) -> Result<Vec<Tuple>> {
+        let storage = ctx.storage();
         let vector_indexes = storage.vector_indexes();
         let all_metadata = vector_indexes.list_all_metadata();
         let mut results = Vec::new();
@@ -4540,7 +4557,8 @@ impl SystemViewRegistry {
     /// Execute pg_branch_stats() system view
     ///
     /// Returns detailed statistics for all database branches
-    fn execute_pg_branch_stats(storage: &StorageEngine) -> Result<Vec<Tuple>> {
+    fn execute_pg_branch_stats(ctx: &DictContext<'_>) -> Result<Vec<Tuple>> {
+        let storage = ctx.storage();
         let branches = storage.list_branches_for_catalog()?;
         let mut results = Vec::new();
 
@@ -4570,7 +4588,8 @@ impl SystemViewRegistry {
     /// Execute pg_class() system view
     ///
     /// Returns information about all tables, indexes, sequences, and views
-    fn execute_pg_class(storage: &StorageEngine) -> Result<Vec<Tuple>> {
+    fn execute_pg_class(ctx: &DictContext<'_>) -> Result<Vec<Tuple>> {
+        let storage = ctx.storage();
         let catalog = storage.catalog();
         let tables = catalog.list_tables()?;
         let mut results = Vec::new();
@@ -4705,7 +4724,8 @@ impl SystemViewRegistry {
     /// Execute sqlite_master view — SQLite-shaped catalog rows for each
     /// user table / materialised view. The `sql` column is best-effort:
     /// most sqlite3 callers only filter on `type` and `name`.
-    fn execute_sqlite_master(storage: &StorageEngine) -> Result<Vec<Tuple>> {
+    fn execute_sqlite_master(ctx: &DictContext<'_>) -> Result<Vec<Tuple>> {
+        let storage = ctx.storage();
         let catalog = storage.catalog();
         let tables = catalog.list_tables()?;
         let mut results = Vec::new();
@@ -4733,7 +4753,8 @@ impl SystemViewRegistry {
     /// Execute pg_attribute() system view
     ///
     /// Returns information about all table columns and their attributes
-    fn execute_pg_attribute(storage: &StorageEngine) -> Result<Vec<Tuple>> {
+    fn execute_pg_attribute(ctx: &DictContext<'_>) -> Result<Vec<Tuple>> {
+        let storage = ctx.storage();
         let catalog = storage.catalog();
         let tables = catalog.list_tables()?;
         let mut results = Vec::new();
@@ -4822,7 +4843,7 @@ impl SystemViewRegistry {
     /// the `_<name>` array row for every entry that declares an array OID. The
     /// value order below MUST match the column order registered in
     /// `register_phase3_views`.
-    fn execute_pg_type(_storage: &StorageEngine) -> Result<Vec<Tuple>> {
+    fn execute_pg_type(_ctx: &DictContext<'_>) -> Result<Vec<Tuple>> {
         let mut results = Vec::with_capacity(BUILTIN_TYPES.len() * 2);
         for t in BUILTIN_TYPES {
             let (typinput, typoutput) = builtin_type_io(t.name);
@@ -4895,7 +4916,8 @@ impl SystemViewRegistry {
     /// sequence per identity column with name `<table>_<col>_seq`.
     /// drizzle-kit's sequence-diff path treats these as existing
     /// objects → no spurious "missing sequence" diffs.
-    fn execute_pg_sequences(storage: &StorageEngine) -> Result<Vec<Tuple>> {
+    fn execute_pg_sequences(ctx: &DictContext<'_>) -> Result<Vec<Tuple>> {
+        let storage = ctx.storage();
         let catalog = storage.catalog();
         let mut rows = Vec::new();
         // Track the names we've already emitted so a real CREATE SEQUENCE and a
@@ -4977,7 +4999,8 @@ impl SystemViewRegistry {
     /// SERIAL/IDENTITY-owned sequences here, so this lists REAL CREATE SEQUENCE
     /// definitions only. Numeric metadata + the value columns are decimal
     /// STRINGS per the standard.
-    fn execute_information_schema_sequences(storage: &StorageEngine) -> Result<Vec<Tuple>> {
+    fn execute_information_schema_sequences(ctx: &DictContext<'_>) -> Result<Vec<Tuple>> {
+        let storage = ctx.storage();
         let catalog = storage.catalog();
         let mut rows = Vec::new();
         for def in catalog.list_sequences()? {
@@ -5010,7 +5033,8 @@ impl SystemViewRegistry {
     /// pg_get_expr(ad.adbin, ad.adrelid) = 'nextval(''<seq>''::regclass)')
     /// resolves to TRUE for those columns. The literal `adsrc` string
     /// matches the format drizzle's CASE arm looks for.
-    fn execute_pg_attrdef(storage: &StorageEngine) -> Result<Vec<Tuple>> {
+    fn execute_pg_attrdef(ctx: &DictContext<'_>) -> Result<Vec<Tuple>> {
+        let storage = ctx.storage();
         let catalog = storage.catalog();
         let mut rows = Vec::new();
         let mut oid_counter: i32 = 7000;
@@ -5056,7 +5080,8 @@ impl SystemViewRegistry {
     /// PK + UNIQUE per table. Mirrors the legacy
     /// `query_information_schema_table_constraints` in
     /// protocol/postgres/catalog.rs.
-    fn execute_information_schema_table_constraints(storage: &StorageEngine) -> Result<Vec<Tuple>> {
+    fn execute_information_schema_table_constraints(ctx: &DictContext<'_>) -> Result<Vec<Tuple>> {
+        let storage = ctx.storage();
         let catalog = storage.catalog();
         let mut rows = Vec::new();
         for name in catalog.list_tables()? {
@@ -5135,7 +5160,8 @@ impl SystemViewRegistry {
     /// constraint (same as KCU). For FK constraints, lists the
     /// REFERENCED (target) columns on the parent table. drizzle reads
     /// this to map FK definitions to their target table+column.
-    fn execute_information_schema_constraint_column_usage(storage: &StorageEngine) -> Result<Vec<Tuple>> {
+    fn execute_information_schema_constraint_column_usage(ctx: &DictContext<'_>) -> Result<Vec<Tuple>> {
+        let storage = ctx.storage();
         let catalog = storage.catalog();
         let mut rows = Vec::new();
         for name in catalog.list_tables()? {
@@ -5186,7 +5212,8 @@ impl SystemViewRegistry {
     }
 
     /// KanttBan #23 phase 2.8: information_schema.key_column_usage.
-    fn execute_information_schema_key_column_usage(storage: &StorageEngine) -> Result<Vec<Tuple>> {
+    fn execute_information_schema_key_column_usage(ctx: &DictContext<'_>) -> Result<Vec<Tuple>> {
+        let storage = ctx.storage();
         let catalog = storage.catalog();
         let mut rows = Vec::new();
         for name in catalog.list_tables()? {
@@ -5254,7 +5281,8 @@ impl SystemViewRegistry {
 
     /// KanttBan #23 phase 2.8: information_schema.referential_constraints
     /// — FK ON UPDATE / ON DELETE rules per constraint.
-    fn execute_information_schema_referential_constraints(storage: &StorageEngine) -> Result<Vec<Tuple>> {
+    fn execute_information_schema_referential_constraints(ctx: &DictContext<'_>) -> Result<Vec<Tuple>> {
+        let storage = ctx.storage();
         let catalog = storage.catalog();
         let mut rows = Vec::new();
         for table in catalog.list_tables()? {
@@ -5284,7 +5312,8 @@ impl SystemViewRegistry {
     /// `protocol/postgres/catalog.rs::query_information_schema_tables`
     /// (sans the substring LIKE filter — the planner handles WHERE
     /// LIKE natively now).
-    fn execute_information_schema_tables(storage: &StorageEngine) -> Result<Vec<Tuple>> {
+    fn execute_information_schema_tables(ctx: &DictContext<'_>) -> Result<Vec<Tuple>> {
+        let storage = ctx.storage();
         let table_names = storage.catalog().list_tables()?;
         let mut rows = Vec::with_capacity(table_names.len());
         for name in &table_names {
@@ -5317,7 +5346,8 @@ impl SystemViewRegistry {
     /// three hardcoded rows the wire router served (which never showed a
     /// `CREATE SCHEMA` schema) and, before this, did not exist at all on the
     /// embedded / REPL / Python route.
-    fn execute_information_schema_schemata(storage: &StorageEngine) -> Result<Vec<Tuple>> {
+    fn execute_information_schema_schemata(ctx: &DictContext<'_>) -> Result<Vec<Tuple>> {
+        let storage = ctx.storage();
         let mut rows = Vec::new();
         for schema_name in all_schema_names(storage)? {
             rows.push(Tuple::new(vec![
@@ -5343,7 +5373,8 @@ impl SystemViewRegistry {
     /// HC3: `pg_views` — REAL rows from the persisted `ViewCatalog`. The
     /// deleted wire stub returned zero rows behind a comment claiming Nano does
     /// not persist view definitions; it always has (src/storage/view_catalog.rs).
-    fn execute_pg_views(storage: &StorageEngine) -> Result<Vec<Tuple>> {
+    fn execute_pg_views(ctx: &DictContext<'_>) -> Result<Vec<Tuple>> {
+        let storage = ctx.storage();
         let mut rows = Vec::new();
         for (view_schema, view_name, metadata) in sorted_views(storage)? {
             rows.push(Tuple::new(vec![
@@ -5359,7 +5390,8 @@ impl SystemViewRegistry {
     /// HC3: `information_schema.views` — the SQL-standard rendering of the same
     /// `ViewCatalog` rows `pg_views` serves. Nano's views are read-only, so the
     /// updatability columns are honestly 'NO' rather than optimistically 'YES'.
-    fn execute_information_schema_views(storage: &StorageEngine) -> Result<Vec<Tuple>> {
+    fn execute_information_schema_views(ctx: &DictContext<'_>) -> Result<Vec<Tuple>> {
+        let storage = ctx.storage();
         let mut rows = Vec::new();
         for (view_schema, view_name, metadata) in sorted_views(storage)? {
             rows.push(Tuple::new(vec![
@@ -5389,7 +5421,8 @@ impl SystemViewRegistry {
     /// `default_expr_json_to_sql` renderer `column_default` / `pg_attrdef` use.
     /// A blob that will not deserialise falls back to the raw stored string
     /// rather than being dropped — a visible oddity beats a missing constraint.
-    fn execute_information_schema_check_constraints(storage: &StorageEngine) -> Result<Vec<Tuple>> {
+    fn execute_information_schema_check_constraints(ctx: &DictContext<'_>) -> Result<Vec<Tuple>> {
+        let storage = ctx.storage();
         let catalog = storage.catalog();
         let mut rows = Vec::new();
         for table_key in catalog.list_tables()? {
@@ -5416,7 +5449,8 @@ impl SystemViewRegistry {
     /// HC3: `pg_matviews` — REAL materialised-view rows, replacing the
     /// `Ok(vec![])` arm. Sourced from `storage.mv_catalog()`, the same catalogue
     /// `REFRESH MATERIALIZED VIEW` writes.
-    fn execute_pg_matviews(storage: &StorageEngine) -> Result<Vec<Tuple>> {
+    fn execute_pg_matviews(ctx: &DictContext<'_>) -> Result<Vec<Tuple>> {
+        let storage = ctx.storage();
         let mv_catalog = storage.mv_catalog();
         let mut names = mv_catalog.list_views()?;
         names.sort();
@@ -5457,10 +5491,11 @@ impl SystemViewRegistry {
     /// and only for tables in the same listing; and the view is built again until
     /// two builds agree, so a statement that commits between its reads is not
     /// half seen ([`PG_INDEXES_READ_ATTEMPTS`]).
-    fn execute_pg_indexes(storage: &StorageEngine) -> Result<Vec<Tuple>> {
-        let mut last = Self::build_pg_indexes(storage)?;
+    fn execute_pg_indexes(ctx: &DictContext<'_>) -> Result<Vec<Tuple>> {
+        let storage = ctx.storage();
+        let mut last = Self::build_pg_indexes(ctx)?;
         for _ in 0..PG_INDEXES_READ_ATTEMPTS {
-            let again = Self::build_pg_indexes(storage)?;
+            let again = Self::build_pg_indexes(ctx)?;
             if again == last {
                 return Ok(again);
             }
@@ -5470,7 +5505,8 @@ impl SystemViewRegistry {
     }
 
     /// One read of [`Self::execute_pg_indexes`].
-    fn build_pg_indexes(storage: &StorageEngine) -> Result<Vec<Tuple>> {
+    fn build_pg_indexes(ctx: &DictContext<'_>) -> Result<Vec<Tuple>> {
+        let storage = ctx.storage();
         let catalog = storage.catalog();
         let mut rows = Vec::new();
         let tables = catalog.list_tables()?;
@@ -5623,7 +5659,8 @@ impl SystemViewRegistry {
     /// a follow-up that widens the executor context. `\l` already
     /// renders only `heliosdb` (via try_psql_metacommand's own
     /// matcher), so there's no current-behaviour regression.
-    fn execute_pg_database(storage: &StorageEngine) -> Result<Vec<Tuple>> {
+    fn execute_pg_database(ctx: &DictContext<'_>) -> Result<Vec<Tuple>> {
+        let storage = ctx.storage();
         let row = |oid: i32, name: String| {
             Tuple::new(vec![
                 Value::Int4(oid),                // oid
@@ -5650,7 +5687,8 @@ impl SystemViewRegistry {
         Ok(rows)
     }
 
-    fn execute_pg_namespace(storage: &StorageEngine) -> Result<Vec<Tuple>> {
+    fn execute_pg_namespace(ctx: &DictContext<'_>) -> Result<Vec<Tuple>> {
+        let storage = ctx.storage();
         // Schema enumeration lives in ONE place (`all_schema_names`); this view
         // and `information_schema.schemata` are two renderings of it.
         let mut results = Vec::new();
@@ -5670,7 +5708,8 @@ impl SystemViewRegistry {
     /// Execute pg_index() system view
     ///
     /// Returns information about all indexes
-    fn execute_pg_index(storage: &StorageEngine) -> Result<Vec<Tuple>> {
+    fn execute_pg_index(ctx: &DictContext<'_>) -> Result<Vec<Tuple>> {
+        let storage = ctx.storage();
         let catalog = storage.catalog();
         let tables = catalog.list_tables()?;
         let mut results = Vec::new();
@@ -5740,7 +5779,8 @@ impl SystemViewRegistry {
     /// Execute pg_constraint() system view
     ///
     /// Returns information about all constraints
-    fn execute_pg_constraint(storage: &StorageEngine) -> Result<Vec<Tuple>> {
+    fn execute_pg_constraint(ctx: &DictContext<'_>) -> Result<Vec<Tuple>> {
+        let storage = ctx.storage();
         let catalog = storage.catalog();
         let tables = catalog.list_tables()?;
         let indexes = sorted_art_indexes(storage);
@@ -5882,7 +5922,8 @@ impl SystemViewRegistry {
     /// Execute information_schema.columns() system view
     ///
     /// Returns ANSI SQL standard view of all table columns
-    fn execute_information_schema_columns(storage: &StorageEngine, table_filter: Option<&str>) -> Result<Vec<Tuple>> {
+    fn execute_information_schema_columns(ctx: &DictContext<'_>, table_filter: Option<&str>) -> Result<Vec<Tuple>> {
+        let storage = ctx.storage();
         let catalog = storage.catalog();
         let tables = catalog.list_tables()?;
         let mut results = Vec::new();
@@ -5984,7 +6025,7 @@ impl SystemViewRegistry {
     }
 
     /// Helper function to get PostgreSQL type OID for HeliosDB data types
-    fn get_type_oid(data_type: &DataType) -> i32 {
+    pub(crate) fn get_type_oid(data_type: &DataType) -> i32 {
         match data_type {
             DataType::Boolean => 16,
             DataType::Int2 => 21,
@@ -6020,7 +6061,8 @@ impl SystemViewRegistry {
     // === Compression Monitoring View Executors ===
 
     /// Execute heliosdb_compression_stats view
-    fn execute_heliosdb_compression_stats(storage: &StorageEngine) -> Result<Vec<Tuple>> {
+    fn execute_heliosdb_compression_stats(ctx: &DictContext<'_>) -> Result<Vec<Tuple>> {
+        let storage = ctx.storage();
         let catalog = storage.catalog();
         let tables = catalog.list_tables()?;
         let mut results = Vec::new();
@@ -6108,7 +6150,7 @@ impl SystemViewRegistry {
     }
 
     /// Execute heliosdb_pattern_stats view
-    fn execute_heliosdb_pattern_stats(_storage: &StorageEngine) -> Result<Vec<Tuple>> {
+    fn execute_heliosdb_pattern_stats(_ctx: &DictContext<'_>) -> Result<Vec<Tuple>> {
         // Pattern detection statistics - returns predefined patterns based on data type affinity
         let results = vec![
             Tuple::new(vec![
@@ -6128,7 +6170,8 @@ impl SystemViewRegistry {
     }
 
     /// Execute heliosdb_compression_events view
-    fn execute_heliosdb_compression_events(storage: &StorageEngine) -> Result<Vec<Tuple>> {
+    fn execute_heliosdb_compression_events(ctx: &DictContext<'_>) -> Result<Vec<Tuple>> {
+        let storage = ctx.storage();
         let catalog = storage.catalog();
         let tables = catalog.list_tables()?;
         let mut results = Vec::new();
@@ -6160,7 +6203,8 @@ impl SystemViewRegistry {
     }
 
     /// Execute heliosdb_config view
-    fn execute_heliosdb_config(storage: &StorageEngine) -> Result<Vec<Tuple>> {
+    fn execute_heliosdb_config(ctx: &DictContext<'_>) -> Result<Vec<Tuple>> {
+        let storage = ctx.storage();
         let catalog = storage.catalog();
         let tables = catalog.list_tables()?;
         let mut results = Vec::new();
@@ -6475,7 +6519,8 @@ impl SystemViewRegistry {
 
     /// `heliosdb_standby_status`: the replication block of the node serving
     /// `storage` (spec P1.3) — the same values `/health` reports.
-    fn execute_heliosdb_standby_status(storage: &StorageEngine) -> Tuple {
+    fn execute_heliosdb_standby_status(ctx: &DictContext<'_>) -> Tuple {
+        let storage = ctx.storage();
         let block = crate::standby_posture::status_block(storage);
         let optional_text = |value: Option<String>| value.map_or(Value::Null, Value::String);
         Tuple::new(vec![
@@ -6608,7 +6653,8 @@ impl SystemViewRegistry {
     /// the epoch the store holds (`repl:epoch`, 1 before any promotion), and
     /// `prev_timeline_id` the epoch it was promoted from (1 when never
     /// promoted, as PostgreSQL's timeline 1 reports).
-    fn execute_pg_control_checkpoint(storage: &StorageEngine) -> Tuple {
+    fn execute_pg_control_checkpoint(ctx: &DictContext<'_>) -> Tuple {
+        let storage = ctx.storage();
         use crate::standby_posture::{current_sequence, epoch_and_previous, format_lsn};
         let lsn = format_lsn(current_sequence(Some(storage)));
         let (epoch, previous) = epoch_and_previous(Some(storage));
@@ -6626,7 +6672,8 @@ impl SystemViewRegistry {
     /// Execute heliosdb_art_indexes view
     ///
     /// Returns information about all ART indexes
-    fn execute_heliosdb_art_indexes(storage: &StorageEngine) -> Result<Vec<Tuple>> {
+    fn execute_heliosdb_art_indexes(ctx: &DictContext<'_>) -> Result<Vec<Tuple>> {
+        let storage = ctx.storage();
         let art_manager = storage.art_indexes();
         let indexes = art_manager.list_indexes();
         let mut results = Vec::new();
@@ -6700,7 +6747,8 @@ impl SystemViewRegistry {
     /// Execute heliosdb_row_cache_stats view
     ///
     /// Returns row cache statistics
-    fn execute_heliosdb_row_cache_stats(storage: &StorageEngine) -> Result<Vec<Tuple>> {
+    fn execute_heliosdb_row_cache_stats(ctx: &DictContext<'_>) -> Result<Vec<Tuple>> {
+        let storage = ctx.storage();
         let row_cache = storage.row_cache();
         let stats = row_cache.stats();
         let mut results = Vec::new();
@@ -6792,7 +6840,8 @@ impl SystemViewRegistry {
     /// all.
     ///
     /// Locks are exclusive-only in this build, so `mode` is a constant.
-    fn execute_pg_advisory_locks(storage: &StorageEngine) -> Result<Vec<Tuple>> {
+    fn execute_pg_advisory_locks(ctx: &DictContext<'_>) -> Result<Vec<Tuple>> {
+        let storage = ctx.storage();
         let results = crate::advisory_lock::manager()
             .snapshot_for_database(storage.instance_id())
             .into_iter()
@@ -6906,7 +6955,7 @@ mod tests {
 
         let registry = SystemViewRegistry::new();
         let results = registry
-            .execute("pg_database_branches", &storage)
+            .execute("pg_database_branches", &DictContext::new(&storage))
             .expect("Failed to execute pg_database_branches");
 
         // Should have at least 2 branches (main + test_branch)
@@ -6923,7 +6972,7 @@ mod tests {
 
         let registry = SystemViewRegistry::new();
         let results = registry
-            .execute("pg_mv_staleness", &storage)
+            .execute("pg_mv_staleness", &DictContext::new(&storage))
             .expect("Failed to execute pg_mv_staleness");
 
         // Should return empty results if no materialized views exist
@@ -6937,7 +6986,7 @@ mod tests {
 
         let registry = SystemViewRegistry::new();
         let results = registry
-            .execute("pg_vector_index_stats", &storage)
+            .execute("pg_vector_index_stats", &DictContext::new(&storage))
             .expect("Failed to execute pg_vector_index_stats");
 
         // Should return empty results if no vector indexes exist
@@ -6953,7 +7002,7 @@ mod tests {
         let config = Config::in_memory();
         let storage = StorageEngine::open_in_memory(&config).expect("storage");
         let registry = SystemViewRegistry::new();
-        let rows = registry.execute("pg_type", &storage).expect("pg_type");
+        let rows = registry.execute("pg_type", &DictContext::new(&storage)).expect("pg_type");
         let schema = registry.get_schema("pg_type").expect("pg_type schema");
 
         assert_eq!(schema.columns.len(), 22, "pg_type column count");
