@@ -35,6 +35,7 @@ code_graph_on_branch
 code_graph_parallel_index
 code_graph_parallel_index_bench
 code_graph_phase2
+code_graph_reindex_by_key
 code_graph_rename_apply
 code_graph_semantic_hash_ddl
 code_graph_sql
@@ -63,6 +64,7 @@ mcp_listener_composition
 mcp_new_tools
 mcp_progress
 mcp_progress_http
+mcp_result_cache_staleness
 mv_auto_refresh_integration_test
 mv_incremental_test
 mv_uncertain_publication
