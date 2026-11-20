@@ -92,7 +92,11 @@ impl<'a> DictContext<'a> {
                 .rev()
                 .find(|entry| entry.engine == engine)
                 .map_or((None, None, None), |entry| {
-                    (entry.functions.upgrade(), entry.triggers.upgrade(), entry.tenants.upgrade())
+                    (
+                        entry.functions.upgrade(),
+                        entry.triggers.upgrade(),
+                        entry.tenants.upgrade(),
+                    )
                 })
         };
         Self {
@@ -178,7 +182,13 @@ impl<'a> DictContext<'a> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::assert_is_empty
+)]
 mod tests {
     use super::*;
     use crate::EmbeddedDatabase;

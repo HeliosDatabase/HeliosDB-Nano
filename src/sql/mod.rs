@@ -9,8 +9,8 @@
 pub mod acl_views;
 pub mod compiled; // RAG-native compiled query plan cache (idea 4)
 pub mod constraints;
-pub mod dict; // The system dictionary's foundation: producer context, identifiers, reserved names, aliases
 pub(crate) mod default_volatility; // Spec R5.2: a column DEFAULT's volatility, and its one evaluation rule
+pub mod dict; // The system dictionary's foundation: producer context, identifiers, reserved names, aliases
 pub mod evaluator;
 pub mod executor;
 pub mod features;

@@ -123,3 +123,71 @@ fn pg_proc_is_scoped_to_its_own_database() {
         "another open database must not see this one's routines"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Item 2: one internal-object predicate
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_user_table_named_mv_x_is_a_table() {
+    let db = db();
+    db.execute("CREATE TABLE mv_x (id INTEGER PRIMARY KEY, note TEXT)")
+        .unwrap();
+    assert_eq!(
+        rows(&db, "SELECT type, name FROM sqlite_master WHERE name = 'mv_x'"),
+        vec![vec!["table", "mv_x"]],
+        "a user table whose name starts with mv_ is a table"
+    );
+    assert_eq!(
+        one(
+            &db,
+            "SELECT table_type FROM information_schema.tables WHERE table_name = 'mv_x'"
+        ),
+        "BASE TABLE"
+    );
+    assert_eq!(one(&db, "SELECT relkind FROM pg_class WHERE relname = 'mv_x'"), "r");
+    assert_eq!(one(&db, "SELECT count(*) FROM pg_tables WHERE tablename = 'mv_x'"), "1");
+}
+
+#[test]
+fn a_materialized_view_data_table_is_internal() {
+    let db = db();
+    db.execute("CREATE TABLE dc_base (id INTEGER PRIMARY KEY, n INTEGER)")
+        .unwrap();
+    db.execute("INSERT INTO dc_base VALUES (1, 10), (2, 20)").unwrap();
+    db.execute("CREATE MATERIALIZED VIEW dc_mv AS SELECT id, n FROM dc_base")
+        .unwrap();
+
+    for sql in [
+        "SELECT count(*) FROM information_schema.tables WHERE table_name LIKE '\\_\\_mv\\_%'",
+        "SELECT count(*) FROM pg_tables WHERE tablename LIKE '\\_\\_mv\\_%'",
+        "SELECT count(*) FROM sqlite_master WHERE name LIKE '\\_\\_mv\\_%'",
+        "SELECT count(*) FROM pg_class WHERE relname LIKE '\\_\\_mv\\_%'",
+    ] {
+        assert_eq!(
+            one(&db, sql),
+            "0",
+            "the data table of a materialized view is internal: {sql}"
+        );
+    }
+    assert_eq!(
+        rows(&db, "SELECT type, name FROM sqlite_master WHERE name = 'dc_mv'"),
+        vec![vec!["view", "dc_mv"]]
+    );
+    // pg_class shows the materialized view itself, and its columns join.
+    assert_eq!(one(&db, "SELECT relkind FROM pg_class WHERE relname = 'dc_mv'"), "m");
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT a.attname FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid \
+             WHERE c.relname = 'dc_mv' AND a.attnum > 0 ORDER BY a.attnum"
+        ),
+        vec![vec!["id"], vec!["n"]]
+    );
+    assert_eq!(
+        one(&db, "SELECT count(*) FROM pg_matviews WHERE matviewname = 'dc_mv'"),
+        "1"
+    );
+    // The view still reads.
+    assert_eq!(one(&db, "SELECT count(*) FROM dc_mv"), "2");
+}

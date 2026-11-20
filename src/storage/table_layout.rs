@@ -232,7 +232,7 @@ pub fn describe_cut(cause: HistoryCut, table: &str) -> String {
         HistoryCut::Renamed => format!("table \"{table}\" was renamed"),
         HistoryCut::Refreshed => format!(
             "materialized view \"{}\" was refreshed",
-            table.strip_prefix("__mv_").unwrap_or(table)
+            super::internal_relations::materialized_view_of(table).unwrap_or(table)
         ),
         HistoryCut::StorageMoved => {
             format!("table \"{table}\" had a column moved to other storage")

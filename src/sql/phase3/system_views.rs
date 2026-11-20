@@ -13,6 +13,7 @@
 mod catalog_columns_scope_tests;
 
 use crate::sql::dict::DictContext;
+use crate::storage::internal_relations::{is_internal_relation, materialized_view_of, InternalKind};
 use crate::storage::{art_index::ArtIndexType, StorageEngine};
 use crate::{Column, ColumnStorageMode, DataType, Error, Result, Schema, Tuple, Value};
 use std::collections::{HashMap, HashSet};
@@ -4600,7 +4601,21 @@ impl SystemViewRegistry {
             // non-`public` table; `relname` is the BARE table (PostgreSQL keeps
             // the schema in `relnamespace`, not `relname`), so two coexisting
             // `a.t` / `b.t` both surface as `relname = 't'`.
-            let (relschema, relname) = crate::sql::Planner::split_schema_key(table_name);
+            //
+            // The table that stores a materialized view's rows is that view's
+            // row here: relkind `m`, under the view's name and schema, with
+            // the identifier `pg_attribute` gives its columns.
+            let (relschema, relname, relkind) =
+                match (is_internal_relation(table_name), materialized_view_of(table_name)) {
+                    (Some(InternalKind::MaterializedViewData), Some(view)) => {
+                        let (schema, name) = crate::sql::Planner::split_schema_key(view);
+                        (schema, name, "m")
+                    }
+                    _ => {
+                        let (schema, name) = crate::sql::Planner::split_schema_key(table_name);
+                        (schema, name, "r")
+                    }
+                };
             let tuple = Tuple::new(vec![
                 Value::Int4(oid),       // oid
                 Value::String(relname), // relname
@@ -4608,11 +4623,11 @@ impl SystemViewRegistry {
                 // to 2200; a `s.t` key maps to s's oid), via the shared map that
                 // also fills pg_namespace.oid so JOINs line up.
                 Value::Int4(crate::sql::Planner::schema_name_to_oid(&relschema)),
-                Value::Int4(oid + 1000),        // reltype
-                Value::String("r".to_string()), // relkind (r = relation/table)
-                Value::Int4(oid),               // relfilenode
-                Value::Boolean(false),          // relrowsecurity (Nano RLS is via TenantManager, not pg_catalog)
-                Value::Null,                    // relpartbound (Stage-0 flatten keeps no typed bound)
+                Value::Int4(oid + 1000),            // reltype
+                Value::String(relkind.to_string()), // relkind (r = table, m = materialized view)
+                Value::Int4(oid),                   // relfilenode
+                Value::Boolean(false),              // relrowsecurity (Nano RLS is via TenantManager, not pg_catalog)
+                Value::Null,                        // relpartbound (Stage-0 flatten keeps no typed bound)
             ]);
             results.push(tuple);
         }
@@ -4730,19 +4745,27 @@ impl SystemViewRegistry {
         let tables = catalog.list_tables()?;
         let mut results = Vec::new();
         for table_name in tables {
-            // Skip internal helios_* bookkeeping tables — sqlite3 apps don't expect them.
-            if table_name.starts_with("helios_") || table_name.starts_with("_hdb_") {
-                continue;
-            }
-            let (kind, sql_decl) = if let Some(rest) = table_name.strip_prefix("mv_") {
-                ("view", format!("CREATE MATERIALIZED VIEW {rest} AS ..."))
-            } else {
-                ("table", format!("CREATE TABLE {table_name} (...)"))
+            // sqlite3 applications expect their own tables: no engine table, no
+            // bookkeeping. The table that stores a materialized view's rows is
+            // listed as that view, under the view's name. A user table called
+            // `mv_<x>` is a table.
+            let internal = is_internal_relation(&table_name);
+            let (kind, name, sql_decl) = match internal {
+                Some(InternalKind::MaterializedViewData) => {
+                    let view = materialized_view_of(&table_name).unwrap_or(&table_name).to_string();
+                    let sql_decl = format!("CREATE MATERIALIZED VIEW {view} AS ...");
+                    ("view", view, sql_decl)
+                }
+                Some(kind) if kind.is_engine_table() || kind.is_hidden_storage() => continue,
+                _ => {
+                    let sql_decl = format!("CREATE TABLE {table_name} (...)");
+                    ("table", table_name, sql_decl)
+                }
             };
             results.push(Tuple::new(vec![
                 Value::String(kind.to_string()),
-                Value::String(table_name.clone()),
-                Value::String(table_name),
+                Value::String(name.clone()),
+                Value::String(name),
                 Value::Int4(0),
                 Value::String(sql_decl),
             ]));
@@ -5317,6 +5340,11 @@ impl SystemViewRegistry {
         let table_names = storage.catalog().list_tables()?;
         let mut rows = Vec::with_capacity(table_names.len());
         for name in &table_names {
+            // The table that stores a materialized view's rows is not a base
+            // table of the user's: PostgreSQL lists no materialized view here.
+            if is_internal_relation(name) == Some(InternalKind::MaterializedViewData) {
+                continue;
+            }
             // Schema namespacing: `table_schema` is the real schema and
             // `table_name` the bare table (split the `schema.table` key).
             let (table_schema, table_name) = crate::sql::Planner::split_schema_key(name);
@@ -6178,7 +6206,9 @@ impl SystemViewRegistry {
         let now = chrono::Utc::now();
 
         for table_name in &tables {
-            if table_name.starts_with("helios_") || table_name.starts_with("mv_") {
+            // No rows for storage the user did not create as a table. A user
+            // table called `mv_<x>` is a user table.
+            if is_internal_relation(table_name).is_some_and(|kind| kind.is_hidden_storage()) {
                 continue;
             }
 
@@ -6242,7 +6272,9 @@ impl SystemViewRegistry {
 
         // Add per-table compression configs
         for table_name in &tables {
-            if table_name.starts_with("helios_") || table_name.starts_with("mv_") {
+            // No rows for storage the user did not create as a table. A user
+            // table called `mv_<x>` is a user table.
+            if is_internal_relation(table_name).is_some_and(|kind| kind.is_hidden_storage()) {
                 continue;
             }
 
@@ -7002,7 +7034,9 @@ mod tests {
         let config = Config::in_memory();
         let storage = StorageEngine::open_in_memory(&config).expect("storage");
         let registry = SystemViewRegistry::new();
-        let rows = registry.execute("pg_type", &DictContext::new(&storage)).expect("pg_type");
+        let rows = registry
+            .execute("pg_type", &DictContext::new(&storage))
+            .expect("pg_type");
         let schema = registry.get_schema("pg_type").expect("pg_type schema");
 
         assert_eq!(schema.columns.len(), 22, "pg_type column count");

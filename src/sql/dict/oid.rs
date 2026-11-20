@@ -159,7 +159,10 @@ impl DictOids {
                 oids.claim(OidClass::Index, &two_part_key(&table, &name));
             }
             for metadata in crate::sql::phase3::system_views::sorted_vector_indexes(storage) {
-                oids.claim(OidClass::VectorIndex, &two_part_key(&metadata.table_name, &metadata.name));
+                oids.claim(
+                    OidClass::VectorIndex,
+                    &two_part_key(&metadata.table_name, &metadata.name),
+                );
             }
         }
         if scope >= OidScope::Views {
@@ -291,11 +294,20 @@ mod tests {
             (OidClass::Schema, "app"),
         ] {
             let oid = stable_oid(class, key);
-            assert!((FIRST_DERIVED_OID..END_DERIVED_OID).contains(&oid), "{class:?} {key:?} -> {oid}");
+            assert!(
+                (FIRST_DERIVED_OID..END_DERIVED_OID).contains(&oid),
+                "{class:?} {key:?} -> {oid}"
+            );
             assert_eq!(oid, stable_oid(class, key));
         }
-        assert_ne!(stable_oid(OidClass::Table, "orders"), stable_oid(OidClass::Index, "orders"));
-        assert_ne!(stable_oid(OidClass::Table, "orders"), stable_oid(OidClass::Table, "Orders"));
+        assert_ne!(
+            stable_oid(OidClass::Table, "orders"),
+            stable_oid(OidClass::Index, "orders")
+        );
+        assert_ne!(
+            stable_oid(OidClass::Table, "orders"),
+            stable_oid(OidClass::Table, "Orders")
+        );
     }
 
     #[test]
@@ -316,7 +328,11 @@ mod tests {
             many.claim(OidClass::Table, name);
         }
         assert_eq!(many.table("m"), Some(alone));
-        assert_eq!(many.table("M"), Some(alone), "a lookup falls back to ASCII case folding");
+        assert_eq!(
+            many.table("M"),
+            Some(alone),
+            "a lookup falls back to ASCII case folding"
+        );
         assert_eq!(many.table_of(alone), Some("m"));
         assert_eq!(many.table("missing"), None);
     }

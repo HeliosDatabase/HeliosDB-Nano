@@ -75,11 +75,11 @@ pub mod prepared;
 pub mod server;
 // Spec P5.2 §1: every PostgreSQL session of the process, and the push
 // termination (FATAL 57P01) a fence or a promotion ends them with.
+#[cfg(test)]
+mod dict_core_wire_tests;
 pub mod sessions;
 pub mod ssl;
 pub mod timeouts;
-#[cfg(test)]
-mod dict_core_wire_tests;
 #[cfg(test)]
 mod wire_tests;
 

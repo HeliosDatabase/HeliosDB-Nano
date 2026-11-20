@@ -616,7 +616,7 @@ fn do_list_tables(db: &EmbeddedDatabase, args: JsonValue) -> ToolOutcome {
     };
     let user_tables: Vec<String> = names
         .into_iter()
-        .filter(|n| !n.starts_with("helios_") && !n.starts_with("mv_"))
+        .filter(|n| !crate::storage::internal_relations::is_hidden_storage_table(n))
         .collect();
     ToolOutcome::ok(json!({ "branch": input.branch, "tables": user_tables }))
 }

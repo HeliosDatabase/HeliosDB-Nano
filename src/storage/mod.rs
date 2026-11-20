@@ -31,6 +31,7 @@ pub mod dump;
 mod engine;
 mod gin_index;
 // The authoritative map of every key prefix in the default column family.
+pub mod internal_relations; // Which catalogued tables belong to the engine
 pub mod keyspace;
 // Spec R5.6: per-table layout epochs; a statement reads its catalog and its rows
 // under one view.

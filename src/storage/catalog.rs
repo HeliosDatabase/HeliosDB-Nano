@@ -3,6 +3,7 @@
 //! Handles table schemas, row IDs, and metadata storage in RocksDB.
 
 use super::compression::{CompressionConfig, CompressionStats};
+pub use super::internal_relations::{is_internal_relation, InternalKind};
 use super::statistics::TableStatistics;
 use super::StorageEngine;
 use crate::sql::{TriggerDefinition, TriggerPersistence};
@@ -48,7 +49,7 @@ impl TableShapeChange {
             TableShapeChangeKind::Renamed => format!("table \"{table}\" was renamed"),
             TableShapeChangeKind::Refreshed => format!(
                 "materialized view \"{}\" was refreshed",
-                table.strip_prefix("__mv_").unwrap_or(table)
+                super::internal_relations::materialized_view_of(table).unwrap_or(table)
             ),
         }
     }
@@ -2027,7 +2028,7 @@ impl<'a> Catalog<'a> {
     ) -> Result<()> {
         use super::table_layout::{HistoryCut, TableLayout};
         let is_temp = crate::sql::temp_tables::is_temp_key;
-        let swap = !move_side_records || new_name.starts_with("__mv_");
+        let swap = !move_side_records || super::internal_relations::materialized_view_of(new_name).is_some();
         // Spec R5.5: the layout records follow the shape records. The old name's
         // history goes with it, so whatever table takes the name next has nothing
         // before the rename to read there (a cut, as a branch anchor is refused); the
@@ -3700,10 +3701,8 @@ impl<'a> Catalog<'a> {
         let mut out: Vec<(String, String)> = names
             .into_iter()
             .map(|n| {
-                if let Some(rest) = n.strip_prefix("_hdb_code_") {
-                    ("_hdb_code".to_string(), rest.to_string())
-                } else if let Some(rest) = n.strip_prefix("_hdb_graph_") {
-                    ("_hdb_graph".to_string(), rest.to_string())
+                if let Some((schema, rest)) = super::internal_relations::engine_schema_and_name(&n) {
+                    (schema.to_string(), rest.to_string())
                 } else if let Some(idx) = n.find('.') {
                     let (s, t) = n.split_at(idx);
                     (s.to_string(), t[1..].to_string())
@@ -4168,7 +4167,7 @@ impl<'a> Catalog<'a> {
             // Skip system / internal bookkeeping tables — they have no
             // user-facing constraint indexes and rebuilding them just
             // wastes time at startup.
-            if table_name.starts_with("helios_") {
+            if is_internal_relation(&table_name) == Some(InternalKind::LegacyBookkeeping) {
                 continue;
             }
 

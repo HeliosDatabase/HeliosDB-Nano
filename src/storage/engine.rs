@@ -12160,7 +12160,9 @@ impl StorageEngine {
         let marker_bytes = bincode::serialize(&marker).map_err(|e| Error::storage(format!("marker serialize: {e}")))?;
 
         for table_name in tables {
-            if table_name.starts_with("helios_") {
+            if super::internal_relations::is_internal_relation(&table_name)
+                == Some(super::internal_relations::InternalKind::LegacyBookkeeping)
+            {
                 continue;
             }
             let indexes = self.art_index_manager.export_table_snapshot(&table_name);
@@ -21324,8 +21326,11 @@ impl StorageEngine {
         let tables = catalog.list_tables()?;
 
         for table_name in tables {
-            // Skip system tables
-            if table_name.starts_with("helios_") || table_name.starts_with("mv_") {
+            // Skip the bookkeeping tables of earlier releases. A user table
+            // called `mv_<x>` is a user table and is analyzed.
+            if super::internal_relations::is_internal_relation(&table_name)
+                == Some(super::internal_relations::InternalKind::LegacyBookkeeping)
+            {
                 continue;
             }
 

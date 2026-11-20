@@ -64,7 +64,7 @@ fn all_tables(db: &EmbeddedDatabase, uri: &str) -> Result<ResourcePayload, Strin
         .list_tables()
         .map_err(|e| e.to_string())?
         .into_iter()
-        .filter(|n| !n.starts_with("helios_") && !n.starts_with("mv_"))
+        .filter(|n| !crate::storage::internal_relations::is_hidden_storage_table(n))
         .collect::<Vec<_>>();
     Ok(ResourcePayload {
         uri: uri.to_string(),

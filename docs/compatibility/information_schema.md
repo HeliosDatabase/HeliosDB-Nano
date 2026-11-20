@@ -198,7 +198,7 @@ These `pg_catalog` views are populated on every route:
 | `pg_views` | Populated | `schemaname`, `viewname`, `viewowner`, `definition` (the stored `CREATE VIEW` body) |
 | `pg_indexes` | Populated | Primary-key, `UNIQUE`, manual B-tree and HNSW vector indexes with a rendered `indexdef`. Previously reachable only over the PostgreSQL wire — the embedded/REPL/Python routes errored |
 | `pg_matviews` | Populated | One row per materialised view with its `definition`. Previously empty on every route while a working implementation sat unreachable in a dead registry |
-| `pg_class` | Populated | Tables (`r`), indexes (`i`), sequences (`S`) and views (`v`) |
+| `pg_class` | Populated | Tables (`r`), indexes (`i`), sequences (`S`), views (`v`) and materialised views (`m`, under the view's own name) |
 
 `pg_proc` lists every user function (`prokind` `f`) and procedure (`p`):
 `proname`, `pronamespace`, `prolang`, `prorettype`, `proargtypes`, `pronargs`
