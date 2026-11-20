@@ -1336,9 +1336,12 @@ fn resolve_parser_and_extractor(lang: &str) -> Option<ParseExtractPair> {
 /// engine surfaces a column-conflict error from the underlying
 /// schema check.
 fn ensure_body_vec_column(db: &EmbeddedDatabase, dim: usize) -> Result<()> {
-    db.execute(&format!(
-        "ALTER TABLE _hdb_code_symbols ADD COLUMN IF NOT EXISTS body_vec VECTOR({dim})"
-    ))?;
+    // The engine's own change to a table it owns.
+    crate::sql::dict::reserved::engine_ddl(|| {
+        db.execute(&format!(
+            "ALTER TABLE _hdb_code_symbols ADD COLUMN IF NOT EXISTS body_vec VECTOR({dim})"
+        ))
+    })?;
     Ok(())
 }
 

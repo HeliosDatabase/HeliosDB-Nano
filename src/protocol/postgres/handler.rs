@@ -7200,6 +7200,14 @@ fn sqlstate_for_query_execution_message(message: &str) -> &'static str {
     if crate::notify::is_invalid_parameter_message(message) {
         return sqlstate::INVALID_PARAMETER_VALUE; // 22023
     }
+    // A name the system dictionary keeps, and DDL on an engine-owned table.
+    // Anchored on the one emitter of each (`sql::dict::reserved`).
+    if message.contains(crate::sql::dict::reserved::RESERVED_NAME_MARKER) {
+        return sqlstate::RESERVED_NAME; // 42939
+    }
+    if message.contains(crate::sql::dict::reserved::ENGINE_OWNED_MARKER) {
+        return sqlstate::INSUFFICIENT_PRIVILEGE; // 42501
+    }
     // sprinter 6dc0cc115db9: `lastval()` before any `nextval()` in this session.
     // PostgreSQL reports 55000 object_not_in_prerequisite_state, and a DB-API
     // shim branches on it to decide that `cursor.lastrowid` is simply unknown

@@ -229,3 +229,74 @@ async fn wire_pg_proc_lists_user_routines() {
         ]
     );
 }
+
+// ---------------------------------------------------------------------------
+// Item 3: reserved names and engine-owned tables
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn wire_reserved_names_are_42939() {
+    let db = new_db();
+    let (mut handler, mut client) = connect(&db);
+    setup(&mut handler, &mut client, "CREATE TABLE dw_ok (id INTEGER PRIMARY KEY)").await;
+    for sql in [
+        "CREATE TABLE hdb_mine (id INTEGER)",
+        "CREATE TABLE pg_class (id INTEGER)",
+        "CREATE TABLE hdb_ctas AS SELECT 1 AS x",
+        "CREATE VIEW hdb_v AS SELECT id FROM dw_ok",
+        "CREATE VIEW pg_tables AS SELECT id FROM dw_ok",
+        "ALTER TABLE dw_ok RENAME TO hdb_renamed",
+        "ALTER TABLE dw_ok RENAME TO pg_settings",
+    ] {
+        let out = simple(&mut handler, &mut client, sql).await;
+        assert_eq!(sqlstates(&out), vec!["42939".to_string()], "simple protocol: `{sql}`");
+        let out = extended(&mut handler, &mut client, sql).await;
+        assert_eq!(
+            sqlstates(&out).first().map(String::as_str),
+            Some("42939"),
+            "extended protocol: `{sql}`"
+        );
+    }
+    // The embedded error carries the same class.
+    let error = db.execute("CREATE TABLE hdb_mine (id INTEGER)").expect_err("refused");
+    assert_eq!(super::handler::sqlstate_for_error(&error), "42939");
+    // The session is usable and nothing was created or renamed.
+    let got = rows(
+        &mut handler,
+        &mut client,
+        "SELECT table_name FROM information_schema.tables WHERE table_name LIKE 'hdb\\_%' OR table_name = 'dw_ok'",
+    )
+    .await;
+    assert_eq!(got, vec![vec!["dw_ok"]]);
+}
+
+#[tokio::test]
+async fn wire_engine_tables_refuse_user_ddl_with_42501() {
+    let db = new_db();
+    let (mut handler, mut client) = connect(&db);
+    setup(
+        &mut handler,
+        &mut client,
+        "CREATE TABLE IF NOT EXISTS _hdb_code_dw_probe (id INTEGER)",
+    )
+    .await;
+    for sql in [
+        "ALTER TABLE _hdb_code_dw_probe ADD COLUMN extra INTEGER",
+        "DROP TABLE _hdb_code_dw_probe",
+    ] {
+        let out = simple(&mut handler, &mut client, sql).await;
+        if cfg!(feature = "code-graph") {
+            assert_eq!(sqlstates(&out), vec!["42501".to_string()], "`{sql}`");
+        } else {
+            assert!(
+                sqlstates(&out).is_empty(),
+                "`{sql}`: nothing owns the table in this binary"
+            );
+        }
+    }
+    // The decision itself, whatever this binary was compiled with.
+    let refusal = crate::sql::dict::reserved::engine_table_refusal("_hdb_graph_nodes", "DROP TABLE", true)
+        .expect("refused while the owning feature is compiled in");
+    assert_eq!(super::handler::sqlstate_for_error(&refusal), "42501");
+    assert!(crate::sql::dict::reserved::engine_table_refusal("_hdb_graph_nodes", "DROP TABLE", false).is_none());
+}

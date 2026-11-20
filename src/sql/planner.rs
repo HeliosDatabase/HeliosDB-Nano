@@ -1779,9 +1779,11 @@ impl<'a> Planner<'a> {
             // after planning and decline to admit. Arming only at
             // `Catalog::create_table` would be one step too late.
             super::temp_tables::note_temp_table_planned(self.catalog.map(|c| c.storage()));
+            super::dict::reserved::refuse_reserved_name(&bare)?;
             return Ok(format!("{namespace}.{bare}"));
         }
         let key = self.resolve_table_create(name);
+        super::dict::reserved::refuse_reserved_name(&key)?;
         if super::temp_tables::is_temp_key(&key) {
             return Err(Error::query_execution(
                 super::temp_tables::reserved_temp_schema_message(&key),
@@ -2093,6 +2095,7 @@ impl<'a> Planner<'a> {
                         },
                         sqlparser::ast::ObjectType::Table => {
                             let name = self.resolve_table_ref(name);
+                            super::dict::reserved::refuse_engine_table_ddl(&name, "DROP TABLE")?;
                             if cascade {
                                 LogicalPlan::DropTableCascade { name, if_exists }
                             } else {
@@ -2485,6 +2488,8 @@ impl<'a> Planner<'a> {
                 options,
                 ..
             } => {
+                // A view cannot take a name the system dictionary keeps (42939).
+                super::dict::reserved::refuse_reserved_name(&Self::normalize_nontable_name(&name))?;
                 // Check if this is a materialized view
                 if materialized {
                     // Convert the query to a logical plan
@@ -4386,7 +4391,9 @@ impl<'a> Planner<'a> {
                 use crate::sql::phase3::SystemViewRegistry;
                 let registry = SystemViewRegistry::shared();
 
-                if registry.is_system_view(&table_name) {
+                if registry.is_system_view(&table_name)
+                    && super::dict::reserved::names_dictionary_view(&table_name, self.catalog)
+                {
                     let schema = Arc::new(
                         registry
                             .get_schema(&table_name)
@@ -7751,6 +7758,8 @@ impl<'a> Planner<'a> {
         if operations.is_empty() {
             return Err(Error::query_execution("ALTER TABLE requires an operation"));
         }
+        // An engine-owned table is not altered by a user statement (42501).
+        super::dict::reserved::refuse_engine_table_ddl(&table_name, "ALTER TABLE")?;
 
         // Single operation: return directly (no wrapper needed)
         if operations.len() == 1 {
@@ -7949,6 +7958,7 @@ impl<'a> Planner<'a> {
             // from the session — see `resolve_rename_target`.
             AlterTableOperation::RenameTable { table_name: new_name } => {
                 let new_table_name = Self::resolve_rename_target(&table_name, source_name, &new_name)?;
+                super::dict::reserved::refuse_reserved_name(&new_table_name)?;
                 Ok(LogicalPlan::AlterTableRename {
                     table_name,
                     new_table_name,

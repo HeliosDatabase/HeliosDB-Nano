@@ -98,6 +98,15 @@ impl MaterializedViewParser {
         options_str: Option<&str>,
         if_not_exists: bool,
     ) -> Result<LogicalPlan> {
+        // A materialized view cannot take a name the system dictionary keeps.
+        // `name` is the name as written: compare its last part, unquoted.
+        let written = name
+            .rsplit('.')
+            .next()
+            .unwrap_or(&name)
+            .trim_matches('"')
+            .to_lowercase();
+        crate::sql::dict::reserved::refuse_reserved_name(&written)?;
         let options = if let Some(opts) = options_str {
             Self::parse_mv_options(opts)?
         } else {

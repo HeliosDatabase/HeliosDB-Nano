@@ -9618,6 +9618,7 @@ impl EmbeddedDatabase {
             ));
         }
         sql::udf_bridge::install_on(&self.storage, &bridge);
+        sql::dict::reserved::warn_about_shadowing_tables(&self.storage);
         // What the system views read besides storage: routines, triggers, tenants.
         sql::dict::context::install_sources(
             &self.storage,

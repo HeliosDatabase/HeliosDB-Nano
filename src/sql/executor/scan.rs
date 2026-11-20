@@ -2285,7 +2285,9 @@ pub(super) fn handle_scan(executor: &Executor, plan: &LogicalPlan) -> Result<Box
         // Join compose on top exactly like a user table.
         use crate::sql::phase3::SystemViewRegistry;
         let registry = SystemViewRegistry::shared();
-        if registry.is_system_view(table_name) {
+        if registry.is_system_view(table_name)
+            && crate::sql::dict::reserved::names_dictionary_view_in(table_name, executor.storage())
+        {
             let storage = executor
                 .storage()
                 .ok_or_else(|| Error::query_execution("system view requires storage context".to_string()))?;
@@ -2683,7 +2685,9 @@ pub(super) fn handle_filtered_scan(executor: &Executor, plan: &LogicalPlan) -> R
 
         use crate::sql::phase3::SystemViewRegistry;
         let registry = SystemViewRegistry::shared();
-        if registry.is_system_view(table_name) {
+        if registry.is_system_view(table_name)
+            && crate::sql::dict::reserved::names_dictionary_view_in(table_name, executor.storage())
+        {
             let storage = executor
                 .storage()
                 .ok_or_else(|| Error::query_execution("system view requires storage context".to_string()))?;

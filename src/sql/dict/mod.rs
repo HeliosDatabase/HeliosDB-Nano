@@ -17,6 +17,13 @@
 
 pub mod context;
 pub mod oid;
+pub mod reserved;
 pub mod routines;
 
 pub use context::DictContext;
+
+/// Whether `name` is a name of the dictionary: a registered system view or an
+/// alias of one.
+pub fn is_dictionary_name(name: &str) -> bool {
+    crate::sql::phase3::SystemViewRegistry::shared().is_system_view(name)
+}

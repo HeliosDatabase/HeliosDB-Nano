@@ -139,7 +139,12 @@ fn a_late_reference_refusal_restores_old_graph_rows_and_deletes() -> Result<()> 
             seed_old_graph(&db)?;
             // Symbol INSERTs precede reference INSERTs in the real indexer.
             // Refuse the real call edge only after new symbols were staged.
-            db.execute("ALTER TABLE _hdb_code_symbol_refs ADD CONSTRAINT cg_ref_refusal CHECK (to_name <> 'callee')")?;
+            // A statement may no longer alter an engine-owned table; the fault is injected as the engine.
+            heliosdb_nano::sql::dict::reserved::engine_ddl(|| {
+                db.execute(
+                    "ALTER TABLE _hdb_code_symbol_refs ADD CONSTRAINT cg_ref_refusal CHECK (to_name <> 'callee')",
+                )
+            })?;
             let before = image(&db)?;
             if caller {
                 db.begin()?;
@@ -163,7 +168,9 @@ fn a_late_reference_refusal_restores_old_graph_rows_and_deletes() -> Result<()> 
             );
             assert_eq!(count(&db, "cg_user")?, 0);
             assert!(!db.in_transaction());
-            db.execute("ALTER TABLE _hdb_code_symbol_refs DROP CONSTRAINT cg_ref_refusal")?;
+            heliosdb_nano::sql::dict::reserved::engine_ddl(|| {
+                db.execute("ALTER TABLE _hdb_code_symbol_refs DROP CONSTRAINT cg_ref_refusal")
+            })?;
             db.code_index(CodeIndexOptions::for_table("cg_src"))?;
             complete(&db)?;
             eprintln!("codegraph-transaction-cell late-refusal history={history} caller={caller}");
