@@ -3,7 +3,10 @@
 //! Tests for vector similarity search via SQL layer
 
 use heliosdb_nano::{
-    sql::SystemViewRegistry, storage::VectorIndexType, vector::DistanceMetric, EmbeddedDatabase, Result, Value,
+    sql::{dict::DictContext, phase3::SystemViewRegistry},
+    storage::VectorIndexType,
+    vector::DistanceMetric,
+    EmbeddedDatabase, Result, Value,
 };
 use tempfile::TempDir;
 
@@ -86,7 +89,7 @@ fn test_create_hnsw_index_on_populated_table_backfills_existing_rows() -> Result
          backfilled index; top-2 returned {hit_ids:?}"
     );
 
-    let pg_indexes = SystemViewRegistry::new().execute("pg_indexes", &db.storage)?;
+    let pg_indexes = SystemViewRegistry::shared().execute("pg_indexes", &DictContext::for_engine(&db.storage))?;
     assert!(
         pg_indexes.iter().any(|tuple| {
             matches!(
@@ -136,7 +139,7 @@ fn test_hnsw_index_definition_survives_reopen() -> Result<()> {
         other => panic!("expected standard HNSW metadata after reopen, got {other:?}"),
     }
 
-    let pg_indexes = SystemViewRegistry::new().execute("pg_indexes", &db.storage)?;
+    let pg_indexes = SystemViewRegistry::shared().execute("pg_indexes", &DictContext::for_engine(&db.storage))?;
     assert!(
         pg_indexes.iter().any(|tuple| {
             matches!(

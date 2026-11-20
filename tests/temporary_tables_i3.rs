@@ -353,8 +353,8 @@ async fn a_permanent_table_of_the_same_shape_is_still_shared() {
 }
 
 /// Catalog visibility across BOTH implementations of the table list — the
-/// registry/`system_views` path (`information_schema.tables`) and the wire
-/// interceptor (`pg_tables` / `pg_class`, which is also what `psql \dt` runs).
+/// registry path (`information_schema.tables`, `pg_tables`, `pg_class`) and the
+/// wire interceptor (what `psql \dt` runs).
 ///
 /// Pre-fix every one of these listed `tmp_cat` to session B, because the table
 /// was catalogued under the ordinary bare key.

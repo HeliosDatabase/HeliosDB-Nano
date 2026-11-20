@@ -845,7 +845,11 @@ pub enum LogicalPlan {
     },
 
     // === Phase 3: System Views ===
-    /// Query a system view (e.g., pg_database_branches())
+    /// RETIRED. Never built: a system view plans as a [`LogicalPlan::Scan`]
+    /// of its name. The variant keeps its place only because this enum is
+    /// persisted positionally (the stored plan of a materialized view):
+    /// removing it would renumber every variant after it. Executing one is an
+    /// error.
     SystemView {
         /// View name
         name: String,
@@ -2800,16 +2804,9 @@ impl LogicalPlan {
                 // AlterMaterializedView doesn't have output schema
                 Arc::new(Schema { columns: vec![] })
             }
-            LogicalPlan::SystemView { name, .. } => {
-                // System views have predefined schemas from the registry
-                use crate::sql::phase3::SystemViewRegistry;
-                let registry = SystemViewRegistry::new();
-                if let Some(schema) = registry.get_schema(name) {
-                    Arc::new(schema.clone())
-                } else {
-                    // Fallback to empty schema if view not found
-                    Arc::new(Schema { columns: vec![] })
-                }
+            LogicalPlan::SystemView { .. } => {
+                // Retired variant (see its declaration): it has no output.
+                Arc::new(Schema { columns: vec![] })
             }
             LogicalPlan::TableFunction {
                 function_name,

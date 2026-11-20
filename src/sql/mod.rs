@@ -32,7 +32,6 @@ pub mod sequences;
 pub mod settings;
 pub mod sqlite_compat;
 pub mod system_tables;
-pub mod system_views;
 pub mod temp_tables; // sprinter 1703dba8e82d: session-private CREATE TEMPORARY TABLE
 pub mod triggers;
 pub mod type_inference; // Named-counter store for CREATE SEQUENCE / nextval / currval / setval
@@ -76,7 +75,6 @@ pub use settings::{
     SessionSettings, SettingValue, REGISTERED_PARAMETERS,
 };
 pub use system_tables::{ProtocolType, SessionInfo, SessionRegistry, SessionState, SystemTables};
-pub use system_views::{SystemView, SystemViewRegistry, ViewCategory};
 pub use triggers::{
     DeferralMode, DeferredTriggerTracker, PendingTriggerExecution, TransitionTables, TriggerAction, TriggerContext,
     TriggerDefinition, TriggerPersistence, TriggerRegistry, TriggerRowContext, MAX_TRIGGER_DEPTH,

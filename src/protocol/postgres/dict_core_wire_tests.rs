@@ -347,3 +347,70 @@ async fn wire_psql_describe_uses_the_pg_class_identifier() {
         "the identifier must not move when another table is created"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Item 5: pg_tables has one shape
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn wire_pg_tables_has_one_shape() {
+    let db = new_db();
+    let (mut handler, mut client) = connect(&db);
+    setup(&mut handler, &mut client, "CREATE SCHEMA dw_s").await;
+    setup(
+        &mut handler,
+        &mut client,
+        "CREATE TABLE dw_keyed (id INTEGER PRIMARY KEY)",
+    )
+    .await;
+    setup(&mut handler, &mut client, "CREATE TABLE dw_plain (v TEXT)").await;
+    setup(
+        &mut handler,
+        &mut client,
+        "CREATE TABLE dw_s.dw_scoped (id INTEGER PRIMARY KEY)",
+    )
+    .await;
+    let expected = [
+        "schemaname",
+        "tablename",
+        "tableowner",
+        "tablespace",
+        "hasindexes",
+        "hasrules",
+        "hastriggers",
+        "rowsecurity",
+    ];
+    for sql in [
+        "SELECT * FROM pg_tables",
+        "SELECT * FROM pg_catalog.pg_tables WHERE schemaname = 'public'",
+        "SELECT * FROM pg_tables WHERE tablename = 'dw_keyed'",
+        "SELECT * FROM pg_tables WHERE tablename = 'dw_keyed' OR tablename = 'dw_plain'",
+    ] {
+        let out = simple(&mut handler, &mut client, sql).await;
+        assert!(sqlstates(&out).is_empty(), "`{sql}`: {:?}", sqlstates(&out));
+        assert_eq!(column_names(&out), expected, "simple protocol: `{sql}`");
+        let out = extended(&mut handler, &mut client, sql).await;
+        assert_eq!(column_names(&out), expected, "extended protocol: `{sql}`");
+    }
+    let got = rows(
+        &mut handler,
+        &mut client,
+        "SELECT schemaname, tablename, hasindexes FROM pg_tables WHERE schemaname <> 'pg_catalog' ORDER BY tablename",
+    )
+    .await;
+    assert_eq!(
+        got,
+        vec![
+            vec!["public", "dw_keyed", "t"],
+            vec!["public", "dw_plain", "f"],
+            vec!["dw_s", "dw_scoped", "t"]
+        ]
+    );
+    let got = rows(
+        &mut handler,
+        &mut client,
+        "SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename",
+    )
+    .await;
+    assert_eq!(got, vec![vec!["dw_keyed"], vec!["dw_plain"]]);
+}

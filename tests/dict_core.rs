@@ -421,3 +421,44 @@ fn object_identifiers_are_stable_across_ddl_and_join() {
         "a relation identifier must not collide with a type identifier"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Item 5: pg_tables has one shape
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pg_tables_has_the_postgresql_shape_and_real_values() {
+    let db = db();
+    db.execute("CREATE SCHEMA dc_s").unwrap();
+    db.execute("CREATE TABLE dc_keyed (id INTEGER PRIMARY KEY)").unwrap();
+    db.execute("CREATE TABLE dc_plain (v TEXT)").unwrap();
+    db.execute("CREATE TABLE dc_s.dc_scoped (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    let expected_columns = [
+        "schemaname",
+        "tablename",
+        "tableowner",
+        "tablespace",
+        "hasindexes",
+        "hasrules",
+        "hastriggers",
+        "rowsecurity",
+    ];
+    for sql in [
+        "SELECT * FROM pg_tables",
+        "SELECT * FROM pg_catalog.pg_tables WHERE schemaname = 'public'",
+    ] {
+        assert_eq!(both(&db, sql).1, expected_columns, "{sql}");
+    }
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT schemaname, tablename, hasindexes FROM pg_tables WHERE tablename LIKE 'dc\\_%' ORDER BY tablename"
+        ),
+        vec![
+            vec!["public", "dc_keyed", "true"],
+            vec!["public", "dc_plain", "false"],
+            vec!["dc_s", "dc_scoped", "true"],
+        ]
+    );
+}

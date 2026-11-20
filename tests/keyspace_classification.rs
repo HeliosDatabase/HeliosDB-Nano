@@ -87,8 +87,6 @@ const ALLOW: &[(&str, &str)] = &[
     // `branch@lsn:N` / `branch@scn:N` diff targets.
     ("src/git_integration/diff/mod.rs", "lsn:"),
     ("src/git_integration/diff/mod.rs", "scn:"),
-    // A `query_hash` column value.
-    ("src/sql/system_views.rs", "table:"),
     // Prometheus alert text a unit test asserts on.
     ("src/sql/explain_integrations.rs", "alert:"),
     // host:port inputs of an address-validation unit test.

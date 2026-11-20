@@ -1,7 +1,11 @@
 //! A3 regression coverage: scalar secondary indexes must be populated on
 //! CREATE INDEX and usable for equality point lookups.
 
-use heliosdb_nano::{sql::SystemViewRegistry, storage::ArtIndexManager};
+// The one registry (the second, unused one was deleted): read through the engine's context.
+use heliosdb_nano::{
+    sql::{dict::DictContext, phase3::SystemViewRegistry},
+    storage::ArtIndexManager,
+};
 use heliosdb_nano::{EmbeddedDatabase, Tuple, Value};
 use tempfile::TempDir;
 
@@ -139,7 +143,9 @@ fn manual_secondary_index_definition_survives_reopen_and_uuid_lookup_uses_art() 
         "manual secondary index must be rebuilt from persisted metadata on reopen"
     );
 
-    let indexes = SystemViewRegistry::new().execute("pg_indexes", &db.storage).unwrap();
+    let indexes = SystemViewRegistry::shared()
+        .execute("pg_indexes", &DictContext::for_engine(&db.storage))
+        .unwrap();
     assert!(
         indexes.iter().any(|row| matches!(
             row.values.get(2),

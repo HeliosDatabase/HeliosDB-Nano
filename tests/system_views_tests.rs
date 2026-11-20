@@ -1,31 +1,65 @@
-//! Comprehensive tests for PostgreSQL-compatible system views
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::many_single_char_names
+)]
+#![allow(clippy::assert_is_empty)]
+//! The PostgreSQL-compatible system views, read from the registry that answers
+//! real queries (`sql::phase3::SystemViewRegistry`).
 //!
-//! Tests all 18 system views across categories:
-//! - Core catalog views
-//! - Session and activity views
-//! - v2.0 feature views
-//! - v2.1 feature views
+//! These tests used to assert a second registry that no statement could reach.
+//! That registry is deleted; every test of a view that exists in the live
+//! registry was ported here, reading columns by name. The tests of views that
+//! existed only in the deleted registry (`pg_stat_database`, `pg_branches`,
+//! `pg_snapshots`, `pg_stat_ssl`, `pg_stat_optimizer`, `pg_compression_stats`,
+//! and the view-category listing) were removed with it.
 
 use heliosdb_nano::{
-    sql::{ProtocolType, SessionRegistry, SystemViewRegistry},
-    Column, Config, DataType, Schema, StorageEngine, Tuple, Value,
+    sql::{dict::DictContext, phase3::SystemViewRegistry},
+    Column, Config, DataType, EmbeddedDatabase, Schema, StorageEngine, Tuple, Value,
 };
+
+fn storage() -> StorageEngine {
+    StorageEngine::open_in_memory(&Config::in_memory()).unwrap()
+}
+
+/// The rows of `view` over a bare storage engine.
+fn rows_of(view: &str, storage: &StorageEngine) -> Vec<Tuple> {
+    SystemViewRegistry::shared()
+        .execute(view, &DictContext::new(storage))
+        .unwrap_or_else(|e| panic!("{view} must execute: {e}"))
+}
+
+/// Position of `column` in `view`.
+fn col(view: &str, column: &str) -> usize {
+    let schema = SystemViewRegistry::shared()
+        .get_schema(view)
+        .unwrap_or_else(|| panic!("{view} must be registered"));
+    schema
+        .columns
+        .iter()
+        .position(|c| c.name == column)
+        .unwrap_or_else(|| panic!("{view} must have a column {column}"))
+}
+
+fn text(tuple: &Tuple, idx: usize) -> String {
+    match &tuple.values[idx] {
+        Value::String(s) => s.clone(),
+        other => panic!("expected text, got {other:?}"),
+    }
+}
+
+fn width(view: &str) -> usize {
+    SystemViewRegistry::shared().get_schema(view).unwrap().columns.len()
+}
 
 #[test]
 fn test_system_view_registry_initialization() {
-    let registry = SystemViewRegistry::new();
-
-    // Verify all 18 views are registered
-    let all_views = registry.list_views();
-    assert!(
-        all_views.len() >= 18,
-        "Expected at least 18 views, got {}",
-        all_views.len()
-    );
-
-    // Verify specific views exist
-    let expected_views = vec![
-        // Core catalog (8)
+    let registry = SystemViewRegistry::shared();
+    assert!(registry.list_views().len() >= 18);
+    for view in [
         "pg_tables",
         "pg_views",
         "pg_indexes",
@@ -34,325 +68,193 @@ fn test_system_view_registry_initialization() {
         "pg_namespace",
         "pg_class",
         "pg_type",
-        // Session/Activity (3)
         "pg_stat_activity",
-        "pg_stat_database",
         "pg_settings",
-        // v2.0 Features (3)
-        "pg_branches",
         "pg_matviews",
-        "pg_snapshots",
-        // v2.1 Features (4)
-        "pg_stat_ssl",
         "pg_authid",
-        "pg_stat_optimizer",
-        "pg_compression_stats",
-    ];
-
-    for view_name in expected_views {
-        assert!(
-            registry.is_system_view(view_name),
-            "Expected view '{}' to be registered",
-            view_name
-        );
+    ] {
+        assert!(registry.is_system_view(view), "expected view '{view}' to be registered");
     }
 }
 
 #[test]
 fn test_pg_tables_basic() {
-    let config = Config::in_memory();
-    let storage = StorageEngine::open_in_memory(&config).unwrap();
-
-    // Create test tables
+    let storage = storage();
     let schema = Schema::new(vec![
         Column::new("id", DataType::Int4),
         Column::new("name", DataType::Text),
     ]);
-
     storage.catalog().create_table("users", schema.clone()).unwrap();
-    storage.catalog().create_table("products", schema.clone()).unwrap();
+    storage.catalog().create_table("products", schema).unwrap();
 
-    let registry = SystemViewRegistry::new();
-    let results = registry.execute("pg_tables", &storage).unwrap();
-
-    // Should have at least 2 tables
-    assert!(results.len() >= 2, "Expected at least 2 tables");
-
-    // Verify structure
+    let results = rows_of("pg_tables", &storage);
+    assert_eq!(results.len(), 2, "two tables were created");
+    let (schemaname, tablename) = (col("pg_tables", "schemaname"), col("pg_tables", "tablename"));
     for tuple in &results {
-        assert_eq!(tuple.values.len(), 8, "pg_tables should have 8 columns");
-
-        // schemaname should be "public"
-        if let Value::String(schema) = &tuple.values[0] {
-            assert_eq!(schema, "public");
-        } else {
-            panic!("Expected schemaname to be a string");
-        }
-
-        // tablename should be a string
-        assert!(matches!(&tuple.values[1], Value::String(_)));
+        assert_eq!(tuple.values.len(), 8, "pg_tables has PostgreSQL's 8 columns");
+        assert_eq!(text(tuple, schemaname), "public");
     }
+    let mut names: Vec<String> = results.iter().map(|t| text(t, tablename)).collect();
+    names.sort();
+    assert_eq!(names, ["products", "users"]);
 }
 
 #[test]
 fn test_pg_tables_excludes_system_tables() {
-    let config = Config::in_memory();
-    let storage = StorageEngine::open_in_memory(&config).unwrap();
-
-    // Create regular table
+    let storage = storage();
     let schema = Schema::new(vec![Column::new("id", DataType::Int4)]);
     storage.catalog().create_table("regular_table", schema.clone()).unwrap();
+    storage
+        .catalog()
+        .create_table("helios_internal", schema.clone())
+        .unwrap();
+    // A user table whose name starts with `mv_` is a user table and is listed.
+    storage.catalog().create_table("mv_user_table", schema).unwrap();
 
-    // Create system-like table (should be excluded)
-    storage.catalog().create_table("helios_internal", schema).unwrap();
-
-    let registry = SystemViewRegistry::new();
-    let results = registry.execute("pg_tables", &storage).unwrap();
-
-    // Verify helios_ tables are excluded
-    for tuple in &results {
-        if let Value::String(tablename) = &tuple.values[1] {
-            assert!(
-                !tablename.starts_with("helios_"),
-                "System table '{}' should be excluded from pg_tables",
-                tablename
-            );
-        }
-    }
+    let tablename = col("pg_tables", "tablename");
+    let names: Vec<String> = rows_of("pg_tables", &storage)
+        .iter()
+        .map(|t| text(t, tablename))
+        .collect();
+    assert!(names.contains(&"regular_table".to_string()));
+    assert!(names.contains(&"mv_user_table".to_string()));
+    assert!(
+        !names.iter().any(|name| name.starts_with("helios_")),
+        "bookkeeping tables are excluded from pg_tables: {names:?}"
+    );
 }
 
 #[test]
 fn test_pg_indexes_vector_indexes() {
-    let config = Config::in_memory();
-    let storage = StorageEngine::open_in_memory(&config).unwrap();
-
-    // Create table with vector column
-    let schema = Schema::new(vec![
-        Column::new("id", DataType::Int4),
-        Column::new("embedding", DataType::Vector(128)),
-    ]);
-    storage.catalog().create_table("documents", schema).unwrap();
-
-    // Create vector index
-    use heliosdb_nano::vector::DistanceMetric;
-    storage
-        .vector_indexes()
-        .create_index(
-            "doc_embedding_idx".to_string(),
-            "documents".to_string(),
-            "embedding".to_string(),
-            128,
-            DistanceMetric::Cosine,
-        )
+    let db = EmbeddedDatabase::new_in_memory().unwrap();
+    db.execute("CREATE TABLE documents (id INT4 PRIMARY KEY, embedding VECTOR(3))")
+        .unwrap();
+    db.execute("CREATE INDEX doc_embedding_idx ON documents USING hnsw (embedding vector_cosine_ops)")
         .unwrap();
 
-    let registry = SystemViewRegistry::new();
-    let results = registry.execute("pg_indexes", &storage).unwrap();
-
-    // Should have the vector index
-    assert!(results.len() >= 1, "Expected at least 1 index");
-
-    // Verify structure
+    let results = SystemViewRegistry::shared()
+        .execute("pg_indexes", &DictContext::for_engine(&db.storage))
+        .unwrap();
+    let (indexname, indexdef) = (col("pg_indexes", "indexname"), col("pg_indexes", "indexdef"));
+    let vector_index = results
+        .iter()
+        .find(|t| text(t, indexname) == "doc_embedding_idx")
+        .expect("the vector index is listed");
     for tuple in &results {
-        assert_eq!(tuple.values.len(), 5, "pg_indexes should have 5 columns");
-
-        // Verify indexdef contains CREATE INDEX
-        if let Value::String(indexdef) = &tuple.values[4] {
-            assert!(indexdef.contains("CREATE INDEX"));
-        }
+        assert_eq!(tuple.values.len(), 5, "pg_indexes has 5 columns");
+        assert!(text(tuple, indexdef).contains("INDEX"));
     }
+    assert!(text(vector_index, indexdef).contains("CREATE INDEX"));
+    assert!(text(vector_index, indexdef).contains("hnsw"));
 }
 
 #[test]
 fn test_pg_attribute_column_metadata() {
-    let config = Config::in_memory();
-    let storage = StorageEngine::open_in_memory(&config).unwrap();
-
-    // Create table with various column types
+    let storage = storage();
+    let column = |name: &str, data_type: DataType, nullable: bool, primary_key: bool| Column {
+        name: name.to_string(),
+        data_type,
+        nullable,
+        primary_key,
+        source_table: None,
+        source_table_name: None,
+        default_expr: None,
+        unique: false,
+        storage_mode: heliosdb_nano::ColumnStorageMode::Default,
+    };
     let schema = Schema::new(vec![
-        Column {
-            name: "id".to_string(),
-            data_type: DataType::Int4,
-            nullable: false,
-            primary_key: true,
-            source_table: None,
-            source_table_name: None,
-            default_expr: None,
-            unique: false,
-            storage_mode: heliosdb_nano::ColumnStorageMode::Default,
-        },
-        Column {
-            name: "name".to_string(),
-            data_type: DataType::Text,
-            nullable: true,
-            primary_key: false,
-            source_table: None,
-            source_table_name: None,
-            default_expr: None,
-            unique: false,
-            storage_mode: heliosdb_nano::ColumnStorageMode::Default,
-        },
-        Column {
-            name: "age".to_string(),
-            data_type: DataType::Int2,
-            nullable: false,
-            primary_key: false,
-            source_table: None,
-            source_table_name: None,
-            default_expr: None,
-            unique: false,
-            storage_mode: heliosdb_nano::ColumnStorageMode::Default,
-        },
+        column("id", DataType::Int4, false, true),
+        column("name", DataType::Text, true, false),
+        column("age", DataType::Int2, false, false),
     ]);
-
     storage.catalog().create_table("test_attrs", schema).unwrap();
 
-    let registry = SystemViewRegistry::new();
-    let results = registry.execute("pg_attribute", &storage).unwrap();
-
-    // Should have 3 columns
-    assert!(results.len() >= 3, "Expected at least 3 columns");
-
-    // Verify structure
-    let mut found_nullable = false;
-    let mut found_notnull = false;
-
+    let results = rows_of("pg_attribute", &storage);
+    assert_eq!(results.len(), 3, "one row per column");
+    let (attname, attnotnull, attnum) = (
+        col("pg_attribute", "attname"),
+        col("pg_attribute", "attnotnull"),
+        col("pg_attribute", "attnum"),
+    );
+    let described: Vec<(String, Value, Value)> = results
+        .iter()
+        .map(|t| (text(t, attname), t.values[attnotnull].clone(), t.values[attnum].clone()))
+        .collect();
+    assert_eq!(
+        described,
+        vec![
+            ("id".to_string(), Value::Boolean(true), Value::Int4(1)),
+            ("name".to_string(), Value::Boolean(false), Value::Int4(2)),
+            ("age".to_string(), Value::Boolean(true), Value::Int4(3)),
+        ]
+    );
     for tuple in &results {
-        assert_eq!(tuple.values.len(), 7, "pg_attribute should have 7 columns");
-
-        // Check attnotnull field
-        if let Value::Boolean(notnull) = &tuple.values[5] {
-            if *notnull {
-                found_notnull = true;
-            } else {
-                found_nullable = true;
-            }
-        }
+        assert_eq!(tuple.values.len(), width("pg_attribute"));
     }
-
-    assert!(found_nullable, "Should have at least one nullable column");
-    assert!(found_notnull, "Should have at least one not-null column");
 }
 
 #[test]
 fn test_pg_database_single_database() {
-    let config = Config::in_memory();
-    let storage = StorageEngine::open_in_memory(&config).unwrap();
-
-    let registry = SystemViewRegistry::new();
-    let results = registry.execute("pg_database", &storage).unwrap();
-
-    // Should return exactly 1 database
-    assert_eq!(results.len(), 1, "Expected exactly 1 database");
-
-    // Verify structure
+    let storage = storage();
+    let results = rows_of("pg_database", &storage);
+    assert_eq!(results.len(), 1, "exactly one database before any CREATE DATABASE");
     let tuple = &results[0];
-    assert_eq!(tuple.values.len(), 7, "pg_database should have 7 columns");
-
-    // datname should be "heliosdb"
-    if let Value::String(datname) = &tuple.values[0] {
-        assert_eq!(datname, "heliosdb");
-    } else {
-        panic!("Expected datname to be a string");
-    }
-
-    // datallowconn should be true
-    if let Value::Boolean(allow_conn) = &tuple.values[6] {
-        assert!(*allow_conn);
-    }
+    assert_eq!(tuple.values.len(), width("pg_database"));
+    assert_eq!(text(tuple, col("pg_database", "datname")), "heliosdb");
+    assert_eq!(tuple.values[col("pg_database", "datallowconn")], Value::Boolean(true));
 }
 
 #[test]
 fn test_pg_namespace_public_schema() {
-    let config = Config::in_memory();
-    let storage = StorageEngine::open_in_memory(&config).unwrap();
-
-    let registry = SystemViewRegistry::new();
-    let results = registry.execute("pg_namespace", &storage).unwrap();
-
-    // Should have at least the public schema
-    assert!(results.len() >= 1, "Expected at least 1 namespace");
-
-    // Find public schema
-    let public_schema = results
-        .iter()
-        .find(|t| matches!(&t.values[0], Value::String(name) if name == "public"));
-
-    assert!(public_schema.is_some(), "Expected to find 'public' schema");
+    let storage = storage();
+    let nspname = col("pg_namespace", "nspname");
+    let results = rows_of("pg_namespace", &storage);
+    assert!(
+        results.iter().any(|t| text(t, nspname) == "public"),
+        "expected to find the 'public' schema"
+    );
 }
 
 #[test]
 fn test_pg_class_tables_and_matviews() {
-    let config = Config::in_memory();
-    let storage = StorageEngine::open_in_memory(&config).unwrap();
-
-    // Create regular table
+    let storage = storage();
     let schema = Schema::new(vec![Column::new("id", DataType::Int4)]);
-    storage.catalog().create_table("regular_table", schema).unwrap();
+    storage.catalog().create_table("regular_table", schema.clone()).unwrap();
+    // The storage of a materialized view is listed as the view, relkind `m`.
+    storage.catalog().create_table("__mv_some_view", schema).unwrap();
 
-    let registry = SystemViewRegistry::new();
-    let results = registry.execute("pg_class", &storage).unwrap();
-
-    // Should have at least 1 relation
-    assert!(results.len() >= 1, "Expected at least 1 relation");
-
-    // Verify structure
+    let results = rows_of("pg_class", &storage);
+    let (relname, relkind) = (col("pg_class", "relname"), col("pg_class", "relkind"));
+    let kinds: Vec<(String, String)> = results.iter().map(|t| (text(t, relname), text(t, relkind))).collect();
+    assert!(
+        kinds.contains(&("regular_table".to_string(), "r".to_string())),
+        "{kinds:?}"
+    );
+    assert!(kinds.contains(&("some_view".to_string(), "m".to_string())), "{kinds:?}");
     for tuple in &results {
-        assert_eq!(tuple.values.len(), 7, "pg_class should have 7 columns");
-
-        // relkind should be 'r' or 'm'
-        if let Value::String(relkind) = &tuple.values[2] {
-            assert!(
-                relkind == "r" || relkind == "m",
-                "relkind should be 'r' (table) or 'm' (matview), got '{}'",
-                relkind
-            );
-        }
+        assert_eq!(tuple.values.len(), width("pg_class"));
+        let kind = text(tuple, relkind);
+        assert!(
+            kind == "r" || kind == "m",
+            "only a table and a materialized view exist, got '{kind}'"
+        );
     }
 }
 
-/// HDB-011. Two things were wrong with this test before:
-///
-///   1. it read `values[0]` as the type NAME. In the registry the planner
-///      actually consults that column is the `oid`, so the name list it built
-///      was always empty and `contains(...)` could only ever pass by luck (it
-///      passed against the LEGACY registry, whose column order differs);
-///   2. it asserted the registry the planner does NOT use.
-///      `heliosdb_nano::sql::SystemViewRegistry` is the legacy registry in
-///      `src/sql/system_views.rs`; every runtime caller — the planner, the
-///      executor scan, the REPL — resolves `pg_type` through
-///      `sql::phase3::SystemViewRegistry`. This test now pins the one that
-///      answers a real query.
+/// HDB-011: the full PostgreSQL type inventory, read by column name.
 #[test]
 fn test_pg_type_builtin_types() {
-    let config = Config::in_memory();
-    let storage = StorageEngine::open_in_memory(&config).unwrap();
+    let storage = storage();
+    let results = rows_of("pg_type", &storage);
+    let name_idx = col("pg_type", "typname");
 
-    let registry = heliosdb_nano::sql::phase3::SystemViewRegistry::new();
-    let results = registry.execute("pg_type", &storage).unwrap();
-    let schema = registry.get_schema("pg_type").unwrap();
-    let name_idx = schema
-        .columns
-        .iter()
-        .position(|c| c.name == "typname")
-        .expect("pg_type must have a typname column");
-
-    // The full PostgreSQL inventory, not the seven rows this used to carry.
     assert!(
         results.len() >= 40,
         "Expected at least 40 pg_type rows, got {}",
         results.len()
     );
-
-    let type_names: Vec<String> = results
-        .iter()
-        .filter_map(|t| match t.values.get(name_idx) {
-            Some(Value::String(name)) => Some(name.clone()),
-            _ => None,
-        })
-        .collect();
-
-    let expected_types = vec![
+    let type_names: Vec<String> = results.iter().map(|t| text(t, name_idx)).collect();
+    for expected in [
         "bool",
         "int2",
         "int4",
@@ -367,35 +269,25 @@ fn test_pg_type_builtin_types() {
         "jsonb",
         "numeric",
         "date",
-        // Array types are part of the inventory now, linked by typarray/typelem.
+        // Array types are part of the inventory, linked by typarray/typelem.
         "_int4",
-    ];
-    for expected in expected_types {
+    ] {
         assert!(
             type_names.contains(&expected.to_string()),
-            "Expected type '{}' not found",
-            expected
+            "Expected type '{expected}' not found"
         );
     }
 }
 
-/// HDB-011: `pg_range` and `pg_enum` are registered EMPTY in the registry the
-/// planner consults, so the introspection every driver runs alongside
-/// `pg_type` resolves instead of erroring. tokio-postgres' TYPEINFO lookup
-/// `LEFT OUTER JOIN`s `pg_range`; drizzle-kit and Prisma join `pg_enum` to
-/// read enum labels. Both tolerate zero rows; neither tolerates "relation does
-/// not exist".
-///
-/// Registered in `sql::phase3::SystemViewRegistry` — the one the planner, the
-/// executor scan and the REPL all resolve through. The legacy
-/// `sql::SystemViewRegistry` enumerated by
-/// `test_system_view_registry_initialization` above is a different table and
-/// does not carry these.
+/// HDB-011: `pg_range` and `pg_enum` are registered and empty, so the
+/// introspection every driver runs alongside `pg_type` resolves instead of
+/// erroring. tokio-postgres' TYPEINFO lookup `LEFT OUTER JOIN`s `pg_range`;
+/// drizzle-kit and Prisma join `pg_enum` to read enum labels. Both tolerate
+/// zero rows; neither tolerates "relation does not exist".
 #[test]
 fn test_pg_range_and_pg_enum_are_registered_and_empty() {
-    let config = Config::in_memory();
-    let storage = StorageEngine::open_in_memory(&config).unwrap();
-    let registry = heliosdb_nano::sql::phase3::SystemViewRegistry::new();
+    let storage = storage();
+    let registry = SystemViewRegistry::shared();
 
     for (view, columns) in [
         (
@@ -418,173 +310,62 @@ fn test_pg_range_and_pg_enum_are_registered_and_empty() {
             .unwrap_or_else(|| panic!("{view} must have a schema"));
         let names: Vec<&str> = schema.columns.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, columns, "{view} must use PostgreSQL's column names");
-        let rows = registry
-            .execute(view, &storage)
-            .unwrap_or_else(|e| panic!("{view} must execute, got {e}"));
+        let rows = rows_of(view, &storage);
         assert!(rows.is_empty(), "{view} must answer zero rows, got {}", rows.len());
     }
 }
 
+/// `pg_stat_activity` lists the live backends of the database. The deleted
+/// registry filled it from a session table of its own; the live view reads the
+/// backends that exist.
 #[test]
-fn test_pg_stat_activity_with_sessions() {
-    let config = Config::in_memory();
-    let storage = StorageEngine::open_in_memory(&config).unwrap();
-
-    // Create session registry
-    let session_registry = std::sync::Arc::new(SessionRegistry::new());
-
-    // Register some sessions
-    session_registry
-        .register_session(
-            ProtocolType::PostgreSQL,
-            "user1".to_string(),
-            "127.0.0.1".to_string(),
-            5432,
-        )
+fn test_pg_stat_activity_answers_with_postgresql_columns() {
+    let db = EmbeddedDatabase::new_in_memory().unwrap();
+    let (rows, columns) = db
+        .query_with_columns("SELECT pid, usename, application_name, state FROM pg_stat_activity")
         .unwrap();
-
-    session_registry
-        .register_session(
-            ProtocolType::Oracle,
-            "user2".to_string(),
-            "192.168.1.100".to_string(),
-            1521,
-        )
-        .unwrap();
-
-    // Create registry with session tracking
-    let registry = SystemViewRegistry::with_session_registry(session_registry.clone());
-    let results = registry.execute("pg_stat_activity", &storage).unwrap();
-
-    // Should show both sessions
-    assert_eq!(results.len(), 2, "Expected 2 active sessions");
-
-    // Verify structure
-    for tuple in &results {
-        assert_eq!(tuple.values.len(), 12, "pg_stat_activity should have 12 columns");
-
-        // Verify datname
-        if let Value::String(datname) = &tuple.values[1] {
-            assert_eq!(datname, "heliosdb");
-        }
-
-        // Verify usename is present
-        assert!(matches!(&tuple.values[4], Value::String(_)));
-
-        // Verify state is present
-        assert!(matches!(&tuple.values[10], Value::String(_)));
-    }
-}
-
-#[test]
-fn test_pg_stat_database_statistics() {
-    let config = Config::in_memory();
-    let storage = StorageEngine::open_in_memory(&config).unwrap();
-
-    let registry = SystemViewRegistry::new();
-    let results = registry.execute("pg_stat_database", &storage).unwrap();
-
-    // Should return at least 1 database stats row
-    assert!(results.len() >= 1, "Expected at least 1 database stats row");
-
-    // Verify structure
-    let tuple = &results[0];
-    assert_eq!(tuple.values.len(), 12, "pg_stat_database should have 12 columns");
-
-    // datname should be "heliosdb"
-    if let Value::String(datname) = &tuple.values[1] {
-        assert_eq!(datname, "heliosdb");
+    assert_eq!(columns, ["pid", "usename", "application_name", "state"]);
+    for row in &rows {
+        assert!(matches!(row.values[0], Value::Int4(_)), "pid is an integer: {row:?}");
     }
 }
 
 #[test]
 fn test_pg_settings_configuration() {
-    let config = Config::in_memory();
-    let storage = StorageEngine::open_in_memory(&config).unwrap();
-
-    let registry = SystemViewRegistry::new();
-    let results = registry.execute("pg_settings", &storage).unwrap();
-
-    // Should have multiple settings
+    let storage = storage();
+    let results = rows_of("pg_settings", &storage);
     assert!(results.len() >= 4, "Expected at least 4 settings");
-
-    // Verify structure
+    let (name, setting) = (col("pg_settings", "name"), col("pg_settings", "setting"));
     for tuple in &results {
-        assert_eq!(tuple.values.len(), 10, "pg_settings should have 10 columns");
-
-        // name should be a string
-        assert!(matches!(&tuple.values[0], Value::String(_)));
-
-        // setting should be a string
-        assert!(matches!(&tuple.values[1], Value::String(_)));
+        assert_eq!(tuple.values.len(), width("pg_settings"));
+        assert!(matches!(&tuple.values[name], Value::String(_)));
     }
-
-    // Verify we have expected settings
-    let setting_names: Vec<String> = results
+    let names: Vec<String> = results.iter().map(|t| text(t, name)).collect();
+    for expected in ["server_version", "max_connections", "search_path"] {
+        assert!(names.contains(&expected.to_string()), "{expected} is a setting");
+    }
+    let version = results
         .iter()
-        .filter_map(|t| match &t.values[0] {
-            Value::String(name) => Some(name.clone()),
-            _ => None,
-        })
-        .collect();
-
-    assert!(setting_names.contains(&"wal_enabled".to_string()));
-    assert!(setting_names.contains(&"time_travel_enabled".to_string()));
-}
-
-#[test]
-fn test_pg_branches_database_branching() {
-    let config = Config::in_memory();
-    let storage = StorageEngine::open_in_memory(&config).unwrap();
-
-    // Create a test branch
-    use heliosdb_nano::storage::BranchOptions;
-    storage
-        .create_branch("feature_branch", Some("main"), BranchOptions::default())
-        .unwrap();
-
-    let registry = SystemViewRegistry::new();
-    let results = registry.execute("pg_branches", &storage).unwrap();
-
-    // Should have at least 2 branches (main + feature)
-    assert!(results.len() >= 2, "Expected at least 2 branches");
-
-    // Verify structure
-    for tuple in &results {
-        assert_eq!(tuple.values.len(), 9, "pg_branches should have 9 columns");
-
-        // branch_id should be an int
-        assert!(matches!(&tuple.values[0], Value::Int8(_)));
-
-        // branch_name should be a string
-        assert!(matches!(&tuple.values[1], Value::String(_)));
-
-        // state should be a string
-        assert!(matches!(&tuple.values[6], Value::String(_)));
-    }
+        .find(|t| text(t, name) == "server_version")
+        .expect("server_version");
+    assert!(matches!(&version.values[setting], Value::String(v) if !v.is_empty()));
 }
 
 #[test]
 fn test_pg_matviews_materialized_views() {
-    let config = Config::in_memory();
-    let storage = StorageEngine::open_in_memory(&config).unwrap();
+    use heliosdb_nano::sql::LogicalPlan;
+    use heliosdb_nano::storage::MaterializedViewMetadata;
+    use std::sync::Arc;
 
-    // Create a base table
+    let storage = storage();
     let schema = Schema::new(vec![
         Column::new("id", DataType::Int4),
         Column::new("value", DataType::Int4),
     ]);
     storage.catalog().create_table("base_table", schema.clone()).unwrap();
-
-    // Insert some data
     storage
         .insert_tuple("base_table", Tuple::new(vec![Value::Int4(1), Value::Int4(100)]))
         .unwrap();
-
-    // Create a materialized view
-    use heliosdb_nano::sql::LogicalPlan;
-    use heliosdb_nano::storage::MaterializedViewMetadata;
-    use std::sync::Arc;
 
     let query_plan = LogicalPlan::Scan {
         alias: None,
@@ -593,8 +374,6 @@ fn test_pg_matviews_materialized_views() {
         projection: None,
         as_of: None,
     };
-
-    let mv_catalog = storage.mv_catalog();
     let metadata = MaterializedViewMetadata::new(
         "test_mv".to_string(),
         "SELECT * FROM base_table".to_string(),
@@ -602,190 +381,49 @@ fn test_pg_matviews_materialized_views() {
         vec!["base_table".to_string()],
         schema,
     );
-    mv_catalog.create_view(metadata).unwrap();
+    storage.mv_catalog().create_view(metadata).unwrap();
 
-    let registry = SystemViewRegistry::new();
-    let results = registry.execute("pg_matviews", &storage).unwrap();
-
-    // Should have 1 materialized view
+    let results = rows_of("pg_matviews", &storage);
     assert_eq!(results.len(), 1, "Expected 1 materialized view");
-
-    // Verify structure
     let tuple = &results[0];
-    assert_eq!(tuple.values.len(), 10, "pg_matviews should have 10 columns");
-
-    // matviewname should be "test_mv"
-    if let Value::String(matviewname) = &tuple.values[1] {
-        assert_eq!(matviewname, "test_mv");
-    }
-
-    // ispopulated should be false (not refreshed yet)
-    if let Value::Boolean(populated) = &tuple.values[4] {
-        assert!(!populated);
-    }
-}
-
-#[test]
-fn test_pg_snapshots_time_travel() {
-    let config = Config::in_memory();
-    let storage = StorageEngine::open_in_memory(&config).unwrap();
-
-    // Create a snapshot
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-    storage.snapshot_manager().register_snapshot(timestamp).unwrap();
-
-    let registry = SystemViewRegistry::new();
-    let results = registry.execute("pg_snapshots", &storage).unwrap();
-
-    // Should have at least 1 snapshot
-    assert!(results.len() >= 1, "Expected at least 1 snapshot");
-
-    // Verify structure
-    for tuple in &results {
-        assert_eq!(tuple.values.len(), 7, "pg_snapshots should have 7 columns");
-
-        // snapshot_id should be an int
-        assert!(matches!(&tuple.values[0], Value::Int8(_)));
-
-        // is_automatic should be a boolean
-        assert!(matches!(&tuple.values[6], Value::Boolean(_)));
-    }
-}
-
-#[test]
-fn test_pg_stat_ssl_connection_info() {
-    let config = Config::in_memory();
-    let storage = StorageEngine::open_in_memory(&config).unwrap();
-
-    // Create session registry with sessions
-    let session_registry = std::sync::Arc::new(SessionRegistry::new());
-    session_registry
-        .register_session(
-            ProtocolType::PostgreSQL,
-            "user1".to_string(),
-            "127.0.0.1".to_string(),
-            5432,
-        )
-        .unwrap();
-
-    let registry = SystemViewRegistry::with_session_registry(session_registry);
-    let results = registry.execute("pg_stat_ssl", &storage).unwrap();
-
-    // Should have 1 session
-    assert_eq!(results.len(), 1, "Expected 1 session");
-
-    // Verify structure
-    let tuple = &results[0];
-    assert_eq!(tuple.values.len(), 8, "pg_stat_ssl should have 8 columns");
-
-    // ssl should be false (not implemented yet)
-    if let Value::Boolean(ssl) = &tuple.values[1] {
-        assert!(!ssl);
-    }
+    assert_eq!(tuple.values.len(), width("pg_matviews"));
+    assert_eq!(text(tuple, col("pg_matviews", "matviewname")), "test_mv");
+    assert_eq!(text(tuple, col("pg_matviews", "schemaname")), "public");
+    // Not refreshed yet.
+    assert_eq!(tuple.values[col("pg_matviews", "ispopulated")], Value::Boolean(false));
+    assert_eq!(
+        text(tuple, col("pg_matviews", "definition")),
+        "SELECT * FROM base_table"
+    );
 }
 
 #[test]
 fn test_pg_authid_users() {
-    let config = Config::in_memory();
-    let storage = StorageEngine::open_in_memory(&config).unwrap();
-
-    let registry = SystemViewRegistry::new();
-    let results = registry.execute("pg_authid", &storage).unwrap();
-
-    // Should have at least 1 user
-    assert!(results.len() >= 1, "Expected at least 1 user");
-
-    // Verify structure
-    let tuple = &results[0];
-    assert_eq!(tuple.values.len(), 8, "pg_authid should have 8 columns");
-
-    // rolname should be a string
-    assert!(matches!(&tuple.values[0], Value::String(_)));
-
-    // rolsuper should be a boolean
-    assert!(matches!(&tuple.values[1], Value::Boolean(_)));
-}
-
-#[test]
-fn test_pg_compression_stats() {
-    let config = Config::in_memory();
-    let storage = StorageEngine::open_in_memory(&config).unwrap();
-
-    // Create table
-    let schema = Schema::new(vec![
-        Column::new("id", DataType::Int4),
-        Column::new("data", DataType::Text),
-    ]);
-    storage.catalog().create_table("compressed_table", schema).unwrap();
-
-    // Set compression config
-    use heliosdb_nano::storage::compression::CompressionConfig;
-    use std::collections::HashMap;
-    let compression_config = CompressionConfig {
-        enabled: true,
-        compression_level: 3,
-        min_data_size: 1024,
-        min_compression_ratio: 1.2,
-        column_overrides: HashMap::new(),
-    };
-    storage
-        .catalog()
-        .set_compression_config("compressed_table", &compression_config)
-        .unwrap();
-
-    // Set mock compression stats
-    use heliosdb_nano::storage::compression::CompressionStats;
-    let stats = CompressionStats {
-        total_original_size: 10000,
-        total_compressed_size: 2500,
-        overall_ratio: 4.0,
-        column_stats: HashMap::new(),
-    };
-    storage
-        .catalog()
-        .set_compression_stats("compressed_table", &stats)
-        .unwrap();
-
-    let registry = SystemViewRegistry::new();
-    let results = registry.execute("pg_compression_stats", &storage).unwrap();
-
-    // Should have 1 table with compression stats
-    assert_eq!(results.len(), 1, "Expected 1 table with compression stats");
-
-    // Verify structure
-    let tuple = &results[0];
-    assert_eq!(tuple.values.len(), 9, "pg_compression_stats should have 9 columns");
-
-    // Verify compression ratio calculation
-    if let Value::Float8(ratio) = &tuple.values[5] {
-        assert!(*ratio > 1.0, "Compression ratio should be > 1.0");
-        assert!((*ratio - 4.0).abs() < 0.1, "Expected ratio ~4.0, got {}", ratio);
+    let storage = storage();
+    let results = rows_of("pg_authid", &storage);
+    assert!(!results.is_empty(), "Expected at least 1 role");
+    for tuple in &results {
+        assert_eq!(tuple.values.len(), width("pg_authid"));
+        assert!(matches!(&tuple.values[col("pg_authid", "rolname")], Value::String(_)));
+        assert!(matches!(&tuple.values[col("pg_authid", "rolsuper")], Value::Boolean(_)));
     }
 }
 
 #[test]
 fn test_all_views_have_valid_schemas() {
-    let registry = SystemViewRegistry::new();
-
+    let registry = SystemViewRegistry::shared();
     for view_name in registry.list_views() {
         let schema = registry
             .get_schema(view_name)
-            .unwrap_or_else(|| panic!("View '{}' should have a schema", view_name));
-
+            .unwrap_or_else(|| panic!("View '{view_name}' should have a schema"));
         assert!(
             !schema.columns.is_empty(),
-            "View '{}' should have at least one column",
-            view_name
+            "View '{view_name}' should have at least one column"
         );
-
-        // Verify all columns have names
         for (idx, column) in schema.columns.iter().enumerate() {
             assert!(
                 !column.name.is_empty(),
-                "View '{}' column {} should have a name",
-                view_name,
-                idx
+                "View '{view_name}' column {idx} should have a name"
             );
         }
     }
@@ -793,120 +431,54 @@ fn test_all_views_have_valid_schemas() {
 
 #[test]
 fn test_execute_nonexistent_view() {
-    let config = Config::in_memory();
-    let storage = StorageEngine::open_in_memory(&config).unwrap();
-
-    let registry = SystemViewRegistry::new();
-    let result = registry.execute("pg_nonexistent", &storage);
-
-    assert!(result.is_err(), "Querying nonexistent view should return error");
-
-    if let Err(e) = result {
-        assert!(
-            e.to_string().contains("Unknown system view"),
-            "Error message should mention unknown view"
-        );
-    }
-}
-
-#[test]
-fn test_view_categories() {
-    let registry = SystemViewRegistry::new();
-
-    use heliosdb_nano::sql::ViewCategory;
-
-    let core_views = registry.list_views_by_category(ViewCategory::Core);
-    assert!(core_views.len() >= 6, "Should have at least 6 core views");
-
-    let session_views = registry.list_views_by_category(ViewCategory::Session);
-    assert!(session_views.len() >= 1, "Should have at least 1 session view");
-
-    let feature_views = registry.list_views_by_category(ViewCategory::Feature);
-    assert!(feature_views.len() >= 3, "Should have at least 3 feature views");
-
-    let stats_views = registry.list_views_by_category(ViewCategory::Statistics);
-    assert!(stats_views.len() >= 2, "Should have at least 2 statistics views");
+    let storage = storage();
+    let error = SystemViewRegistry::shared()
+        .execute("pg_nonexistent", &DictContext::new(&storage))
+        .expect_err("a name that is not a system view is an error");
+    assert!(error.to_string().contains("Unknown system view"), "{error}");
 }
 
 #[test]
 fn test_integration_full_workflow() {
-    // Comprehensive integration test
-    let config = Config::in_memory();
-    let storage = StorageEngine::open_in_memory(&config).unwrap();
+    use heliosdb_nano::storage::BranchOptions;
 
-    // Setup: Create tables, indexes, branches, materialized views
+    let storage = storage();
     let schema = Schema::new(vec![
         Column::new("id", DataType::Int4),
         Column::new("name", DataType::Text),
-        Column::new("embedding", DataType::Vector(128)),
     ]);
-
-    storage.catalog().create_table("products", schema.clone()).unwrap();
-
-    // Insert data
+    storage.catalog().create_table("products", schema).unwrap();
     storage
         .insert_tuple(
             "products",
-            Tuple::new(vec![
-                Value::Int4(1),
-                Value::String("Product 1".to_string()),
-                Value::Vector(vec![0.1; 128]),
-            ]),
+            Tuple::new(vec![Value::Int4(1), Value::String("Product 1".to_string())]),
         )
         .unwrap();
-
-    // Create vector index
-    use heliosdb_nano::vector::DistanceMetric;
-    storage
-        .vector_indexes()
-        .create_index(
-            "products_embedding_idx".to_string(),
-            "products".to_string(),
-            "embedding".to_string(),
-            128,
-            DistanceMetric::Cosine,
-        )
-        .unwrap();
-
-    // Create branch
-    use heliosdb_nano::storage::BranchOptions;
     storage
         .create_branch("dev_branch", Some("main"), BranchOptions::default())
         .unwrap();
 
-    // Create session
-    let session_registry = std::sync::Arc::new(SessionRegistry::new());
-    session_registry
-        .register_session(
-            ProtocolType::PostgreSQL,
-            "testuser".to_string(),
-            "127.0.0.1".to_string(),
-            5432,
-        )
-        .unwrap();
-
-    let registry = SystemViewRegistry::with_session_registry(session_registry);
-
-    // Test all views work
-    let views_to_test = vec![
+    for view in [
         "pg_tables",
-        "pg_indexes",
+        "pg_class",
         "pg_attribute",
         "pg_database",
-        "pg_stat_activity",
+        "pg_namespace",
         "pg_settings",
-        "pg_branches",
-    ];
-
-    for view_name in views_to_test {
-        let results = registry
-            .execute(view_name, &storage)
-            .unwrap_or_else(|e| panic!("Failed to execute {}: {}", view_name, e));
-
-        assert!(
-            !results.is_empty() || view_name == "pg_views",
-            "View '{}' should return results",
-            view_name
-        );
+        "pg_type",
+        "pg_authid",
+    ] {
+        let results = rows_of(view, &storage);
+        assert!(!results.is_empty(), "View '{view}' should return results");
+        for tuple in &results {
+            assert_eq!(tuple.values.len(), width(view), "{view}: one value per column");
+        }
+    }
+    // Views that are empty here still answer.
+    for view in ["pg_views", "pg_indexes", "pg_matviews", "pg_proc", "pg_stat_activity"] {
+        let results = rows_of(view, &storage);
+        for tuple in &results {
+            assert_eq!(tuple.values.len(), width(view), "{view}: one value per column");
+        }
     }
 }

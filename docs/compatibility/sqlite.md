@@ -16,7 +16,7 @@ isn't covered.
 | `INSERT OR IGNORE INTO …` | ✅ | planner (`Planner::sqlite_conflict_clause`) | `ON CONFLICT DO NOTHING`. |
 | `INTEGER PRIMARY KEY AUTOINCREMENT` | ✅ | `src/sql/sqlite_compat.rs::rewrite_autoincrement` | Mapped to `BIGSERIAL PRIMARY KEY` in `CREATE` / `ALTER` statements only, never inside quoted text. |
 | `DATETIME('now')` | ✅ | `src/sql/sqlite_compat.rs::rewrite_datetime_now` | Mapped to `CURRENT_TIMESTAMP`. Other `DATETIME(arg)` forms pass through unchanged. |
-| `sqlite_master` introspection | ✅ | `src/sql/system_views.rs`, `src/sql/phase3/system_views.rs` | Returns one row per user table / materialised view, columns: `type, name, tbl_name, rootpage, sql`. The `sql` column is best-effort and intended for `WHERE name = ?` filtering, not faithful DDL. |
+| `sqlite_master` introspection | ✅ | `src/sql/phase3/system_views.rs` | Returns one row per user table (`type = 'table'`) and per materialised view (`type = 'view'`, under the view's name), columns: `type, name, tbl_name, rootpage, sql`. The `sql` column is best-effort and intended for `WHERE name = ?` filtering, not faithful DDL. |
 | `PRAGMA table_info(t)` | ✅ | `src/lib.rs::handle_pragma_query`, `src/protocol/postgres/handler.rs::pragma_table_info`, `src/repl/shell.rs` | Returns SQLite-shaped rows `(cid, name, type, notnull, dflt_value, pk)`. |
 | `PRAGMA foreign_keys = …`, `journal_mode = …`, `synchronous = …`, `busy_timeout = …` | ✅ no-op | same as above | Parsed and acknowledged silently. Foreign keys are always on; journal mode is RocksDB-managed. |
 | Other `PRAGMA name [= value]` | ✅ no-op | `parse_pragma` | Unknown PRAGMAs return an empty result instead of raising. |

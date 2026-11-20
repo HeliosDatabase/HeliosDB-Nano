@@ -19,6 +19,7 @@ pub mod context;
 pub mod oid;
 pub mod reserved;
 pub mod routines;
+pub mod tables;
 
 pub use context::DictContext;
 

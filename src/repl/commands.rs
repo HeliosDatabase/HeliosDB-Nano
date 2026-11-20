@@ -1592,9 +1592,9 @@ impl MetaCommand {
             }
 
             MetaCommand::ListSnapshots => {
-                // The embedded planner doesn't expose `pg_snapshots` as
-                // a system view (that registry is PG-wire only); read
-                // directly from the storage time-travel API.
+                // There is no `pg_snapshots` system view (the registry that
+                // declared one was never reachable from SQL and is deleted);
+                // read directly from the storage time-travel API.
                 let snapshots = db.storage.snapshot_manager().list_snapshots().unwrap_or_default();
                 println!("\n{}", "Time-Travel Snapshots:".bold());
                 if snapshots.is_empty() {

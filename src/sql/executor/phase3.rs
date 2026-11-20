@@ -329,7 +329,9 @@ pub(super) fn handle_phase3_operation(
             handle_drop_materialized_view(executor, name, *if_exists)
         }
         LogicalPlan::AlterMaterializedView { name, options } => handle_alter_materialized_view(executor, name, options),
-        LogicalPlan::SystemView { name, .. } => handle_system_view(executor, name),
+        LogicalPlan::SystemView { name, .. } => Err(Error::query_execution(format!(
+            "internal: the retired system-view plan node was reached for '{name}'; a system view is read as a scan"
+        ))),
         LogicalPlan::CreateView {
             name,
             query_sql,
@@ -1212,31 +1214,6 @@ fn handle_alter_materialized_view(
         )
         .with_timeout(executor.timeout_ctx()),
     ))
-}
-
-/// Handle SYSTEM VIEW query
-fn handle_system_view(executor: &Executor, name: &str) -> Result<Box<dyn PhysicalOperator>> {
-    // Execute system view query
-    use crate::sql::phase3::SystemViewRegistry;
-
-    let storage = executor
-        .storage()
-        .ok_or_else(|| Error::query_execution("System views require storage engine"))?;
-
-    let registry = SystemViewRegistry::new();
-
-    // Execute the system view and get results
-    let tuples = registry.execute(name, &crate::sql::dict::DictContext::for_engine(storage))?;
-
-    // Get schema for the view
-    let schema = registry
-        .get_schema(name)
-        .ok_or_else(|| Error::query_execution(format!("System view '{}' schema not found", name)))?
-        .clone();
-
-    // Convert tuples to a materialized operator
-    // Since we have all the data, we can return a simple in-memory result set
-    Ok(Box::new(MaterializedOperator::new(tuples, Arc::new(schema))))
 }
 
 /// Resolve merge strategy from SQL options

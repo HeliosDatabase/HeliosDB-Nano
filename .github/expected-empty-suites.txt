@@ -81,7 +81,6 @@ sequence_refill_funnel
 sequence_setval_outcomes
 time_travel_integration_tests
 time_travel_optimization_tests
-time_travel_system_views_tests
 vector_create_cleanup
 vector_create_retry
 vector_row_overlay_recovery

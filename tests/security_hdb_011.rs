@@ -522,7 +522,8 @@ async fn hdb011_describe_reports_column_types() {
 // 11. A WHERE the router cannot interpret must not widen the answer
 // ===========================================================================
 
-/// REGRESSION: the wire half. `pg_tables` is still intercepted, and an `OR`
+/// REGRESSION: the wire half. `pg_tables` was intercepted (it is served by the
+/// planner-backed registry now, so this pins the registry's answer), and an `OR`
 /// predicate fell into "unknown shape — keep the row", so this listed EVERY
 /// table. It must now either be answered correctly by the planner or fail —
 /// never silently return more rows than were asked for.
@@ -652,8 +653,9 @@ async fn hdb011_pg_range_and_pg_enum_are_empty_not_missing() {
 // 13. A bound parameter's VALUE cannot change the route
 // ===========================================================================
 
-/// REGRESSION (review FIX-A / FIX-B): `pg_tables` is the one view this router
-/// still answers itself, and the extended protocol classifies its WHERE clause
+/// REGRESSION (review FIX-A / FIX-B): `pg_tables` was the one view the wire router
+/// still answered itself (it no longer does: the registry serves one 8-column shape
+/// at Parse and at Execute, so this pins that the two agree), and the extended protocol classifies its WHERE clause
 /// TWICE — at Parse, on text that still holds `$1` (that decision fixes the
 /// RowDescription Describe sends), and again at Execute, on the text
 /// `substitute_parameters` spliced the value into.

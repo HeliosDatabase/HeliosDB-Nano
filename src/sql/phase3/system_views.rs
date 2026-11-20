@@ -2226,9 +2226,8 @@ impl SystemViewRegistry {
             description: "Advisory locks (pg_advisory_lock family) currently held, by session".to_string(),
         });
 
-        // pg_tables — make the basic catalog query work over SQL.
-        // The legacy SystemViewRegistry in sql/system_views.rs has
-        // a richer implementation we delegate to at execute time.
+        // pg_tables — PostgreSQL's eight columns, produced by
+        // `sql::dict::tables` on every route.
         self.register_view(SystemViewSchema {
             name: "pg_tables".to_string(),
             schema: Schema {
@@ -2369,8 +2368,8 @@ impl SystemViewRegistry {
             description: "Persisted role catalog (attributes are recorded, NOT enforced)".to_string(),
         });
 
-        // pg_authid — `pg_roles`'s twin. Previously it existed ONLY in the dead
-        // legacy registry (`sql/system_views.rs`), so `SELECT * FROM pg_authid`
+        // pg_authid — `pg_roles`'s twin. Previously it existed ONLY in a dead
+        // second registry (since deleted), so `SELECT * FROM pg_authid`
         // was an unknown relation on every live route while a test asserted it
         // was "registered". Registering it here is what makes it reachable.
         self.register_view(SystemViewSchema {
@@ -2939,16 +2938,15 @@ impl SystemViewRegistry {
         // sprinter f4f5d450e816: pg_stat_activity — one row per LIVE backend.
         //
         // This registry (`sql::phase3::SystemViewRegistry`) is the one the
-        // planner and the executor scan; the older `sql::system_views` module
-        // also declares a `pg_stat_activity`, but nothing routes SQL to it, so
-        // `SELECT * FROM pg_stat_activity` simply did not resolve. It has to
+        // planner and the executor scan; an older second registry (since
+        // deleted) also declared a `pg_stat_activity`, but nothing routed SQL to
+        // it, so `SELECT * FROM pg_stat_activity` simply did not resolve. It has to
         // exist here for `pg_backend_pid()` to be joinable at all, which is the
         // whole point of the function: `... WHERE pid = pg_backend_pid()` is how
         // a pool, a health check and a test suite prove statement A and
         // statement B ran on the same backend.
         //
-        // Column set and order mirror the `sql::system_views` declaration so the
-        // two cannot disagree about shape. `query` is always NULL and `state` is
+        // Column set and order are PostgreSQL's. `query` is always NULL and `state` is
         // reported per the executor's own row only: stamping the current
         // statement text onto shared state for EVERY statement would be a wire
         // hot-path cost paid by workloads that never read this view.
@@ -4310,9 +4308,7 @@ impl SystemViewRegistry {
                 .into_iter()
                 .map(Tuple::new)
                 .collect()),
-            // pg_tables — delegate to the legacy SystemViewRegistry
-            // which has the schema-namespacing split we want.
-            "pg_tables" => Self::execute_pg_tables_compat(ctx),
+            "pg_tables" => crate::sql::dict::tables::pg_tables_rows(ctx),
             _ => {
                 // Other system views not yet implemented
                 Ok(vec![])
@@ -4330,15 +4326,6 @@ impl SystemViewRegistry {
         table_name: &str,
     ) -> Result<Vec<Tuple>> {
         Self::execute_information_schema_columns(ctx, Some(table_name))
-    }
-
-    /// Bridge to the legacy SystemViewRegistry's pg_tables
-    /// implementation so SELECT * FROM pg_tables works over SQL
-    /// (the planner only consults the phase-3 registry).
-    fn execute_pg_tables_compat(ctx: &DictContext<'_>) -> Result<Vec<Tuple>> {
-        let storage = ctx.storage();
-        let legacy = crate::sql::SystemViewRegistry::new();
-        legacy.execute("pg_tables", storage)
     }
 
     /// Materialise `hdb_code_languages`: one row per static

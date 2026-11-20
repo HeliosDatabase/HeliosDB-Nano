@@ -364,27 +364,12 @@ impl PgCatalog {
                 ]),
                 vec![],
             ))
-        } else if Self::contains_word(&matchable, "pg_tables") {
-            // Leave until migrated to registry. `contains_word` still matches
-            // inside `pg_catalog.pg_tables` (the `.` is a boundary).
-            //
-            // HDB-011: `pg_tables` is ALSO registered in the planner-backed
-            // registry, so when the WHERE clause is not one of the shapes
-            // `apply_where_filter` interprets, deferring costs nothing and the
-            // planner answers it correctly. Returning the UNFILTERED catalog —
-            // what `apply_where_filter`'s "when in doubt, keep the row" fallback
-            // did — is the worse answer: `WHERE tablename = 'a' OR tablename =
-            // 'zzz'` listed EVERY table.
-            //
-            // Classified on `matchable_folded`, NOT on `query_lower`: the
-            // decision has to be the same at Parse (`$1` still in the text) and
-            // at Execute (the value spliced in), and syntax that only occurs
-            // inside a literal must not count (HDB-011 review FIX-A/FIX-B).
-            if !Self::where_clause_is_fully_supported(&matchable_folded) {
-                return Ok(None);
-            }
-            Some(self.query_pg_tables()?)
         } else {
+            // `pg_tables` is served by the planner-backed registry like every
+            // other catalog view: one eight-column shape, with or without a
+            // WHERE clause, on the simple and the extended protocol. The
+            // five-column answer this router gave for a "simple" WHERE is gone.
+            //
             // KanttBan #22 (v3.31.0): pg_namespace / pg_class / pg_attribute /
             // pg_index / pg_constraint / pg_user / pg_roles previously had
             // fixed-shape branches here; HC3 added pg_views and pg_indexes to
@@ -520,7 +505,9 @@ impl PgCatalog {
     /// Anything more complex (OR, function calls, subqueries) falls
     /// through unchanged; the caller will get all rows, which is
     /// still correct-if-noisy for every driver I've tested — but see
-    /// `where_clause_is_fully_supported`, which the caller consults FIRST for
+    /// `where_clause_is_fully_supported` (the guard of the `pg_tables`
+    /// interception, removed together with it: every answer this router still
+    /// gives is an empty or fixed shape), which the caller consulted FIRST for
     /// any view the planner can serve, so "keep every row" is now only the
     /// last resort (HDB-011).
     ///
@@ -687,104 +674,6 @@ impl PgCatalog {
         }
         spans.push(Self::trim_span(pred_lower, cursor, pred_lower.len()));
         spans
-    }
-
-    /// True when EVERY top-level conjunct of the WHERE clause is a shape
-    /// `eval_simple_pred` actually interprets — so applying the filter answers
-    /// the user's question rather than silently widening it (HDB-011).
-    ///
-    /// `apply_where_filter` keeps a row whose predicate it cannot parse. For a
-    /// view the planner can also serve, that "graceful degradation" is a wrong
-    /// answer the client cannot detect: `WHERE tablename = 'a' OR tablename =
-    /// 'zzz'` came back with every table in the database. The caller consults
-    /// this first and defers to the planner (`Ok(None)`) when it is false.
-    ///
-    /// A clause is supported when it contains no top-level ` or `, and each
-    /// ` and `-conjunct is one of: `col IS [NOT] NULL`, `col [NOT] IN (…)`
-    /// (whose parentheses are the only ones allowed anywhere), or
-    /// `col = / <> / != <literal>`. Anything else — a function call, a cast, a
-    /// subquery, a `LIKE`, a range comparison — is not supported.
-    ///
-    /// The SPACES around the operator are part of the shape: `eval_simple_pred`
-    /// looks for ` = `, so `tablename='a'` is NOT evaluable here and is refused
-    /// (the planner then answers it correctly). Accepting it would run a filter
-    /// that matches nothing.
-    fn where_clause_is_fully_supported(q: &str) -> bool {
-        let (start, end) = match Self::where_clause_span(q) {
-            Some(span) => span,
-            // No WHERE at all: there is nothing to misinterpret.
-            None => return true,
-        };
-        let (ps, pe) = Self::trim_span(q, start, end);
-        let predicate = match q.get(ps..pe) {
-            Some(p) if !p.is_empty() => p,
-            // There IS a WHERE keyword but no predicate came out of it (it
-            // ended the statement, or the span was empty). Not understood —
-            // defer, rather than serve the whole view (HDB-011 review FIX-1).
-            _ => return false,
-        };
-        if predicate.contains(" or ") {
-            return false;
-        }
-        Self::split_conjunct_spans(predicate)
-            .iter()
-            .all(|&(s, e)| Self::is_supported_pred_shape(predicate.get(s..e).unwrap_or("")))
-    }
-
-    /// One conjunct of `where_clause_is_fully_supported`. The order of the
-    /// tests mirrors `eval_simple_pred` exactly, so the two can never disagree
-    /// about which shape a predicate is.
-    ///
-    /// `p` is a conjunct of the literal/comment-STRIPPED text
-    /// (`matchable_folded`), so every check below sees only real SQL syntax —
-    /// `' is null'` or `' and '` sitting inside a string VALUE is already
-    /// blanked out by the time it gets here (HDB-011 review FIX-A/FIX-B).
-    ///
-    /// Two shapes are refused even though `eval_simple_pred` would happily take
-    /// them, because it evaluates both to the WRONG answer (review FIX-B):
-    ///   * a qualified left-hand side (`t.tablename = 'x'`) — `row_value`
-    ///     resolves bare column names against the canned schema and never
-    ///     strips an alias or schema prefix, so the conjunct matches NO row and
-    ///     an aliased existence check reports the table missing;
-    ///   * an IN *subquery* (`tablename IN (SELECT …)`) — `parse_in_list` would
-    ///     compare each row against the literal text `select …`, again matching
-    ///     nothing.
-    ///
-    /// Refused, both go to the planner, which resolves aliases and subqueries.
-    fn is_supported_pred_shape(p: &str) -> bool {
-        let p = p.trim();
-        if p.is_empty() {
-            return false;
-        }
-        // `row_value` cannot resolve `alias.col` / `schema.col`.
-        let lhs_is_bare_column = |idx: usize| !p.get(..idx).unwrap_or("").contains('.');
-        if let Some(idx) = p.find(" is not null") {
-            return lhs_is_bare_column(idx) && !p.contains('(');
-        }
-        if let Some(idx) = p.find(" is null") {
-            return lhs_is_bare_column(idx) && !p.contains('(');
-        }
-        // ` not in (` first, exactly as `eval_simple_pred` tests it, so the
-        // left-hand side of a NOT IN is the column and not `col not`.
-        for kw in [" not in (", " in ("] {
-            if let Some(idx) = p.find(kw) {
-                // Exactly the IN list's own parenthesis pair, closing the conjunct.
-                if p.matches('(').count() != 1 || p.matches(')').count() != 1 || !p.ends_with(')') {
-                    return false;
-                }
-                // A SELECT inside the list is a subquery, not a literal list.
-                if Self::contains_word(p.get(idx + kw.len()..).unwrap_or(""), "select") {
-                    return false;
-                }
-                return lhs_is_bare_column(idx);
-            }
-        }
-        for op in [" = ", " <> ", " != "] {
-            if let Some(idx) = p.find(op) {
-                return lhs_is_bare_column(idx) && !p.contains('(');
-            }
-        }
-        false
     }
 
     /// Evaluate one of the predicate shapes supported by
@@ -2058,35 +1947,6 @@ impl PgCatalog {
         Ok((schema, rows))
     }
 
-    /// Query pg_tables (view) — 5 cols (schemaname, tablename, tableowner, tablespace, hasindexes).
-    fn query_pg_tables(&self) -> Result<(Schema, Vec<Tuple>)> {
-        let schema = Schema::new(vec![
-            Column::new("schemaname", DataType::Text),
-            Column::new("tablename", DataType::Text),
-            Column::new("tableowner", DataType::Text),
-            Column::new("tablespace", DataType::Text),
-            Column::new("hasindexes", DataType::Boolean),
-        ]);
-        let db = match &self.database {
-            Some(db) => db,
-            None => return Ok((schema, vec![])),
-        };
-        let tables = db.storage.catalog().list_tables()?;
-        let rows = tables
-            .into_iter()
-            .map(|t| {
-                Tuple::new(vec![
-                    Value::String("public".into()),
-                    Value::String(t),
-                    Value::String("heliosdb".into()),
-                    Value::Null,
-                    Value::Boolean(true),
-                ])
-            })
-            .collect();
-        Ok((schema, rows))
-    }
-
     /// Query pg_constraint — primary key + unique constraints per table.
     fn query_pg_constraint(&self) -> Result<(Schema, Vec<Tuple>)> {
         let schema = Schema::new(vec![
@@ -2405,12 +2265,13 @@ mod tests {
     }
 
     /// HDB-011: `pg_type` moved to the planner; v07.2 moved `pg_settings` to
-    /// the engine's one parameter registry (the view `sql::params` serves), so
-    /// the "this router still answers something" smoke test uses `pg_tables`.
+    /// the engine's one parameter registry (the view `sql::params` serves), and
+    /// `pg_tables` moved to the registry too, so the "this router still answers
+    /// something" smoke test uses `information_schema.routines`.
     #[test]
     fn test_handle_query_catalog() {
         let catalog = PgCatalog::new();
-        let result = catalog.handle_query("SELECT * FROM pg_tables");
+        let result = catalog.handle_query("SELECT * FROM information_schema.routines");
         assert!(result.is_ok());
         assert!(result.unwrap().is_some());
     }
@@ -2591,18 +2452,26 @@ mod tests {
 
     // ---- The introspection contract these branches exist for still holds ---
 
-    /// A real `pg_tables` reference is still intercepted.
+    /// A real `pg_tables` reference defers to the registry (it used to be
+    /// answered here, in a five-column shape).
     #[test]
-    fn task38_real_pg_tables_still_intercepted() {
+    fn task38_real_pg_tables_defers_to_the_registry() {
         let catalog = PgCatalog::new();
         let result = catalog.handle_query("SELECT tablename FROM pg_tables").unwrap();
-        assert!(result.is_some(), "real pg_tables SELECT must still be served");
+        assert!(result.is_none(), "pg_tables is served by the registry, got {result:?}");
+        let result = catalog
+            .handle_query("SELECT * FROM pg_catalog.pg_tables WHERE schemaname = 'public'")
+            .unwrap();
+        assert!(
+            result.is_none(),
+            "pg_tables with a WHERE is served by the registry, got {result:?}"
+        );
     }
 
-    /// The drizzle shape: markers inside ITS OWN literals get stripped, but the
-    /// real `FROM pg_tables` reference remains and must still be served.
+    /// The drizzle shape defers to the registry as well (it used to be
+    /// answered here).
     #[test]
-    fn task38_drizzle_pg_tables_shape_still_intercepted() {
+    fn task38_drizzle_pg_tables_shape_defers_to_the_registry() {
         let catalog = PgCatalog::new();
         let result = catalog
             .handle_query(
@@ -2610,7 +2479,10 @@ mod tests {
                  WHERE schemaname NOT IN ('pg_catalog','information_schema')",
             )
             .unwrap();
-        assert!(result.is_some(), "drizzle pg_tables shape must still be served");
+        assert!(
+            result.is_none(),
+            "the drizzle pg_tables shape is served by the registry, got {result:?}"
+        );
     }
 
     /// A schema-qualified `pg_catalog.pg_type` reference must survive
@@ -2943,106 +2815,6 @@ mod tests {
         ));
     }
 
-    /// HDB-011: the WHERE shapes this router can actually evaluate. Anything
-    /// else must be reported unsupported so `handle_query` defers to the
-    /// planner instead of returning the unfiltered catalog.
-    #[test]
-    fn hdb011_where_clause_support_matches_what_we_can_evaluate() {
-        for q in &[
-            "select tablename from pg_tables",
-            "select tablename from pg_tables where tablename = 'a'",
-            "select tablename from pg_tables where schemaname = 'public' and tablename <> 'a'",
-            "select tablename from pg_tables where schemaname not in ('pg_catalog','information_schema')",
-            "select tablename from pg_tables where tablename is not null",
-            "select tablename from pg_tables where tablename = 'a' order by tablename",
-        ] {
-            assert!(
-                PgCatalog::where_clause_is_fully_supported(q),
-                "`{q}` should be evaluable here"
-            );
-        }
-        for q in &[
-            "select tablename from pg_tables where tablename = 'a' or tablename = 'zzz'",
-            // `tablename='a'` — no spaces around the operator — is NOT a shape
-            // `eval_simple_pred` evaluates (it looks for ` = `, with spaces),
-            // so it must be REFUSED here, not accepted: accepting it would run
-            // a filter that matches nothing and answer `a` with zero rows.
-            // Refused, the planner answers it, which is the correct result.
-            "select tablename from pg_tables where tablename='a'",
-            "select tablename from pg_tables where tablename like 'a%'",
-            "select tablename from pg_tables where length(tablename) > 3",
-            "select tablename from pg_tables where (tablename = 'a')",
-            "select tablename from pg_tables where tablename = (select 'a')",
-        ] {
-            assert!(
-                !PgCatalog::where_clause_is_fully_supported(q),
-                "`{q}` must be refused so the planner answers it"
-            );
-        }
-    }
-
-    /// HDB-011 review FIX-1: clause keywords are located AFTER every ASCII
-    /// whitespace byte has been folded to a space, so a WHERE (or an OR, an
-    /// AND, an ORDER BY) on its own line reads exactly like the one-line
-    /// spelling. Before the fold, `\nWHERE …` was invisible to
-    /// `where_clause_span`, `where_clause_is_fully_supported` answered "no
-    /// WHERE at all → supported", and `pg_tables` came back UNFILTERED.
-    #[test]
-    fn hdb011_line_breaks_do_not_defeat_the_where_guard() {
-        let fold = |q: &str| PgCatalog::fold_ascii_whitespace(&q.to_ascii_lowercase());
-        let predicate = |q: &str| {
-            let folded = fold(q);
-            let (start, end) = PgCatalog::where_clause_span(&folded).expect("a WHERE clause");
-            folded.get(start..end).unwrap_or("").trim().to_string()
-        };
-
-        // The clause is FOUND across a line break, a tab, and a statement that
-        // ends right after the predicate.
-        assert_eq!(
-            predicate("SELECT tablename FROM pg_tables\nWHERE tablename = 'a'"),
-            "tablename = 'a'"
-        );
-        assert_eq!(
-            predicate("SELECT tablename FROM pg_tables\n\tWHERE\ttablename = 'a'\nORDER BY tablename"),
-            "tablename = 'a'"
-        );
-        assert_eq!(
-            predicate("SELECT tablename FROM pg_tables\nWHERE tablename = 'a'\nLIMIT 1;"),
-            "tablename = 'a'"
-        );
-
-        // …and then judged on its merits, exactly as the one-line spelling is.
-        for q in &[
-            "SELECT tablename FROM pg_tables\nWHERE tablename = 'a' OR tablename = 'zzz'",
-            "SELECT tablename FROM pg_tables WHERE tablename = 'a'\nOR tablename = 'zzz'",
-            "SELECT tablename FROM pg_tables WHERE tablename = 'a'\tOR\ttablename = 'zzz'",
-            "SELECT tablename FROM pg_tables WHERE tablename = 'a'\nAND length(tablename) > 1",
-            "SELECT tablename FROM pg_tables\nWHERE tablename='a'",
-        ] {
-            assert!(
-                !PgCatalog::where_clause_is_fully_supported(&fold(q)),
-                "`{q}` must be refused so the planner answers it"
-            );
-        }
-        for q in &[
-            "SELECT tablename FROM pg_tables\nWHERE tablename = 'a'",
-            "SELECT tablename FROM pg_tables\nWHERE schemaname = 'public'\nAND tablename <> 'a'",
-            "SELECT tablename FROM pg_tables\nWHERE tablename IN ('a','b')\nORDER BY tablename",
-        ] {
-            assert!(
-                PgCatalog::where_clause_is_fully_supported(&fold(q)),
-                "`{q}` should be evaluable here"
-            );
-        }
-
-        // A clause keyword INSIDE a literal is not a clause keyword: the whole
-        // predicate must survive, not just the text before the quote.
-        assert_eq!(
-            predicate("SELECT tablename FROM pg_tables WHERE tablename = 'order by me'"),
-            "tablename = 'order by me'"
-        );
-    }
-
     /// HDB-011: `pg_tables` has a registry twin, so an uninterpretable WHERE
     /// defers instead of silently returning every table. v07.2: `pg_settings`
     /// now has one too (the engine's parameter registry), so it defers as well.
@@ -3075,203 +2847,6 @@ mod tests {
             deferred_settings.is_none(),
             "pg_settings is served by the engine view, got {deferred_settings:?}"
         );
-    }
-
-    /// HDB-011 review FIX-A/FIX-B: the WHERE clause is classified on the
-    /// literal/comment-STRIPPED, whitespace-FOLDED copy of the statement
-    /// (`matchable_folded` in `handle_query`), so text that only LOOKS like
-    /// syntax because it sits inside a string VALUE is not syntax — while the
-    /// value itself is still read, case-intact, out of the original statement.
-    ///
-    /// Before this, `WHERE tablename = 'x is null'` was classified as an
-    /// `IS NULL` predicate on the "column" `tablename = 'x`, which `row_value`
-    /// resolves to NULL for EVERY row — so the client got every table in the
-    /// database, the exact widening the guard exists to prevent.
-    #[test]
-    fn hdb011_literal_text_is_not_treated_as_syntax() {
-        // Exactly the pipeline `handle_query` builds: lower → strip → fold.
-        // All three are byte-for-byte length-preserving, so the result
-        // addresses the same characters as the original statement.
-        fn classify(q: &str) -> String {
-            PgCatalog::fold_ascii_whitespace(&PgCatalog::strip_literals_and_comments(&q.to_ascii_lowercase()))
-        }
-        // The two columns of `query_pg_tables` this test needs.
-        fn pg_tables_rows(names: &[&str]) -> (Schema, Vec<Tuple>) {
-            let schema = Schema::new(vec![
-                Column::new("schemaname", DataType::Text),
-                Column::new("tablename", DataType::Text),
-            ]);
-            let rows = names
-                .iter()
-                .map(|n| Tuple::new(vec![Value::String("public".into()), Value::String((*n).to_string())]))
-                .collect();
-            (schema, rows)
-        }
-        // `tablename` of every row the filter keeps. `q` is passed as the
-        // ORIGINAL text, so literal VALUES are read from it.
-        fn selected(q: &str, names: &[&str]) -> Vec<String> {
-            let (schema, rows) = pg_tables_rows(names);
-            PgCatalog::apply_where_filter(&classify(q), q, &schema, rows)
-                .into_iter()
-                .filter_map(|row| match row.values.get(1) {
-                    Some(Value::String(name)) => Some(name.clone()),
-                    _ => None,
-                })
-                .collect()
-        }
-
-        // 1. `' is null'` INSIDE a literal is a VALUE. The shape is a plain
-        //    equality, and it must select the one row actually named
-        //    `x is null` — not every row.
-        const IS_NULL_LITERAL: &str = "SELECT tablename FROM pg_tables WHERE tablename = 'x is null'";
-        assert!(
-            PgCatalog::where_clause_is_fully_supported(&classify(IS_NULL_LITERAL)),
-            "`= 'x is null'` is an equality predicate, not an IS NULL predicate"
-        );
-        assert_eq!(
-            selected(IS_NULL_LITERAL, &["a", "x is null", "zzz"]),
-            vec!["x is null".to_string()],
-            "the literal must be COMPARED, not parsed — one row, never the whole catalog"
-        );
-
-        // 2. A literal containing `' and '`, written across two lines (what an
-        //    ORM emits). The fold finds the clause; the strip stops ` and `
-        //    from splitting the predicate into two bogus conjuncts; the value
-        //    still comes from the original text.
-        const AND_LITERAL: &str = "SELECT tablename FROM pg_tables\nWHERE tablename = 'orders and returns'";
-        assert!(
-            PgCatalog::where_clause_is_fully_supported(&classify(AND_LITERAL)),
-            "` and ` inside a literal must not split the predicate"
-        );
-        assert_eq!(
-            selected(AND_LITERAL, &["orders", "orders and returns", "returns"]),
-            vec!["orders and returns".to_string()],
-            "the whole literal is the value being compared"
-        );
-
-        // 3. `' or '` inside a literal is not a top-level OR either.
-        const OR_LITERAL: &str = "SELECT tablename FROM pg_tables WHERE tablename = 'this or that'";
-        assert!(
-            PgCatalog::where_clause_is_fully_supported(&classify(OR_LITERAL)),
-            "` or ` inside a literal must not read as a disjunction"
-        );
-        assert_eq!(
-            selected(OR_LITERAL, &["a", "this or that"]),
-            vec!["this or that".to_string()],
-            "one row, not both"
-        );
-
-        // 4. A `(` inside a literal is not a parenthesis: the shape tests
-        //    reject `(`, and before the strip this deferred a predicate the
-        //    router evaluates perfectly well.
-        const PAREN_LITERAL: &str = "SELECT tablename FROM pg_tables WHERE tablename = 'orders (eu)'";
-        assert!(
-            PgCatalog::where_clause_is_fully_supported(&classify(PAREN_LITERAL)),
-            "`(` inside a literal is not a parenthesis"
-        );
-        assert_eq!(
-            selected(PAREN_LITERAL, &["orders", "orders (eu)"]),
-            vec!["orders (eu)".to_string()],
-            "one row, not both"
-        );
-
-        // 5. Case survives the round trip: the classification copy is lowered,
-        //    the VALUE is not.
-        const UPPER_LITERAL: &str = "SELECT tablename FROM pg_tables WHERE tablename = 'Orders'";
-        assert_eq!(
-            selected(UPPER_LITERAL, &["orders", "Orders"]),
-            vec!["Orders".to_string()],
-            "the literal is compared case-sensitively, from the ORIGINAL text"
-        );
-    }
-
-    /// HDB-011 review FIX-B: two shapes `eval_simple_pred` accepts but
-    /// provably mis-evaluates (both to ZERO rows) are now refused, so the
-    /// planner — which resolves aliases and subqueries — answers them.
-    #[test]
-    fn hdb011_shapes_the_evaluator_gets_wrong_are_refused() {
-        fn classify(q: &str) -> String {
-            PgCatalog::fold_ascii_whitespace(&PgCatalog::strip_literals_and_comments(&q.to_ascii_lowercase()))
-        }
-
-        for q in &[
-            // `row_value` never strips an alias/schema prefix, so `t.tablename`
-            // resolves to NULL and the conjunct matches no row at all — an
-            // aliased existence check reported the table MISSING.
-            "SELECT t.tablename FROM pg_tables t WHERE t.tablename = 'users'",
-            "SELECT tablename FROM pg_tables WHERE pg_tables.tablename = 'users'",
-            "SELECT tablename FROM pg_tables t WHERE t.tablename IN ('a','b')",
-            "SELECT tablename FROM pg_tables t WHERE t.tablename IS NOT NULL",
-            // `parse_in_list` would treat `select …` as a single literal.
-            "SELECT tablename FROM pg_tables WHERE tablename IN (SELECT tablename FROM pg_tables)",
-            "SELECT tablename FROM pg_tables WHERE tablename NOT IN (SELECT tablename FROM pg_tables)",
-        ] {
-            assert!(
-                !PgCatalog::where_clause_is_fully_supported(&classify(q)),
-                "`{q}` must be refused so the planner answers it"
-            );
-        }
-
-        // A quoted (but UNqualified) column still works — `row_value` trims the
-        // quotes — and so does a literal that merely CONTAINS a dot or the word
-        // `select`, because both are blanked before classification.
-        for q in &[
-            "SELECT tablename FROM pg_tables WHERE \"tablename\" = 'users'",
-            "SELECT tablename FROM pg_tables WHERE tablename = 'schema.users'",
-            "SELECT tablename FROM pg_tables WHERE tablename IN ('select','a')",
-        ] {
-            assert!(
-                PgCatalog::where_clause_is_fully_supported(&classify(q)),
-                "`{q}` is evaluable here"
-            );
-        }
-    }
-
-    /// HDB-011 review FIX-A: a bound parameter's VALUE can no longer change
-    /// the interceptor-vs-planner decision.
-    ///
-    /// The extended protocol classifies TWICE: at Parse, on text that still
-    /// holds `$1` (that decision fixes the RowDescription Describe sends), and
-    /// again at Execute, on the text `substitute_parameters` spliced the value
-    /// into. When the two disagreed, Describe had announced the interceptor's
-    /// 5-column `pg_tables` while Execute answered from the registry's
-    /// 8-column one — DataRows with more fields than the RowDescription, which
-    /// is a protocol violation (tokio-postgres rejects the row; node-postgres
-    /// throws). Classifying on the literal-stripped copy makes the two
-    /// decisions identical by construction: the parameter's value lives
-    /// entirely inside a literal, and literal bodies are blanked.
-    #[test]
-    fn hdb011_a_parameter_value_cannot_change_the_route() {
-        fn classify(q: &str) -> String {
-            PgCatalog::fold_ascii_whitespace(&PgCatalog::strip_literals_and_comments(&q.to_ascii_lowercase()))
-        }
-
-        const PARSE_TIME: &str = "SELECT * FROM pg_tables WHERE tablename = $1";
-        let at_parse = PgCatalog::where_clause_is_fully_supported(&classify(PARSE_TIME));
-
-        // Every one of these is `substitute_parameters`' output for some value
-        // of `$1`; each contains a fragment that USED to re-classify the
-        // statement at Execute time.
-        for executed in &[
-            "SELECT * FROM pg_tables WHERE tablename = 'a'",
-            "SELECT * FROM pg_tables WHERE tablename = 'orders and returns'",
-            "SELECT * FROM pg_tables WHERE tablename = 'this or that'",
-            "SELECT * FROM pg_tables WHERE tablename = 'x is null'",
-            "SELECT * FROM pg_tables WHERE tablename = 'orders (eu)'",
-            "SELECT * FROM pg_tables WHERE tablename = 'a; drop'",
-            "SELECT * FROM pg_tables WHERE tablename = 'order by me'",
-        ] {
-            assert_eq!(
-                PgCatalog::where_clause_is_fully_supported(&classify(executed)),
-                at_parse,
-                "`{executed}` must take the SAME route as the unsubstituted `{PARSE_TIME}` — \
-                 otherwise Execute contradicts the RowDescription Describe already sent"
-            );
-        }
-
-        // And the route the two agree on is the interceptor, whose answer is
-        // correctly filtered — the whole point of keeping the shape supported.
-        assert!(at_parse, "`tablename = $1` is a plain equality shape");
     }
 
     #[test]
