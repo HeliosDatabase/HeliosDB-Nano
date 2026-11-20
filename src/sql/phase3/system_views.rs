@@ -4302,10 +4302,11 @@ impl SystemViewRegistry {
                 .map(Tuple::new)
                 .collect()),
             "pg_tables" => crate::sql::dict::tables::pg_tables_rows(ctx),
-            _ => {
-                // Other system views not yet implemented
-                Ok(vec![])
-            }
+            // A registered view without a producer is a defect, never an empty
+            // answer: a view that is empty on purpose has its own arm above.
+            _ => Err(Error::internal(format!(
+                "system view '{view_name}' is registered but has no producer"
+            ))),
         }
     }
 
@@ -4587,9 +4588,9 @@ impl SystemViewRegistry {
         // changes nothing about that — but they are held in a SEPARATE registry
         // (`storage.vector_indexes()`), so the ART loop above walked straight
         // past them and `\d`, `\di` and every ORM that enumerates relations
-        // through pg_class reported that the index did not exist. Their OIDs
-        // come from the dedicated 8000 base so they can never collide with an
-        // ART index's.
+        // through pg_class reported that the index did not exist. Their
+        // identifiers are derived from table and index name, in a class of
+        // their own, so they can never collide with an ART index's.
         for metadata in &sorted_vector_indexes(storage) {
             let Some(oid) = oids.vector_index(&metadata.table_name, &metadata.name) else {
                 continue;
@@ -5467,7 +5468,6 @@ impl SystemViewRegistry {
     /// two builds agree, so a statement that commits between its reads is not
     /// half seen ([`PG_INDEXES_READ_ATTEMPTS`]).
     fn execute_pg_indexes(ctx: &DictContext<'_>) -> Result<Vec<Tuple>> {
-        let storage = ctx.storage();
         let mut last = Self::build_pg_indexes(ctx)?;
         for _ in 0..PG_INDEXES_READ_ATTEMPTS {
             let again = Self::build_pg_indexes(ctx)?;
@@ -5783,6 +5783,7 @@ impl SystemViewRegistry {
                 .collect();
             if !pk_columns.is_empty() {
                 let constraint_name = format!("{}_pkey", table_name);
+                let conindid = oids.index_named(&constraint_name);
                 push_pg_constraint_row(
                     &mut results,
                     &mut oids,
@@ -5792,7 +5793,7 @@ impl SystemViewRegistry {
                     "p",
                     table_oid,
                     None,
-                    oids.index_named(&constraint_name),
+                    conindid,
                     pg_conkey(&schema, &pk_columns),
                     Value::Null,
                     None,
@@ -5806,6 +5807,7 @@ impl SystemViewRegistry {
             for col in &schema.columns {
                 if col.unique && !col.primary_key {
                     let constraint_name = format!("{}_{}_key", table_name, col.name);
+                    let conindid = oids.index_named(&constraint_name);
                     push_pg_constraint_row(
                         &mut results,
                         &mut oids,
@@ -5815,7 +5817,7 @@ impl SystemViewRegistry {
                         "u",
                         table_oid,
                         None,
-                        oids.index_named(&constraint_name),
+                        conindid,
                         pg_conkey(&schema, std::slice::from_ref(&col.name)),
                         Value::Null,
                         None,
@@ -5833,6 +5835,7 @@ impl SystemViewRegistry {
             };
 
             for unique in constraints.unique_constraints {
+                let conindid = oids.index_named(&unique.name);
                 push_pg_constraint_row(
                     &mut results,
                     &mut oids,
@@ -5842,7 +5845,7 @@ impl SystemViewRegistry {
                     if unique.is_primary_key { "p" } else { "u" },
                     table_oid,
                     None,
-                    oids.index_named(&unique.name),
+                    conindid,
                     pg_conkey(&schema, &unique.columns),
                     Value::Null,
                     None,

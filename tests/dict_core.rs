@@ -572,3 +572,30 @@ fn an_alias_is_a_projection_over_its_canonical_view() {
         "hdb_features"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Item 7: an empty answer is a decision, never a missing producer
+// ---------------------------------------------------------------------------
+
+#[test]
+fn every_system_view_in_the_dictionary_answers() {
+    let db = db();
+    let names = rows(&db, "SELECT name FROM hdb_dictionary ORDER BY name");
+    assert!(names.len() >= 78);
+    for name in names {
+        let name = &name[0];
+        let sql = format!("SELECT * FROM {name}");
+        for outcome in [
+            db.query_with_columns(&sql).map(|_| ()),
+            db.query_params_with_columns(&sql, &[]).map(|_| ()),
+        ] {
+            if let Err(e) = outcome {
+                let message = e.to_string();
+                assert!(
+                    message.contains("pg_compare_branches is not implemented"),
+                    "`{sql}` must answer or refuse by design, got: {message}"
+                );
+            }
+        }
+    }
+}

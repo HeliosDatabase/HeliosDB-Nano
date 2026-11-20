@@ -23,6 +23,9 @@ pub mod reserved;
 pub mod routines;
 pub mod tables;
 
+#[cfg(test)]
+mod registry_tests;
+
 pub use alias::{alias_for, DictAlias};
 pub use context::DictContext;
 
