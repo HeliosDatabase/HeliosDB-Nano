@@ -30,44 +30,6 @@ fn err_of(db: &EmbeddedDatabase, sql: &str) -> String {
 }
 
 // ===========================================================================
-// GAP: set-returning functions. `Planner::is_table_function` is still the fixed
-// `generate_series | unnest` whitelist, so `SELECT * FROM f()` plans as a plain
-// table reference. Lifting it needs a return-signature slot on `StoredFunction`,
-// which is a bincode-positional WAL/`meta:` payload — hence deferred.
-// ===========================================================================
-
-#[test]
-fn select_star_from_a_function_still_resolves_as_a_missing_table() {
-    let db = db();
-    db.execute("CREATE FUNCTION g_srf(x INTEGER) RETURNS INTEGER AS $$ SELECT $1 $$ LANGUAGE sql")
-        .unwrap();
-    assert!(db.function_registry.function_exists("g_srf"), "precondition");
-
-    let err = err_of(&db, "SELECT * FROM g_srf(1)");
-    assert!(err.contains("does not exist"), "expected 'does not exist', got: {err}");
-    assert!(err.contains("g_srf"), "the error should name the function: {err}");
-    assert!(
-        !err.contains("Unknown scalar function"),
-        "this route fails as a MISSING TABLE, not as an unknown scalar function: {err}"
-    );
-}
-
-#[test]
-fn returns_table_is_accepted_but_its_column_list_is_discarded() {
-    // `RETURNS TABLE(...)` parses (the planner accepts it as a `Custom("TABLE")`
-    // type) and the function registers, but neither `LogicalPlan::CreateFunction`
-    // nor `StoredFunction` has anywhere to keep the column list, and
-    // `execute_function` returns a single scalar `Value`.
-    let db = db();
-    db.execute("CREATE FUNCTION g_tab() RETURNS TABLE(a INT) AS $$ SELECT 1 $$ LANGUAGE sql")
-        .expect("RETURNS TABLE must still be accepted");
-    assert!(db.function_registry.function_exists("g_tab"));
-
-    let err = err_of(&db, "SELECT * FROM g_tab()");
-    assert!(err.contains("does not exist"), "got: {err}");
-}
-
-// ===========================================================================
 // GAP: overload resolution. The registry keys on the LOWERCASE NAME ONLY, with
 // no signature, so two same-name functions collide regardless of parameters.
 // ===========================================================================

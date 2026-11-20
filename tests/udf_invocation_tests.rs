@@ -827,3 +827,25 @@ fn a_bare_parameter_name_still_fails_the_sigil_rule_in_both_languages() {
         assert_eq!(rows_in(&db, "fn_audit"), 0, "nothing may have been written");
     }
 }
+
+// `SELECT * FROM f()` runs a user-defined function as a row source (it used to
+// plan as a missing table; the gap test said to replace it with this coverage).
+#[test]
+fn select_star_from_a_user_function_returns_its_value() {
+    let db = EmbeddedDatabase::new_in_memory().expect("in-memory db");
+    db.execute("CREATE FUNCTION inv_srf(x INTEGER) RETURNS INTEGER AS $$ SELECT $1 $$ LANGUAGE sql")
+        .unwrap();
+    let rows = db.query("SELECT * FROM inv_srf(7)", &[]).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(as_i64(&rows[0].values[0]), 7);
+}
+
+#[test]
+fn select_star_from_a_returns_table_function_returns_its_row() {
+    let db = EmbeddedDatabase::new_in_memory().expect("in-memory db");
+    db.execute("CREATE FUNCTION inv_tab() RETURNS TABLE(a INT) AS $$ SELECT 1 $$ LANGUAGE sql")
+        .unwrap();
+    let rows = db.query("SELECT * FROM inv_tab()", &[]).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(as_i64(&rows[0].values[0]), 1);
+}

@@ -228,8 +228,8 @@ fn test_system_view_pg_database_branches() {
     let branches = db.query("SELECT * FROM pg_database_branches()", &[]).unwrap();
     assert_eq!(branches.len(), 4); // main + 3 created
 
-    // Verify schema (7 columns)
-    assert_eq!(branches[0].values.len(), 7);
+    // Verify schema (9 columns: v10.7 added expires_at and label)
+    assert_eq!(branches[0].values.len(), 9);
 
     // Verify main branch exists and has no parent
     let main_branch = branches.iter().find(|row| get_string(row, 0) == "main").unwrap();
@@ -257,9 +257,15 @@ fn test_system_view_pg_branch_stats() {
     // Verify columns: branch_name, modified_keys, storage_bytes, commit_count, last_modified, compression_ratio
     let main_stats = stats.iter().find(|row| get_string(row, 0) == "main").unwrap();
 
-    assert!(get_i64(main_stats, 1).is_some()); // modified_keys
-    assert!(get_i64(main_stats, 2).is_some()); // storage_bytes
-    assert!(get_i64(main_stats, 3).is_some()); // commit_count
+    // modified_keys, storage_bytes, commit_count: a count, or NULL when the
+    // counter is not measured (never a made-up 0).
+    for index in 1..=3 {
+        let value = &main_stats.values[index];
+        assert!(
+            get_i64(main_stats, index).is_some() || *value == Value::Null,
+            "column {index}: {value:?}"
+        );
+    }
 }
 
 #[test]
@@ -492,9 +498,14 @@ fn test_pg_branch_stats_accuracy() {
 
     assert_eq!(stats.len(), 1);
 
-    // Initial values should be 0
+    // A new branch has changed nothing: each counter is 0 or, when it is not
+    // measured, NULL.
     let row = &stats[0];
-    assert_eq!(get_i64(row, 0).unwrap(), 0); // modified_keys
-    assert_eq!(get_i64(row, 1).unwrap(), 0); // storage_bytes
-    assert_eq!(get_i64(row, 2).unwrap(), 0); // commit_count
+    for index in 0..3 {
+        assert!(
+            matches!(get_i64(row, index), Some(0) | None),
+            "column {index}: {:?}",
+            row.values
+        );
+    }
 }

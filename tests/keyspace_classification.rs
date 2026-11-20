@@ -56,6 +56,10 @@ use std::path::{Path, PathBuf};
 /// starts with the path AND its text starts with the literal prefix, so an
 /// allowance for one file can never hide a real key written elsewhere.
 const ALLOW: &[(&str, &str)] = &[
+    // --- Range bounds, not keys ---
+    // `touches_index_definitions`: the exclusive upper bound of the
+    // `meta:index:` range (`:` + 1), compared against, never written.
+    ("src/storage/write_gate.rs", "meta:index;"),
     // --- Names, not keys ---
     // `expr_to_logical`: EXTRACT's internal scalar-function name.
     ("src/sql/planner.rs", "__extract_"),
