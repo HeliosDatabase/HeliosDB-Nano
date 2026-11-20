@@ -47,7 +47,7 @@ permissions:
 jobs:
   build:
     name: Build abi3 manylinux wheel
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
 
@@ -85,7 +85,7 @@ jobs:
   publish:
     name: Publish to PyPI
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       id-token: write   # PyPI Trusted Publishing (OIDC) — no token stored in secrets
     steps:
