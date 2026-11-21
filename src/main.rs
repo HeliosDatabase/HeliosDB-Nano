@@ -1566,6 +1566,12 @@ enum Commands {
         )]
         mysql_tls_post_quantum: bool,
 
+        /// RSA private key (PKCS#8 PEM, 2048 bits or more) for MySQL password
+        /// logins over a connection without TLS. Without it a key pair is
+        /// generated at start and lives in memory only.
+        #[arg(long)]
+        mysql_rsa_private_key: Option<PathBuf>,
+
         /// PostgreSQL Unix domain socket directory. If set, listens at
         /// `<dir>/.s.PGSQL.<port>` — the libpq default. Use with psql `-h /tmp`.
         #[arg(long)]
@@ -1979,6 +1985,7 @@ async fn run(cli: Cli) -> Result<()> {
             mysql_tls_cert,
             mysql_tls_key,
             mysql_tls_post_quantum,
+            mysql_rsa_private_key,
             pg_socket_dir,
             max_connections,
             join_memory_limit_mb,
@@ -2296,6 +2303,7 @@ async fn run(cli: Cli) -> Result<()> {
                     mysql_tls_cert,
                     mysql_tls_key,
                     mysql_tls_post_quantum,
+                    mysql_rsa_private_key,
                     pg_socket_dir,
                     policy_args,
                     performance_args,
@@ -2324,6 +2332,7 @@ async fn run(cli: Cli) -> Result<()> {
                     mysql_tls_cert,
                     mysql_tls_key,
                     mysql_tls_post_quantum,
+                    mysql_rsa_private_key,
                     pg_socket_dir,
                     policy_args,
                     performance_args,
@@ -2585,6 +2594,7 @@ async fn start_server(
     mysql_tls_cert: Option<PathBuf>,
     mysql_tls_key: Option<PathBuf>,
     mysql_tls_post_quantum: bool,
+    mysql_rsa_private_key: Option<PathBuf>,
     pg_socket_dir: Option<PathBuf>,
     policy_args: ConnectionPolicyArgs,
     performance_args: PerformanceArgs,
@@ -2883,21 +2893,14 @@ async fn start_server(
         Some(addr)
     };
 
-    // P0-8: the MySQL wire listener is trust-only. Enabling it while the
-    // PostgreSQL wire requires a credential silently bypasses that credential
-    // for any MySQL client, so fail closed at startup rather than warn. This
-    // covers BOTH MySQL transports: the TCP listener (`--mysql`) and the Unix
-    // domain socket (`--mysql-socket`). A UDS is a local credential-free path
-    // into the same SQL engine, so it is not exempt just because it is local.
-    if (mysql_enabled || mysql_socket.is_some()) && (password.is_some() || !matches!(auth_method, AuthMethod::Trust)) {
-        let transport = if mysql_enabled { "--mysql" } else { "--mysql-socket" };
-        return Err(Error::config(format!(
-            "MySQL authentication is not implemented: the MySQL listener accepts any username, so \
-             {transport} alongside the PostgreSQL {auth_display} method would let any MySQL client run \
-             SQL without the configured password. Disable {transport}, or use --auth trust for an \
-             explicit local/dev deployment."
-        )));
-    }
+    // The MySQL listeners (`--mysql`, `--mysql-socket`) authenticate against the
+    // same accounts and roles as the PostgreSQL wire; under `trust` there is no
+    // authenticator and they accept every login, as that wire does.
+    let mysql_auth = heliosdb_nano::protocol::mysql::MysqlAuth::for_listener(
+        &auth_manager,
+        mysql_rsa_private_key.as_deref(),
+        mysql_enabled || mysql_socket.is_some(),
+    )?;
 
     // Configure PostgreSQL server
     // A bare IPv4 or IPv6 literal (`::1`, `[::1]`) or IP:port; the port is explicit.
@@ -3462,22 +3465,21 @@ async fn start_server(
             .parse()
             .map_err(|e| Error::config(format!("Invalid MySQL listen address '{}': {}", mysql_listen, e)))?;
 
-        // P0-8: a non-trust PostgreSQL method with --mysql already failed closed
-        // before the database opened. Reaching here means the wire is in trust
-        // mode, so the trust-only MySQL listener is consistent with an explicit
-        // local/dev deployment — but say so loudly if it is exposed off loopback.
-        if !mysql_addr.ip().is_loopback() {
+        // Without an authenticator the wire is in trust mode, and so is the
+        // PostgreSQL one: say so loudly if this listener is exposed off loopback.
+        if mysql_auth.is_none() && !mysql_addr.ip().is_loopback() {
             tracing::warn!(
-                "MySQL listener on {mysql_addr} is trust-only and the PostgreSQL wire is also in \
-                 trust mode; both accept any client. Use --mysql-listen 127.0.0.1 unless this is a \
-                 deliberate local/dev deployment."
+                "MySQL listener on {mysql_addr} is in trust mode, as is the PostgreSQL wire; both \
+                 accept any client. Use --mysql-listen 127.0.0.1 unless this is a deliberate \
+                 local/dev deployment."
             );
         }
 
         let mysql_tls_enabled = mysql_tls_cert.is_some();
         let mut mysql_server_config = heliosdb_nano::protocol::mysql::MysqlServerConfig::with_address(mysql_addr)
             .with_max_connections(max_connections)
-            .with_timeouts(connection_policy.clone());
+            .with_timeouts(connection_policy.clone())
+            .with_auth(mysql_auth.clone());
         if let (Some(cert_path), Some(key_path)) = (&mysql_tls_cert, &mysql_tls_key) {
             let mysql_ssl_config = heliosdb_nano::protocol::mysql::MysqlSslConfig::new(cert_path, key_path)
                 .with_post_quantum(mysql_tls_post_quantum);
@@ -3511,6 +3513,7 @@ async fn start_server(
         let conn_counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(1_000_000));
         let conn_limiter = std::sync::Arc::new(tokio::sync::Semaphore::new(max_connections));
         let policy = connection_policy.clone();
+        let socket_auth = mysql_auth.clone();
         let utilisation_warned = std::sync::atomic::AtomicBool::new(false);
         info!("MySQL Unix socket listening on {}", path.display());
         println!("    mysql (UDS): mysql --socket={}", path.display());
@@ -3545,14 +3548,16 @@ async fn start_server(
                         let db_clone = Arc::clone(&mysql_db);
                         let conn_id = conn_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let conn_policy = policy.clone();
+                        let conn_auth = socket_auth.clone();
                         tokio::spawn(async move {
                             let _permit = permit;
                             if let Err(e) =
-                                heliosdb_nano::protocol::mysql::handler::handle_mysql_connection_unix_with_timeouts(
+                                heliosdb_nano::protocol::mysql::handler::handle_mysql_connection_unix_with_auth(
                                     db_clone,
                                     stream,
                                     conn_id,
                                     conn_policy,
+                                    conn_auth,
                                 )
                                 .await
                             {
@@ -4386,6 +4391,7 @@ async fn start_server_daemon(
     mysql_tls_cert: Option<PathBuf>,
     mysql_tls_key: Option<PathBuf>,
     mysql_tls_post_quantum: bool,
+    mysql_rsa_private_key: Option<PathBuf>,
     pg_socket_dir: Option<PathBuf>,
     policy_args: ConnectionPolicyArgs,
     performance_args: PerformanceArgs,
@@ -4474,6 +4480,10 @@ async fn start_server_daemon(
     }
     args.push("--mysql-tls-post-quantum".to_string());
     args.push(mysql_tls_post_quantum.to_string());
+    if let Some(key) = mysql_rsa_private_key {
+        args.push("--mysql-rsa-private-key".to_string());
+        args.push(key.display().to_string());
+    }
 
     // Add auth options. The password is NEVER placed on the child's argv:
     // a file-backed source forwards only the path (--password-file), and an

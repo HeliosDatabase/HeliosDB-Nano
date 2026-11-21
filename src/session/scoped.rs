@@ -202,6 +202,15 @@ pub fn request_cancel(backend_pid: i32, secret: i32) -> bool {
     true
 }
 
+/// The live backend `backend_pid` of the engine `engine_instance`: what a SQL
+/// `KILL` names. A backend of another open database is not found.
+pub(crate) fn live_backend(engine_instance: u64, backend_pid: i32) -> Option<Arc<SessionScopedState>> {
+    live_backends()
+        .get(&backend_pid)
+        .and_then(|entry| entry.value().upgrade())
+        .filter(|state| state.engine_instance() == engine_instance)
+}
+
 /// A snapshot of one live backend, in `pg_stat_activity` column order.
 #[derive(Debug, Clone)]
 pub struct BackendSnapshot {
@@ -636,6 +645,12 @@ impl SessionScopedState {
     pub(crate) fn arm_cancel(&self, secret: i32) -> Arc<AtomicBool> {
         self.cancel_secret.store(i64::from(secret), Ordering::Release);
         Arc::clone(&self.cancel_requested)
+    }
+
+    /// A cancel request made in SQL (`KILL QUERY`) by a session entitled to
+    /// make it: the same request a wire `CancelRequest` with the right key makes.
+    pub(crate) fn request_cancel_now(&self) {
+        self.cancel_requested.store(true, Ordering::Release);
     }
 
     /// Spec R5.1: has a cancel request arrived for the statement running? Taken: it

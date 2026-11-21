@@ -37,9 +37,9 @@ allowed-tools: Bash(heliosdb-nano *), Bash(psql *), Bash(systemctl *), Read
 | SWITCHOVER (both roles, one command) | SQL | on the PRIMARY's PostgreSQL port: `SWITCHOVER CHECK TO '<standby>'` (rows `check`, `ok`, `detail`; nothing changes) · `SWITCHOVER TO '<standby>'` (node id, replication address or alias from `/health` `standbys`): the standby promotes online (fencing this primary), this primary demotes in-process and follows it; one row `new_primary`, `epoch`, `final_sequence`, `this_node`, `other_standbys`, then FATAL 57P01; superuser only (42501); roles recorded in `<data dir>.role.toml`, bound to the directory |
 | archive-only standby | CLI | `--replication-role standby --source archive --archive-source /srv/segments` (no replication connection, no token needed) |
 | cascading standby | TOML | `[replication.physical] cascade = true` on a standby + its own `--replication-port`; downstream `--primary-host` = that port |
-| MySQL listener | CLI | `--mysql --mysql-listen 127.0.0.1:3306` |
+| MySQL listener | CLI | `--mysql --mysql-listen 127.0.0.1:3306` (asks for the same accounts and passwords as the PostgreSQL wire unless `--auth trust`; plugin `caching_sha2_password`; TLS with `--mysql-tls-cert`/`--mysql-tls-key`; `--mysql-rsa-private-key <pkcs8.pem>` keeps one RSA key for password logins over plain TCP) |
 | Unix socket (PG) | CLI | `--pg-socket-dir /tmp` |
-| Unix socket (MySQL) | CLI | `--mysql-socket /tmp/heliosdb-mysql.sock` |
+| Unix socket (MySQL) | CLI | `--mysql-socket /tmp/heliosdb-mysql.sock` (authenticates like the TCP listener) |
 | HTTP health port | CLI | `--http-port 8080` |
 | TOML config | CLI | `--config ./config.toml` |
 | roles (catalog records, not logins) | REPL | `\user list`, `\user add <n>`, `\user remove <n>` run `CREATE ROLE` / `DROP ROLE`; `\password <n>` only says where server passwords come from |

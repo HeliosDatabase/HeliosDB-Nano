@@ -30,6 +30,10 @@ use crate::protocol::postgres::timeouts::{ConnectionTimeouts, SessionActivity};
 use crate::storage::dump::sql_text::quote_ident as quote_sql_ident;
 use crate::{EmbeddedDatabase, Tuple, Value};
 
+mod admin;
+mod login;
+mod session;
+
 // ============================================================================
 // Constants
 // ============================================================================
@@ -231,6 +235,7 @@ pub enum Command {
     ComFieldList = 0x04,
     ComStatistics = 0x09,
     ComPing = 0x0e,
+    ComChangeUser = 0x11,
     ComStmtPrepare = 0x16,
     ComStmtExecute = 0x17,
     ComStmtClose = 0x19,
@@ -248,6 +253,7 @@ impl Command {
             0x04 => Some(Self::ComFieldList),
             0x09 => Some(Self::ComStatistics),
             0x0e => Some(Self::ComPing),
+            0x11 => Some(Self::ComChangeUser),
             0x16 => Some(Self::ComStmtPrepare),
             0x17 => Some(Self::ComStmtExecute),
             0x19 => Some(Self::ComStmtClose),
@@ -1037,13 +1043,16 @@ enum SessionFn {
     FoundRows,
     LastInsertId,
     Version,
+    /// `CONNECTION_ID()`: the id of the greeting, the one `KILL` takes.
+    ConnectionId,
 }
 
 impl SessionFn {
-    const ALL: [(&'static str, SessionFn); 3] = [
+    const ALL: [(&'static str, SessionFn); 4] = [
         ("FOUND_ROWS", SessionFn::FoundRows),
         ("LAST_INSERT_ID", SessionFn::LastInsertId),
         ("VERSION", SessionFn::Version),
+        ("CONNECTION_ID", SessionFn::ConnectionId),
     ];
 
     /// Column name MySQL gives the bare call.
@@ -1052,6 +1061,7 @@ impl SessionFn {
             SessionFn::FoundRows => "FOUND_ROWS()",
             SessionFn::LastInsertId => "LAST_INSERT_ID()",
             SessionFn::Version => "VERSION()",
+            SessionFn::ConnectionId => "CONNECTION_ID()",
         }
     }
 }
@@ -1171,12 +1181,6 @@ fn view_is_query(view: &str) -> bool {
     word_is("SELECT") || word_is("WITH") || t.starts_with('(')
 }
 
-/// `SELECT ... @@var` — answered by the variable handler.
-fn view_selects_variable(view: &str) -> bool {
-    let t = view.trim_start();
-    t.starts_with("SELECT") && view.contains("@@")
-}
-
 /// A query reading `information_schema` — answered by the catalog handler.
 fn view_reads_information_schema(sql: &str, view: &str) -> bool {
     view_is_query(view)
@@ -1232,6 +1236,74 @@ pub struct MySqlHandler<S: AsyncRead + AsyncWrite + Unpin + Send> {
     /// [`super::server::MysqlServer::negotiate`]. `None` on a plaintext
     /// connection. Exposed as `Ssl_kx_group` / `@@ssl_kx_group`.
     tls_kx_group: Option<String>,
+    /// The listener's authenticator; `None` is `trust` (every login accepted).
+    auth: Option<Arc<super::auth::MysqlAuth>>,
+    /// Is THIS connection encrypted (TLS) or local (the Unix socket)? Decides
+    /// whether a password may travel as it is. Not `tls_enabled`, which says
+    /// what the server has configured.
+    transport_secure: bool,
+    /// What this session has `SET`, and its user variables.
+    vars: super::vars::SessionVars,
+    /// The listener's policy, which `wait_timeout = DEFAULT` and a reset go back to.
+    listener_timeouts: ConnectionTimeouts,
+    /// Another statement of the same `COM_QUERY` follows the one being answered.
+    more_results: bool,
+    /// The statement being answered was answered with an ERR packet.
+    last_was_error: bool,
+    /// The open transaction is `READ ONLY`.
+    txn_read_only: bool,
+    /// `SET TRANSACTION ...` without `SESSION`: the next transaction only.
+    next_txn_isolation: Option<String>,
+    next_txn_read_only: Option<bool>,
+    /// The isolation level the engine session was last set to.
+    applied_isolation: String,
+    /// Statements this connection has sent (`SHOW STATUS LIKE 'Questions'`).
+    questions: u64,
+    /// The session's backend id: this connection's id on the wire.
+    backend_pid: i32,
+    /// What `KILL CONNECTION` from another session trips.
+    kill_switch: Arc<super::kill::KillSwitch>,
+    /// The session's cancel request flag (`KILL QUERY`), cleared when a new
+    /// command arrives: a request that found nothing running does nothing.
+    cancel_flag: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// A wire session opened before the connection's handler exists, so that the
+/// handshake can already carry the session's id as the connection id. Ended
+/// again if the connection never gets as far as a handler.
+pub(crate) struct ReservedSession {
+    database: Arc<EmbeddedDatabase>,
+    session_id: Option<crate::session::SessionId>,
+    backend_pid: i32,
+}
+
+impl ReservedSession {
+    pub(crate) fn open(database: &Arc<EmbeddedDatabase>) -> crate::Result<Self> {
+        let session_id = database.create_wire_session("mysql_wire")?;
+        let backend_pid = database.session_backend_pid(session_id).unwrap_or(0);
+        Ok(Self {
+            database: Arc::clone(database),
+            session_id: Some(session_id),
+            backend_pid,
+        })
+    }
+
+    /// The id the handshake announces for this connection.
+    pub(crate) fn connection_id(&self, fallback: u32) -> u32 {
+        u32::try_from(self.backend_pid).ok().filter(|id| *id != 0).unwrap_or(fallback)
+    }
+
+    fn take(mut self) -> Option<(crate::session::SessionId, i32)> {
+        self.session_id.take().map(|id| (id, self.backend_pid))
+    }
+}
+
+impl Drop for ReservedSession {
+    fn drop(&mut self) {
+        if let Some(session_id) = self.session_id.take() {
+            let _ = self.database.destroy_session(session_id);
+        }
+    }
 }
 
 /// GH#28: MySQL's own wording (ER_CLIENT_INTERACTION_TIMEOUT, 4031) for a
@@ -1255,6 +1327,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Drop for MySqlHandler<S> {
     fn drop(&mut self) {
         // Roll back any open transaction and release the session when the
         // connection ends, however it ends.
+        super::kill::unregister(self.backend_pid);
         let _ = self.database.destroy_session(self.session_id);
     }
 }
@@ -1315,10 +1388,32 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
         auth_plugin: String,
         tls_enabled: bool,
         tls_kx_group: Option<String>,
+        reserved: Option<ReservedSession>,
     ) -> Self {
-        let session_id = database
-            .create_wire_session("mysql_wire")
-            .expect("wire session creation is infallible");
+        let (session_id, backend_pid) = match reserved.and_then(ReservedSession::take) {
+            Some(pair) => pair,
+            None => {
+                let session_id = database
+                    .create_wire_session("mysql_wire")
+                    .expect("wire session creation is infallible");
+                (session_id, database.session_backend_pid(session_id).unwrap_or(0))
+            }
+        };
+        let connection_id = u32::try_from(backend_pid)
+            .ok()
+            .filter(|id| *id != 0)
+            .unwrap_or(connection_id);
+        let kill_switch = super::kill::register(backend_pid, database.storage.instance_id());
+        let cancel_flag = database
+            .session_manager
+            .get_session(session_id)
+            .ok()
+            .map(|session| {
+                let scoped = Arc::clone(&session.read().scoped);
+                scoped.arm_cancel(rand::random())
+            })
+            .unwrap_or_default();
+        super::listener_started();
         Self {
             database,
             stream,
@@ -1340,7 +1435,32 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
             timeouts: ConnectionTimeouts::disabled(),
             tls_enabled,
             tls_kx_group,
+            auth: None,
+            transport_secure: false,
+            vars: super::vars::SessionVars::default(),
+            listener_timeouts: ConnectionTimeouts::disabled(),
+            more_results: false,
+            last_was_error: false,
+            txn_read_only: false,
+            next_txn_isolation: None,
+            next_txn_read_only: None,
+            applied_isolation: "READ-COMMITTED".to_string(),
+            questions: 0,
+            backend_pid,
+            kill_switch,
+            cancel_flag,
         }
+    }
+
+    /// Install the listener's authenticator and say whether this connection's
+    /// transport is secure (TLS or the Unix socket). Before the handshake is
+    /// sent: with an authenticator the greeting names `caching_sha2_password`.
+    pub(crate) fn set_auth(&mut self, auth: Option<Arc<super::auth::MysqlAuth>>, transport_secure: bool) {
+        if auth.is_some() {
+            self.auth_plugin = super::auth::CACHING_SHA2_PASSWORD.to_string();
+        }
+        self.auth = auth;
+        self.transport_secure = transport_secure;
     }
 
     fn new(database: Arc<EmbeddedDatabase>, stream: S, connection_id: u32) -> Self {
@@ -1359,6 +1479,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
             StatusFlags::default_flags(),
             "mysql_native_password".into(),
             false,
+            None,
             None,
         )
     }
@@ -1399,6 +1520,40 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
             auth_plugin,
             tls_enabled,
             tls_kx_group,
+            None,
+        )
+    }
+
+    /// [`Self::new_pre_negotiated`] on a session opened before the greeting
+    /// was sent, whose id the greeting announced.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_pre_negotiated_on(
+        reserved: ReservedSession,
+        database: Arc<EmbeddedDatabase>,
+        stream: S,
+        connection_id: u32,
+        seq: u8,
+        auth_seed: [u8; 20],
+        capabilities: CapabilityFlags,
+        character_set: u8,
+        status_flags: StatusFlags,
+        auth_plugin: String,
+        tls_enabled: bool,
+        tls_kx_group: Option<String>,
+    ) -> Self {
+        Self::new_inner(
+            database,
+            stream,
+            connection_id,
+            seq,
+            auth_seed,
+            capabilities,
+            character_set,
+            status_flags,
+            auth_plugin,
+            tls_enabled,
+            tls_kx_group,
+            Some(reserved),
         )
     }
 
@@ -1407,6 +1562,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
     /// which negotiates TLS — and therefore constructs the handler — before
     /// the idle-timeout loop starts).
     pub(crate) fn set_timeouts(&mut self, timeouts: ConnectionTimeouts) {
+        self.listener_timeouts = timeouts.clone();
         self.timeouts = timeouts;
     }
 
@@ -1416,7 +1572,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
     /// TLS-upgraded — the client ended up on). Mirrors the tail of
     /// [`Self::handshake_and_authenticate`] after `receive_handshake_response`.
     pub(crate) async fn finish_handshake(&mut self, hs: HandshakeResponse) -> Result<()> {
-        self.authenticate(&hs)?;
+        self.authenticate(&hs).await?;
         self.database
             .set_session_login_user(self.session_id, self.username.clone())?;
         // sprinter d03de7fc3b22: the MySQL listener's equivalent of the
@@ -1562,8 +1718,25 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
         connection_id: u32,
         timeouts: ConnectionTimeouts,
     ) -> Result<()> {
+        Self::handle_connection_with_auth(database, stream, connection_id, timeouts, None, false).await
+    }
+
+    /// [`Self::handle_connection_with_timeouts`] for a listener that asks for
+    /// a password: `auth` is its authenticator (`None` is `trust`), and
+    /// `transport_secure` says whether this stream is encrypted or local (TLS,
+    /// the Unix socket), which decides how the password may travel.
+    pub async fn handle_connection_with_auth(
+        database: Arc<EmbeddedDatabase>,
+        stream: S,
+        connection_id: u32,
+        timeouts: ConnectionTimeouts,
+        auth: Option<Arc<super::auth::MysqlAuth>>,
+        transport_secure: bool,
+    ) -> Result<()> {
         let mut handler = Self::new(database, stream, connection_id);
-        handler.timeouts = timeouts;
+        handler.set_timeouts(timeouts);
+        handler.set_auth(auth, transport_secure);
+        let connection_id = handler.connection_id;
         info!("New MySQL connection: id={}", connection_id);
 
         // Handshake + authenticate under one absolute deadline.
@@ -1609,7 +1782,27 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
                 SessionActivity::Idle
             };
             let budget = self.timeouts.read_deadline(activity);
-            let received = match self.receive_command_deadlined(budget).await {
+            // `KILL CONNECTION` from another session ends the wait (and the
+            // connection); checked first, so a kill that arrived while a
+            // statement ran is honoured before the next command is read.
+            let kill_switch = Arc::clone(&self.kill_switch);
+            let next = tokio::select! {
+                biased;
+                () = kill_switch.killed() => None,
+                received = self.receive_command_deadlined(budget) => Some(received),
+            };
+            let Some(next) = next else {
+                info!("MySQL connection {} closed: killed by another session", connection_id);
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    self.send_error(1053, "08S01", "Server shutdown in progress: this connection was killed"),
+                )
+                .await;
+                break;
+            };
+            // A `KILL QUERY` that found no statement running does nothing.
+            self.cancel_flag.store(false, std::sync::atomic::Ordering::Release);
+            let received = match next {
                 Ok(Some(received)) => Ok(received),
                 Ok(None) => {
                     info!(
@@ -1670,15 +1863,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
     async fn handshake_and_authenticate(&mut self) -> Result<()> {
         self.send_handshake().await?;
         let hs = self.receive_handshake_response().await?;
-        // Authenticate (trust-based for Nano — accept any non-empty creds)
-        self.authenticate(&hs)?;
-        // HDB-009: publish the handshake user as this session's SQL identity,
-        // so `current_user` / `session_user` / `current_role` answer the name
-        // the client logged in with instead of the hardcoded service user, and
-        // so this connection's result-cache entries are keyed to it. NOTE: this
-        // listener is trust-only — the name is asserted by the client, not
-        // proved — which is documented in `docs/guides/authentication.md`; it
-        // is reported identity, never an authorization decision.
+        // Trust without an authenticator, the password exchange with one
+        // (`handler/login.rs`).
+        self.authenticate(&hs).await?;
+        // HDB-009: publish the login user as this session's SQL identity, so
+        // `current_user` / `session_user` / `current_role` answer the name the
+        // client logged in with, this connection's result-cache entries are
+        // keyed to it, and privileges and row-level security see it as the
+        // principal — the same call the PostgreSQL handler makes after its
+        // own authentication. Under `trust` the name is asserted by the
+        // client, not proved.
         self.database
             .set_session_login_user(self.session_id, self.username.clone())?;
         self.send_ok(0, 0).await?;
@@ -1703,24 +1897,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
         let (seq, payload) = read_packet(&mut self.stream).await?;
         self.seq = seq.wrapping_add(1);
         HandshakeResponse::decode(payload, &self.capabilities)
-    }
-
-    /// Trust-based authentication: accept any user that provides a username.
-    fn authenticate(&mut self, hs: &HandshakeResponse) -> Result<()> {
-        self.username = Some(hs.username.clone());
-        self.current_database = hs.database.clone();
-
-        // Intersect capabilities
-        self.capabilities = CapabilityFlags::new(self.capabilities.as_u32() & hs.capability_flags.as_u32());
-
-        let plugin = hs.auth_plugin_name.as_deref().unwrap_or("mysql_native_password");
-
-        debug!("Auth user='{}' plugin='{}' db={:?}", hs.username, plugin, hs.database);
-
-        // Nano uses trust authentication — accept any connection.
-        // A production deployment would verify credentials here.
-        info!("User '{}' authenticated (trust)", hs.username);
-        Ok(())
     }
 
     // ------------------------------------------------------------------
@@ -1787,19 +1963,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
             }
             Command::ComResetConnection => {
                 // HDB-008: COM_RESET_CONNECTION must also end the ENGINE
-                // transaction. Clearing only the handler flags leaked the
-                // session transaction (and, after a failed statement, its
-                // aborted mark) into the reset connection.
-                if self.in_transaction && self.database.session_in_transaction(self.session_id) {
-                    let _ = self.database.rollback_transaction_for_session(self.session_id);
-                }
-                // sprinter 6bc4a4040eb7 (B1 fix pass): a reset connection does
-                // not keep the previous client's `USE BRANCH` either — it goes
-                // back to the branch it was opened on (main for MySQL).
-                self.database.reset_session_branch(self.session_id);
-                self.status_flags = StatusFlags::default_flags();
-                self.in_transaction = false;
+                // transaction, not only the handler's flags; sprinter
+                // 6bc4a4040eb7: and go back to the branch the connection was
+                // opened on. It also forgets every session variable, user
+                // variable and prepared statement (`reset_session_state`).
+                self.reset_session_state();
                 self.send_ok(0, 0).await?;
+            }
+            Command::ComChangeUser => {
+                self.handle_change_user(payload).await?;
             }
             Command::ComStatistics => {
                 // Return a simple statistics string (no packet framing
@@ -1852,6 +2024,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
             SessionFn::FoundRows => Value::Int8(self.last_row_count as i64),
             SessionFn::LastInsertId => Value::Int8(self.last_insert_id as i64),
             SessionFn::Version => Value::String(SERVER_VERSION.to_string()),
+            SessionFn::ConnectionId => Value::Int8(i64::from(self.connection_id)),
         }
     }
 
@@ -1868,6 +2041,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
             match kind {
                 SessionFn::FoundRows => out.push_str(&self.last_row_count.to_string()),
                 SessionFn::LastInsertId => out.push_str(&self.last_insert_id.to_string()),
+                SessionFn::ConnectionId => out.push_str(&self.connection_id.to_string()),
                 SessionFn::Version => {
                     out.push('\'');
                     out.push_str(&SERVER_VERSION.replace('\'', "''"));
@@ -1883,24 +2057,61 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
     async fn handle_com_query(&mut self, payload: Bytes) -> Result<()> {
         // Strip trailing null bytes (some MySQL clients send NUL-terminated strings)
         let raw_bytes = payload.as_ref();
-        let trimmed_bytes = if raw_bytes.last() == Some(&0) {
-            &raw_bytes[..raw_bytes.len() - 1]
-        } else {
-            raw_bytes
-        };
+        let trimmed_bytes = raw_bytes.strip_suffix(&[0]).unwrap_or(raw_bytes);
         let raw_sql = String::from_utf8_lossy(trimmed_bytes).to_string();
 
+        // A packet may hold several statements: each one is run and answered
+        // by itself, every answer but the last flagged
+        // SERVER_MORE_RESULTS_EXISTS, and the first error ends the batch
+        // (`super::batch`). A client that did not negotiate
+        // CLIENT_MULTI_STATEMENTS may send one statement only, as in MySQL.
+        let statements = super::batch::split_statements(&raw_sql);
+        let Some(last) = statements.len().checked_sub(1) else {
+            return self.send_ok(0, 0).await;
+        };
+        if last > 0 && !self.capabilities.has(CapabilityFlags::CLIENT_MULTI_STATEMENTS) {
+            return self
+                .send_error(
+                    1064,
+                    "42000",
+                    "You have an error in your SQL syntax: this connection did not ask for multiple statements \
+                     (CLIENT_MULTI_STATEMENTS), so one query may hold one statement only",
+                )
+                .await;
+        }
+        for (index, statement) in statements.iter().enumerate() {
+            self.more_results = index < last;
+            self.last_was_error = false;
+            let outcome = self.run_statement(statement).await;
+            if outcome.is_err() || self.last_was_error {
+                self.more_results = false;
+                return outcome;
+            }
+        }
+        self.more_results = false;
+        Ok(())
+    }
+
+    /// Run one statement of a `COM_QUERY` and answer it.
+    async fn run_statement(&mut self, raw_statement: &str) -> Result<()> {
+        self.questions = self.questions.wrapping_add(1);
+        // The statement log of a conformance run: `RUST_LOG=mysql_statements=debug`.
+        tracing::debug!(target: "mysql_statements", connection = self.connection_id, "query: {raw_statement}");
+        // `/*!40101 SET ... */`: MySQL runs it, and so does this listener.
+        let raw_sql = super::batch::versioned_set(raw_statement).unwrap_or(raw_statement);
+        let raw_trimmed = super::translator::skip_leading_comments(raw_sql).trim();
+
         // Apply MySQL-to-PostgreSQL SQL translation
-        let translated = super::translator::translate(&raw_sql);
+        let translated = super::translator::translate(raw_sql);
         let sql = translated.as_str();
 
         // Always log CREATE TABLE translation at INFO level for diagnostics
         let is_create = raw_sql.to_ascii_uppercase().contains("CREATE TABLE");
         if is_create {
-            info!("MySQL DDL in:  {}", &raw_sql[..raw_sql.len().min(200)]);
-            info!("MySQL DDL out: {}", &sql[..sql.len().min(200)]);
+            info!("MySQL DDL in:  {}", raw_sql.chars().take(200).collect::<String>());
+            info!("MySQL DDL out: {}", sql.chars().take(200).collect::<String>());
         } else if translated != raw_sql {
-            debug!("MySQL→PG: {}", &sql[..sql.len().min(200)]);
+            debug!("MySQL→PG: {}", sql.chars().take(200).collect::<String>());
         }
         // v01.1: classify (and run) from the first keyword, past any leading
         // comment, so `/* c */ SELECT 2` returns its result set.
@@ -1909,15 +2120,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
             return self.send_ok(0, 0).await;
         }
 
+        // A `SET` that names one of this listener's own variables
+        // (`transaction_isolation`, `autocommit`, ...) is its to answer, also
+        // where the engine has a parameter of the same name.
+        let mysql_set = session::set_names_listener_variable(raw_trimmed);
+
         // sprinter f4f5d450e816: `SET` / `SET LOCAL` / `RESET application_name`
-        // must actually take effect. The blanket `SET` acknowledgement below
-        // answers OK to EVERY `SET` this listener sees and applies none of them,
-        // so a PHP/WordPress client that tagged its connection was told the tag
-        // stuck while `current_setting('application_name')` stayed empty.
-        // (The blanket ack is a broader pre-existing gap — it also swallows
-        // GH#28's `SET idle_session_timeout` on COM_QUERY — but widening it is
-        // not this item's business; only the GUC these items own is routed.)
-        if (starts_with_icase(trimmed, "SET ") || starts_with_icase(trimmed, "RESET "))
+        // lands on this session.
+        if !mysql_set
+            && (starts_with_icase(trimmed, "SET ") || starts_with_icase(trimmed, "RESET "))
             && EmbeddedDatabase::is_application_name_statement(trimmed)
         {
             return match self
@@ -1929,13 +2140,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
             };
         }
 
-        // sprinter a3077a3f68d8: a USER-SETTABLE GUC (`statement_timeout`,
-        // `work_mem`, `bulk_load_mode`, the planner switches) must land on THIS
-        // session. The blanket acknowledgement below answered OK to every `SET`
-        // and applied none of them, so the MySQL wire was the one listener where
-        // `SET statement_timeout` was a pure lie; routing it here also keeps the
-        // knob off the process-global registry that used to back it.
-        if (starts_with_icase(trimmed, "SET ") || starts_with_icase(trimmed, "RESET "))
+        // sprinter a3077a3f68d8: a USER-SETTABLE engine parameter
+        // (`statement_timeout`, `work_mem`, `bulk_load_mode`, the planner
+        // switches) lands on THIS session.
+        if !mysql_set
+            && (starts_with_icase(trimmed, "SET ") || starts_with_icase(trimmed, "RESET "))
             && EmbeddedDatabase::is_session_guc_statement(trimmed)
         {
             return match self.database.try_handle_session_guc(self.session_id, trimmed) {
@@ -1947,8 +2156,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
         // sprinter 6bc4a4040eb7 (B1): `USE BRANCH x` / `USE DATABASE BRANCH x`
         // and `SET` / `RESET` / `SHOW heliosdb.branch` bind (or report) THIS
         // connection's branch — the same per-session binding the PostgreSQL wire
-        // uses. Routed ahead of the blanket `SET` and `USE` acknowledgements
-        // below, which would answer OK and apply nothing.
+        // uses.
         if EmbeddedDatabase::is_branch_binding_statement(trimmed) {
             // Off the async worker: `MERGE BRANCH x ABORT` can wait for the
             // statements on the branch.
@@ -1966,9 +2174,28 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
             };
         }
 
-        // ---- SET (session variables) — acknowledge silently ----
-        if starts_with_icase(trimmed, "SET ") {
-            return self.send_ok(0, 0).await;
+        // ---- SET: session variables, user variables, transaction
+        // characteristics, SET PASSWORD. Read from the statement as the client
+        // wrote it: every assignment takes effect, is stored with a documented
+        // "no effect", or is refused (`handler/session.rs`). ----
+        if super::vars::strip_keyword(raw_trimmed, "SET").is_some() {
+            return self.handle_set(raw_trimmed).await;
+        }
+
+        // ---- KILL [CONNECTION | QUERY] id ----
+        if let Some(parsed) = super::kill::parse_kill(raw_trimmed) {
+            return match parsed {
+                Ok((target, id)) => self.handle_kill(target, id).await,
+                Err(e) => self.send_var_error(&e).await,
+            };
+        }
+
+        // ---- CREATE USER / ALTER USER / DROP USER: the server's roles ----
+        if let Some(parsed) = super::accounts::parse_account_statement(raw_trimmed) {
+            return match parsed.and_then(|statement| self.run_account_statement(statement)) {
+                Ok(()) => self.send_ok(0, 0).await,
+                Err(e) => self.send_var_error(&e).await,
+            };
         }
 
         // ---- SHOW commands ----
@@ -1982,14 +2209,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
         }
 
         // ---- Transaction control ----
-        if starts_with_icase(trimmed, "BEGIN") || starts_with_icase(trimmed, "START TRANSACTION") {
-            return self.handle_begin().await;
-        }
-        if trimmed.eq_ignore_ascii_case("COMMIT") {
-            return self.handle_commit().await;
-        }
-        if trimmed.eq_ignore_ascii_case("ROLLBACK") {
-            return self.handle_rollback().await;
+        let view = super::translator::code_view(trimmed);
+        if let Some(classified) = session::classify_txn(&view) {
+            return match classified {
+                Ok(statement) => self.handle_txn_statement(statement).await,
+                Err(e) => self.send_var_error(&e).await,
+            };
         }
 
         // ---- Session functions: FOUND_ROWS() / LAST_INSERT_ID() / VERSION() ----
@@ -1997,7 +2222,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
         // call. Anywhere else (an INSERT value, a WHERE, a literal that merely
         // mentions the name) the statement runs; calls in its code are replaced
         // by the session value first, and calls in literals are left alone.
-        let view = super::translator::code_view(trimmed);
         let calls = find_session_calls(&view);
         let substituted;
         let (trimmed, view) = if calls.is_empty() {
@@ -2012,14 +2236,34 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
             (t, super::translator::code_view(t))
         };
 
-        // ---- SELECT @@variable — MySQL session/global variables ----
-        if view_selects_variable(&view) {
-            return self.handle_select_variable(trimmed).await;
-        }
+        // ---- System variables (@@name) and user variables (@name) ----
+        // A SELECT of variables only is answered from the session; in any
+        // other statement each variable is replaced by its value and the
+        // statement runs. An unknown system variable is error 1193.
+        let resolved;
+        let (trimmed, view) = if view.contains('@') {
+            match self.resolve_variables(trimmed).await? {
+                Ok(None) => return Ok(()),
+                Ok(Some(text)) => {
+                    resolved = text;
+                    let t = resolved.trim();
+                    (t, super::translator::code_view(t))
+                }
+                Err(e) => return self.send_var_error(&e).await,
+            }
+        } else {
+            (trimmed, view)
+        };
 
         // ---- USE database — SQL-level database switch ----
         if starts_with_icase(trimmed, "USE ") {
             return self.send_ok(0, 0).await;
+        }
+
+        // A write in a READ ONLY transaction, an unkeyed UPDATE or DELETE
+        // under sql_safe_updates.
+        if let Some(refusal) = self.statement_refusal(&view) {
+            return self.send_var_error(&refusal).await;
         }
 
         // ---- INFORMATION_SCHEMA queries — intercept before SQL parser ----
@@ -2033,14 +2277,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
         // transaction ended, and that transaction's earlier writes would be invisible
         // meanwhile and lost on a ROLLBACK that MySQL would not have had. The
         // PostgreSQL wire and the embedded API keep their transactional DDL.
-        if self.in_transaction && causes_implicit_commit(trimmed) {
-            let outcome = self.database.commit_transaction_for_session(self.session_id);
-            if let Err(e) = outcome {
-                self.sync_transaction_state_after_error();
-                return Err(e.into());
-            }
-            self.in_transaction = false;
-            self.status_flags.clear(StatusFlags::SERVER_STATUS_IN_TRANS);
+        let defines_data = causes_implicit_commit(trimmed);
+        if defines_data {
+            self.implicit_commit()?;
         }
 
         // ---- SELECT / DML / DDL — delegate to EmbeddedDatabase ----
@@ -2049,8 +2288,23 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
             || starts_with_icase(trimmed, "VALUES")
             || starts_with_icase(trimmed, "TABLE ");
 
+        // `autocommit = 0`: this statement opens the transaction it runs in,
+        // unless it is one MySQL runs by itself.
+        if !defines_data {
+            if let Err(e) = self.ensure_implicit_transaction() {
+                return self.send_statement_error(&e.to_string()).await;
+            }
+        }
+        if !self.in_transaction {
+            // `SET TRANSACTION ...` named the next transaction: under
+            // autocommit that is this statement.
+            self.next_txn_isolation = None;
+            self.next_txn_read_only = None;
+        }
+
         if is_select {
-            self.execute_query(trimmed).await
+            let limit = self.select_row_limit(&view);
+            self.execute_query_limited(trimmed, limit).await
         } else {
             // ON DUPLICATE KEY UPDATE is now translated to ON CONFLICT DO UPDATE
             // by the MySQL translator and handled natively by the planner/executor.
@@ -2061,41 +2315,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
     // ------------------------------------------------------------------
     // Transaction helpers
     // ------------------------------------------------------------------
-
-    async fn handle_begin(&mut self) -> Result<()> {
-        if !self.in_transaction {
-            self.database.begin_transaction_for_session(self.session_id)?;
-            self.in_transaction = true;
-            self.status_flags.set(StatusFlags::SERVER_STATUS_IN_TRANS);
-        }
-        self.send_ok(0, 0).await
-    }
-
-    async fn handle_commit(&mut self) -> Result<()> {
-        if self.in_transaction {
-            let outcome = self.database.commit_transaction_for_session(self.session_id);
-            if let Err(e) = outcome {
-                self.sync_transaction_state_after_error();
-                return Err(e.into());
-            }
-            self.in_transaction = false;
-            self.status_flags.clear(StatusFlags::SERVER_STATUS_IN_TRANS);
-        }
-        self.send_ok(0, 0).await
-    }
-
-    async fn handle_rollback(&mut self) -> Result<()> {
-        if self.in_transaction {
-            let outcome = self.database.rollback_transaction_for_session(self.session_id);
-            if let Err(e) = outcome {
-                self.sync_transaction_state_after_error();
-                return Err(e.into());
-            }
-            self.in_transaction = false;
-            self.status_flags.clear(StatusFlags::SERVER_STATUS_IN_TRANS);
-        }
-        self.send_ok(0, 0).await
-    }
 
     /// HDB-008: re-synchronise this connection's transaction state with the
     /// ENGINE after a failed `COMMIT` / `ROLLBACK`.
@@ -2111,8 +2330,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
     /// a transaction. Ask the engine instead of guessing.
     fn sync_transaction_state_after_error(&mut self) {
         if !self.database.session_in_transaction(self.session_id) {
-            self.in_transaction = false;
-            self.status_flags.clear(StatusFlags::SERVER_STATUS_IN_TRANS);
+            self.note_transaction_ended();
         }
     }
 
@@ -2137,6 +2355,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
     async fn send_statement_error(&mut self, msg: &str) -> Result<()> {
         if self.in_transaction {
             let _ = self.database.clear_session_transaction_failure(self.session_id);
+            // The engine may have ended the transaction with the error (a
+            // deadlock victim, a serialization failure): the status flags of
+            // the next answer must say so.
+            self.sync_transaction_state_after_error();
         }
         let (code, state) = map_error_code(msg);
         self.send_error(code, state, msg).await
@@ -2173,8 +2395,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
     // ------------------------------------------------------------------
 
     async fn execute_query(&mut self, sql: &str) -> Result<()> {
+        self.execute_query_limited(sql, None).await
+    }
+
+    /// Run a query and send at most `limit` of its rows (`sql_select_limit`).
+    async fn execute_query_limited(&mut self, sql: &str, limit: Option<usize>) -> Result<()> {
         match self.database.query_with_columns_for_session(self.session_id, sql) {
-            Ok((rows, columns)) => {
+            Ok((mut rows, columns)) => {
+                if let Some(limit) = limit {
+                    rows.truncate(limit);
+                }
                 self.last_row_count = rows.len() as u64;
                 self.send_result_set(&columns, &rows).await
             }
@@ -2564,89 +2794,60 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
     // ------------------------------------------------------------------
 
     async fn handle_show(&mut self, trimmed: &str) -> Result<()> {
-        let upper = trimmed.to_uppercase();
-
-        if upper.contains("DATABASES") || upper.contains("SCHEMAS") {
-            return self.show_single_column("Database", &["heliosdb"]).await;
-        }
-
-        // TABLE STATUS must be checked before TABLES to avoid false match
-        if upper.contains("TABLE STATUS") {
-            return self.handle_show_table_status(trimmed).await;
-        }
-
-        if upper.contains("TABLES") {
-            // Query actual tables from the catalog.
-            //
-            // sprinter 1703dba8e82d: `list_tables` filters session-private
-            // (`pg_temp_*`) tables against the caller's namespace, and this
-            // path never enters an engine `_for_session` funnel — so publish
-            // the namespace from the `SessionId` first or this connection's
-            // SHOW TABLES would be filtered as if it had no session at all.
-            let mut tables = {
-                let _temp_ns = self.temp_namespace_guard();
-                self.database.storage.catalog().list_tables().unwrap_or_default()
-            };
-
-            // SHOW TABLES LIKE 'pattern' — apply LIKE filter
-            if let Some(like_pattern) = extract_like_pattern(trimmed) {
-                tables.retain(|t| sql_like_match(t, &like_pattern));
+        use admin::ShowKind;
+        // Classified by its leading keywords, never by a word that merely
+        // appears in it (`SHOW COLUMNS FROM my_tables` is about columns).
+        let kind = admin::classify_show(trimmed);
+        match &kind {
+            ShowKind::Databases => return self.show_databases(trimmed).await,
+            ShowKind::TableStatus => return self.handle_show_table_status(trimmed).await,
+            ShowKind::Tables => {
+                // sprinter 1703dba8e82d: `list_tables` filters session-private
+                // (`pg_temp_*`) tables against the caller's namespace, and this
+                // path never enters an engine `_for_session` funnel — so publish
+                // the namespace from the `SessionId` first or this connection's
+                // SHOW TABLES would be filtered as if it had no session at all.
+                let mut tables = {
+                    let _temp_ns = self.temp_namespace_guard();
+                    self.database.storage.catalog().list_tables().unwrap_or_default()
+                };
+                // SHOW TABLES LIKE 'pattern' — apply LIKE filter
+                if let Some(like_pattern) = extract_like_pattern(trimmed) {
+                    tables.retain(|t| sql_like_match(t, &like_pattern));
+                }
+                let refs: Vec<&str> = tables.iter().map(String::as_str).collect();
+                return self.show_single_column("Tables_in_heliosdb", &refs).await;
             }
-
-            let refs: Vec<&str> = tables.iter().map(String::as_str).collect();
-            return self.show_single_column("Tables_in_heliosdb", &refs).await;
+            ShowKind::Index => return self.handle_show_index(trimmed).await,
+            ShowKind::Columns => return self.handle_show_columns(trimmed).await,
+            ShowKind::CreateTable => return self.handle_show_create_table(trimmed).await,
+            ShowKind::Variables { global, filter } => return self.show_variables(*global, filter).await,
+            ShowKind::Status { filter } => return self.show_status(filter).await,
+            ShowKind::Warnings | ShowKind::Errors => {
+                // No warnings or errors are queued for a session.
+                return self.show_three_columns("Level", "Code", "Message", &[]).await;
+            }
+            ShowKind::Collation => return self.handle_show_collation().await,
+            ShowKind::CharacterSet => return self.handle_show_character_set().await,
+            ShowKind::Engines => return self.handle_show_engines().await,
+            ShowKind::Processlist => return self.show_processlist().await,
+            ShowKind::Plugins => return self.handle_show_plugins().await,
+            ShowKind::Privileges => return self.handle_show_privileges().await,
+            ShowKind::Replication => {
+                // Empty answer: this server has no binary log or replica state
+                // of MySQL's kind to report.
+                return self.send_ok(0, 0).await;
+            }
+            ShowKind::Engine => {
+                // One of the engine's own (`SHOW BRANCHES`, `SHOW TOPOLOGY`,
+                // `SHOW <parameter>`): the engine runs it, and one it does not
+                // know is its error, not an empty OK.
+                return self.execute_query(trimmed).await;
+            }
+            ShowKind::Grants => {}
         }
 
-        if upper.contains("INDEX") || upper.contains("INDEXES") || upper.contains("KEYS") {
-            return self.handle_show_index(trimmed).await;
-        }
-
-        if upper.contains("COLUMNS") || upper.contains("FIELDS") {
-            return self.handle_show_columns(trimmed).await;
-        }
-
-        if upper.contains("CREATE TABLE") {
-            return self.handle_show_create_table(trimmed).await;
-        }
-
-        if upper.contains("VARIABLES") || upper.contains("SESSION STATUS") || upper.contains("GLOBAL STATUS") {
-            return self.handle_show_variables(&upper).await;
-        }
-
-        if upper.contains("WARNINGS") {
-            // Return empty set — no warnings queued.
-            return self.show_three_columns("Level", "Code", "Message", &[]).await;
-        }
-
-        if upper.contains("ERRORS") {
-            return self.show_three_columns("Level", "Code", "Message", &[]).await;
-        }
-
-        if upper.contains("COLLATION") {
-            return self.handle_show_collation().await;
-        }
-
-        if upper.contains("CHARACTER SET") || upper.contains("CHARSET") {
-            return self.handle_show_character_set().await;
-        }
-
-        if upper.contains("ENGINES") {
-            return self.handle_show_engines().await;
-        }
-
-        if upper.contains("PROCESSLIST") {
-            return self.handle_show_processlist().await;
-        }
-
-        if upper.contains("PLUGINS") {
-            return self.handle_show_plugins().await;
-        }
-
-        if upper.contains("PRIVILEGES") {
-            return self.handle_show_privileges().await;
-        }
-
-        if upper.contains("GRANTS") {
+        {
             // HC4: this used to fabricate
             // `GRANT ALL PRIVILEGES ON *.* TO '<user>'@'%' WITH GRANT OPTION`
             // for whoever was connected — an affirmative FALSE statement about
@@ -2668,20 +2869,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
                 crate::sql::acl_views::mysql_show_grants_lines(&user, &acls)
             };
             let refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
-            return self.show_single_column(&format!("Grants for {}@%", user), &refs).await;
+            self.show_single_column(&format!("Grants for {}@%", user), &refs).await
         }
-
-        if upper.contains("MASTER STATUS")
-            || upper.contains("BINARY LOGS")
-            || upper.contains("REPLICA STATUS")
-            || upper.contains("SLAVE STATUS")
-        {
-            // Empty result set — replication introspection not supported in embedded mode.
-            return self.send_ok(0, 0).await;
-        }
-
-        // Fallback: empty OK
-        self.send_ok(0, 0).await
     }
 
     /// SHOW ENGINES — 6 columns (Engine, Support, Comment, Transactions, XA, Savepoints).
@@ -2797,33 +2986,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
             row("ascii_general_ci", "ascii", 11, "Yes"),
             row("binary", "binary", 63, "Yes"),
         ];
-        self.send_result_set(&cols, &rows).await
-    }
-
-    /// SHOW PROCESSLIST — 8 columns. Reports this connection only.
-    async fn handle_show_processlist(&mut self) -> Result<()> {
-        let cols = vec![
-            "Id".to_string(),
-            "User".to_string(),
-            "Host".to_string(),
-            "db".to_string(),
-            "Command".to_string(),
-            "Time".to_string(),
-            "State".to_string(),
-            "Info".to_string(),
-        ];
-        let user = self.username.clone().unwrap_or_else(|| "root".to_string());
-        let db = self.current_database.clone().unwrap_or_else(|| "heliosdb".to_string());
-        let rows = vec![Tuple::new(vec![
-            Value::Int8(self.connection_id as i64),
-            Value::String(user),
-            Value::String("localhost".to_string()),
-            Value::String(db),
-            Value::String("Query".to_string()),
-            Value::Int8(0),
-            Value::String("executing".to_string()),
-            Value::String("SHOW PROCESSLIST".to_string()),
-        ])];
         self.send_result_set(&cols, &rows).await
     }
 
@@ -3051,89 +3213,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
         )
     }
 
-    async fn handle_show_variables(&mut self, upper: &str) -> Result<()> {
-        // Return a small set of common MySQL variables.
-        let vars: Vec<(&str, &str)> = vec![
-            ("character_set_client", "utf8mb4"),
-            ("character_set_connection", "utf8mb4"),
-            ("character_set_results", "utf8mb4"),
-            ("character_set_server", "utf8mb4"),
-            ("collation_connection", "utf8mb4_general_ci"),
-            ("collation_server", "utf8mb4_general_ci"),
-            ("version", SERVER_VERSION),
-            ("version_comment", "HeliosDB Nano"),
-            ("max_allowed_packet", "67108864"),
-            ("system_time_zone", "UTC"),
-            ("time_zone", "SYSTEM"),
-            ("lower_case_table_names", "0"),
-            ("sql_mode", "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION"),
-            ("autocommit", "ON"),
-            ("tx_isolation", "REPEATABLE-READ"),
-            ("transaction_isolation", "REPEATABLE-READ"),
-        ];
-
-        // If there is a LIKE filter, apply it.
-        let filter = if let Some(pos) = upper.find("LIKE ") {
-            let rest = upper.get(pos + 5..).unwrap_or("").trim();
-            let pattern = rest.trim_matches('\'').trim_matches('%');
-            if pattern.is_empty() {
-                None
-            } else {
-                Some(pattern.to_lowercase())
-            }
-        } else {
-            None
-        };
-
-        let cols = vec!["Variable_name".to_string(), "Value".to_string()];
-        let mut rows: Vec<Tuple> = vars
-            .iter()
-            .filter(|(name, _)| {
-                if let Some(ref pat) = filter {
-                    name.to_lowercase().contains(pat.as_str())
-                } else {
-                    true
-                }
-            })
-            .map(|(name, val)| {
-                Tuple::new(vec![
-                    Value::String((*name).to_string()),
-                    Value::String((*val).to_string()),
-                ])
-            })
-            .collect();
-
-        // Dynamic, per-connection variables (not `'static str`, so kept out of
-        // the `vars` table above): `have_ssl` mirrors the `@@have_ssl` answer,
-        // `ssl_kx_group` reports the negotiated key-exchange group (PQ hybrid
-        // vs classical) for THIS connection, and the four timeout variables
-        // report the listener's CONFIGURED idle budget (sprinter 35c74e86 —
-        // see `session_timeout_secs`). The timeouts were previously absent
-        // from `SHOW VARIABLES` altogether, so a client that probed them this
-        // way (rather than through `SELECT @@wait_timeout`) got an EMPTY
-        // result set and fell back to its own driver default.
-        let timeout_secs = self.session_timeout_secs().to_string();
-        let dynamic_vars: [(&str, String); 6] = [
-            ("have_ssl", self.have_ssl_value().to_string()),
-            ("ssl_kx_group", self.ssl_kx_group_value()),
-            ("wait_timeout", timeout_secs.clone()),
-            ("interactive_timeout", timeout_secs.clone()),
-            ("net_read_timeout", timeout_secs.clone()),
-            ("net_write_timeout", timeout_secs),
-        ];
-        for (name, val) in dynamic_vars {
-            let matches_filter = match &filter {
-                Some(pat) => name.to_lowercase().contains(pat.as_str()),
-                None => true,
-            };
-            if matches_filter {
-                rows.push(Tuple::new(vec![Value::String(name.to_string()), Value::String(val)]));
-            }
-        }
-
-        self.send_result_set(&cols, &rows).await
-    }
-
     /// Handle SHOW INDEX FROM / SHOW INDEXES FROM / SHOW KEYS FROM.
     ///
     /// Returns MySQL-compatible index metadata columns. At minimum, returns the
@@ -3286,67 +3365,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
     // ------------------------------------------------------------------
     // SELECT @@variable — MySQL session/global variable queries
     // ------------------------------------------------------------------
-
-    /// Handle `SELECT @@variable` queries from MySQL clients.
-    ///
-    /// MySQL clients (including PHP's `mysqli`) send these to probe server
-    /// capabilities and configuration.  We return sensible defaults without
-    /// hitting the SQL parser, which does not understand `@@` syntax.
-    async fn handle_select_variable(&mut self, sql: &str) -> Result<()> {
-        // Extract @@variable names from the query using a simple regex.
-        // Handles both @@session.var and @@global.var and @@var forms.
-        static VAR_RE: OnceLock<Regex> = OnceLock::new();
-        let re = VAR_RE.get_or_init(|| {
-            Regex::new(r"@@(?:session\.|global\.)?(\w+)").unwrap_or_else(|_| Regex::new("^$").expect("static regex"))
-        });
-
-        let mut col_names: Vec<String> = Vec::new();
-        let mut values: Vec<Value> = Vec::new();
-
-        for cap in re.captures_iter(sql) {
-            let full_match = cap.get(0).map_or("", |m| m.as_str());
-            let var_name = cap.get(1).map_or("", |m| m.as_str()).to_lowercase();
-
-            let val = match var_name.as_str() {
-                "version" => Value::String(SERVER_VERSION.to_string()),
-                "version_comment" => Value::String("HeliosDB Nano".to_string()),
-                "max_allowed_packet" => Value::Int8(67_108_864),
-                "character_set_client" | "character_set_connection"
-                | "character_set_results" | "character_set_server"
-                | "character_set_database" => Value::String("utf8mb4".to_string()),
-                "collation_connection" | "collation_server"
-                | "collation_database" => Value::String("utf8mb4_general_ci".to_string()),
-                "auto_increment_increment" | "auto_increment_offset" => Value::Int8(1),
-                // sprinter 35c74e86: the CONFIGURED idle budget, not MySQL's
-                // stock 28800/30 — see `session_timeout_secs`.
-                "interactive_timeout" | "wait_timeout" | "net_write_timeout" | "net_read_timeout" => {
-                    Value::Int8(self.session_timeout_secs())
-                }
-                "sql_mode" => Value::String(
-                    "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION".to_string()
-                ),
-                "time_zone" | "system_time_zone" => Value::String("SYSTEM".to_string()),
-                "tx_isolation" | "transaction_isolation" => Value::String("REPEATABLE-READ".to_string()),
-                "autocommit" => Value::Int8(1),
-                "have_ssl" | "have_openssl" => Value::String(self.have_ssl_value().to_string()),
-                "ssl_kx_group" => Value::String(self.ssl_kx_group_value()),
-                "lower_case_table_names" => Value::Int8(0),
-                "sql_auto_is_null" => Value::Int8(0),
-                "last_insert_id" => Value::Int8(self.last_insert_id as i64),
-                _ => Value::String(String::new()),
-            };
-            col_names.push(full_match.to_string());
-            values.push(val);
-        }
-
-        if col_names.is_empty() {
-            // Fallback: return empty result
-            return self.send_ok(0, 0).await;
-        }
-
-        let row = Tuple::new(values);
-        self.send_result_set(&col_names, &[row]).await
-    }
 
     // ------------------------------------------------------------------
     // INFORMATION_SCHEMA queries
@@ -3716,9 +3734,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
         // binary-protocol clients receive protocol-correct rows.
         let exec_view = super::translator::code_view(trimmed);
         let exec_calls = find_session_calls(&exec_view);
+        let has_variables =
+            exec_view.contains('@') && !super::vars::find_var_refs(trimmed, &exec_view).is_empty();
         let needs_text_dispatch = !is_row_returning
             || !exec_calls.is_empty()
-            || view_selects_variable(&exec_view)
+            || has_variables
             || view_reads_information_schema(trimmed, &exec_view);
 
         if params.is_empty() && needs_text_dispatch {
@@ -3736,6 +3756,37 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
             bound_sql.trim()
         };
 
+        // The same session rules as the text protocol: variables are replaced
+        // by their values, a READ ONLY transaction and sql_safe_updates
+        // refuse, a statement that defines data commits first, and under
+        // `autocommit = 0` the statement opens the transaction it runs in.
+        let resolved_sql;
+        let trimmed = if has_variables {
+            match self.resolve_variables(trimmed).await? {
+                Ok(None) => return Ok(()),
+                Ok(Some(text)) => {
+                    resolved_sql = text;
+                    resolved_sql.trim()
+                }
+                Err(e) => return self.send_var_error(&e).await,
+            }
+        } else {
+            trimmed
+        };
+        let bound_view = super::translator::code_view(trimmed);
+        if let Some(refusal) = self.statement_refusal(&bound_view) {
+            return self.send_var_error(&refusal).await;
+        }
+        if causes_implicit_commit(trimmed) {
+            self.implicit_commit()?;
+        } else if let Err(e) = self.ensure_implicit_transaction() {
+            return self.send_statement_error(&e.to_string()).await;
+        }
+        if !self.in_transaction {
+            self.next_txn_isolation = None;
+            self.next_txn_read_only = None;
+        }
+
         if is_row_returning {
             // Note: an intercepted shape (@@vars etc.) that nevertheless
             // carries parameters cannot use the text replay path without
@@ -3745,7 +3796,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
                 .database
                 .query_params_with_columns_for_session(self.session_id, trimmed, &params)
             {
-                Ok((rows, columns)) => {
+                Ok((mut rows, columns)) => {
+                    if let Some(limit) = self.select_row_limit(&bound_view) {
+                        rows.truncate(limit);
+                    }
                     self.last_row_count = rows.len() as u64;
                     self.send_binary_result_set(&columns, &rows).await
                 }
@@ -3846,11 +3900,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
         }
 
         // 5. Closing EOF / OK
-        if self.capabilities.has(CapabilityFlags::CLIENT_DEPRECATE_EOF) {
-            self.send_ok(0, 0).await
-        } else {
-            self.send_eof().await
-        }
+        self.send_result_end().await
     }
 
     /// Spec R5.2: the refusal of a row whose field count differs from the column
@@ -3947,11 +3997,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
         }
 
         // 5. Closing EOF / OK
-        if self.capabilities.has(CapabilityFlags::CLIENT_DEPRECATE_EOF) {
-            self.send_ok(0, 0).await
-        } else {
-            self.send_eof().await
-        }
+        self.send_result_end().await
     }
 
     /// Encode one binary-protocol result row:
@@ -3986,21 +4032,50 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
     // OK / ERR / EOF packets
     // ------------------------------------------------------------------
 
+    /// The status flags of the answer being written: the session's, plus
+    /// SERVER_MORE_RESULTS_EXISTS when another statement of the same query
+    /// is still to be answered.
+    fn answer_status(&self) -> u16 {
+        let mut flags = self.status_flags;
+        if self.more_results {
+            flags.set(StatusFlags::SERVER_MORE_RESULTS_EXISTS);
+        }
+        flags.as_u16()
+    }
+
     async fn send_ok(&mut self, affected_rows: u64, last_insert_id: u64) -> Result<()> {
+        self.send_ok_with_header(0x00, affected_rows, last_insert_id).await
+    }
+
+    async fn send_ok_with_header(&mut self, header: u8, affected_rows: u64, last_insert_id: u64) -> Result<()> {
         let mut p = BytesMut::new();
-        p.put_u8(0x00); // OK header
+        p.put_u8(header);
         write_lenenc_int(&mut p, affected_rows);
         write_lenenc_int(&mut p, last_insert_id);
 
         if self.capabilities.has(CapabilityFlags::CLIENT_PROTOCOL_41) {
-            p.put_u16_le(self.status_flags.as_u16());
+            p.put_u16_le(self.answer_status());
             p.put_u16_le(0); // warnings
         }
 
         self.write_pkt(&p).await
     }
 
+    /// The end of a result set's rows: an EOF packet, or for a client that
+    /// negotiated CLIENT_DEPRECATE_EOF the OK packet that replaces it, which
+    /// carries the EOF header (0xFE) so that it cannot be read as a row.
+    async fn send_result_end(&mut self) -> Result<()> {
+        if self.capabilities.has(CapabilityFlags::CLIENT_DEPRECATE_EOF) {
+            self.send_ok_with_header(0xFE, 0, 0).await
+        } else {
+            self.send_eof().await
+        }
+    }
+
     async fn send_error(&mut self, code: u16, state: &str, msg: &str) -> Result<()> {
+        // An error is the last answer of its query, whatever was to follow.
+        self.last_was_error = true;
+        tracing::debug!(target: "mysql_statements", connection = self.connection_id, "error {code}: {msg}");
         let mut p = BytesMut::new();
         p.put_u8(0xFF); // ERR header
         p.put_u16_le(code);
@@ -4025,7 +4100,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
 
         if self.capabilities.has(CapabilityFlags::CLIENT_PROTOCOL_41) {
             p.put_u16_le(0); // warnings
-            p.put_u16_le(self.status_flags.as_u16());
+            p.put_u16_le(self.answer_status());
         }
 
         self.write_pkt(&p).await
@@ -4139,7 +4214,7 @@ fn put_binary_value(p: &mut BytesMut, col_type: ColumnType, val: &Value) {
     }
 }
 
-fn value_to_mysql_string(v: &Value) -> String {
+pub(crate) fn value_to_mysql_string(v: &Value) -> String {
     match v {
         Value::Null => String::new(), // Should not be called for NULL (handled above)
         Value::Boolean(b) => if *b { "1" } else { "0" }.to_string(),
@@ -4277,6 +4352,15 @@ fn map_error_code(err_msg: &str) -> (u16, &'static str) {
     // through to before. `contains`, not `starts_with`: this function is handed
     // the Display form (`Transaction error: …`), as its own unit tests show.
     // Checked before the wording arms below so none of them can claim it.
+    // A statement ended by `KILL QUERY` (or a cancel request of the other
+    // wire), and one that ran past the session's statement timeout
+    // (`max_execution_time`): MySQL's own errors for both.
+    if lower.contains("canceling statement due to user request") {
+        return (1317, "70100"); // ER_QUERY_INTERRUPTED
+    }
+    if lower.contains("canceling statement due to statement timeout") {
+        return (3024, "HY000"); // ER_QUERY_TIMEOUT
+    }
     if lower.contains("current transaction is aborted") {
         return (1105, "25000"); // ER_UNKNOWN_ERROR number, invalid-transaction-state SQLSTATE
     }
@@ -4481,6 +4565,20 @@ pub async fn handle_mysql_connection_unix_with_timeouts(
     timeouts: ConnectionTimeouts,
 ) -> Result<()> {
     MySqlHandler::handle_connection_with_timeouts(database, stream, connection_id, timeouts).await
+}
+
+/// [`handle_mysql_connection_unix_with_timeouts`] for a listener that asks for
+/// a password (`auth`; `None` is `trust`). The Unix socket is a local
+/// transport: the password may travel on it as it is, as over TLS.
+#[cfg(unix)]
+pub async fn handle_mysql_connection_unix_with_auth(
+    database: Arc<EmbeddedDatabase>,
+    stream: UnixStream,
+    connection_id: u32,
+    timeouts: ConnectionTimeouts,
+    auth: Option<Arc<super::auth::MysqlAuth>>,
+) -> Result<()> {
+    MySqlHandler::handle_connection_with_auth(database, stream, connection_id, timeouts, auth, true).await
 }
 
 // ============================================================================

@@ -25,8 +25,8 @@
 //! the handler's own state matches what the client already saw.
 
 use super::handler::{
-    build_handshake_v10, read_packet, write_packet, CapabilityFlags, HandshakeResponse, MySqlHandler, StatusFlags,
-    UTF8MB4_GENERAL_CI,
+    build_handshake_v10, read_packet, write_packet, CapabilityFlags, HandshakeResponse, MySqlHandler, ReservedSession,
+    StatusFlags, UTF8MB4_GENERAL_CI,
 };
 use super::ssl::{MysqlSslConfig, MysqlSslNegotiator};
 use crate::protocol::postgres::timeouts::ConnectionTimeouts;
@@ -56,6 +56,10 @@ pub struct MysqlServerConfig {
     /// GH#28-style connection-lifetime policy, shared with the PostgreSQL
     /// listener's `ConnectionTimeouts`.
     pub timeouts: ConnectionTimeouts,
+    /// The authenticator (`None` is `trust`: every login is accepted). With
+    /// one, clients log in with `caching_sha2_password` against the server's
+    /// accounts and roles.
+    pub auth: Option<Arc<super::auth::MysqlAuth>>,
 }
 
 impl Default for MysqlServerConfig {
@@ -65,6 +69,7 @@ impl Default for MysqlServerConfig {
             max_connections: 100,
             ssl_config: None,
             timeouts: ConnectionTimeouts::disabled(),
+            auth: None,
         }
     }
 }
@@ -87,6 +92,12 @@ impl MysqlServerConfig {
     /// Set the connection-lifetime policy.
     pub fn with_timeouts(mut self, timeouts: ConnectionTimeouts) -> Self {
         self.timeouts = timeouts;
+        self
+    }
+
+    /// Set the authenticator (see [`super::auth::MysqlAuth::for_manager`]).
+    pub fn with_auth(mut self, auth: Option<Arc<super::auth::MysqlAuth>>) -> Self {
+        self.auth = auth;
         self
     }
 
@@ -189,12 +200,14 @@ impl MysqlServer {
                     let database = Arc::clone(&self.database);
                     let ssl_negotiator = self.ssl_negotiator.clone();
                     let timeouts = self.config.timeouts.clone();
+                    let auth = self.config.auth.clone();
                     let connection_id = self.conn_counter.fetch_add(1, Ordering::Relaxed);
 
                     tokio::spawn(async move {
                         let _permit = permit;
                         if let Err(e) =
-                            Self::handle_connection(stream, database, ssl_negotiator, timeouts, connection_id).await
+                            Self::handle_connection(stream, database, ssl_negotiator, timeouts, auth, connection_id)
+                                .await
                         {
                             tracing::debug!("MySQL connection {} error from {}: {}", connection_id, addr, e);
                         }
@@ -223,13 +236,14 @@ impl MysqlServer {
         database: Arc<EmbeddedDatabase>,
         ssl_negotiator: Option<Arc<MysqlSslNegotiator>>,
         timeouts: ConnectionTimeouts,
+        auth: Option<Arc<super::auth::MysqlAuth>>,
         connection_id: u32,
     ) -> Result<()> {
         let auth_deadline = timeouts
             .read_deadline(crate::protocol::postgres::timeouts::SessionActivity::Authenticating)
             .map(|d| tokio::time::Instant::now() + d);
 
-        let negotiate = Self::negotiate(stream, database, ssl_negotiator, connection_id);
+        let negotiate = Self::negotiate(stream, database, ssl_negotiator, auth, connection_id);
         let mut handler = match auth_deadline {
             Some(at) => match tokio::time::timeout_at(at, negotiate).await {
                 Ok(negotiated) => {
@@ -267,8 +281,15 @@ impl MysqlServer {
         stream: TcpStream,
         database: Arc<EmbeddedDatabase>,
         ssl_negotiator: Option<Arc<MysqlSslNegotiator>>,
+        auth: Option<Arc<super::auth::MysqlAuth>>,
         connection_id: u32,
     ) -> super::handler::Result<MySqlHandler<SecureConnection<TcpStream>>> {
+        // The session is opened before the greeting so that the greeting can
+        // announce the session's id as the connection id: the number `KILL`
+        // and `SHOW PROCESSLIST` use. It ends with the connection, also when
+        // the handshake never completes.
+        let reserved = ReservedSession::open(&database)?;
+        let connection_id = reserved.connection_id(connection_id);
         let mut auth_seed = [0u8; 20];
         {
             use rand::Rng;
@@ -278,7 +299,13 @@ impl MysqlServer {
         let capabilities = CapabilityFlags::server_default(has_tls);
         let status_flags = StatusFlags::default_flags();
         let character_set = UTF8MB4_GENERAL_CI;
-        let auth_plugin = "mysql_native_password".to_string();
+        // `trust` keeps the greeting it always had; a listener with accounts
+        // names the plugin it authenticates with.
+        let auth_plugin = if auth.is_some() {
+            super::auth::CACHING_SHA2_PASSWORD.to_string()
+        } else {
+            "mysql_native_password".to_string()
+        };
 
         let greeting = build_handshake_v10(
             connection_id,
@@ -363,7 +390,10 @@ impl MysqlServer {
 
         let hs = HandshakeResponse::decode(hs_payload, &capabilities)?;
 
-        let mut handler = MySqlHandler::new_pre_negotiated(
+        // Is THIS connection encrypted? Decides how a password may travel.
+        let transport_secure = matches!(secure_stream, SecureConnection::Tls(_));
+        let mut handler = MySqlHandler::new_pre_negotiated_on(
+            reserved,
             database,
             secure_stream,
             connection_id,
@@ -376,6 +406,7 @@ impl MysqlServer {
             has_tls,
             kx_group,
         );
+        handler.set_auth(auth, transport_secure);
         handler.finish_handshake(hs).await?;
         Ok(handler)
     }

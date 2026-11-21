@@ -118,15 +118,23 @@ heliosdb-nano start --data-dir ./mydata --mysql --mysql-listen 127.0.0.1:3306
 # Optional Unix socket for PHP/WordPress:
 # heliosdb-nano start --data-dir ./mydata --mysql --mysql-socket /tmp/heliosdb-mysql.sock
 ```
-**Client**:
+**Client** (trust, the default: no password is asked):
 ```bash
 mysql -h 127.0.0.1 -P 3306 -u heliosdb
 ```
+**With a password** (`--auth scram-sha-256 --password …` on the server): the same accounts and roles as the PostgreSQL wire, plugin `caching_sha2_password`.
+```bash
+mysql -h 127.0.0.1 -P 3306 -u helios -p --get-server-public-key   # plain TCP: RSA key exchange
+mysql --socket=/tmp/heliosdb-mysql.sock -u helios -p              # Unix socket
+mysql -h db.example.com -u helios -p --ssl-mode=REQUIRED          # TLS (--mysql-tls-cert/--mysql-tls-key)
+```
+`CREATE USER 'app'@'%' IDENTIFIED BY 'secret'` makes an account for both wires.
 **WordPress / PHP**:
 ```php
-$conn = mysqli_connect('localhost', 'heliosdb', '', 'wordpress');
+$conn = mysqli_connect('127.0.0.1', 'heliosdb', '', 'wordpress');            // trust
+$conn = mysqli_connect('127.0.0.1', 'wordpress', 'secret', 'wordpress');     // with a password
 // Or via socket:
-$conn = mysqli_connect(null, 'heliosdb', '', 'wordpress', null, '/tmp/heliosdb-mysql.sock');
+$conn = mysqli_connect(null, 'wordpress', 'secret', 'wordpress', null, '/tmp/heliosdb-mysql.sock');
 ```
 
 ### Recipe 5: Python `sqlite3` drop-in
@@ -174,6 +182,7 @@ PGSSLMODE=require psql -h db.example.com -p 5432 -U heliosdb
 ## Pitfalls
 - **`--auth password|md5|scram-sha-256` requires `--password`** at startup. Without it the server refuses to start.
 - **`--mysql` flag is required** for MySQL-wire connections to work; the listener is off by default.
+- **MySQL sessions keep MySQL state**: `SET autocommit = 0` opens a real transaction, session and user variables are per connection, an unknown variable is error 1193 and a value the server cannot honour (another time zone, `latin1`, `ANSI_QUOTES`) is error 1231. `mysql_native_password`-only clients cannot log in to a server that asks for a password. See `docs/compatibility/mysql.md`.
 - **Embedded mode (Rust) is single-process**. Multiple OS processes opening the same data directory will see locking errors. For multi-process, run `start` and connect via PG wire.
 - **`heliosdb_sqlite` `mode='embedded'` spawns a subprocess per `Connection`**. For high-concurrency Python apps prefer `mode='daemon'` against a running server.
 - **Default port 5432 collides with PostgreSQL**. If both are on the host, use `--port 5433` or stop PostgreSQL.

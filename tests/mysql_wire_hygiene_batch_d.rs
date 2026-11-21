@@ -306,9 +306,15 @@ async fn show_variables_reports_the_configured_idle_timeout() {
     }
 
     // One `LIKE '%timeout%'` lists all four, and not one of them is a stock
-    // MySQL default any more.
+    // MySQL default any more. (5.0: the list also holds the lock and statement
+    // timeouts and the engine's own timeout parameters, so the four are picked out.)
     let (_cols, rows) = c.query("SHOW VARIABLES LIKE '%timeout%'").await;
-    let mut listed: Vec<String> = rows.iter().map(|r| format!("{}={}", r[0], r[1])).collect();
+    let four = ["interactive_timeout", "net_read_timeout", "net_write_timeout", "wait_timeout"];
+    let mut listed: Vec<String> = rows
+        .iter()
+        .filter(|r| four.contains(&r[0].as_str()))
+        .map(|r| format!("{}={}", r[0], r[1]))
+        .collect();
     listed.sort();
     assert_eq!(
         listed.join(" "),

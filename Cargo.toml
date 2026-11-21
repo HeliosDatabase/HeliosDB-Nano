@@ -123,8 +123,11 @@ rustls = { version = "0.23", default-features = false, features = ["prefer-post-
 tokio-rustls = "0.26"
 rustls-pemfile = "2.0"
 jsonwebtoken = "9"
-# AWS-LC FIPS provider (FIPS 140-3 Certificate #4816)
-aws-lc-rs = { version = "1.12", features = ["fips"], optional = true }
+# AWS-LC: already in every build as the rustls backend ("prefer-post-quantum"
+# above). A direct dependency so the MySQL listener can do the RSA-OAEP
+# public-key exchange of caching_sha2_password with it; the `fips` feature
+# switches it to the FIPS provider (FIPS 140-3 Certificate #4816).
+aws-lc-rs = { version = "1.12" }
 
 # Fast numeric formatting
 itoa = "1"
@@ -342,7 +345,7 @@ ring-crypto = ["dep:ring"]
 # FIPS 140-3 compliant crypto provider (AWS-LC FIPS + SHA-256)
 # Uses: aws-lc-rs (FIPS Certificate #4816), SHA-256 for hashing, PBKDF2 for KDF
 # Build with: cargo build --no-default-features --features fips,encryption,vector-search
-fips = ["dep:aws-lc-rs"]
+fips = ["aws-lc-rs/fips"]
 
 # =============================================================================
 # HIGH AVAILABILITY FEATURE FLAGS

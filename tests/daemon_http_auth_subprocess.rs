@@ -23,8 +23,8 @@
 //!   socket local address out of `/proc/<pid>/net/tcp*` (connecting to 127.0.0.1
 //!   alone would also succeed against an `0.0.0.0` bind, so it proves nothing),
 //!   with a non-loopback connection-refusal check when a routable address exists;
-//! * fail-closed startup cases for remote binds and for MySQL (TCP and UDS) with a
-//!   configured credential.
+//! * fail-closed startup cases for remote binds, and the MySQL listeners (TCP and
+//!   UDS) asking for the configured credential.
 //!
 //! The harness owns the child through `Daemon`, whose `Drop` kills and reaps it on
 //! every path including a panic, forwards no inherited `HELIOSDB_PASSWORD`, and
@@ -1722,46 +1722,185 @@ fn authenticated_remote_http_bind_is_refused_even_with_allow_insecure() {
     );
 }
 
-#[test]
-fn mysql_tcp_with_authenticated_postgres_fails_closed() {
-    assert_refused(
-        &[
-            "start",
-            "--memory",
-            "--auth",
-            "scram-sha-256",
-            "--password",
-            PASSWORD,
-            "--port",
-            "0",
-            "--http-port",
-            "0",
-            "--mysql",
-        ],
-        "MySQL authentication is not implemented",
-    );
+// The MySQL listeners used to refuse to start beside a PostgreSQL method that
+// asks for a password (they accepted every login). They now start and ask for
+// the same password, so these two tests assert the login instead of the refusal.
+
+/// A blocking MySQL login as a MySQL 8 client does it (`caching_sha2_password`):
+/// the scramble, then the password as it is (`public_key` false: the Unix
+/// socket) or encrypted under the server's RSA public key (plain TCP).
+/// Returns the first byte of the final packet (0x00 OK, 0xFF ERR) and the plugin
+/// the greeting named.
+fn mysql_login<S: Read + Write>(stream: &mut S, user: &str, password: &str, public_key: bool) -> (u8, String) {
+    use sha2::{Digest, Sha256};
+    fn read_packet<S: Read>(stream: &mut S) -> (u8, Vec<u8>) {
+        let mut header = [0u8; 4];
+        stream.read_exact(&mut header).expect("packet header");
+        let len = usize::from(header[0]) | (usize::from(header[1]) << 8) | (usize::from(header[2]) << 16);
+        let mut payload = vec![0u8; len];
+        stream.read_exact(&mut payload).expect("packet payload");
+        (header[3], payload)
+    }
+    fn write_packet<S: Write>(stream: &mut S, seq: u8, payload: &[u8]) {
+        let len = payload.len();
+        stream
+            .write_all(&[(len & 0xFF) as u8, ((len >> 8) & 0xFF) as u8, ((len >> 16) & 0xFF) as u8, seq])
+            .expect("write header");
+        stream.write_all(payload).expect("write payload");
+        stream.flush().expect("flush");
+    }
+
+    let (_, greeting) = read_packet(stream);
+    assert_eq!(greeting[0], 10, "protocol version 10");
+    let version_end = 1 + greeting[1..].iter().position(|b| *b == 0).expect("server version");
+    let mut pos = version_end + 1 + 4;
+    let mut nonce = greeting[pos..pos + 8].to_vec();
+    pos += 8 + 1 + 2 + 1 + 2 + 2 + 1 + 10;
+    nonce.extend_from_slice(&greeting[pos..pos + 12]);
+    pos += 13;
+    let plugin_end = pos + greeting[pos..].iter().position(|b| *b == 0).unwrap_or(greeting.len() - pos);
+    let plugin = String::from_utf8_lossy(&greeting[pos..plugin_end]).into_owned();
+
+    let scramble: Vec<u8> = if password.is_empty() {
+        Vec::new()
+    } else {
+        let stage1 = Sha256::digest(password.as_bytes());
+        let stage2 = Sha256::digest(stage1);
+        let mut h = Sha256::new();
+        h.update(stage2);
+        h.update(&nonce);
+        let stage3 = h.finalize();
+        stage1.iter().zip(stage3.iter()).map(|(a, b)| a ^ b).collect()
+    };
+    // CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION | CLIENT_PLUGIN_AUTH
+    let capabilities: u32 = 0x0000_0200 | 0x0000_8000 | 0x0008_0000;
+    let mut response = Vec::new();
+    response.extend_from_slice(&capabilities.to_le_bytes());
+    response.extend_from_slice(&(1u32 << 24).to_le_bytes());
+    response.push(45);
+    response.extend_from_slice(&[0u8; 23]);
+    response.extend_from_slice(user.as_bytes());
+    response.push(0);
+    response.push(scramble.len() as u8);
+    response.extend_from_slice(&scramble);
+    response.extend_from_slice(b"caching_sha2_password\0");
+    write_packet(stream, 1, &response);
+
+    loop {
+        let (seq, packet) = read_packet(stream);
+        match (packet[0], packet.get(1).copied()) {
+            (0x00 | 0xFF, _) => return (packet[0], plugin),
+            (0x01, Some(0x03)) => {}
+            (0x01, Some(0x04)) if !public_key => {
+                let mut clear = password.as_bytes().to_vec();
+                clear.push(0);
+                write_packet(stream, seq.wrapping_add(1), &clear);
+            }
+            (0x01, Some(0x04)) => {
+                write_packet(stream, seq.wrapping_add(1), &[0x02]);
+                let (seq, key) = read_packet(stream);
+                assert_eq!(key[0], 0x01, "the server's public key");
+                let pem = String::from_utf8(key[1..].to_vec()).expect("PEM");
+                let sealed = heliosdb_nano::protocol::mysql::auth::rsa_encrypt_password(&pem, password, &nonce)
+                    .expect("encrypt under the server's key");
+                write_packet(stream, seq.wrapping_add(1), &sealed);
+            }
+            other => panic!("unexpected packet in the MySQL login: {other:?}"),
+        }
+    }
+}
+
+fn retry_connect<T>(mut connect: impl FnMut() -> io::Result<T>, daemon: &Daemon) -> T {
+    let deadline = Instant::now() + START_TIMEOUT;
+    loop {
+        match connect() {
+            Ok(stream) => return stream,
+            Err(e) if Instant::now() >= deadline => {
+                panic!("the MySQL listener never accepted: {e}{}", daemon.diagnostics())
+            }
+            Err(_) => thread::sleep(Duration::from_millis(100)),
+        }
+    }
 }
 
 #[test]
-fn mysql_uds_with_authenticated_postgres_fails_closed() {
-    let sock = std::env::temp_dir().join(format!("heliosdb-mysql-{}.sock", std::process::id()));
-    assert_refused(
+fn mysql_tcp_beside_an_authenticated_postgres_starts_and_asks_for_the_password() {
+    let mysql_port = free_port();
+    let mysql_listen = format!("127.0.0.1:{mysql_port}");
+    let daemon = spawn(
         &[
-            "start",
-            "--memory",
             "--auth",
             "scram-sha-256",
             "--password",
             PASSWORD,
-            "--port",
-            "0",
-            "--http-port",
-            "0",
+            "--mysql",
+            "--mysql-listen",
+            &mysql_listen,
+        ],
+        free_port(),
+        free_port(),
+        false,
+    );
+    let connect = || {
+        let stream = TcpStream::connect(&mysql_listen)?;
+        stream.set_read_timeout(Some(IO_TIMEOUT))?;
+        stream.set_write_timeout(Some(IO_TIMEOUT))?;
+        Ok(stream)
+    };
+
+    // Plain TCP: the password goes through the RSA public-key exchange.
+    let mut stream = retry_connect(connect, &daemon);
+    let (answer, plugin) = mysql_login(&mut stream, "helios", PASSWORD, true);
+    assert_eq!(plugin, "caching_sha2_password", "{}", daemon.diagnostics());
+    assert_eq!(answer, 0x00, "the server's password logs in{}", daemon.diagnostics());
+
+    for (user, password) in [("helios", "not-the-password"), ("helios", ""), ("nobody", PASSWORD)] {
+        let mut stream = retry_connect(connect, &daemon);
+        let (answer, _) = mysql_login(&mut stream, user, password, true);
+        assert_eq!(answer, 0xFF, "{user} / {password:?} is refused{}", daemon.diagnostics());
+    }
+    // The password as it is, on a connection without TLS, is refused.
+    let mut stream = retry_connect(connect, &daemon);
+    let (answer, _) = mysql_login(&mut stream, "postgres", PASSWORD, false);
+    assert_eq!(answer, 0xFF, "{}", daemon.diagnostics());
+}
+
+#[cfg(unix)]
+#[test]
+fn mysql_uds_beside_an_authenticated_postgres_starts_and_asks_for_the_password() {
+    let dir = TempDir::new().expect("socket tempdir");
+    let sock = dir.path().join("mysql.sock");
+    let daemon = spawn(
+        &[
+            "--auth",
+            "scram-sha-256",
+            "--password",
+            PASSWORD,
             "--mysql-socket",
             sock.to_str().expect("utf8 socket path"),
         ],
-        "MySQL authentication is not implemented",
+        free_port(),
+        free_port(),
+        false,
     );
+    let connect = || {
+        let stream = std::os::unix::net::UnixStream::connect(&sock)?;
+        stream.set_read_timeout(Some(IO_TIMEOUT))?;
+        stream.set_write_timeout(Some(IO_TIMEOUT))?;
+        Ok(stream)
+    };
+
+    // The Unix socket is a local transport: the password travels as it is.
+    let mut stream = retry_connect(connect, &daemon);
+    let (answer, plugin) = mysql_login(&mut stream, "postgres", PASSWORD, false);
+    assert_eq!(plugin, "caching_sha2_password", "{}", daemon.diagnostics());
+    assert_eq!(answer, 0x00, "the server's password logs in{}", daemon.diagnostics());
+
+    for (user, password) in [("postgres", "not-the-password"), ("postgres", ""), ("nobody", PASSWORD)] {
+        let mut stream = retry_connect(connect, &daemon);
+        let (answer, _) = mysql_login(&mut stream, user, password, false);
+        assert_eq!(answer, 0xFF, "{user} / {password:?} is refused{}", daemon.diagnostics());
+    }
 }
 
 // ===========================================================================

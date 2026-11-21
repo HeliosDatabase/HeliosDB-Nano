@@ -4,9 +4,9 @@ HeliosDB Nano exposes four authentication modes on the PG-wire listener
 (and the HTTP API, which shares its credentials): `trust` (default for
 same-host development), `password` (cleartext, suitable only with TLS), `md5`
 (PG legacy), and `scram-sha-256` (PG 10+ default, standards-compliant). The
-MySQL-wire listener is trust-only in 4.41.x and refuses to start next to a
-password-protected PG wire; password authentication for it is planned for
-4.42.0 (see "Custom password stores" below).
+MySQL-wire listener authenticates against the same accounts and roles with
+`caching_sha2_password` whenever the method is not `trust` (see "MySQL
+logins" below).
 
 ```bash
 # Production default — SCRAM-SHA-256 over TLS, password from a file
@@ -186,13 +186,46 @@ The per-peer failure limiter (default 10 failures per 60 s, bounded simultaneous
 verifications, bounded tracked peers) is configured through the `[api]`
 `http_auth_*` keys. See the README's "HTTP API authentication and exposure".
 
+### MySQL logins
+
+With `--auth password`, `md5` or `scram-sha-256` the MySQL listeners (`--mysql`,
+`--mysql-socket`) ask for the password of the account the client names: the
+server's own accounts (`postgres`, `helios`) and every role with `LOGIN` and a
+password (not under `md5`, where only the server's own accounts exist, as on
+the PostgreSQL wire). With `--auth trust` they ask for nothing.
+
+The plugin is `caching_sha2_password`. The server keeps no MySQL-specific
+verifier: a login is checked against the SCRAM verifier the PostgreSQL wire
+uses, so the client has to send the password itself once ("full
+authentication"), and how it may travel depends on the connection:
+
+| Connection | The password travels | Typical client setting |
+|---|---|---|
+| TLS (`--mysql-tls-cert`, `--mysql-tls-key`) | as it is, encrypted by TLS | `mysql --ssl-mode=REQUIRED` |
+| Unix socket (`--mysql-socket`) | as it is | `mysql --socket=/tmp/heliosdb-mysql.sock` |
+| plain TCP | RSA-OAEP encrypted with the server's public key | `mysql --get-server-public-key`, JDBC `allowPublicKeyRetrieval=true` |
+
+- The RSA key pair is generated at start and lives in memory only. Pass
+  `--mysql-rsa-private-key <pkcs8.pem>` (2048 bits or more) to keep one key
+  across restarts. A client that fetches the key over plain TCP trusts the
+  network not to substitute it, exactly as with MySQL; use TLS when it cannot.
+- After one full authentication the server accepts the plugin's scramble for
+  that account from memory, until the account's password changes or the
+  account is dropped (or the server restarts).
+- Refused: the password in the clear on a connection without TLS (never
+  checked), `mysql_native_password` (the client is switched to
+  `caching_sha2_password`), `mysql_clear_password` without TLS or the socket,
+  an empty password. Every refused login is error 1045, the same for a wrong
+  password and an unknown user, after the same work.
+- `COM_CHANGE_USER` authenticates again. `CREATE USER`, `ALTER USER`,
+  `SET PASSWORD` and `DROP USER` act on the roles
+  ([MySQL wire compatibility](../compatibility/mysql.md)).
+
 ### Custom password stores
 
 Everything in this subsection is about the PostgreSQL-wire listener. The
-MySQL-wire listener (`--mysql` TCP and `--mysql-socket`) is trust-only: starting
-either while the PostgreSQL wire has a configured credential or a password fails
-closed at startup rather than offering an unauthenticated SQL path (see the
-README's "MySQL and Unix-socket authentication").
+MySQL-wire listener (`--mysql` TCP and `--mysql-socket`) checks a password
+against the same store and the same roles; see "MySQL logins" below.
 
 A name that does not exist completes the *same* SCRAM exchange as one that
 does — challenge, proof, and then the identical `28P01 password
@@ -399,8 +432,8 @@ and `current_setting('session_authorization')` report the login name of the
 connection asking: the PG-wire StartupMessage `user`, published only *after*
 authentication succeeds (a rejected login never becomes a SQL identity, and a
 startup packet with no `user` is refused with `08P01`); the MySQL-wire
-handshake user — that listener is trust-only, so the name is asserted by the
-client, not proved, and an *empty* handshake user is not an identity at all
+login user — authenticated like the PG-wire one when the method is not
+`trust`, asserted by the client under `trust`; an *empty* handshake user is not an identity at all
 (such a session reports `heliosdb`); or the name passed to `create_session()`
 on the embedded API. A session-less embedded call reports the service user
 `heliosdb`. Names are truncated to 63 bytes, PostgreSQL's identifier limit.

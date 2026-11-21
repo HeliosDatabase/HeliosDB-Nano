@@ -263,6 +263,7 @@ pub mod runtime; // Per-request runtime helpers (bump arena, ...)
 pub mod runtime_offload; // A statement never stalls its server (sprinter ccebc95977f1)
 pub mod search;
 pub mod session; // Multi-user session management
+mod session_fk; // Foreign-key checking for one session
 pub mod sql;
 pub mod storage;
 pub mod tenant;
@@ -15465,7 +15466,7 @@ impl EmbeddedDatabase {
         if constraints.foreign_keys.is_empty() {
             return true;
         }
-        let mode = *self.fk_validation_mode.read();
+        let mode = self.session_fk_mode();
         let source = *self.fk_validation_source.read();
         // Off / Proxy: the slow path skips FK validation entirely
         // (`check_fk_constraints_on_write` early return); the batch path does
@@ -15514,7 +15515,7 @@ impl EmbeddedDatabase {
         schema: &Schema,
         prepared: &[(u64, Tuple)],
     ) -> Result<()> {
-        let mode = *self.fk_validation_mode.read();
+        let mode = self.session_fk_mode();
         let source = *self.fk_validation_source.read();
         // Matches `check_fk_constraints_on_write`'s early skip.
         if mode == FkValidationMode::Off || source == FkValidationSource::Proxy {
@@ -16372,7 +16373,7 @@ impl EmbeddedDatabase {
     /// The cached spec of a fast parameterized primary-key `DELETE`, if `sql`
     /// has one under the foreign-key validation mode in force.
     fn cached_fast_param_delete_spec(&self, sql: &str) -> Option<std::sync::Arc<FastParamDeleteSpec>> {
-        let fk_mode = *self.fk_validation_mode.read();
+        let fk_mode = self.session_fk_mode();
         let fk_source = *self.fk_validation_source.read();
         let cache_key = format!("\0fast_param_delete\0{fk_mode:?}\0{fk_source:?}\0{sql}");
         if let Some(spec) = self
@@ -16900,7 +16901,7 @@ impl EmbeddedDatabase {
             return None;
         }
 
-        let fk_mode = *self.fk_validation_mode.read();
+        let fk_mode = self.session_fk_mode();
         let fk_source = *self.fk_validation_source.read();
         let cache_key = format!("\0fast_param_delete\0{fk_mode:?}\0{fk_source:?}\0{sql}");
         if let Some(spec) = self.fast_param_delete_cache.get(&cache_key) {
@@ -17257,7 +17258,7 @@ impl EmbeddedDatabase {
                 })
                 .is_some_and(|spec| self.storage.fast_row_write_is_bounded(&spec.table_name, &spec.schema))
         } else if prefix.eq_ignore_ascii_case(b"DELETE") {
-            let fk_mode = *self.fk_validation_mode.read();
+            let fk_mode = self.session_fk_mode();
             let fk_source = *self.fk_validation_source.read();
             Self::fast_literal_delete_shape(sql)
                 .and_then(|(table_name, pk_col, _)| {
@@ -19289,7 +19290,7 @@ impl EmbeddedDatabase {
             return Some(Err(e));
         }
         drop(in_callers_scope);
-        let fk_mode = *self.fk_validation_mode.read();
+        let fk_mode = self.session_fk_mode();
         let fk_source = *self.fk_validation_source.read();
         let spec = match self.fast_literal_delete_spec(table_name, pk_col, fk_mode, fk_source)? {
             Ok(spec) => spec,
@@ -31285,10 +31286,10 @@ impl EmbeddedDatabase {
     fn merge_fk_policy(&self) -> storage::branch_catalog::MergeFkPolicy {
         use storage::branch_catalog::MergeFkPolicy;
         if *self.fk_validation_source.read() == FkValidationSource::Proxy
-            || *self.fk_validation_mode.read() == FkValidationMode::Off
+            || self.session_fk_mode() == FkValidationMode::Off
         {
             MergeFkPolicy::Bypass
-        } else if *self.fk_validation_mode.read() == FkValidationMode::Audit {
+        } else if self.session_fk_mode() == FkValidationMode::Audit {
             MergeFkPolicy::Audit
         } else {
             MergeFkPolicy::Enforced
@@ -32453,7 +32454,7 @@ impl EmbeddedDatabase {
         in_explicit_txn: bool,
     ) -> Result<()> {
         // Validate FK constraints - check if any other table references this row
-        let referencing_fks = if *self.fk_validation_mode.read() == FkValidationMode::Off
+        let referencing_fks = if self.session_fk_mode() == FkValidationMode::Off
             || *self.fk_validation_source.read() == FkValidationSource::Proxy
         {
             Vec::new()
@@ -33321,7 +33322,7 @@ impl EmbeddedDatabase {
         if constraints.foreign_keys.is_empty() {
             return Ok(());
         }
-        let mode = *self.fk_validation_mode.read();
+        let mode = self.session_fk_mode();
         let source = *self.fk_validation_source.read();
         if mode == FkValidationMode::Off || source == FkValidationSource::Proxy {
             return Ok(());
@@ -33446,7 +33447,7 @@ impl EmbeddedDatabase {
                 active_txn,
             )?;
             if !parent_exists {
-                if *self.fk_validation_mode.read() == FkValidationMode::Audit {
+                if self.session_fk_mode() == FkValidationMode::Audit {
                     self.record_fk_violation(&check.fk, &check.parent_values)?;
                     continue;
                 }
@@ -33466,7 +33467,7 @@ impl EmbeddedDatabase {
     }
 
     fn record_fk_violation(&self, fk: &sql::ForeignKeyConstraint, parent_values: &[Value]) -> Result<()> {
-        Self::record_fk_violation_with(&self.storage, *self.fk_validation_mode.read(), fk, parent_values)
+        Self::record_fk_violation_with(&self.storage, self.session_fk_mode(), fk, parent_values)
     }
 
     fn record_fk_violation_with(
