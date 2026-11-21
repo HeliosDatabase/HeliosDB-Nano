@@ -1,13 +1,12 @@
-//! Round-3 PARTITION BY — Stage 0 (parse-accept + flatten).
+//! Partitioning DDL end to end, on the embedded surface: what the first,
+//! schema-only implementation accepted still loads, and now does what it says.
+//! (The file keeps its name; the routing, bound, pruning, catalog and
+//! older-database cases are in the other `tests/partition_*.rs` files.)
 //!
-//! Stage-0 semantics (see docs/plans / charter-partition-*): the parent is an
-//! ordinary empty table (its `PARTITION BY` clause is stripped); each
-//! `PARTITION OF` child is an independent, self-consistent plain table cloning
-//! the parent's columns (types + NOT NULL); `ATTACH`/`DETACH PARTITION` are
-//! accepted no-ops. No tuple routing / parent-scan union yet — that is Stage 1.
-//!
-//! These exercise the EmbeddedDatabase surface end-to-end (parser rewrite →
-//! planner column-copy → executor), the shape the pgrust corpus hits hardest.
+//! Updated for declarative partitioning: a partitioned table reports relkind
+//! 'p', a partition reports its bound, ATTACH / DETACH change the table, an
+//! expression in the partition key is refused, and
+//! `storage.partition_policy` has no effect any more.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -47,8 +46,8 @@ fn range_parent_and_child_round_trip() -> Result<()> {
     assert_eq!(rows.len(), 1);
     assert!(matches!(rows[0].values[0], Value::Int4(5) | Value::Int8(5)));
 
-    // Both introspect as ordinary tables (relkind 'r') at Stage 0.
-    assert_eq!(relkind(&db, "r_parent"), "r");
+    // The parent is a partitioned table, the partition an ordinary one.
+    assert_eq!(relkind(&db, "r_parent"), "p");
     assert_eq!(relkind(&db, "r_child"), "r");
     Ok(())
 }
@@ -67,20 +66,33 @@ fn list_parent_and_child_in_bounds() -> Result<()> {
 #[test]
 fn hash_parent_with_opclass_key() -> Result<()> {
     let db = EmbeddedDatabase::new_in_memory()?;
-    // Opclass token in the key is a hard parse-reject pre-change; the whole
-    // clause strips uniformly.
+    // An operator class after the key column is accepted and has no effect:
+    // hash partitions use the engine's own hash.
     db.execute("CREATE TABLE h_parent (a INT, b TEXT) PARTITION BY HASH (a part_test_int4_ops)")?;
-    db.execute("CREATE TABLE h_child PARTITION OF h_parent FOR VALUES WITH (MODULUS 4, REMAINDER 0)")?;
-    db.execute("INSERT INTO h_child (a, b) VALUES (7, 'x')")?;
-    assert_eq!(db.query("SELECT a FROM h_child", &[])?.len(), 1);
+    for r in 0..4 {
+        db.execute(&format!(
+            "CREATE TABLE h_child_{r} PARTITION OF h_parent FOR VALUES WITH (MODULUS 4, REMAINDER {r})"
+        ))?;
+    }
+    db.execute("INSERT INTO h_parent (a, b) VALUES (7, 'x')")?;
+    assert_eq!(db.query("SELECT a FROM h_parent", &[])?.len(), 1);
     Ok(())
 }
 
 #[test]
 fn expression_key_parent() -> Result<()> {
     let db = EmbeddedDatabase::new_in_memory()?;
-    // Multi-column / expression key: another hard parse-reject pre-change.
-    db.execute("CREATE TABLE e_parent (a INT, b INT) PARTITION BY RANGE (a, (b + 0))")?;
+    // An expression in the partition key was accepted while partitioning was
+    // schema only. Rows cannot be routed by it yet, so it is refused (0A000)
+    // and nothing is created.
+    let err = db
+        .execute("CREATE TABLE e_parent (a INT, b INT) PARTITION BY RANGE (a, (b + 0))")
+        .expect_err("expression key")
+        .to_string();
+    assert!(err.contains("partitioning feature not supported"), "{err}");
+    assert!(db.query("SELECT a FROM e_parent", &[]).is_err());
+    // the same key without the expression works
+    db.execute("CREATE TABLE e_parent (a INT, b INT) PARTITION BY RANGE (a, b)")?;
     db.execute("CREATE TABLE e_child PARTITION OF e_parent FOR VALUES FROM (0, 0) TO (10, 10)")?;
     db.execute("INSERT INTO e_child (a, b) VALUES (1, 2)")?;
     assert_eq!(db.query("SELECT a, b FROM e_child", &[])?.len(), 1);
@@ -148,25 +160,29 @@ fn drop_in_both_orders() -> Result<()> {
 }
 
 #[test]
-fn attach_and_detach_are_noops() -> Result<()> {
+fn attach_and_detach_change_the_table() -> Result<()> {
     let db = EmbeddedDatabase::new_in_memory()?;
     db.execute("CREATE TABLE ad_parent (a INT) PARTITION BY RANGE (a)")?;
     db.execute("CREATE TABLE ad_child PARTITION OF ad_parent FOR VALUES FROM (0) TO (10)")?;
-
-    // ATTACH / DETACH PARTITION accepted as no-ops (return 0 affected rows).
+    // ATTACH of a table that is a partition already is refused (it was a no-op).
+    assert!(db
+        .execute("ALTER TABLE ad_parent ATTACH PARTITION ad_child FOR VALUES FROM (0) TO (10)")
+        .is_err());
+    assert_eq!(db.execute("ALTER TABLE ad_parent DETACH PARTITION ad_child")?, 0);
+    // detached: not a partition of the table any more
+    assert!(db
+        .execute("ALTER TABLE ad_parent DETACH PARTITION ad_child CONCURRENTLY")
+        .is_err());
     assert_eq!(
         db.execute("ALTER TABLE ad_parent ATTACH PARTITION ad_child FOR VALUES FROM (0) TO (10)")?,
         0
     );
-    assert_eq!(db.execute("ALTER TABLE ad_parent DETACH PARTITION ad_child")?, 0);
     assert_eq!(
         db.execute("ALTER TABLE ad_parent DETACH PARTITION ad_child CONCURRENTLY")?,
         0
     );
-    // ALTER INDEX ... ATTACH PARTITION also a no-op.
+    // `ALTER INDEX … ATTACH PARTITION` (pg_dump writes it) stays accepted.
     assert_eq!(db.execute("ALTER INDEX ad_idx ATTACH PARTITION ad_child_idx")?, 0);
-
-    // The child is untouched by the no-ops and still queryable.
     db.execute("INSERT INTO ad_child (a) VALUES (1)")?;
     assert_eq!(db.query("SELECT a FROM ad_child", &[])?.len(), 1);
     Ok(())
@@ -401,14 +417,12 @@ fn drop_if_exists_parent_twice_and_multi() -> Result<()> {
     Ok(())
 }
 
-/// (f) pg_class exposes `relpartbound` as NULL for every Stage-0 row (the
-/// corpus reads `SELECT relname, relpartbound FROM pg_class WHERE relname IN
-/// (...)`). The query must also succeed (empty) when the tables do not exist.
-/// ERRORS on pre-fix code (no `relpartbound` column).
+/// pg_class exposes `relpartbound`: the bound of a partition, NULL for every
+/// other relation (it was NULL for all while partitioning was schema only).
+/// The query also succeeds (empty) when the tables do not exist.
 #[test]
-fn pg_class_relpartbound_is_null() -> Result<()> {
+fn pg_class_relpartbound_is_the_bound_of_a_partition() -> Result<()> {
     let db = EmbeddedDatabase::new_in_memory()?;
-    // Empty catalog: the exact corpus SELECT shape returns no rows, not an error.
     let empty = db.query(
         "SELECT relname, relpartbound FROM pg_class WHERE relname IN ('pb_parent', 'pb_child')",
         &[],
@@ -421,18 +435,17 @@ fn pg_class_relpartbound_is_null() -> Result<()> {
     db.execute("CREATE TABLE pb_parent (id INT) PARTITION BY RANGE (id)")?;
     db.execute("CREATE TABLE pb_child PARTITION OF pb_parent FOR VALUES FROM (0) TO (10)")?;
     let rows = db.query(
-        "SELECT relname, relpartbound FROM pg_class WHERE relname IN ('pb_parent', 'pb_child')",
+        "SELECT relname, relpartbound FROM pg_class WHERE relname IN ('pb_parent', 'pb_child') ORDER BY relname",
         &[],
     )?;
     assert_eq!(rows.len(), 2, "parent and child both present in pg_class");
-    for row in &rows {
-        assert!(matches!(row.values[0], Value::String(_)), "relname is text");
-        assert!(
-            matches!(row.values[1], Value::Null),
-            "relpartbound must be NULL at Stage 0, got {:?}",
-            row.values[1]
-        );
-    }
+    assert_eq!(rows[0].values[0], Value::String("pb_child".into()));
+    assert_eq!(rows[0].values[1], Value::String("FOR VALUES FROM (0) TO (10)".into()));
+    assert_eq!(
+        rows[1].values[1],
+        Value::Null,
+        "a partitioned table has no bound of its own"
+    );
     Ok(())
 }
 
@@ -476,30 +489,19 @@ fn attach_or_detach_of_missing_table_errors() -> Result<()> {
     Ok(())
 }
 
-/// v07.3: `storage.partition_policy = "error"` refuses all four shapes with
-/// 0A000's "is not supported" and creates nothing.
+/// `storage.partition_policy` is deprecated and has no effect: with the former
+/// refusing value `"error"` partitioning DDL works like without it. (It used to
+/// refuse every partitioning statement with 0A000.)
 #[test]
-fn partition_policy_error_refuses_all_four_shapes_and_creates_nothing() -> Result<()> {
+fn partition_policy_has_no_effect_any_more() -> Result<()> {
     let mut config = heliosdb_nano::Config::in_memory();
     config.storage.partition_policy = heliosdb_nano::PartitionPolicy::Error;
     let db = EmbeddedDatabase::with_config(config)?;
-    db.execute("CREATE TABLE pp_plain (a INT)")?;
-    for sql in [
-        "CREATE TABLE pp_parent (a INT) PARTITION BY RANGE (a)",
-        "CREATE TABLE pp_child PARTITION OF pp_plain FOR VALUES FROM (0) TO (10)",
-        "ALTER TABLE pp_plain ATTACH PARTITION pp_plain FOR VALUES FROM (0) TO (10)",
-        "ALTER TABLE pp_plain DETACH PARTITION pp_plain",
-        "ALTER INDEX pp_idx ATTACH PARTITION pp_idx2",
-    ] {
-        let err = db.execute(sql).expect_err(sql).to_string();
-        assert!(
-            err.contains("is not supported") && err.contains("partition_policy"),
-            "{sql}: {err}"
-        );
-    }
-    assert!(db.query("SELECT a FROM pp_parent", &[]).is_err(), "nothing created");
-    assert!(db.query("SELECT a FROM pp_child", &[]).is_err(), "nothing created");
-    // A plain table is unaffected.
-    db.execute("CREATE TABLE pp_other (a INT)")?;
+    db.execute("CREATE TABLE pp_parent (a INT) PARTITION BY RANGE (a)")?;
+    db.execute("CREATE TABLE pp_child PARTITION OF pp_parent FOR VALUES FROM (0) TO (10)")?;
+    db.execute("INSERT INTO pp_parent VALUES (1)")?;
+    assert_eq!(db.query("SELECT a FROM pp_child", &[])?.len(), 1);
+    db.execute("ALTER TABLE pp_parent DETACH PARTITION pp_child")?;
+    db.execute("ALTER TABLE pp_parent ATTACH PARTITION pp_child FOR VALUES FROM (0) TO (10)")?;
     Ok(())
 }
