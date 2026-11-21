@@ -130,9 +130,50 @@ pub struct SchemaObjects {
     /// (materialized views, triggers, …). Written into the SQL header and
     /// reported by restore as warnings, never dropped silently.
     pub not_carried: Vec<String>,
+    /// Row-level security, per table: the statements that recreate its
+    /// policies and switches. Appended last: a dump written before the field
+    /// existed is read without it ([`SchemaObjects::from_dump_bytes`]).
+    pub row_security: Vec<RowSecurityDump>,
+}
+
+/// One table's row-level security, as statements.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RowSecurityDump {
+    /// The table.
+    pub table: String,
+    /// `CREATE POLICY …;` and `ALTER TABLE … ROW LEVEL SECURITY;`, in order.
+    pub statements: Vec<String>,
+}
+
+/// [`SchemaObjects`] as written before `row_security` existed.
+#[derive(Deserialize)]
+struct SchemaObjectsWithoutRowSecurity {
+    sequences: Vec<SequenceDump>,
+    identity_columns: Vec<(String, Vec<String>)>,
+    indexes: Vec<IndexDump>,
+    views: Vec<ViewDump>,
+    not_carried: Vec<String>,
 }
 
 impl SchemaObjects {
+    /// Decode the schema-objects section of a dump, of this format or the one
+    /// before row-level security was carried.
+    pub fn from_dump_bytes(bytes: &[u8]) -> std::result::Result<Self, bincode::Error> {
+        bincode::deserialize::<Self>(bytes).or_else(|current| {
+            match bincode::deserialize::<SchemaObjectsWithoutRowSecurity>(bytes) {
+                Ok(old) => Ok(Self {
+                    sequences: old.sequences,
+                    identity_columns: old.identity_columns,
+                    indexes: old.indexes,
+                    views: old.views,
+                    not_carried: old.not_carried,
+                    row_security: Vec::new(),
+                }),
+                Err(_) => Err(current),
+            }
+        })
+    }
+
     /// True when there is nothing to write.
     pub fn is_empty(&self) -> bool {
         self.sequences.is_empty()
@@ -140,6 +181,7 @@ impl SchemaObjects {
             && self.indexes.is_empty()
             && self.views.is_empty()
             && self.not_carried.is_empty()
+            && self.row_security.is_empty()
     }
 
     /// The identity columns recorded for `table`.
@@ -634,6 +676,7 @@ impl DumpManager {
             objects.views.clear();
             objects.indexes.retain(|i| in_dump(&i.table));
             objects.identity_columns.retain(|(t, _)| in_dump(t));
+            objects.row_security.retain(|r| in_dump(&r.table));
         }
         // Postgres: anything without a portable spelling is a comment.
         let mut unportable_indexes: Vec<String> = Vec::new();
@@ -809,6 +852,18 @@ impl DumpManager {
             writeln!(writer, "\n-- Views").map_err(w)?;
             for view in &objects.views {
                 writeln!(writer, "{}", sql_text::view_ddl(view)).map_err(w)?;
+            }
+        }
+
+        // Phase 7 — row-level security, after the rows: a restore run by a role
+        // the policies apply to could otherwise not load them. The roles a
+        // policy names are not in the dump and must exist where it is restored.
+        if write_ddl && !objects.row_security.is_empty() {
+            writeln!(writer, "\n-- Row-level security").map_err(w)?;
+            for table in &objects.row_security {
+                for statement in &table.statements {
+                    writeln!(writer, "{statement}").map_err(w)?;
+                }
             }
         }
 
@@ -1374,7 +1429,7 @@ impl DumpManager {
                         .read_exact(&mut bytes)
                         .map_err(|e| Error::storage(format!("Failed to read schema objects: {}", e)))?;
                     schema_objects = Some(
-                        bincode::deserialize(&bytes)
+                        SchemaObjects::from_dump_bytes(&bytes)
                             .map_err(|e| Error::storage(format!("Failed to deserialize schema objects: {}", e)))?,
                     );
                     continue;

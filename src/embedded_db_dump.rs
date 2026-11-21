@@ -438,6 +438,17 @@ impl DatabaseInterface for EmbeddedDatabase {
             });
         }
 
+        // Row-level security: every table's policies and switches.
+        for table in &tables {
+            let statements = crate::rls::dump::statements(&self.storage, &|name| name == table)?;
+            if !statements.is_empty() {
+                objects.row_security.push(crate::storage::dump::RowSecurityDump {
+                    table: table.clone(),
+                    statements,
+                });
+            }
+        }
+
         if let Ok(mvs) = self.storage.mv_catalog().list_views() {
             for mv in mvs {
                 objects
@@ -859,6 +870,19 @@ impl DatabaseRestoreInterface for EmbeddedDatabase {
         }
         for view in &objects.views {
             self.execute(&sql_text::view_ddl(view))?;
+        }
+        // Last, after the rows. A statement that fails (a policy naming a role
+        // that does not exist here) fails the restore: a table restored without
+        // one of its policies would show rows the dump's database hid.
+        for table in &objects.row_security {
+            for statement in &table.statements {
+                self.execute(statement).map_err(|e| {
+                    Error::query_execution(format!(
+                        "restoring the row-level security of table \"{}\" failed at `{statement}`: {e}",
+                        table.table
+                    ))
+                })?;
+            }
         }
         Ok(())
     }

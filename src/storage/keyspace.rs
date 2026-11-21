@@ -102,6 +102,12 @@ pub enum KeyClass {
     MetaRole,
     /// `meta:acl:{type}:{object}:{grantee}` — stored grants.
     MetaAcl,
+    /// `meta:policy:{table-id}:{policy}`, `meta:rowsec:{table-id}` and
+    /// `meta:relowner:{table-id}` — row-level security: a policy, a table's
+    /// ENABLE / FORCE switches, a table's owner (`rls::record`).
+    MetaRowSecurity,
+    /// `meta:tenant:{uuid}` — a registered tenant (`rls::record`).
+    MetaTenant,
     /// `meta:function:{name}` — user-defined function definition.
     MetaFunction,
     /// `meta:procedure:{name}` — stored procedure definition.
@@ -311,6 +317,14 @@ pub const PREFIXES: &[(&[u8], KeyClass)] = &[
     (b"meta:role:", KeyClass::MetaRole),
     // storage/catalog.rs:4648 `acl_key`
     (b"meta:acl:", KeyClass::MetaAcl),
+    // rls/record.rs `POLICY_PREFIX`
+    (b"meta:policy:", KeyClass::MetaRowSecurity),
+    // rls/record.rs `ROWSEC_PREFIX`
+    (b"meta:rowsec:", KeyClass::MetaRowSecurity),
+    // rls/record.rs `OWNER_PREFIX`
+    (b"meta:relowner:", KeyClass::MetaRowSecurity),
+    // rls/record.rs `TENANT_PREFIX`
+    (b"meta:tenant:", KeyClass::MetaTenant),
     // storage/materialized_view.rs:555 `mv_metadata_key`
     (b"meta:mv:", KeyClass::MetaMv),
     // lib.rs:5772 `FUNCTION_META_PREFIX`
@@ -604,6 +618,11 @@ mod tests {
         (b"meta:role:app_user", KeyClass::MetaRole, None),
         (b"meta:role_oid_next", KeyClass::MetaRole, None),
         (b"meta:acl:table:users:app_user", KeyClass::MetaAcl, None),
+        (b"meta:policy:00000000000000ab:own_rows", KeyClass::MetaRowSecurity, None),
+        (b"meta:policy:@users:own_rows", KeyClass::MetaRowSecurity, None),
+        (b"meta:rowsec:00000000000000ab", KeyClass::MetaRowSecurity, None),
+        (b"meta:relowner:00000000000000ab", KeyClass::MetaRowSecurity, None),
+        (b"meta:tenant:6f9619ff-8b86-d011-b42d-00c04fc964ff", KeyClass::MetaTenant, None),
         (b"meta:function:double_it", KeyClass::MetaFunction, None),
         (b"meta:procedure:log_it", KeyClass::MetaProcedure, None),
         (b"meta:col_storage:users:bio", KeyClass::MetaColStorage, None),

@@ -623,6 +623,8 @@ impl SystemViewRegistry {
                     // returns for a non-partition relation); Stage 1 fills real
                     // `pg_get_expr`-style bounds for partition children.
                     sv_col("relpartbound", DataType::Text),
+                    // 5.0: `ALTER TABLE … FORCE ROW LEVEL SECURITY`.
+                    sv_col("relforcerowsecurity", DataType::Boolean),
                 ],
             },
             description: "Catalog of tables, indexes, sequences, and views".to_string(),
@@ -2730,7 +2732,7 @@ impl SystemViewRegistry {
                     sv_col("with_check", DataType::Text),
                 ],
             },
-            description: "PG-compat RLS policies view (empty — Nano RLS via TenantManager)".to_string(),
+            description: "Row-level security policies".to_string(),
         });
 
         self.register_view(SystemViewSchema {
@@ -2747,7 +2749,7 @@ impl SystemViewRegistry {
                     sv_col("polwithcheck", DataType::Text),
                 ],
             },
-            description: "PG-compat RLS policy catalogue (empty stub)".to_string(),
+            description: "Row-level security policy catalogue".to_string(),
         });
 
         self.register_view(SystemViewSchema {
@@ -4285,8 +4287,13 @@ impl SystemViewRegistry {
             // TenantManager hang off `EmbeddedDatabase`, not `StorageEngine`.
             // Populating them requires widening this signature (named follow-up),
             // NOT another wire-side fixed-shape copy.
-            "pg_proc" | "pg_description" | "pg_policies" | "pg_policy" | "pg_inherits" | "pg_publication"
-            | "pg_statistic_ext" => Ok(vec![]),
+            "pg_proc" | "pg_description" | "pg_inherits" | "pg_publication" | "pg_statistic_ext" => Ok(vec![]),
+            // 5.0: policies are stored with the database (`crate::rls`).
+            "pg_policies" => crate::rls::catalog::pg_policies_rows(storage),
+            "pg_policy" => {
+                let tables = storage.catalog().list_tables()?;
+                crate::rls::catalog::pg_policy_rows(storage, &|table| pg_table_oid_by_name(&tables, table))
+            }
             // Empty for the reasons given at registration (HDB-011): no range
             // subtypes are registered, and enum types cannot be enumerated
             // from the catalog. A driver's `LEFT OUTER JOIN pg_range` / enum
@@ -4573,6 +4580,7 @@ impl SystemViewRegistry {
     fn execute_pg_class(storage: &StorageEngine) -> Result<Vec<Tuple>> {
         let catalog = storage.catalog();
         let tables = catalog.list_tables()?;
+        let switches = crate::rls::catalog::table_switches(storage)?;
         let mut results = Vec::new();
 
         for (idx, table_name) in tables.iter().enumerate() {
@@ -4582,6 +4590,7 @@ impl SystemViewRegistry {
             // the schema in `relnamespace`, not `relname`), so two coexisting
             // `a.t` / `b.t` both surface as `relname = 't'`.
             let (relschema, relname) = crate::sql::Planner::split_schema_key(table_name);
+            let security = switches.get(table_name).copied().unwrap_or_default();
             let tuple = Tuple::new(vec![
                 Value::Int4(oid),       // oid
                 Value::String(relname), // relname
@@ -4592,8 +4601,9 @@ impl SystemViewRegistry {
                 Value::Int4(oid + 1000),        // reltype
                 Value::String("r".to_string()), // relkind (r = relation/table)
                 Value::Int4(oid),               // relfilenode
-                Value::Boolean(false),          // relrowsecurity (Nano RLS is via TenantManager, not pg_catalog)
-                Value::Null,                    // relpartbound (Stage-0 flatten keeps no typed bound)
+                Value::Boolean(security.enabled), // relrowsecurity
+                Value::Null,                      // relpartbound (Stage-0 flatten keeps no typed bound)
+                Value::Boolean(security.forced),  // relforcerowsecurity
             ]);
             results.push(tuple);
         }
@@ -4609,6 +4619,7 @@ impl SystemViewRegistry {
                 Value::Int4(oid),
                 Value::Boolean(false),
                 Value::Null, // relpartbound
+                Value::Boolean(false), // relforcerowsecurity
             ]));
         }
 
@@ -4632,6 +4643,7 @@ impl SystemViewRegistry {
                 Value::Int4(oid),
                 Value::Boolean(false),
                 Value::Null, // relpartbound
+                Value::Boolean(false), // relforcerowsecurity
             ]));
         }
 
@@ -4656,6 +4668,7 @@ impl SystemViewRegistry {
                 Value::Int4(oid),                     // relfilenode
                 Value::Boolean(false),                // relrowsecurity
                 Value::Null,                          // relpartbound
+                Value::Boolean(false), // relforcerowsecurity
             ]));
         }
         for table_name in &tables {
@@ -4675,6 +4688,7 @@ impl SystemViewRegistry {
                     Value::Int4(oid),
                     Value::Boolean(false),
                     Value::Null, // relpartbound
+                    Value::Boolean(false), // relforcerowsecurity
                 ]));
             }
         }
@@ -4696,6 +4710,7 @@ impl SystemViewRegistry {
                 Value::Int4(0),                 // relfilenode (a view has no storage)
                 Value::Boolean(false),          // relrowsecurity
                 Value::Null,                    // relpartbound
+                Value::Boolean(false), // relforcerowsecurity
             ]));
         }
 

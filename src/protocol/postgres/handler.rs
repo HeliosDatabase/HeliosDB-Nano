@@ -7172,6 +7172,9 @@ fn message_names_a_column(lower: &str) -> bool {
 fn sqlstate_for_query_execution_message(message: &str) -> &'static str {
     use crate::network::protocol::sqlstate;
 
+    if let Some(code) = crate::rls::sqlstate_for_message(message) {
+        return code;
+    }
     if message.contains(crate::error::APPLIED_PUBLICATION_FAILURE_MARKER) {
         return sqlstate::SYSTEM_ERROR; // 58000, before nested cause markers
     }

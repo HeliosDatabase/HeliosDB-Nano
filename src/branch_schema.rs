@@ -182,6 +182,7 @@ pub fn schema_statement_name(plan: &LogicalPlan) -> Option<&'static str> {
         LogicalPlan::DropRole { .. } => "DROP ROLE",
         LogicalPlan::GrantPrivileges { .. } => "GRANT",
         LogicalPlan::RevokePrivileges { .. } => "REVOKE",
+        LogicalPlan::RowSecurity(command) => command.tag(),
         _ => return None,
     })
 }

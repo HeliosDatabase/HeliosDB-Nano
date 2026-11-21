@@ -2530,6 +2530,8 @@ impl<'a> Planner<'a> {
                     // — views stay FLAT on BOTH create and reference so a bare or
                     // schema-qualified read resolves to the same stored view.
                     let query_sql = query.to_string();
+                    // 5.0: `WITH (security_invoker = …)`.
+                    crate::rls::command::check_view_options(&options)?;
 
                     Ok(LogicalPlan::CreateView {
                         name: Self::normalize_nontable_name(&name),
@@ -3034,6 +3036,11 @@ impl<'a> Planner<'a> {
                     objects,
                     grantees: grantees.iter().map(Self::normalize_ident).collect(),
                 })
+            }
+            // 5.0: policies (`crate::rls::command`).
+            Statement::CreatePolicy { .. } | Statement::AlterPolicy { .. } | Statement::DropPolicy { .. } => {
+                crate::rls::command::plan_statement(self, &statement)?
+                    .ok_or_else(|| Error::query_execution("not a policy statement"))
             }
             // A statement kind this planner has no arm for. TWO defects lived
             // in the three lines this replaces (sprinter e143ae12ea2d):
@@ -7750,6 +7757,10 @@ impl<'a> Planner<'a> {
         // Check if operations are empty
         if operations.is_empty() {
             return Err(Error::query_execution("ALTER TABLE requires an operation"));
+        }
+        // 5.0: ENABLE / DISABLE / FORCE / NO FORCE ROW LEVEL SECURITY.
+        if let Some(plan) = crate::rls::command::plan_table_switches(&table_name, &operations)? {
+            return Ok(plan);
         }
 
         // Single operation: return directly (no wrapper needed)

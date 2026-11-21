@@ -202,9 +202,14 @@ These `pg_catalog` views are populated on every route:
 
 `pg_proc` is still **empty** with a function registered, for the same
 reason `information_schema.routines` is: the function registry hangs off
-`EmbeddedDatabase`, which the system-view executor cannot reach. Same for
-`pg_policies` / `pg_policy` (RLS policies live in the tenant manager).
+`EmbeddedDatabase`, which the system-view executor cannot reach.
 Widening that context is a named follow-up.
+
+`pg_policies` and `pg_policy` are populated from 5.0: one row per row-level
+security policy (policies are stored with the database), and
+`pg_class.relrowsecurity` / `pg_class.relforcerowsecurity` report a table's
+`ENABLE` / `FORCE ROW LEVEL SECURITY` switches. `information_schema` has no
+policy view, as in PostgreSQL.
 
 See also:
 

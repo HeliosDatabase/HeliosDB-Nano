@@ -5086,6 +5086,20 @@ impl<'a> Executor<'a> {
                     .with_timeout(self.timeout_ctx()),
                 ))
             }
+            // Policies and the table switches (`crate::rls::command`).
+            LogicalPlan::RowSecurity(command) => {
+                crate::rls::command::execute(self.storage, command)?;
+                Ok(Box::new(
+                    ScanOperator::new(
+                        String::new(),
+                        Arc::new(crate::Schema { columns: vec![] }),
+                        None,
+                        vec![],
+                        vec![],
+                    )
+                    .with_timeout(self.timeout_ctx()),
+                ))
+            }
             LogicalPlan::Noop => {
                 // Any statement the planner maps to Noop parses and succeeds
                 // with zero effect — same empty-result shape as CreateSchema

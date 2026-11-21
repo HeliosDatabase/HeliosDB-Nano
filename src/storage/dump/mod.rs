@@ -13,5 +13,5 @@ pub use format::{CompressionType, DumpFormat, DumpMetadata as FormatMetadata, DU
 pub use manager::{
     DatabaseInterface, DatabaseRestoreInterface, DirtyTracker, DumpManager, DumpMetadata, DumpMode, DumpOptions,
     DumpOutputFormat, DumpReport, DumpType, IndexDump, IndexMetadata, RestoreOptions, RestoreReport, RestoreValidation,
-    SchemaObjects, SequenceDump, SqlDialect, SqlDumpOptions, ViewDump,
+    SchemaObjects, SequenceDump, SqlDialect, SqlDumpOptions, RowSecurityDump, ViewDump,
 };

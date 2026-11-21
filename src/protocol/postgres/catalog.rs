@@ -1381,8 +1381,10 @@ impl PgCatalog {
             ]);
             let target_oid = Self::extract_relchecks_oid(q);
             let table_names = catalog.list_tables()?;
+            let switches = crate::rls::catalog::table_switches(&db.storage)?;
             let mut rows = Vec::new();
             for (ti, name) in table_names.iter().enumerate() {
+                let security = switches.get(name).copied().unwrap_or_default();
                 let table_oid = (16384 + ti) as i32;
                 if let Some(t) = target_oid {
                     if t != table_oid {
@@ -1407,8 +1409,8 @@ impl PgCatalog {
                     Value::Boolean(has_index),    // relhasindex
                     Value::Boolean(false),        // relhasrules
                     Value::Boolean(false),        // relhastriggers
-                    Value::Boolean(false),        // relrowsecurity
-                    Value::Boolean(false),        // relforcerowsecurity
+                    Value::Boolean(security.enabled), // relrowsecurity
+                    Value::Boolean(security.forced), // relforcerowsecurity
                     Value::Boolean(false),        // relhasoids
                     Value::Boolean(false),        // relispartition
                     Value::String(String::new()), // (literal '' from psql query)

@@ -4234,23 +4234,17 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                 println!("\n{}", "Deleting RLS Policy:".bold());
                 println!("{}", "─".repeat(60));
 
-                // Note: delete_rls_policy method would need to be implemented in TenantManager
-                // For now, show what would be deleted
-                let policies = db.tenant_manager.get_rls_policies(&table);
-                let found = policies.iter().find(|p| &p.name == policy);
-
-                if found.is_some() {
-                    println!(
-                        "{}: Would delete policy '{}' from table '{}'",
-                        "Note".yellow(),
+                match db.tenant_manager.delete_rls_policy(table, policy) {
+                    Ok(true) => println!(
+                        "{}: Policy '{}' deleted from table '{}'",
+                        "Success".green(),
                         policy.cyan(),
                         table.cyan()
-                    );
-                    println!();
-                    println!("{}", "⚠ Policy deletion not yet implemented in TenantManager.".yellow());
-                    println!("{}", "  Policies persist for the session.".dimmed());
-                } else {
-                    println!("{}: Policy '{}' not found in table '{}'", "Error".red(), policy, table);
+                    ),
+                    Ok(false) => {
+                        println!("{}: Policy '{}' not found in table '{}'", "Error".red(), policy, table);
+                    }
+                    Err(e) => println!("{}: Policy '{}' was not deleted: {}", "Error".red(), policy, e),
                 }
                 println!();
                 Ok(MetaCommandResult::Continue)

@@ -519,6 +519,57 @@ pub struct Tenant {
     pub created_at: String,
 }
 
+impl IsolationMode {
+    fn stored_name(self) -> &'static str {
+        match self {
+            IsolationMode::SharedSchema => "shared_schema",
+            IsolationMode::DatabasePerTenant => "database_per_tenant",
+            IsolationMode::SchemaPerTenant => "schema_per_tenant",
+        }
+    }
+
+    fn from_stored_name(name: &str) -> Option<Self> {
+        match name {
+            "shared_schema" => Some(IsolationMode::SharedSchema),
+            "database_per_tenant" => Some(IsolationMode::DatabasePerTenant),
+            "schema_per_tenant" => Some(IsolationMode::SchemaPerTenant),
+            _ => None,
+        }
+    }
+}
+
+impl Tenant {
+    fn to_record(&self) -> crate::rls::record::TenantRecord {
+        crate::rls::record::TenantRecord {
+            id: self.id.to_string(),
+            name: self.name.clone(),
+            plan_id: self.plan_id.clone(),
+            isolation_mode: self.isolation_mode.stored_name().to_string(),
+            max_storage_bytes: self.limits.max_storage_bytes,
+            max_connections: self.limits.max_connections as u64,
+            max_qps: self.limits.max_qps as u64,
+            rls_enabled: self.rls_enabled,
+            created_at: self.created_at.clone(),
+        }
+    }
+
+    fn from_record(record: &crate::rls::record::TenantRecord) -> Option<Self> {
+        Some(Self {
+            id: Uuid::parse_str(&record.id).ok()?,
+            name: record.name.clone(),
+            plan_id: record.plan_id.clone(),
+            isolation_mode: IsolationMode::from_stored_name(&record.isolation_mode)?,
+            limits: ResourceLimits {
+                max_storage_bytes: record.max_storage_bytes,
+                max_connections: usize::try_from(record.max_connections).unwrap_or(usize::MAX),
+                max_qps: usize::try_from(record.max_qps).unwrap_or(usize::MAX),
+            },
+            rls_enabled: record.rls_enabled,
+            created_at: record.created_at.clone(),
+        })
+    }
+}
+
 /// Resource limits for a tenant
 #[derive(Debug, Clone)]
 pub struct ResourceLimits {
@@ -844,8 +895,12 @@ pub struct TenantManager {
     tenants: Arc<parking_lot::RwLock<HashMap<TenantId, Tenant>>>,
     /// Plan manager
     pub plan_manager: PlanManager,
-    /// RLS policies per table
-    rls_policies: Arc<parking_lot::RwLock<HashMap<String, Vec<RLSPolicy>>>>,
+    /// The policy store: every policy, per-table switch and stored tenant.
+    /// The tenant model is one user of it; `CREATE POLICY` is another.
+    rls: crate::rls::PolicyStore,
+    /// The schema generation the tenant registry was last read at, on a
+    /// physical standby (which gets tenants as replicated bytes, not calls).
+    tenants_generation: AtomicU64,
     /// Current tenant context (thread-local or request-scoped)
     current_context: Arc<parking_lot::RwLock<Option<TenantContext>>>,
     /// Quota tracking per tenant
@@ -882,7 +937,8 @@ impl TenantManager {
         Self {
             tenants: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             plan_manager: PlanManager::new(),
-            rls_policies: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            rls: crate::rls::PolicyStore::new(),
+            tenants_generation: AtomicU64::new(u64::MAX),
             current_context: Arc::new(parking_lot::RwLock::new(None)),
             quota_tracking: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             cdc_logs: Arc::new(parking_lot::RwLock::new(HashMap::new())),
@@ -969,6 +1025,7 @@ impl TenantManager {
         self.tenants.write().insert(tenant.id, tenant.clone());
         // Initialize quota tracking for the new tenant
         self.quota_tracking.write().insert(tenant.id, QuotaTracking::default());
+        self.store_tenant(&tenant);
         tenant
     }
 
@@ -990,8 +1047,11 @@ impl TenantManager {
 
         tenant.plan_id = plan.id;
         tenant.limits = plan.limits;
+        let changed = tenant.clone();
+        drop(tenants);
+        self.store_tenant(&changed);
 
-        Ok(tenant.clone())
+        Ok(changed)
     }
 
     /// Get tenants by plan ID
@@ -1012,6 +1072,7 @@ impl TenantManager {
             .ok_or_else(|| format!("Target plan '{}' not found", to_plan_id))?;
 
         let mut downgraded = Vec::new();
+        let mut changed = Vec::new();
         let mut tenants = self.tenants.write();
 
         for tenant in tenants.values_mut() {
@@ -1019,7 +1080,12 @@ impl TenantManager {
                 tenant.plan_id = new_plan.id.clone();
                 tenant.limits = new_plan.limits.clone();
                 downgraded.push(tenant.id);
+                changed.push(tenant.clone());
             }
+        }
+        drop(tenants);
+        for tenant in &changed {
+            self.store_tenant(tenant);
         }
 
         Ok(downgraded)
@@ -1052,16 +1118,19 @@ impl TenantManager {
     /// answer, not an approximation.
     #[inline]
     pub fn has_any_tenant(&self) -> bool {
+        self.sync_tenants();
         !self.tenants.read().is_empty()
     }
 
     /// Get a tenant by ID
     pub fn get_tenant(&self, tenant_id: TenantId) -> Option<Tenant> {
+        self.sync_tenants();
         self.tenants.read().get(&tenant_id).cloned()
     }
 
     /// List all tenants (sorted by name for deterministic ordering)
     pub fn list_tenants(&self) -> Vec<Tenant> {
+        self.sync_tenants();
         let mut tenants: Vec<Tenant> = self.tenants.read().values().cloned().collect();
         tenants.sort_by(|a, b| a.name.cmp(&b.name));
         tenants
@@ -1129,35 +1198,180 @@ impl TenantManager {
         *self.current_context.write() = None;
     }
 
-    /// Create RLS policy for table
+    /// Create RLS policy for table.
+    ///
+    /// The policy is a stored policy, the same kind `CREATE POLICY` makes:
+    /// permissive, for every role. It is kept with the database and is there
+    /// after a restart. A policy of the same name on the table is replaced.
+    ///
+    /// It applies to sessions bound to a tenant with row security on. For it
+    /// to apply to every role that is not exempt, switch the table on with
+    /// `ALTER TABLE … ENABLE ROW LEVEL SECURITY`.
     pub fn create_rls_policy(
         &self,
         table_name: String,
         policy_name: String,
-        condition: String,
+        // Never read by enforcement: the USING text is the policy.
+        _condition: String,
         cmd: RLSCommand,
         using_expr: String,
         with_check_expr: Option<String>,
     ) {
-        let policy = RLSPolicy {
+        let policy = crate::rls::PolicyRecord {
             name: policy_name,
-            table_name: table_name.clone(),
-            condition,
-            cmd,
-            using_expr,
-            with_check_expr,
+            table: table_name.clone(),
+            permissive: true,
+            command: match cmd {
+                RLSCommand::Select => crate::rls::PolicyCommand::Select,
+                RLSCommand::Insert => crate::rls::PolicyCommand::Insert,
+                RLSCommand::Update => crate::rls::PolicyCommand::Update,
+                RLSCommand::Delete => crate::rls::PolicyCommand::Delete,
+                RLSCommand::All => crate::rls::PolicyCommand::All,
+            },
+            roles: Vec::new(),
+            using: Some(using_expr),
+            with_check: with_check_expr,
+            oid: 0,
         };
+        if let Err(e) = self.rls.put_policy(&table_name, policy) {
+            // This signature has no error to return. The policy is not in the
+            // store, so it does not apply; say so loudly.
+            tracing::error!("row-level security policy on '{table_name}' was not stored: {e}");
+        }
+    }
 
-        self.rls_policies
-            .write()
-            .entry(table_name)
-            .or_insert_with(Vec::new)
-            .push(policy);
+    /// Delete an RLS policy. `Ok(false)` when the table has no such policy.
+    pub fn delete_rls_policy(&self, table_name: &str, policy_name: &str) -> Result<bool, String> {
+        self.rls.delete_policy(table_name, policy_name).map_err(|e| e.to_string())
     }
 
     /// Get RLS policies for table
     pub fn get_rls_policies(&self, table_name: &str) -> Vec<RLSPolicy> {
-        self.rls_policies.read().get(table_name).cloned().unwrap_or_default()
+        let Ok(Some(entry)) = self.rls.table(table_name) else {
+            return Vec::new();
+        };
+        entry
+            .policies
+            .iter()
+            .map(|policy| {
+                let using = policy.using.clone().unwrap_or_default();
+                RLSPolicy {
+                    name: policy.name.clone(),
+                    table_name: table_name.to_string(),
+                    condition: using.clone(),
+                    cmd: match policy.command {
+                        crate::rls::PolicyCommand::Select => RLSCommand::Select,
+                        crate::rls::PolicyCommand::Insert => RLSCommand::Insert,
+                        crate::rls::PolicyCommand::Update => RLSCommand::Update,
+                        crate::rls::PolicyCommand::Delete => RLSCommand::Delete,
+                        crate::rls::PolicyCommand::All => RLSCommand::All,
+                    },
+                    using_expr: using,
+                    with_check_expr: policy.with_check.clone(),
+                }
+            })
+            .collect()
+    }
+
+    /// The policy store this manager reads and writes.
+    pub fn policy_store(&self) -> &crate::rls::PolicyStore {
+        &self.rls
+    }
+
+    /// Bind the manager to a database: policies and tenants are read from it
+    /// and every later change is written to it. Called once, when the
+    /// database handle is built.
+    pub fn attach_storage(&self, storage: Arc<crate::storage::StorageEngine>) {
+        if let Err(e) = self.rls.attach(storage) {
+            // The store now refuses every lookup, so statements on tables that
+            // may have policies fail instead of running unfiltered.
+            tracing::error!("row-level security records could not be loaded: {e}");
+        }
+        match self.rls.load_tenants() {
+            Ok(records) => {
+                let mut tenants = self.tenants.write();
+                let mut tracking = self.quota_tracking.write();
+                for record in records {
+                    let Some(tenant) = Tenant::from_record(&record) else {
+                        tracing::error!("stored tenant '{}' has an unreadable id or isolation mode", record.id);
+                        continue;
+                    };
+                    tracking.entry(tenant.id).or_default();
+                    tenants.entry(tenant.id).or_insert(tenant);
+                }
+            }
+            Err(e) => tracing::error!("stored tenants could not be loaded: {e}"),
+        }
+    }
+
+    /// On a physical standby the registry arrives as replicated records:
+    /// read them again whenever the catalog moved. Elsewhere the registry in
+    /// memory is the one that is written through, and nothing is read.
+    fn sync_tenants(&self) {
+        let Some(storage) = self.rls.storage() else { return };
+        if !storage.is_physical_standby() {
+            return;
+        }
+        let generation = storage.schema_generation();
+        if self.tenants_generation.swap(generation, Ordering::AcqRel) == generation {
+            return;
+        }
+        match self.rls.load_tenants() {
+            Ok(records) => {
+                let loaded: HashMap<TenantId, Tenant> = records
+                    .iter()
+                    .filter_map(Tenant::from_record)
+                    .map(|tenant| (tenant.id, tenant))
+                    .collect();
+                let mut tracking = self.quota_tracking.write();
+                for id in loaded.keys() {
+                    tracking.entry(*id).or_default();
+                }
+                *self.tenants.write() = loaded;
+            }
+            Err(e) => tracing::error!("stored tenants could not be read: {e}"),
+        }
+    }
+
+    fn store_tenant(&self, tenant: &Tenant) {
+        if let Err(e) = self.rls.put_tenant(&tenant.to_record()) {
+            tracing::error!("tenant '{}' was not stored: {e}", tenant.name);
+        }
+    }
+
+    /// Who the statement running on this thread is, for row-level security:
+    /// the session's login role, whether that role is exempt, and the tenant
+    /// in force.
+    pub fn rls_identity(&self) -> crate::rls::RlsIdentity {
+        let role = crate::session_login_user_tls();
+        let exempt = match role.as_deref() {
+            None => true,
+            Some(role) => self.rls.role_is_exempt(role),
+        };
+        let tenant = self.effective_context();
+        let tenant_rls = tenant
+            .as_ref()
+            .and_then(|context| self.get_tenant(context.tenant_id))
+            .is_some_and(|tenant| tenant.rls_enabled);
+        crate::rls::RlsIdentity {
+            role,
+            exempt,
+            tenant,
+            tenant_rls,
+        }
+    }
+
+    /// Is the session on this thread a role that policies can apply to, in a
+    /// database that has row-level security? `false` in two atomic loads when
+    /// the database has none.
+    pub fn rls_subject_session(&self) -> bool {
+        if !self.rls.active() {
+            return false;
+        }
+        match crate::session_login_user_tls() {
+            None => false,
+            Some(role) => !self.rls.role_is_exempt(&role),
+        }
     }
 
     /// Check resource quota for tenant
@@ -1349,12 +1563,15 @@ impl TenantManager {
 
     /// Set custom resource limits for a tenant
     pub fn update_resource_limits(&self, tenant_id: TenantId, limits: ResourceLimits) -> Result<(), String> {
-        if let Some(tenant) = self.tenants.write().get_mut(&tenant_id) {
-            tenant.limits = limits;
-            Ok(())
-        } else {
-            Err(format!("Tenant {} not found", tenant_id))
-        }
+        let changed = match self.tenants.write().get_mut(&tenant_id) {
+            Some(tenant) => {
+                tenant.limits = limits;
+                tenant.clone()
+            }
+            None => return Err(format!("Tenant {} not found", tenant_id)),
+        };
+        self.store_tenant(&changed);
+        Ok(())
     }
 
     /// Apply RLS to query (adds WHERE clauses for tenant isolation)
@@ -1385,34 +1602,25 @@ impl TenantManager {
     /// which no wire handler ever wrote — so RLS was silently inert on every
     /// connection that was not the REPL's own.
     pub fn should_apply_rls(&self, table_name: &str, cmd: &str) -> bool {
-        if let Some(context) = self.effective_context() {
-            if let Some(tenant) = self.get_tenant(context.tenant_id) {
-                if !tenant.rls_enabled {
-                    return false;
-                }
-
-                let policies = self.get_rls_policies(table_name);
-                if policies.is_empty() {
-                    return false;
-                }
-
-                // Check if any policy applies to this command
-                let cmd_upper = cmd.to_uppercase();
-                for policy in policies {
-                    let applies = match policy.cmd {
-                        RLSCommand::All => true,
-                        RLSCommand::Select => cmd_upper == "SELECT",
-                        RLSCommand::Insert => cmd_upper == "INSERT",
-                        RLSCommand::Update => cmd_upper == "UPDATE",
-                        RLSCommand::Delete => cmd_upper == "DELETE",
-                    };
-                    if applies {
-                        return true;
-                    }
-                }
+        // 5.0: "applies" is the policy store's decision for the session's role
+        // and tenant. A materialized view is answered `true` for a role that
+        // is subject to policies: its base tables' policies are applied where
+        // the plan is rewritten, never on a path that skips the planner. A
+        // decision that cannot be made (unreadable records) is `true` too, so
+        // the statement reaches the rewrite and fails there.
+        let Some(command) = crate::rls::PolicyCommand::from_keyword(cmd) else {
+            return false;
+        };
+        if !self.rls.active() {
+            return false;
+        }
+        let identity = self.rls_identity();
+        match self.rls.decide(table_name, command, &identity) {
+            Ok(crate::rls::Decision::Apply(_)) | Err(_) => true,
+            Ok(crate::rls::Decision::Off) => {
+                !identity.exempt_everywhere() && self.rls.materialized_view_behind(table_name).is_some()
             }
         }
-        false
     }
 
     /// Get RLS conditions for current context and table
@@ -1435,61 +1643,32 @@ impl TenantManager {
     /// already established that a context exists, its tenant exists, `rls_enabled` is
     /// set, and at least one policy applies to `cmd`.
     pub fn get_rls_conditions(&self, table_name: &str, cmd: &str) -> Option<(String, Option<String>)> {
-        if !self.should_apply_rls(table_name, cmd) {
+        let command = crate::rls::PolicyCommand::from_keyword(cmd)?;
+        let identity = self.rls_identity();
+        let Ok(crate::rls::Decision::Apply(applicable)) = self.rls.decide(table_name, command, &identity) else {
             return None;
-        }
+        };
+        let using_of = |p: &crate::rls::PolicyRecord| p.using.clone().unwrap_or_else(|| "true".to_string());
+        let check_of = |p: &crate::rls::PolicyRecord| p.with_check.clone().unwrap_or_else(|| using_of(p));
 
-        let policies = self.get_rls_policies(table_name);
-        let cmd_upper = cmd.to_uppercase();
-
-        // Collect applicable policies
-        let applicable_policies: Vec<&RLSPolicy> = policies
-            .iter()
-            .filter(|p| {
-                matches!(p.cmd, RLSCommand::All)
-                    || (matches!(p.cmd, RLSCommand::Select) && cmd_upper == "SELECT")
-                    || (matches!(p.cmd, RLSCommand::Insert) && cmd_upper == "INSERT")
-                    || (matches!(p.cmd, RLSCommand::Update) && cmd_upper == "UPDATE")
-                    || (matches!(p.cmd, RLSCommand::Delete) && cmd_upper == "DELETE")
-            })
-            .collect();
-
-        if applicable_policies.is_empty() {
-            return None;
-        }
-
-        // One applicable policy is the overwhelmingly common case (and the only
-        // shape the SELECT path ever resolved before this): hand back its
-        // expressions directly. Byte-identical to the pre-fix output, and it
-        // keeps this per-statement resolution at the same two clones it always
-        // cost rather than collecting and joining a one-element list.
-        if let [policy] = applicable_policies.as_slice() {
-            let with_check = match &policy.with_check_expr {
-                Some(expr) => expr.clone(),
-                None => policy.using_expr.clone(),
+        // Permissive policies are joined WITHOUT wrapping each in parentheses:
+        // `OR` is the lowest-precedence boolean operator, so `a AND b` OR-joined
+        // with `c` parses as `(a AND b) OR c`, the intended grouping. One
+        // policy is handed back as written. With no permissive policy nothing
+        // passes; restrictive policies are AND'd around the result.
+        let join = |of: &dyn Fn(&crate::rls::PolicyRecord) -> String| -> String {
+            let permissive: Vec<String> = applicable.permissive.iter().map(|p| of(p)).collect();
+            let mut text = if permissive.is_empty() {
+                "false".to_string()
+            } else {
+                permissive.join(" OR ")
             };
-            return Some((policy.using_expr.clone(), Some(with_check)));
-        }
-
-        // Joined WITHOUT wrapping each policy in parentheses, deliberately:
-        //
-        // * It is safe. `OR` is the lowest-precedence boolean operator in SQL, so
-        //   `a AND b` OR-joined with `c` parses as `(a AND b) OR c` — the intended
-        //   grouping — and `NOT`/comparison/`IS` all bind tighter still. There is
-        //   no policy expression shape that re-associates across a bare ` OR `.
-        // * Parentheses would actively break it. `RLSExpressionEvaluator`'s
-        //   `sql_expr_to_logical` (src/tenant/expression.rs) has no
-        //   `Expr::Nested` arm — the AST node sqlparser emits for `( … )` — and
-        //   falls through to "Unsupported expression in RLS policy". Wrapping the
-        //   operands would therefore turn every multi-policy table into a hard
-        //   error on both the read and the write path.
-        let usings: Vec<&str> = applicable_policies.iter().map(|p| p.using_expr.as_str()).collect();
-        let checks: Vec<&str> = applicable_policies
-            .iter()
-            .map(|p| p.with_check_expr.as_deref().unwrap_or(&p.using_expr))
-            .collect();
-
-        Some((usings.join(" OR "), Some(checks.join(" OR "))))
+            for policy in &applicable.restrictive {
+                text = format!("({text}) AND ({})", of(policy));
+            }
+            text
+        };
+        Some((join(&using_of), Some(join(&check_of))))
     }
 
     // ============================================================================
@@ -1740,6 +1919,10 @@ impl TenantManager {
         // Remove from tenant registry
         if self.tenants.write().remove(&tenant_id).is_none() {
             return Err(format!("Tenant {} not found", tenant_id));
+        }
+
+        if let Err(e) = self.rls.delete_tenant(&tenant_id.to_string()) {
+            tracing::error!("tenant {tenant_id} was removed but its stored record was not: {e}");
         }
 
         // Clean up quota tracking

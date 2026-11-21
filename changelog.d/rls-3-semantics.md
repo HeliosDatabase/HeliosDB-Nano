@@ -1,0 +1,9 @@
+**Row-level security applies to every role that is not exempt, with PostgreSQL's rules.**
+
+What was wrong: a policy applied only while a tenant context was set. A role that connected without one read and wrote every row of a table that had policies.
+
+What happens now: on a table with row security enabled, a role sees and changes only the rows its policies allow. With no policy for the command and the role, nothing is visible and nothing may be written. Permissive policies are OR'd; restrictive policies are AND'd with that result, and restrictive policies alone let nothing through. `USING` filters the rows a `SELECT`, `UPDATE` or `DELETE` can see; `WITH CHECK` (or `USING` when there is none) must hold for every row an `INSERT` or `UPDATE` writes, and a row that fails it is refused with 42501 "new row violates row-level security policy for table …". An `UPDATE` or `DELETE` reaches only rows the `SELECT` policies also show. Superusers and roles with `BYPASSRLS` are exempt; the table's owner is exempt unless the table is `FORCE`d. `SET row_security = off` still makes a statement that would be filtered fail. A policy may use `current_user`, `current_setting('name', true)`, `current_tenant()` and subqueries; the tables a policy's subquery reads are themselves filtered for the reader, and a policy that reads its own table is an error (42P17). A policy that can no longer be applied (its column was dropped) fails the statement.
+
+Three things to know. The embedded API and the shell have no login role and run as the bootstrap superuser, so they are exempt unless a tenant is selected. On the write side a policy's subquery is evaluated once per statement against committed data, and a subquery that refers to the row being written is refused with 0A000. A policy naming a role applies to sessions logged in as that role; membership in it is not yet considered.
+
+Tests: `tests/rls_semantics.rs`, `tests/rls_wire.rs`.

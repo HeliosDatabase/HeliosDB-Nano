@@ -336,6 +336,7 @@ impl Parser {
                     .or_else(|| Self::rewrite_delete_returning(&processed_sql))
                     .or_else(|| Self::rewrite_drop_index_on(&processed_sql))
                     .or_else(|| Self::rewrite_replace_into(&processed_sql))
+                    .or_else(|| crate::rls::command::rewrite_force_syntax(&processed_sql))
                     .map(|s| (s, false))
                     .or_else(|| Self::rewrite_fk_default_referenced_columns(&processed_sql).map(|s| (s, true)));
                 match rewritten {

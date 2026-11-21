@@ -1435,6 +1435,10 @@ pub enum LogicalPlan {
     /// GH#40: `LISTEN` / `UNLISTEN` / `NOTIFY`. No output rows.
     /// APPEND-ONLY — see [`LogicalPlan::Noop`].
     Notification(crate::notify::NotifyCommand),
+
+    /// `CREATE` / `ALTER` / `DROP POLICY` and `ALTER TABLE … ROW LEVEL
+    /// SECURITY`. No output rows. APPEND-ONLY — see [`LogicalPlan::Noop`].
+    RowSecurity(crate::rls::RlsCommand),
 }
 
 /// Function/Procedure parameter
@@ -2994,6 +2998,7 @@ impl LogicalPlan {
             | LogicalPlan::AlterTableAddPrimaryKey { .. }
             | LogicalPlan::AlterTableAddCheck { .. }
             | LogicalPlan::Notification(_)
+            | LogicalPlan::RowSecurity(_)
             | LogicalPlan::Noop => {
                 // KanttBan #20 (v3.31.0): DDL — no output rows.
                 Arc::new(Schema { columns: vec![] })

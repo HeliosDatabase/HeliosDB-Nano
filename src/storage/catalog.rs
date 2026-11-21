@@ -1190,6 +1190,12 @@ impl<'a> Catalog<'a> {
         );
         ddl.put(Self::table_counter_key(table_name), &counter_value)?;
         ddl.put(Self::table_incarnation_key(table_name), &incarnation_value)?;
+        // 5.0: the creating role owns the table (`rls::store`); no record means
+        // the bootstrap superuser.
+        if let Some(owner) = crate::rls::store::creating_role().filter(|_| !crate::sql::temp_tables::is_temp_key(table_name))
+        {
+            ddl.put(crate::rls::record::owner_key(incarnation), owner.as_bytes())?;
+        }
         // Sprinter 6bc4a4040eb7 (B4 fix pass): this table's row ids start over, so
         // whatever history is left under its name goes first: a drop or rename that
         // stopped part way, or an earlier release's. Until the batch is written the
@@ -3272,6 +3278,9 @@ impl<'a> Catalog<'a> {
         batch: &mut rocksdb::WriteBatch,
     ) -> Result<Vec<String>> {
         batch.delete(Self::table_metadata_key(table_name));
+        // 5.0: the table's owner, row-security switches and policies go with
+        // it (read before its id is deleted just below).
+        crate::rls::store::stage_table_drop(self.storage, table_name, batch);
         // sprinter 6bc4a4040eb7 (B3 fix pass): a later CREATE of the name is
         // another table, with another id.
         batch.delete(Self::table_incarnation_key(table_name));

@@ -2395,6 +2395,11 @@ impl Touched {
             | KeyClass::MetaMv
             | KeyClass::MetaRole
             | KeyClass::MetaAcl
+            // Row-level security and the tenant registry: catalog bytes. The
+            // generation bump they cause is what makes the policy store read
+            // them again (`rls::store`).
+            | KeyClass::MetaRowSecurity
+            | KeyClass::MetaTenant
             | KeyClass::MetaFunction
             | KeyClass::MetaProcedure
             | KeyClass::MetaColStorage

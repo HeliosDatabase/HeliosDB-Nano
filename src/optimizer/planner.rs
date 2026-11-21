@@ -361,6 +361,7 @@ impl Planner {
             | LogicalPlan::RevokePrivileges { .. }
             | LogicalPlan::Noop
             | LogicalPlan::Notification(_)
+            | LogicalPlan::RowSecurity(_)
             | LogicalPlan::CreateExtension { .. }
             | LogicalPlan::DropExtension { .. }
             | LogicalPlan::CreateDatabase { .. }

@@ -259,6 +259,7 @@ pub mod protocol;
 pub mod protocols; // Protocol integration layer (adapters)
 pub mod query_trace;
 pub mod repl;
+pub mod rls; // Row-level security: policies, their store, the plan rewrite
 pub mod runtime; // Per-request runtime helpers (bump arena, ...)
 pub mod runtime_offload; // A statement never stalls its server (sprinter ccebc95977f1)
 pub mod search;
@@ -2685,34 +2686,6 @@ struct PendingFkCheck {
     fk: sql::ForeignKeyConstraint,
     parent_values: Vec<Value>,
 }
-
-/// Per-statement, pre-parsed row-level-security policy for one (table, command)
-/// pair. Built ONCE before a DML row loop and reused for every row.
-///
-/// `RLSExpressionEvaluator::parse` (src/tenant/expression.rs) re-tokenizes and
-/// re-parses the policy expression string through `sqlparser` on every call — it
-/// caches nothing — so building this inside a per-row loop would turn an
-/// O(1)-parses-per-statement cost into O(rows). NEVER construct one inside a
-/// row loop: a now-deleted duplicate DML path did exactly that
-/// (`rls_evaluator.parse` inside `for tuple in tuples`), and that is the
-/// mistake this type exists to prevent.
-///
-/// The `USING`/`WITH CHECK` asymmetry is PostgreSQL's, not an oversight — see
-/// `docs/plans/ROADMAP_V5.md` §1.1 and `EmbeddedDatabase::build_rls_write_guard`.
-struct RlsWriteGuard {
-    /// Table the policy belongs to — only used to build the PG error message.
-    table_name: String,
-    /// Parsed, OR-combined `USING`. `None` for INSERT: PostgreSQL has no
-    /// `USING` concept for INSERT (there is no pre-image row to filter).
-    using: Option<sql::LogicalExpr>,
-    /// Parsed, OR-combined, per-policy-fallback-applied effective `WITH CHECK`
-    /// (see `TenantManager::get_rls_conditions`). `None` for DELETE:
-    /// PostgreSQL has no `WITH CHECK` concept for DELETE (no new row).
-    with_check: Option<sql::LogicalExpr>,
-    /// Schema- and tenant-context-bound evaluator shared by both expressions.
-    evaluator: tenant::RLSExpressionEvaluator,
-}
-
 enum TraceControl {
     SetEnabled(bool),
     ShowEnabled,
@@ -2897,6 +2870,9 @@ impl EmbeddedDatabase {
                 | sql::LogicalPlan::DropRole { .. }
                 | sql::LogicalPlan::GrantPrivileges { .. }
                 | sql::LogicalPlan::RevokePrivileges { .. }
+                // Policies and the table switches change `pg_policies` /
+                // `pg_class` rows and which rows a cached read may hold.
+                | sql::LogicalPlan::RowSecurity(_)
                 // Routine DDL. Again NOT about plan shape: `udf_bridge` makes a
                 // user-defined function CALLABLE from the evaluator, and
                 // `query_is_non_deterministic` only knows the built-in volatile
@@ -4846,7 +4822,12 @@ impl EmbeddedDatabase {
     /// only to drop it.
     #[inline]
     pub(crate) fn has_effective_tenant_context(&self) -> bool {
-        crate::session_has_tenant_tls() || self.tenant_manager.has_current_context()
+        // 5.0: also a session whose role is subject to row-level security in a
+        // database that has any (`rls::decide`). Every gate that asked "can a
+        // policy apply to this statement?" asked it through here.
+        crate::session_has_tenant_tls()
+            || self.tenant_manager.has_current_context()
+            || self.tenant_manager.rls_subject_session()
     }
 
     /// The tenant charged for a statement arriving on `session_id`.
@@ -13281,6 +13262,8 @@ impl EmbeddedDatabase {
         // is moved into `Self`.
         let tenant_manager =
             std::sync::Arc::new(crate::tenant::TenantManager::from_quota_config(&config.resource_quotas));
+        // 5.0: policies and tenants are stored with the database.
+        tenant_manager.attach_storage(std::sync::Arc::clone(&storage));
 
         // Built, then FINISHED: `install_routine_runtime` rebuilds the routine
         // registry from the durable `meta:function:` / `meta:procedure:` records
@@ -13440,6 +13423,8 @@ impl EmbeddedDatabase {
         // is moved into `Self`.
         let tenant_manager =
             std::sync::Arc::new(crate::tenant::TenantManager::from_quota_config(&config.resource_quotas));
+        // 5.0: policies and tenants are stored with the database.
+        tenant_manager.attach_storage(std::sync::Arc::clone(&storage));
 
         // Built, then FINISHED: `install_routine_runtime` rebuilds the routine
         // registry from the durable `meta:function:` / `meta:procedure:` records
@@ -13764,6 +13749,8 @@ impl EmbeddedDatabase {
         // is moved into `Self`.
         let tenant_manager =
             std::sync::Arc::new(crate::tenant::TenantManager::from_quota_config(&config.resource_quotas));
+        // 5.0: policies and tenants are stored with the database.
+        tenant_manager.attach_storage(std::sync::Arc::clone(&storage));
 
         // Built, then FINISHED: `install_routine_runtime` rebuilds the routine
         // registry from the durable `meta:function:` / `meta:procedure:` records
@@ -29690,34 +29677,6 @@ impl EmbeddedDatabase {
         Ok(results)
     }
 
-    /// R1.2 (ROADMAP_V5 §1.1 Residual): the ONE place a read plan is filtered
-    /// for row-level security before execution.
-    ///
-    /// The v4.9.0 write-path fix landed because enforcement lived in one shared
-    /// helper called from both executor families; the read-path holes it left
-    /// behind were the opposite shape — `apply_rls_to_plan` was correct, but
-    /// five-plus execution sites hand-rolled a `sql::Executor` and never called
-    /// it. This wraps the rewrite so every such site closes with a single line
-    /// instead of re-deriving the "is a context active / clone / rewrite" dance,
-    /// which is how those sites drifted apart in the first place.
-    ///
-    /// `Cow::Borrowed` on the no-context path: the caller's plan is handed back
-    /// by reference, so the common case pays one `RwLock::read()` and no clone —
-    /// the same fast-out shape as `apply_rls_to_plan`.
-    ///
-    /// FAIL-CLOSED: the `?` propagates a policy-parse error to the caller, so a
-    /// read that cannot be filtered returns `Err` and never rows. Do NOT add a
-    /// `.unwrap_or(plan)` / `.ok()` fallback here or at any call site — that
-    /// would silently downgrade an unparseable policy to "no policy" and serve
-    /// the unfiltered table. Pinned by `rls_parse_error_on_read_fails_closed`
-    /// in `tests/rls_read_parity_tests.rs`.
-    fn rls_filtered_plan<'p>(&self, plan: &'p sql::LogicalPlan) -> Result<std::borrow::Cow<'p, sql::LogicalPlan>> {
-        if !self.has_effective_tenant_context() {
-            return Ok(std::borrow::Cow::Borrowed(plan));
-        }
-        Ok(std::borrow::Cow::Owned(self.apply_rls_to_plan_recursive(plan.clone())?))
-    }
-
     /// Internal method to execute a query plan with parameters
     fn query_plan_with_params(
         &self,
@@ -32302,120 +32261,6 @@ impl EmbeddedDatabase {
         Ok(())
     }
 
-    /// Resolve + parse the RLS policy applying to `table_name` / `cmd`
-    /// (`"INSERT"` | `"UPDATE"` | `"DELETE"`), once per statement.
-    ///
-    /// Shared by both DML executor families — the text family
-    /// (`execute_in_transaction_inner`: psql simple-query, MySQL wire, the COPY
-    /// generic fallback) and the params family
-    /// (`execute_plan_with_params_inner`: PG extended protocol, `RETURNING`
-    /// statements, trigger bodies via `execute_plan_internal`, REST/BaaS) — the
-    /// same shape as `enforce_referencing_fks_on_delete` and
-    /// `validate_on_conflict_updated_row`, so the two arms cannot drift apart
-    /// again. Before this existed, RLS was enforced on `SELECT` only
-    /// (`apply_rls_to_plan`) and *every* write path ignored policies outright:
-    /// a session that could see one row could still UPDATE/DELETE rows it could
-    /// not see, and INSERT ignored `WITH CHECK` (`docs/plans/ROADMAP_V5.md` §1.1).
-    ///
-    /// Which clause applies to which command is PostgreSQL's asymmetry, and
-    /// getting it backwards is a bug in both directions (spurious errors on
-    /// legitimate statements, or silent under-enforcement) — do not "simplify"
-    /// this into one symmetric check:
-    ///
-    /// | command | `USING` (pre-image) | `WITH CHECK` (new row) |
-    /// |---|---|---|
-    /// | INSERT | n/a — no pre-image row exists | error on violation |
-    /// | UPDATE | **filters** — invisible rows are silently not updated | error on violation |
-    /// | DELETE | **filters** — invisible rows are silently not deleted | n/a — no new row |
-    ///
-    /// Returns `Ok(None)` after a single `get_current_context()` probe (inside
-    /// `should_apply_rls`) when no tenant context is active or no policy applies
-    /// to this table/command — mirroring `apply_rls_to_plan`'s early exit, so the
-    /// no-tenant case pays exactly the one extra branch the read path already
-    /// pays and constructs nothing.
-    fn build_rls_write_guard(&self, table_name: &str, cmd: &str, schema: &Schema) -> Result<Option<RlsWriteGuard>> {
-        let Some((using_str, with_check_str)) = self.tenant_manager.get_rls_conditions(table_name, cmd) else {
-            return Ok(None);
-        };
-        if !self.row_security_applies(table_name)? {
-            return Ok(None);
-        }
-
-        let tenant_context = self.effective_tenant_context();
-        let evaluator = tenant::RLSExpressionEvaluator::new(std::sync::Arc::new(schema.clone()), tenant_context);
-
-        // `get_rls_conditions` already applied PG's per-policy
-        // "no WITH CHECK → reuse this policy's USING" fallback before OR-ing the
-        // policies together; the `unwrap_or` here is only a belt-and-braces
-        // default for a caller that hands back `None`.
-        let check_src = with_check_str.as_deref().unwrap_or(&using_str);
-        // INSERT has no pre-image row, so no USING. Everything else (UPDATE and
-        // the DO UPDATE leg of INSERT ... ON CONFLICT) filters on it.
-        let using = if cmd == "INSERT" {
-            None
-        } else {
-            Some(evaluator.parse(&using_str)?)
-        };
-        // DELETE produces no new row, so no WITH CHECK. Everything else errors on it.
-        let with_check = if cmd == "DELETE" {
-            None
-        } else {
-            Some(evaluator.parse(check_src)?)
-        };
-
-        Ok(Some(RlsWriteGuard {
-            table_name: table_name.to_string(),
-            using,
-            with_check,
-            evaluator,
-        }))
-    }
-
-    /// UPDATE / DELETE: does this pre-image row pass the policy's `USING`?
-    ///
-    /// A `false` answer is a **filter**, never an error — PostgreSQL silently
-    /// leaves rows failing `USING` untouched, and they never even reach `BEFORE`
-    /// row triggers. Call sites therefore fold this straight into the existing
-    /// WHERE-match boolean (`if matches && Self::rls_row_visible(..)?`), which
-    /// also keeps invisible rows out of the `updates`/`deleted_tuples`
-    /// collections that feed `RETURNING`.
-    ///
-    /// `Ok(true)` when `guard` is `None` (no context / no policy) so no call
-    /// site needs an extra branch.
-    fn rls_row_visible(guard: Option<&RlsWriteGuard>, tuple: &Tuple) -> Result<bool> {
-        let Some(guard) = guard else { return Ok(true) };
-        let Some(using) = &guard.using else {
-            return Ok(true);
-        };
-        guard.evaluator.evaluate(using, tuple)
-    }
-
-    /// INSERT (fresh row), UPDATE (post-assignment row), and the DO UPDATE leg
-    /// of `ON CONFLICT`: does this row pass the policy's `WITH CHECK`?
-    ///
-    /// **Errors** on violation — never filters, which is the other half of the
-    /// asymmetry documented on `build_rls_write_guard`. The message is
-    /// PostgreSQL's own wording so wire clients get the text they expect, and
-    /// `Error::ConstraintViolation` is the variant every other row-content
-    /// violation in this file uses (FK / UNIQUE / CHECK / NOT NULL). Its
-    /// `"row-level security"` substring is also what `sqlstate_for_error` keys
-    /// on to report SQLSTATE 42501 (`insufficient_privilege`) — keep the two in
-    /// step if this text ever changes.
-    fn enforce_rls_with_check(guard: Option<&RlsWriteGuard>, tuple: &Tuple) -> Result<()> {
-        let Some(guard) = guard else { return Ok(()) };
-        let Some(with_check) = &guard.with_check else {
-            return Ok(());
-        };
-        if guard.evaluator.evaluate(with_check, tuple)? {
-            Ok(())
-        } else {
-            Err(Error::constraint_violation(format!(
-                "new row violates row-level security policy for table \"{}\"",
-                guard.table_name
-            )))
-        }
-    }
-
     /// Enforce every *referencing* foreign key before a row is deleted.
     ///
     /// Shared by both DML executor families: the text family
@@ -34225,19 +34070,6 @@ impl EmbeddedDatabase {
         })
     }
 
-    /// v05.6: an UPDATE / DELETE predicate with a subquery, with the read
-    /// policies applied to every subquery's plan, as a SELECT gets them.
-    /// `None` when there is nothing to change (no subquery or no tenant
-    /// context), so the common path keeps the planned predicate.
-    fn rls_dml_where(&self, selection: Option<&sql::LogicalExpr>) -> Result<Option<sql::LogicalExpr>> {
-        match selection {
-            Some(expr) if self.has_effective_tenant_context() && sql::Executor::expr_contains_subquery(expr) => {
-                Ok(Some(self.apply_rls_to_expr(expr.clone())?))
-            }
-            _ => Ok(None),
-        }
-    }
-
     /// GH#32: prepare an UPDATE / DELETE predicate that holds a subquery.
     ///
     /// Returns `(replacement, per_row)`:
@@ -34664,576 +34496,6 @@ impl EmbeddedDatabase {
             }
         }
         Ok(Some(candidates))
-    }
-
-    /// Apply RLS policies to a query plan by injecting Filter operators
-    fn apply_rls_to_plan(&self, plan: sql::LogicalPlan) -> Result<sql::LogicalPlan> {
-        // Early exit: skip RLS tree walk when no tenant context is set (common case)
-        if !self.has_effective_tenant_context() {
-            return Ok(plan);
-        }
-        self.apply_rls_to_plan_recursive(plan)
-    }
-
-    /// THE one place a SELECT policy becomes a plan predicate.
-    ///
-    /// Returns `Some(parsed predicate)` iff RLS applies to `table_name` for reads.
-    /// Both scan-leaf arms of [`apply_rls_to_plan_recursive`](Self::apply_rls_to_plan_recursive)
-    /// route through this, so a read policy has exactly ONE parse and ONE
-    /// meaning:
-    ///
-    /// > A read policy on table T attaches to T's scan leaf as a scan-level
-    /// > predicate (`FilteredScan.predicate`), which the executor evaluates
-    /// > against the full base-table row BEFORE any projection is applied.
-    ///
-    /// Before this existed the two arms each parsed the policy themselves and
-    /// attached it differently — `Scan` wrapped a `Filter` ABOVE the scan while
-    /// `FilteredScan` merged INTO the scan's predicate. Since the text-family
-    /// pipelines apply RLS *after* `ProjectionPruningRule` has pushed a
-    /// projection into a bare `Scan`, the `Filter` arm could reference a column
-    /// the scan no longer emitted, and the read failed with
-    /// `Column '<policy column>' not found in schema`. One rule with two
-    /// implementations; this is the single implementation.
-    ///
-    /// FAIL-CLOSED: a policy that will not parse propagates `Err` to the caller.
-    /// Never downgrade that to `None` (= "no policy applies"), which would serve
-    /// the unfiltered table. Pinned by `rls_parse_error_on_read_fails_closed` in
-    /// `tests/rls_read_parity_tests.rs`.
-    fn rls_read_predicate(
-        &self,
-        table_name: &str,
-        schema: &std::sync::Arc<Schema>,
-    ) -> Result<Option<sql::LogicalExpr>> {
-        if !self.tenant_manager.should_apply_rls(table_name, "SELECT") {
-            return Ok(None);
-        }
-        let Some((using_expr, _)) = self.tenant_manager.get_rls_conditions(table_name, "SELECT") else {
-            return Ok(None);
-        };
-        if !self.row_security_applies(table_name)? {
-            return Ok(None);
-        }
-        let tenant_context = self.effective_tenant_context();
-        let rls_evaluator = tenant::RLSExpressionEvaluator::new(schema.clone(), tenant_context);
-        Ok(Some(rls_evaluator.parse(&using_expr)?))
-    }
-
-    /// `row_security` (PostgreSQL's GUC; `SET row_security = off` is the
-    /// first line of every pg_dump script). Called only once a policy is known
-    /// to apply to `table_name` for this statement:
-    ///
-    /// * on (the default): `Ok(true)` — the policy filters / checks as always;
-    /// * off, for a session that bypasses RLS (no login identity — the
-    ///   embedded API and the REPL, which run as the process owner — the
-    ///   built-in `postgres` / `helios` roles, or a role with SUPERUSER or
-    ///   BYPASSRLS): `Ok(false)` — the policy is not applied, as PostgreSQL
-    ///   does for such a role;
-    /// * off, for any other role: PostgreSQL's 42501 "query would be affected
-    ///   by row-level security policy" — never silently filtered rows, and
-    ///   never silently unfiltered ones.
-    fn row_security_applies(&self, table_name: &str) -> Result<bool> {
-        if sql::params::row_security_enabled() {
-            return Ok(true);
-        }
-        if self.session_bypasses_rls() {
-            return Ok(false);
-        }
-        // `ConstraintViolation` with "row-level security" in the text is what
-        // `sqlstate_for_error` reports as 42501, like the WITH CHECK refusal.
-        Err(Error::ConstraintViolation(format!(
-            "query would be affected by row-level security policy for table \"{table_name}\""
-        )))
-    }
-
-    /// Does the role running this statement bypass row-level security?
-    fn session_bypasses_rls(&self) -> bool {
-        let Some(login) = crate::session_login_user_tls() else {
-            return true;
-        };
-        if &*login == "postgres" || &*login == "helios" {
-            return true;
-        }
-        matches!(
-            self.storage.catalog().get_role(&login),
-            Ok(Some(role)) if role.rolsuper || role.rolbypassrls
-        )
-    }
-
-    /// Recursively apply RLS to all Scan operators in a plan
-    fn apply_rls_to_plan_recursive(&self, plan: sql::LogicalPlan) -> Result<sql::LogicalPlan> {
-        match plan {
-            sql::LogicalPlan::Scan {
-                table_name,
-                alias,
-                schema,
-                projection,
-                as_of,
-            } => {
-                // Emit a FilteredScan carrying the policy as the scan's own
-                // predicate rather than a Filter wrapped ABOVE the scan. The
-                // projection is PRESERVED: `FilteredScan` evaluates its
-                // predicate against the full base-table schema before rows are
-                // projected (`handle_filtered_scan`, and the index fast paths
-                // that re-filter with the full-width schema), so a policy on a
-                // column outside the projection resolves. `Scan::schema()` and
-                // `FilteredScan::schema()` are the same function, so nothing
-                // above the leaf sees a different arity or column set.
-                if let Some(rls_predicate) = self.rls_read_predicate(&table_name, &schema)? {
-                    return Ok(sql::LogicalPlan::FilteredScan {
-                        table_name,
-                        alias,
-                        schema,
-                        projection,
-                        predicate: Some(rls_predicate),
-                        as_of,
-                    });
-                }
-
-                // No RLS, return as-is
-                Ok(sql::LogicalPlan::Scan {
-                    table_name,
-                    alias,
-                    schema,
-                    projection,
-                    as_of,
-                })
-            }
-
-            sql::LogicalPlan::Filter { input, predicate } => Ok(sql::LogicalPlan::Filter {
-                input: self.apply_rls_to_boxed_plan(input)?,
-                predicate: self.apply_rls_to_expr(predicate)?,
-            }),
-
-            sql::LogicalPlan::Project {
-                input,
-                exprs,
-                aliases,
-                distinct,
-                distinct_on,
-                source_alias,
-            } => Ok(sql::LogicalPlan::Project {
-                input: self.apply_rls_to_boxed_plan(input)?,
-                exprs: self.apply_rls_to_exprs(exprs)?,
-                aliases,
-                distinct,
-                distinct_on: distinct_on.map(|d| self.apply_rls_to_exprs(d)).transpose()?,
-                source_alias,
-            }),
-
-            sql::LogicalPlan::Aggregate {
-                input,
-                group_by,
-                aggr_exprs,
-                having,
-            } => Ok(sql::LogicalPlan::Aggregate {
-                input: self.apply_rls_to_boxed_plan(input)?,
-                group_by: self.apply_rls_to_exprs(group_by)?,
-                aggr_exprs: self.apply_rls_to_exprs(aggr_exprs)?,
-                having: self.apply_rls_to_opt_expr(having)?,
-            }),
-
-            sql::LogicalPlan::Join {
-                left,
-                right,
-                join_type,
-                on,
-                lateral,
-            } => Ok(sql::LogicalPlan::Join {
-                left: self.apply_rls_to_boxed_plan(left)?,
-                right: self.apply_rls_to_boxed_plan(right)?,
-                join_type,
-                on: self.apply_rls_to_opt_expr(on)?,
-                lateral,
-            }),
-
-            sql::LogicalPlan::Sort { input, exprs, asc } => Ok(sql::LogicalPlan::Sort {
-                input: self.apply_rls_to_boxed_plan(input)?,
-                exprs: self.apply_rls_to_exprs(exprs)?,
-                asc,
-            }),
-
-            sql::LogicalPlan::Limit {
-                input,
-                limit,
-                offset,
-                limit_param,
-                offset_param,
-            } => Ok(sql::LogicalPlan::Limit {
-                input: self.apply_rls_to_boxed_plan(input)?,
-                limit,
-                offset,
-                limit_param,
-                offset_param,
-            }),
-
-            // Handle FilteredScan - inject RLS filter into the existing predicate
-            sql::LogicalPlan::FilteredScan {
-                table_name,
-                alias,
-                schema,
-                projection,
-                predicate,
-                as_of,
-            } => {
-                // A pushed-down predicate may itself hold a subquery over a
-                // protected table (`WHERE id IN (SELECT … FROM docs)`).
-                let predicate = self.apply_rls_to_opt_expr(predicate)?;
-                // Same rule, same parse (see `rls_read_predicate`): the policy
-                // becomes part of this scan's own predicate. AND-merged with
-                // any predicate already pushed here by the optimizer.
-                if let Some(rls_predicate) = self.rls_read_predicate(&table_name, &schema)? {
-                    // Combine existing predicate with RLS predicate using AND
-                    let combined_predicate = if let Some(existing) = predicate {
-                        Some(sql::LogicalExpr::BinaryExpr {
-                            left: Box::new(existing),
-                            op: sql::BinaryOperator::And,
-                            right: Box::new(rls_predicate),
-                        })
-                    } else {
-                        Some(rls_predicate)
-                    };
-
-                    return Ok(sql::LogicalPlan::FilteredScan {
-                        table_name,
-                        alias,
-                        schema,
-                        projection,
-                        predicate: combined_predicate,
-                        as_of,
-                    });
-                }
-
-                // No RLS, return as-is
-                Ok(sql::LogicalPlan::FilteredScan {
-                    table_name,
-                    alias,
-                    schema,
-                    projection,
-                    predicate,
-                    as_of,
-                })
-            }
-
-            // Set operations: a policy applies to the relation on either side
-            // (v05.6; before, both inputs were returned unfiltered).
-            sql::LogicalPlan::Union { left, right, all } => Ok(sql::LogicalPlan::Union {
-                left: self.apply_rls_to_boxed_plan(left)?,
-                right: self.apply_rls_to_boxed_plan(right)?,
-                all,
-            }),
-            sql::LogicalPlan::Intersect { left, right, all } => Ok(sql::LogicalPlan::Intersect {
-                left: self.apply_rls_to_boxed_plan(left)?,
-                right: self.apply_rls_to_boxed_plan(right)?,
-                all,
-            }),
-            sql::LogicalPlan::Except { left, right, all } => Ok(sql::LogicalPlan::Except {
-                left: self.apply_rls_to_boxed_plan(left)?,
-                right: self.apply_rls_to_boxed_plan(right)?,
-                all,
-            }),
-
-            // Every CTE body and the main query.
-            sql::LogicalPlan::With { ctes, query, recursive } => Ok(sql::LogicalPlan::With {
-                ctes: ctes
-                    .into_iter()
-                    .map(|(name, plan, columns)| Ok((name, self.apply_rls_to_boxed_plan(plan)?, columns)))
-                    .collect::<Result<Vec<_>>>()?,
-                query: self.apply_rls_to_boxed_plan(query)?,
-                recursive,
-            }),
-
-            // EXPLAIN ANALYZE runs its input; plain EXPLAIN shows the plan that
-            // would run, which is the filtered one.
-            sql::LogicalPlan::Explain { input, options } => Ok(sql::LogicalPlan::Explain {
-                input: self.apply_rls_to_boxed_plan(input)?,
-                options,
-            }),
-
-            sql::LogicalPlan::TableFunction {
-                function_name,
-                args,
-                alias,
-                column_alias,
-            } => Ok(sql::LogicalPlan::TableFunction {
-                function_name,
-                args: self.apply_rls_to_exprs(args)?,
-                alias,
-                column_alias,
-            }),
-
-            // Not reached nested (their sources are rewritten at the call sites),
-            // given arms so the match stays exhaustive and a direct call is
-            // still correct.
-            sql::LogicalPlan::InsertSelect {
-                table_name,
-                columns,
-                source,
-                returning,
-                on_conflict,
-            } => Ok(sql::LogicalPlan::InsertSelect {
-                table_name,
-                columns,
-                source: self.apply_rls_to_boxed_plan(source)?,
-                returning,
-                on_conflict,
-            }),
-            sql::LogicalPlan::CreateTableAs {
-                name,
-                column_names,
-                if_not_exists,
-                query,
-                with_data,
-            } => Ok(sql::LogicalPlan::CreateTableAs {
-                name,
-                column_names,
-                if_not_exists,
-                query: self.apply_rls_to_boxed_plan(query)?,
-                with_data,
-            }),
-
-            // Nodes that read no table through this rewrite. Listed by name, with
-            // no wildcard, so a new plan-bearing variant fails to compile until
-            // it is classified. Notes on the less obvious members:
-            //   * Update / Delete / Insert: read policies on their own target
-            //     are write guards (`build_rls_write_guard`); the subqueries in
-            //     UPDATE … SET are rewritten in the Update executor arms.
-            //   * Prepare: the stored statement is rewritten when EXECUTE runs it
-            //     under the executing session's context, never baked in here.
-            //   * CreateView / CreateMaterializedView / CreateTrigger: stored
-            //     definitions; a view is filtered when it is expanded in a read,
-            //     a materialized view's stored rows are not (as in PostgreSQL).
-            plan @ (sql::LogicalPlan::Insert { .. }
-            | sql::LogicalPlan::CreateTable { .. }
-            | sql::LogicalPlan::DropTable { .. }
-            | sql::LogicalPlan::DropMulti { .. }
-            | sql::LogicalPlan::Truncate { .. }
-            | sql::LogicalPlan::Update { .. }
-            | sql::LogicalPlan::Delete { .. }
-            | sql::LogicalPlan::CreateIndex { .. }
-            | sql::LogicalPlan::CreateSequence { .. }
-            | sql::LogicalPlan::DropSequence { .. }
-            | sql::LogicalPlan::AlterSequence(_)
-            | sql::LogicalPlan::CreateEnumType { .. }
-            | sql::LogicalPlan::DropEnumType { .. }
-            | sql::LogicalPlan::CreateSchema { .. }
-            | sql::LogicalPlan::DropSchema { .. }
-            | sql::LogicalPlan::CreateExtension { .. }
-            | sql::LogicalPlan::CreateDatabase { .. }
-            | sql::LogicalPlan::DropDatabase { .. }
-            | sql::LogicalPlan::DropExtension { .. }
-            | sql::LogicalPlan::AlterColumnStorage { .. }
-            | sql::LogicalPlan::AlterTableAddColumn { .. }
-            | sql::LogicalPlan::AlterTableDropColumn { .. }
-            | sql::LogicalPlan::AlterTableRenameColumn { .. }
-            | sql::LogicalPlan::AlterTableAlterColumnNullability { .. }
-            | sql::LogicalPlan::AlterTableRename { .. }
-            | sql::LogicalPlan::AlterTableSetSchema { .. }
-            | sql::LogicalPlan::AlterTableAddForeignKey { .. }
-            | sql::LogicalPlan::AlterTableAlterConstraintEnforcement { .. }
-            | sql::LogicalPlan::AlterTableDropConstraint { .. }
-            | sql::LogicalPlan::AlterTableMulti { .. }
-            | sql::LogicalPlan::CreateBranch { .. }
-            | sql::LogicalPlan::DropBranch { .. }
-            | sql::LogicalPlan::MergeBranch { .. }
-            | sql::LogicalPlan::UseBranch { .. }
-            | sql::LogicalPlan::ShowBranches
-            | sql::LogicalPlan::CreateMaterializedView { .. }
-            | sql::LogicalPlan::RefreshMaterializedView { .. }
-            | sql::LogicalPlan::DropMaterializedView { .. }
-            | sql::LogicalPlan::AlterMaterializedView { .. }
-            | sql::LogicalPlan::CreateView { .. }
-            | sql::LogicalPlan::DropView { .. }
-            | sql::LogicalPlan::SystemView { .. }
-            | sql::LogicalPlan::CreateTrigger { .. }
-            | sql::LogicalPlan::DropTrigger { .. }
-            | sql::LogicalPlan::StartTransaction
-            | sql::LogicalPlan::Commit
-            | sql::LogicalPlan::Rollback
-            | sql::LogicalPlan::Savepoint { .. }
-            | sql::LogicalPlan::ReleaseSavepoint { .. }
-            | sql::LogicalPlan::RollbackToSavepoint { .. }
-            | sql::LogicalPlan::Prepare { .. }
-            | sql::LogicalPlan::Execute { .. }
-            | sql::LogicalPlan::Deallocate { .. }
-            | sql::LogicalPlan::SetConstraints { .. }
-            | sql::LogicalPlan::CreateFunction { .. }
-            | sql::LogicalPlan::CreateProcedure { .. }
-            | sql::LogicalPlan::DropFunction { .. }
-            | sql::LogicalPlan::DropProcedure { .. }
-            | sql::LogicalPlan::Call { .. }
-            | sql::LogicalPlan::DualScan
-            | sql::LogicalPlan::Noop
-            | sql::LogicalPlan::DropRole { .. }
-            | sql::LogicalPlan::CreateRole { .. }
-            | sql::LogicalPlan::AlterRole { .. }
-            | sql::LogicalPlan::GrantPrivileges { .. }
-            | sql::LogicalPlan::RevokePrivileges { .. }
-            | sql::LogicalPlan::DropIndex { .. }
-            | sql::LogicalPlan::AlterTableAddUnique { .. }
-            | sql::LogicalPlan::AlterTableAddPrimaryKey { .. }
-            | sql::LogicalPlan::AlterTableAddCheck { .. }
-            | sql::LogicalPlan::DropTableCascade { .. }
-            | sql::LogicalPlan::Notification(_)) => Ok(plan),
-
-            #[cfg(feature = "ha-tier1")]
-            plan @ (sql::LogicalPlan::Switchover { .. }
-            | sql::LogicalPlan::SwitchoverCheck { .. }
-            | sql::LogicalPlan::ClusterStatus
-            | sql::LogicalPlan::SetNodeAlias { .. }
-            | sql::LogicalPlan::ShowTopology) => Ok(plan),
-        }
-    }
-
-    /// Apply read policies to every plan embedded in `expr` (scalar, IN and
-    /// EXISTS subqueries, at any depth). The owning counterpart of the
-    /// executor's read-only `walk_expr_subplans`: the expression tree is rebuilt
-    /// unchanged except that each embedded plan goes through
-    /// [`apply_rls_to_plan_recursive`](Self::apply_rls_to_plan_recursive), so a
-    /// policy still becomes a predicate only in
-    /// [`rls_read_predicate`](Self::rls_read_predicate) and a parse error still
-    /// fails the statement.
-    ///
-    /// The subquery executors run the plan held in the expression, they do not
-    /// plan again from text, so rewriting the embedded plan is enough.
-    ///
-    /// Callers check `has_effective_tenant_context()` first (this walk is
-    /// skipped entirely without one). Used by the plan rewrite for every
-    /// expression-bearing node and by UPDATE … SET, whose assignment
-    /// expressions are evaluated outside the plan rewrite.
-    pub(crate) fn apply_rls_to_expr(&self, expr: sql::LogicalExpr) -> Result<sql::LogicalExpr> {
-        use sql::LogicalExpr as E;
-        Ok(match expr {
-            E::ScalarSubquery { subquery } => E::ScalarSubquery {
-                subquery: Box::new(self.apply_rls_to_plan_recursive(*subquery)?),
-            },
-            E::InSubquery {
-                expr,
-                subquery,
-                negated,
-            } => E::InSubquery {
-                expr: self.apply_rls_to_boxed_expr(expr)?,
-                subquery: Box::new(self.apply_rls_to_plan_recursive(*subquery)?),
-                negated,
-            },
-            E::Exists { subquery, negated } => E::Exists {
-                subquery: Box::new(self.apply_rls_to_plan_recursive(*subquery)?),
-                negated,
-            },
-            E::BinaryExpr { left, op, right } => E::BinaryExpr {
-                left: self.apply_rls_to_boxed_expr(left)?,
-                op,
-                right: self.apply_rls_to_boxed_expr(right)?,
-            },
-            E::UnaryExpr { op, expr } => E::UnaryExpr {
-                op,
-                expr: self.apply_rls_to_boxed_expr(expr)?,
-            },
-            E::AggregateFunction { fun, args, distinct } => E::AggregateFunction {
-                fun,
-                args: self.apply_rls_to_exprs(args)?,
-                distinct,
-            },
-            E::ScalarFunction { fun, args } => E::ScalarFunction {
-                fun,
-                args: self.apply_rls_to_exprs(args)?,
-            },
-            E::Case {
-                expr,
-                when_then,
-                else_result,
-            } => E::Case {
-                expr: match expr {
-                    Some(e) => Some(self.apply_rls_to_boxed_expr(e)?),
-                    None => None,
-                },
-                when_then: when_then
-                    .into_iter()
-                    .map(|(w, t)| Ok((self.apply_rls_to_expr(w)?, self.apply_rls_to_expr(t)?)))
-                    .collect::<Result<Vec<_>>>()?,
-                else_result: match else_result {
-                    Some(e) => Some(self.apply_rls_to_boxed_expr(e)?),
-                    None => None,
-                },
-            },
-            E::Cast { expr, data_type } => E::Cast {
-                expr: self.apply_rls_to_boxed_expr(expr)?,
-                data_type,
-            },
-            E::IsNull { expr, is_null } => E::IsNull {
-                expr: self.apply_rls_to_boxed_expr(expr)?,
-                is_null,
-            },
-            E::Between {
-                expr,
-                low,
-                high,
-                negated,
-            } => E::Between {
-                expr: self.apply_rls_to_boxed_expr(expr)?,
-                low: self.apply_rls_to_boxed_expr(low)?,
-                high: self.apply_rls_to_boxed_expr(high)?,
-                negated,
-            },
-            E::InList { expr, list, negated } => E::InList {
-                expr: self.apply_rls_to_boxed_expr(expr)?,
-                list: self.apply_rls_to_exprs(list)?,
-                negated,
-            },
-            E::InSet { expr, values, negated } => E::InSet {
-                expr: self.apply_rls_to_boxed_expr(expr)?,
-                values,
-                negated,
-            },
-            E::ArraySubscript { array, index } => E::ArraySubscript {
-                array: self.apply_rls_to_boxed_expr(array)?,
-                index: self.apply_rls_to_boxed_expr(index)?,
-            },
-            E::Tuple { items } => E::Tuple {
-                items: self.apply_rls_to_exprs(items)?,
-            },
-            E::WindowFunction {
-                fun,
-                args,
-                partition_by,
-                order_by,
-                frame,
-            } => E::WindowFunction {
-                fun,
-                args: self.apply_rls_to_exprs(args)?,
-                partition_by: self.apply_rls_to_exprs(partition_by)?,
-                order_by: order_by
-                    .into_iter()
-                    .map(|(e, asc)| Ok((self.apply_rls_to_expr(e)?, asc)))
-                    .collect::<Result<Vec<_>>>()?,
-                frame,
-            },
-            // Leaves: no child expression, no embedded plan. Listed by name (no
-            // wildcard) so a new expression variant must be classified here.
-            leaf @ (E::Column { .. }
-            | E::Literal(_)
-            | E::DefaultValue
-            | E::Wildcard
-            | E::Parameter { .. }
-            | E::NewRow { .. }
-            | E::OldRow { .. }
-            | E::BoundColumn { .. }) => leaf,
-        })
-    }
-
-    fn apply_rls_to_boxed_expr(&self, expr: Box<sql::LogicalExpr>) -> Result<Box<sql::LogicalExpr>> {
-        Ok(Box::new(self.apply_rls_to_expr(*expr)?))
-    }
-
-    fn apply_rls_to_exprs(&self, exprs: Vec<sql::LogicalExpr>) -> Result<Vec<sql::LogicalExpr>> {
-        exprs.into_iter().map(|e| self.apply_rls_to_expr(e)).collect()
-    }
-
-    fn apply_rls_to_opt_expr(&self, expr: Option<sql::LogicalExpr>) -> Result<Option<sql::LogicalExpr>> {
-        expr.map(|e| self.apply_rls_to_expr(e)).transpose()
-    }
-
-    fn apply_rls_to_boxed_plan(&self, plan: Box<sql::LogicalPlan>) -> Result<Box<sql::LogicalPlan>> {
-        Ok(Box::new(self.apply_rls_to_plan_recursive(*plan)?))
     }
 
     // ==================== Auto-Refresh Worker Methods ====================
