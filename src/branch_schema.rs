@@ -148,6 +148,7 @@ pub fn schema_statement_name(plan: &LogicalPlan) -> Option<&'static str> {
         LogicalPlan::AlterTableRename { .. } => "ALTER TABLE … RENAME TO",
         LogicalPlan::AlterTableSetSchema { .. } => "ALTER TABLE … SET SCHEMA",
         LogicalPlan::AlterTableAlterColumnNullability { .. } => "ALTER TABLE … ALTER COLUMN … NOT NULL",
+        LogicalPlan::AlterTableAlterColumn { .. } => "ALTER TABLE … ALTER COLUMN",
         LogicalPlan::AlterColumnStorage { .. } => "ALTER TABLE … ALTER COLUMN … SET STORAGE",
         LogicalPlan::AlterTableAddForeignKey { .. } => "ALTER TABLE … ADD FOREIGN KEY",
         LogicalPlan::AlterTableAddUnique { .. } => "ALTER TABLE … ADD CONSTRAINT … UNIQUE",
@@ -244,6 +245,7 @@ fn schema_plan_tables(storage: &StorageEngine, plan: &LogicalPlan) -> Vec<String
         }
         LogicalPlan::AlterTableAddColumn { table_name, .. }
         | LogicalPlan::AlterTableAlterColumnNullability { table_name, .. }
+        | LogicalPlan::AlterTableAlterColumn { table_name, .. }
         | LogicalPlan::AlterColumnStorage { table_name, .. }
         | LogicalPlan::AlterTableAddUnique { table_name, .. }
         | LogicalPlan::AlterTableAddPrimaryKey { table_name, .. }

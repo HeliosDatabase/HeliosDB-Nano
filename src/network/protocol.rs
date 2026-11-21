@@ -438,6 +438,8 @@ pub mod sqlstate {
     pub const INVALID_SCHEMA_DEFINITION: &str = "42P15";
     pub const INVALID_TABLE_DEFINITION: &str = "42P16";
     pub const INVALID_OBJECT_DEFINITION: &str = "42P17";
+    /// A direct write of a generated column.
+    pub const GENERATED_ALWAYS: &str = "428C9";
 
     // Class 44 - WITH CHECK OPTION Violation
     pub const WITH_CHECK_OPTION_VIOLATION: &str = "44000";

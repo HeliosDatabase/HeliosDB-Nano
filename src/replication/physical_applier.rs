@@ -2389,6 +2389,8 @@ impl Touched {
             | KeyClass::MetaDatabase
             | KeyClass::MetaEnumType
             | KeyClass::MetaIdentity
+            | KeyClass::MetaColumnOptions
+            | KeyClass::MetaComment
             | KeyClass::MetaPartition
             | KeyClass::MetaSequence
             | KeyClass::MetaSeqState

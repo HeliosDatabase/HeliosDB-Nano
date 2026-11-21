@@ -1435,6 +1435,44 @@ pub enum LogicalPlan {
     /// GH#40: `LISTEN` / `UNLISTEN` / `NOTIFY`. No output rows.
     /// APPEND-ONLY — see [`LogicalPlan::Noop`].
     Notification(crate::notify::NotifyCommand),
+
+    /// `ALTER TABLE … ALTER COLUMN …` forms other than `DROP NOT NULL` /
+    /// `SET NOT NULL` and `SET STORAGE` (see [`AlterColumnAction`]).
+    /// APPEND-ONLY — see [`LogicalPlan::Noop`].
+    AlterTableAlterColumn {
+        /// Table (already schema-resolved).
+        table_name: String,
+        /// Column the clause names.
+        column_name: String,
+        /// What the clause does to it.
+        action: AlterColumnAction,
+    },
+}
+
+/// What one `ALTER TABLE … ALTER COLUMN` clause does to its column.
+/// APPEND-ONLY: plans are persisted by position.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum AlterColumnAction {
+    /// `SET DEFAULT expr`.
+    SetDefault(Box<LogicalExpr>),
+    /// `DROP DEFAULT`.
+    DropDefault,
+    /// `[SET DATA] TYPE type [USING expr]`.
+    SetDataType {
+        /// The new type.
+        data_type: crate::types::DataType,
+        /// `USING expr`, over the row as it is.
+        using: Option<Box<LogicalExpr>>,
+    },
+    /// `ADD GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY`.
+    AddIdentity,
+    /// `DROP IDENTITY [IF EXISTS]`.
+    DropIdentity {
+        /// `IF EXISTS` was given.
+        if_exists: bool,
+    },
+    /// `SET STATISTICS n` (`None`: `DEFAULT`, PostgreSQL's -1).
+    SetStatistics(Option<i32>),
 }
 
 /// Function/Procedure parameter
@@ -2689,7 +2727,9 @@ impl LogicalPlan {
                 // ALTER TABLE RENAME COLUMN doesn't have output schema
                 Arc::new(Schema { columns: vec![] })
             }
-            LogicalPlan::AlterTableAlterColumnNullability { .. } => Arc::new(Schema { columns: vec![] }),
+            LogicalPlan::AlterTableAlterColumnNullability { .. } | LogicalPlan::AlterTableAlterColumn { .. } => {
+                Arc::new(Schema { columns: vec![] })
+            }
             LogicalPlan::AlterTableRename { .. } => {
                 // ALTER TABLE RENAME doesn't have output schema
                 Arc::new(Schema { columns: vec![] })

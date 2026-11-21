@@ -872,6 +872,24 @@ impl EmbeddedDatabase {
                                     value;
                             }
                             if current_child.values == updated.values {
+                                // SET DEFAULT whose default is the key that is going
+                                // away: the row would stay on a key no parent has.
+                                // The default must itself satisfy the foreign key.
+                                if action == ReferentialAction::SetDefault
+                                    && matches_key(&child_schema, &current_child, &fk.columns, &wanted)
+                                {
+                                    if *self.fk_validation_mode.read() == FkValidationMode::Audit
+                                        || fk.enforcement == ConstraintEnforcement::LockFree
+                                    {
+                                        self.record_fk_violation(&fk, &old_key)?;
+                                        continue;
+                                    }
+                                    return Err(Error::constraint_violation(format!(
+                                        "Foreign key constraint '{}' violated: the default of '{}' is the key being \
+                                         removed from '{}', so the row would reference no row",
+                                        fk.name, fk.table_name, parent
+                                    )));
+                                }
                                 continue;
                             }
                             Self::check_not_null_for_materialized_insert(&updated.values, &child_schema)?;

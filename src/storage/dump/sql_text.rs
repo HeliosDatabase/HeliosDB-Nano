@@ -476,6 +476,17 @@ pub fn column_ddl_with_identity(
     if inline_unique && col.unique && !col.primary_key {
         out.push_str(" UNIQUE");
     }
+    // A generated column: its expression, not a default.
+    if let Some(expr) = crate::generated_columns::generation_expr(col.default_expr.as_deref()) {
+        let rendered = expr.to_dump_sql().map_err(|e| {
+            Error::storage(format!(
+                "dump_sql: the generated column {} uses an expression the SQL exporter cannot render ({e})",
+                quote_ident(&col.name)
+            ))
+        })?;
+        out.push_str(&format!(" GENERATED ALWAYS AS ({rendered}) STORED"));
+        return Ok(out);
+    }
     if let Some(stored) = &col.default_expr {
         let rendered = match stored_expr(stored) {
             Some(expr) => expr.to_dump_sql().map_err(|e| {
@@ -588,6 +599,10 @@ pub fn table_ddl_with_identity(
     }
 
     for check in &constraints.check_constraints {
+        // A generated column's own CHECK comes back with the column.
+        if crate::generated_columns::is_implicit_check(&check.expression, schema) {
+            continue;
+        }
         // BLOCK 1: the CHECK body is rendered by the DUMP renderer, which
         // quotes identifiers and errors on anything it cannot spell. The
         // catalog-readback renderer (`to_default_sql`) writes a column
@@ -822,6 +837,10 @@ fn row_values(table: &str, schema: &Schema, row: &Tuple) -> Result<String> {
     let missing = Value::Null;
     let mut rendered: Vec<String> = Vec::with_capacity(schema.columns.len());
     for (idx, col) in schema.columns.iter().enumerate() {
+        // A generated column is computed by the INSERT that restores the row.
+        if crate::generated_columns::is_generated_default(col.default_expr.as_deref()) {
+            continue;
+        }
         let value = row.values.get(idx).unwrap_or(&missing);
         let literal = value_literal(value, &col.data_type)
             .map_err(|e| Error::storage(format!("cannot export {}.{}: {}", table, col.name, e)))?;
@@ -847,7 +866,12 @@ pub fn insert_statement_batch(table: &str, schema: &Schema, rows: &[Tuple]) -> R
     if rows.is_empty() {
         return Ok(String::new());
     }
-    let columns: Vec<String> = schema.columns.iter().map(|c| quote_ident(&c.name)).collect();
+    let columns: Vec<String> = schema
+        .columns
+        .iter()
+        .filter(|c| !crate::generated_columns::is_generated_default(c.default_expr.as_deref()))
+        .map(|c| quote_ident(&c.name))
+        .collect();
     let mut tuples: Vec<String> = Vec::with_capacity(rows.len());
     for row in rows {
         tuples.push(row_values(table, schema, row)?);

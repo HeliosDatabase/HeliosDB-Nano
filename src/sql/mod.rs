@@ -7,6 +7,7 @@
 // interceptor + phase-3 registry). STORED AND INTROSPECTABLE ONLY — nothing
 // in this build enforces a privilege; see the module docs.
 pub mod acl_views;
+pub(crate) mod alter_column_plan; // ALTER TABLE … ALTER COLUMN forms and the 0A000 of forms with no plan
 pub mod compiled; // RAG-native compiled query plan cache (idea 4)
 pub mod constraints;
 pub(crate) mod default_volatility; // Spec R5.2: a column DEFAULT's volatility, and its one evaluation rule
@@ -56,6 +57,7 @@ pub mod explain_webui;
 
 // Phase 3: SQL Extensions for branching, time-travel, and MVs
 pub mod phase3;
+pub(crate) mod pieces; // a statement in lexical pieces, for forms the grammar lacks
 
 pub use constraints::{
     CheckConstraint, ConstraintEnforcement, ConstraintOperation, ConstraintRef, DeferredConstraintTracker,

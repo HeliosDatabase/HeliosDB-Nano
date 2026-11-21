@@ -4605,6 +4605,68 @@ impl ArtIndexManager {
         Self::int_value_width(tuple.values.get(schema.get_column_index(column)?)?)
     }
 
+    /// One index built again from `tuples` (every row of its table, values resolved,
+    /// with row ids), in a tree of its own: the registered tree is not touched, so
+    /// a reader of it sees the old entries until [`Self::install_index_tree`]. A
+    /// PRIMARY KEY or UNIQUE index refuses two rows under one key
+    /// ([`ArtIndexError::DuplicateKey`], naming the constraint). `REINDEX`, and
+    /// `ALTER COLUMN … TYPE`, whose new values encode to other keys.
+    pub(crate) fn build_index_tree(
+        &self,
+        name: &str,
+        schema: &Schema,
+        tuples: &[Tuple],
+    ) -> ArtResult<AdaptiveRadixTree> {
+        let entry = {
+            let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
+            indexes
+                .get(name)
+                .cloned()
+                .ok_or_else(|| ArtIndexError::IndexNotFound(name.to_string()))?
+        };
+        let enforces = matches!(entry.index_type, ArtIndexType::PrimaryKey | ArtIndexType::Unique);
+        let mut tree = AdaptiveRadixTree::new(name, &entry.table, entry.columns.clone(), entry.index_type);
+        for tuple in tuples {
+            let Some(row_id) = tuple.row_id else {
+                return Err(ArtIndexError::Internal(format!(
+                    "Cannot rebuild index '{}' from a tuple without row_id",
+                    name
+                )));
+            };
+            let Some(key) = Self::entry_row_key(&entry, schema, tuple) else {
+                continue;
+            };
+            if enforces && tree.contains(&key) {
+                return Err(ArtIndexError::DuplicateKey(format!(
+                    "Duplicate key value violates UNIQUE constraint \"{}\"",
+                    Self::violation_name(&entry, name)
+                )));
+            }
+            tree.insert(&key, row_id)?;
+            if let Some((value, key_width)) = Self::entry_dense_int(&entry, schema, tuple) {
+                tree.record_dense_int_insert(key_width, value);
+            }
+        }
+        Ok(tree)
+    }
+
+    /// Put `tree` ([`Self::build_index_tree`]) in the place of index `name`'s tree,
+    /// in one step under the tree's write lock: a reader sees the old entries or
+    /// the new ones, never an empty index.
+    pub(crate) fn install_index_tree(&self, name: &str, tree: AdaptiveRadixTree) -> ArtResult<()> {
+        self.note_mutation();
+        let entry = {
+            let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
+            indexes
+                .get(name)
+                .cloned()
+                .ok_or_else(|| ArtIndexError::IndexNotFound(name.to_string()))?
+        };
+        let mut current = entry.tree.write().unwrap_or_else(|e| e.into_inner());
+        *current = tree;
+        Ok(())
+    }
+
     /// sprinter 6bc4a4040eb7 (B3 fourth fix pass): all of a table's key changes for
     /// a MERGE BRANCH, one tree at a time and all at once in each, under that tree's
     /// write lock: nothing gets between looking at a key and taking it, and a row

@@ -258,6 +258,7 @@ pub use lockfree::{
 
 // Per-column storage optimization exports
 pub use catalog::PersistedIndexDefinition;
+pub use catalog::StoredComment;
 // The ONE index-type → owning-structure classifier, shared by CREATE INDEX,
 // DROP INDEX and the open-time rebuild so the mapping cannot drift again.
 pub use catalog::{index_family, IndexFamily};

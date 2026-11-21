@@ -1498,6 +1498,10 @@ impl Evaluator {
             // pg_get_expr(node_tree, oid[, prettify]): `pg_attrdef` now stores
             // the already-rendered default SQL in `adbin`, so return that first
             // argument verbatim (NULL when there is no node-tree text).
+            // The comment `COMMENT ON` stored for an object id, or NULL.
+            "obj_description" | "col_description" | "shobj_description" => {
+                crate::comments::description_function(fun_dispatch, &arg_values)
+            }
             "pg_get_expr" => Ok(match arg_values.first() {
                 Some(Value::String(s)) if !s.is_empty() => Value::String(s.clone()),
                 _ => Value::Null,

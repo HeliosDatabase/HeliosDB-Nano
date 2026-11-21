@@ -2,8 +2,9 @@
 //!
 //! Dumps and migration tools write `COMMENT ON TABLE … IS '…'` beside the DDL
 //! it describes; the refusal ("Comment is not supported") stopped the script.
-//! The comment is not stored: nothing reads one back yet. The target of a
-//! table or column comment must exist, as in PostgreSQL.
+//! Since 5.0 the comment is stored and read back (`tests/comment_on_stored.rs`);
+//! these cases pin which statements are accepted. The target of a table or
+//! column comment must exist, as in PostgreSQL.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use heliosdb_nano::EmbeddedDatabase;

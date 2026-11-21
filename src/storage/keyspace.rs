@@ -90,6 +90,10 @@ pub enum KeyClass {
     MetaEnumType,
     /// `meta:identity:{table}` — identity-column list.
     MetaIdentity,
+    /// `meta:attoptions:{table}` — per-column options (`SET STATISTICS`).
+    MetaColumnOptions,
+    /// `meta:comment:{kind}:{name}` — a `COMMENT ON` text.
+    MetaComment,
     /// `meta:partchild:{parent}` / `meta:partparent:{child}` — partition links.
     MetaPartition,
     /// `meta:sequence:{seq}` — sequence definition.
@@ -299,6 +303,10 @@ pub const PREFIXES: &[(&[u8], KeyClass)] = &[
     (b"meta:enum_type:", KeyClass::MetaEnumType),
     // storage/catalog.rs:4175 `identity_key`
     (b"meta:identity:", KeyClass::MetaIdentity),
+    // storage/catalog_column_options.rs `column_options_key`
+    (b"meta:attoptions:", KeyClass::MetaColumnOptions),
+    // storage/catalog_comments.rs `comment_key`
+    (b"meta:comment:", KeyClass::MetaComment),
     // storage/catalog.rs:4250 `partition_children_key`
     (b"meta:partchild:", KeyClass::MetaPartition),
     // storage/catalog.rs:4254 `partition_parent_key`
@@ -596,6 +604,8 @@ mod tests {
         (b"meta:database:app_db", KeyClass::MetaDatabase, None),
         (b"meta:enum_type:mood", KeyClass::MetaEnumType, None),
         (b"meta:identity:users", KeyClass::MetaIdentity, None),
+        (b"meta:attoptions:users", KeyClass::MetaColumnOptions, None),
+        (b"meta:comment:table:users", KeyClass::MetaComment, None),
         (b"meta:partchild:events", KeyClass::MetaPartition, None),
         (b"meta:partparent:events_2026", KeyClass::MetaPartition, None),
         (b"meta:sequence:ids", KeyClass::MetaSequence, None),

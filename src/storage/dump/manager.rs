@@ -130,6 +130,21 @@ pub struct SchemaObjects {
     /// (materialized views, triggers, …). Written into the SQL header and
     /// reported by restore as warnings, never dropped silently.
     pub not_carried: Vec<String>,
+    /// The `COMMENT ON` statements of the stored comments, tables before their
+    /// columns. Not part of the bincode layout above (a file written before
+    /// comments were stored has none): the binary writer appends them after it
+    /// in the `SCHM` section, where a reader that does not know them stops.
+    #[serde(skip)]
+    pub comments: Vec<CommentDump>,
+}
+
+/// One stored comment, as the statement that makes it again.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CommentDump {
+    /// The table the comment belongs to (its own, a column's, a constraint's).
+    pub table: Option<String>,
+    /// `COMMENT ON … IS '…';`
+    pub statement: String,
 }
 
 impl SchemaObjects {
@@ -140,6 +155,7 @@ impl SchemaObjects {
             && self.indexes.is_empty()
             && self.views.is_empty()
             && self.not_carried.is_empty()
+            && self.comments.is_empty()
     }
 
     /// The identity columns recorded for `table`.
@@ -634,6 +650,7 @@ impl DumpManager {
             objects.views.clear();
             objects.indexes.retain(|i| in_dump(&i.table));
             objects.identity_columns.retain(|(t, _)| in_dump(t));
+            objects.comments.retain(|c| c.table.as_deref().is_some_and(in_dump));
         }
         // Postgres: anything without a portable spelling is a comment.
         let mut unportable_indexes: Vec<String> = Vec::new();
@@ -812,6 +829,14 @@ impl DumpManager {
             }
         }
 
+        // Phase 7 — comments, once everything they describe exists.
+        if !objects.comments.is_empty() {
+            writeln!(writer, "\n-- Comments").map_err(w)?;
+            for comment in &objects.comments {
+                writeln!(writer, "{}", comment.statement).map_err(w)?;
+            }
+        }
+
         Ok(())
     }
 
@@ -978,8 +1003,15 @@ impl DumpManager {
 
         // Format v3: the schema objects, after every table.
         if !objects.is_empty() {
-            let objects_bytes = bincode::serialize(&objects)
+            let mut objects_bytes = bincode::serialize(&objects)
                 .map_err(|e| Error::storage(format!("Failed to serialize schema objects: {}", e)))?;
+            // The comments follow the schema objects' own bytes (see `comments`).
+            if !objects.comments.is_empty() {
+                objects_bytes.extend(
+                    bincode::serialize(&objects.comments)
+                        .map_err(|e| Error::storage(format!("Failed to serialize comments: {}", e)))?,
+                );
+            }
             writer
                 .write_all(b"SCHM")
                 .map_err(|e| Error::storage(format!("Failed to write schema marker: {}", e)))?;
@@ -1373,10 +1405,18 @@ impl DumpManager {
                     reader
                         .read_exact(&mut bytes)
                         .map_err(|e| Error::storage(format!("Failed to read schema objects: {}", e)))?;
-                    schema_objects = Some(
-                        bincode::deserialize(&bytes)
-                            .map_err(|e| Error::storage(format!("Failed to deserialize schema objects: {}", e)))?,
-                    );
+                    let mut objects: SchemaObjects = bincode::deserialize(&bytes)
+                        .map_err(|e| Error::storage(format!("Failed to deserialize schema objects: {}", e)))?;
+                    // What follows the schema objects' own bytes: the comments.
+                    let used = bincode::serialized_size(&objects)
+                        .ok()
+                        .and_then(|used| usize::try_from(used).ok())
+                        .unwrap_or(bytes.len());
+                    if let Some(rest) = bytes.get(used..).filter(|rest| !rest.is_empty()) {
+                        objects.comments = bincode::deserialize(rest)
+                            .map_err(|e| Error::storage(format!("Failed to deserialize comments: {}", e)))?;
+                    }
+                    schema_objects = Some(objects);
                     continue;
                 }
                 _ => {

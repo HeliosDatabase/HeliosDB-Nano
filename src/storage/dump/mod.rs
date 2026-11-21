@@ -11,7 +11,7 @@ pub(crate) mod sql_text;
 
 pub use format::{CompressionType, DumpFormat, DumpMetadata as FormatMetadata, DUMP_MAGIC_NUMBER, DUMP_VERSION};
 pub use manager::{
-    DatabaseInterface, DatabaseRestoreInterface, DirtyTracker, DumpManager, DumpMetadata, DumpMode, DumpOptions,
-    DumpOutputFormat, DumpReport, DumpType, IndexDump, IndexMetadata, RestoreOptions, RestoreReport, RestoreValidation,
-    SchemaObjects, SequenceDump, SqlDialect, SqlDumpOptions, ViewDump,
+    CommentDump, DatabaseInterface, DatabaseRestoreInterface, DirtyTracker, DumpManager, DumpMetadata, DumpMode,
+    DumpOptions, DumpOutputFormat, DumpReport, DumpType, IndexDump, IndexMetadata, RestoreOptions, RestoreReport,
+    RestoreValidation, SchemaObjects, SequenceDump, SqlDialect, SqlDumpOptions, ViewDump,
 };

@@ -370,6 +370,7 @@ impl Planner {
             | LogicalPlan::AlterTableDropColumn { .. }
             | LogicalPlan::AlterTableRenameColumn { .. }
             | LogicalPlan::AlterTableAlterColumnNullability { .. }
+            | LogicalPlan::AlterTableAlterColumn { .. }
             | LogicalPlan::AlterTableRename { .. }
             | LogicalPlan::AlterTableSetSchema { .. }
             | LogicalPlan::AlterTableAddForeignKey { .. }

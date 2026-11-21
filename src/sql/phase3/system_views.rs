@@ -12,6 +12,9 @@
 #[path = "../../catalog_columns_scope_tests.rs"]
 mod catalog_columns_scope_tests;
 
+#[path = "comment_views.rs"]
+pub(crate) mod comment_views;
+
 use crate::storage::{art_index::ArtIndexType, StorageEngine};
 use crate::{Column, ColumnStorageMode, DataType, Error, Result, Schema, Tuple, Value};
 use std::collections::{HashMap, HashSet};
@@ -725,6 +728,8 @@ impl SystemViewRegistry {
                     sv_col("attgenerated", DataType::Text),
                     sv_col("atthasdef", DataType::Boolean),
                     sv_col("attcollation", DataType::Int4),
+                    // `ALTER COLUMN … SET STATISTICS n`; -1 is the default.
+                    sv_col("attstattarget", DataType::Int4),
                 ],
             },
             description: "Catalog of table columns and their attributes".to_string(),
@@ -2713,7 +2718,7 @@ impl SystemViewRegistry {
                     sv_col("description", DataType::Text),
                 ],
             },
-            description: "PG-compat object descriptions (empty — Nano doesn't store COMMENT ON)".to_string(),
+            description: "The comments stored by COMMENT ON, by object id".to_string(),
         });
 
         self.register_view(SystemViewSchema {
@@ -4285,8 +4290,10 @@ impl SystemViewRegistry {
             // TenantManager hang off `EmbeddedDatabase`, not `StorageEngine`.
             // Populating them requires widening this signature (named follow-up),
             // NOT another wire-side fixed-shape copy.
-            "pg_proc" | "pg_description" | "pg_policies" | "pg_policy" | "pg_inherits" | "pg_publication"
-            | "pg_statistic_ext" => Ok(vec![]),
+            "pg_description" => comment_views::execute_pg_description(storage),
+            "pg_proc" | "pg_policies" | "pg_policy" | "pg_inherits" | "pg_publication" | "pg_statistic_ext" => {
+                Ok(vec![])
+            }
             // Empty for the reasons given at registration (HDB-011): no range
             // subtypes are registered, and enum types cannot be enumerated
             // from the catalog. A driver's `LEFT OUTER JOIN pg_range` / enum
@@ -4746,6 +4753,7 @@ impl SystemViewRegistry {
             // right rows. Empty / missing record → no identity cols
             // → every column gets attidentity = ''.
             let identity_cols = catalog.list_identity_columns(table_name).unwrap_or_default();
+            let statistics_targets = catalog.column_statistics_targets(table_name).unwrap_or_default();
 
             match catalog.get_table_schema(table_name) {
                 Ok(schema) => {
@@ -4757,20 +4765,23 @@ impl SystemViewRegistry {
                             _ => 0,
                         };
                         let has_default = column.default_expr.is_some() || is_identity_col;
+                        let is_generated =
+                            crate::generated_columns::is_generated_default(column.default_expr.as_deref());
                         let tuple = Tuple::new(vec![
-                            Value::Int4(table_oid),                                                  // attrelid
-                            Value::String(column.name.clone()),                                      // attname
-                            Value::Int4(type_oid),                                                   // atttypid
-                            Value::Int4(-1),                                                         // attlen
-                            Value::Boolean(!column.nullable),                                        // attnotnull
-                            Value::Int4((col_idx + 1) as i32),                                       // attnum
-                            Value::Int4(-1),                                                         // atttypmod
-                            Value::Boolean(false),                                                   // attisdropped
-                            Value::Int4(ndims),                                                      // attndims
-                            Value::String(if is_identity_col { "d".into() } else { String::new() }), // attidentity
-                            Value::String(String::new()),                                            // attgenerated
-                            Value::Boolean(has_default),                                             // atthasdef
+                            Value::Int4(table_oid),                                                   // attrelid
+                            Value::String(column.name.clone()),                                       // attname
+                            Value::Int4(type_oid),                                                    // atttypid
+                            Value::Int4(-1),                                                          // attlen
+                            Value::Boolean(!column.nullable),                                         // attnotnull
+                            Value::Int4((col_idx + 1) as i32),                                        // attnum
+                            Value::Int4(-1),                                                          // atttypmod
+                            Value::Boolean(false),                                                    // attisdropped
+                            Value::Int4(ndims),                                                       // attndims
+                            Value::String(if is_identity_col { "d".into() } else { String::new() }),  // attidentity
+                            Value::String(if is_generated { "s".into() } else { String::new() }),     // attgenerated
+                            Value::Boolean(has_default),                                              // atthasdef
                             Value::Int4(0), // attcollation (default)
+                            Value::Int4(statistics_targets.get(&column.name).copied().unwrap_or(-1)), // attstattarget
                         ]);
                         results.push(tuple);
                     }
@@ -4809,6 +4820,7 @@ impl SystemViewRegistry {
                     Value::String(String::new()),       // attgenerated
                     Value::Boolean(false),              // atthasdef
                     Value::Int4(0),                     // attcollation
+                    Value::Int4(-1),                    // attstattarget
                 ]));
             }
         }
@@ -5115,6 +5127,10 @@ impl SystemViewRegistry {
                     }
                 }
                 for check in constraints.check_constraints {
+                    // A generated column's own CHECK is part of the column.
+                    if crate::generated_columns::is_implicit_check_of(storage, &name, &check.expression) {
+                        continue;
+                    }
                     if emitted.insert(check.name.clone()) {
                         rows.push(Tuple::new(vec![
                             Value::String("heliosdb".into()),
@@ -5400,6 +5416,9 @@ impl SystemViewRegistry {
             };
             let (constraint_schema, _bare_table) = crate::sql::Planner::split_schema_key(&table_key);
             for check in &constraints.check_constraints {
+                if crate::generated_columns::is_implicit_check_of(storage, &table_key, &check.expression) {
+                    continue;
+                }
                 let check_clause = crate::sql::logical_plan::default_expr_json_to_sql(&check.expression)
                     .unwrap_or_else(|| check.expression.clone());
                 rows.push(Tuple::new(vec![
@@ -5831,6 +5850,9 @@ impl SystemViewRegistry {
             }
 
             for check in constraints.check_constraints {
+                if crate::generated_columns::is_implicit_check(&check.expression, &schema) {
+                    continue;
+                }
                 push_pg_constraint_row(
                     &mut results,
                     &mut constraint_oid,
@@ -5936,8 +5958,11 @@ impl SystemViewRegistry {
                                 Value::Null,
                             )
                         };
+                        let generation = crate::generated_columns::generation_sql(column.default_expr.as_deref());
                         let column_default = if is_identity_col {
                             Value::String(format!("nextval('{table_name}_{}_seq'::regclass)", column.name,))
+                        } else if generation.is_some() {
+                            Value::Null
                         } else {
                             column
                                 .default_expr
@@ -5960,8 +5985,8 @@ impl SystemViewRegistry {
                             Value::String(is_nullable.to_string()), // is_nullable
                             Value::String(data_type),               // data_type
                             Value::String(pg_type_name),            // udt_name
-                            Value::String("NEVER".into()),          // is_generated
-                            Value::Null,                            // generation_expression
+                            Value::String(if generation.is_some() { "ALWAYS" } else { "NEVER" }.into()), // is_generated
+                            generation.map_or(Value::Null, Value::String), // generation_expression
                             is_identity_str,                        // is_identity
                             id_gen,                                 // identity_generation
                             id_start,                               // identity_start

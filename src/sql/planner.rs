@@ -1988,7 +1988,7 @@ impl<'a> Planner<'a> {
                     self.record_insert_target(&insert.table_name, insert.table_alias.as_ref(), &table_name);
                     self.convert_on_conflict(&on_clause, &table_name)?
                 };
-                match source_opt {
+                let planned = match source_opt {
                     Some(source) => self.insert_to_plan(table_name, columns, source, returning, on_conflict),
                     None => Ok(LogicalPlan::Insert {
                         table_name,
@@ -2003,7 +2003,9 @@ impl<'a> Planner<'a> {
                         returning,
                         on_conflict,
                     }),
-                }
+                }?;
+                // The target's generated columns, computed.
+                crate::generated_columns::finish_insert_plan(self.catalog, planned)
             }
             Statement::CreateTable(create_table) => {
                 // Extract fields from CreateTable struct for v0.53 API
@@ -7239,6 +7241,10 @@ impl<'a> Planner<'a> {
             }
         }
 
+        // Generated columns: the expression validated against the table's
+        // columns, and the CHECK every write verifies the stored value by.
+        crate::generated_columns::finish_create_table(&name, &column_defs, &mut constraints)?;
+
         // Propagate table-level PRIMARY KEY constraint to column defs.
         // WordPress uses `PRIMARY KEY (col)` at the table level, not inline.
         // Without this, col.primary_key stays false and SERIAL auto-fill never fires.
@@ -7793,6 +7799,13 @@ impl<'a> Planner<'a> {
                 ..
             } => {
                 let col_def = self.sql_column_def_to_column_def(&column_def)?;
+                let generated_check = crate::generated_columns::add_column_check(
+                    self.catalog
+                        .and_then(|catalog| catalog.get_table_schema(&table_name).ok())
+                        .as_ref(),
+                    &table_name,
+                    &col_def,
+                )?;
                 let add = LogicalPlan::AlterTableAddColumn {
                     table_name: table_name.clone(),
                     column_def: col_def,
@@ -7828,6 +7841,7 @@ impl<'a> Planner<'a> {
                 // knows these plans.
                 let normalized_column = Self::normalize_ident(&column_def.name);
                 let mut extras = Vec::new();
+                extras.extend(generated_check);
                 for option in &column_def.options {
                     // `CONSTRAINT <name> UNIQUE` / `… CHECK (…)` names the
                     // constraint; an unnamed one lets the executor derive
@@ -7954,14 +7968,9 @@ impl<'a> Planner<'a> {
                     new_table_name,
                 })
             }
-            AlterTableOperation::AlterColumn {
-                column_name,
-                op: sqlparser::ast::AlterColumnOperation::DropNotNull,
-            } => Ok(LogicalPlan::AlterTableAlterColumnNullability {
-                table_name,
-                column_name: column_name.value,
-                nullable: true,
-            }),
+            AlterTableOperation::AlterColumn { column_name, op } => {
+                super::alter_column_plan::plan_alter_column(self, table_name, &column_name, op)
+            }
             // ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY (KanttBan #5
             // against v3.27.0). drizzle-kit / Prisma / Flyway / Liquibase
             // all emit FKs as a separate ALTER TABLE step at the end of
@@ -8075,9 +8084,8 @@ impl<'a> Planner<'a> {
                 constraint_name: name.value,
                 if_exists,
             }),
-            _ => Err(Error::query_execution(format!(
-                "Unsupported ALTER TABLE operation: {operation:?}",
-            ))),
+            // No plan: SQLSTATE 0A000, the form in SQL words.
+            _ => Err(super::alter_column_plan::unsupported_operation(&operation)),
         }
     }
 
@@ -8115,6 +8123,20 @@ impl<'a> Planner<'a> {
                 ColumnOption::Default(expr) => {
                     default = Some(self.expr_to_logical(expr)?);
                 }
+                // `GENERATED ALWAYS AS (expr) STORED`: the expression is the
+                // column's stored default, marked (`generated_columns`).
+                ColumnOption::Generated {
+                    generation_expr: Some(expr),
+                    generation_expr_mode,
+                    ..
+                } => {
+                    default = Some(crate::generated_columns::plan_generated(
+                        self,
+                        &col.name,
+                        expr,
+                        generation_expr_mode.as_ref(),
+                    )?);
+                }
                 ColumnOption::Generated {
                     generated_as: sqlparser::ast::GeneratedAs::Always | sqlparser::ast::GeneratedAs::ByDefault,
                     ..
@@ -8125,8 +8147,9 @@ impl<'a> Planner<'a> {
                 // `ColumnDef` carries no foreign key. Both callers recover it
                 // themselves — the CREATE TABLE column loop and the ALTER TABLE
                 // `AddColumn` arm (GH#27) — via `inline_reference_constraint`.
-                // (`CHECK` on a column is likewise recovered only by CREATE
-                // TABLE; on ADD COLUMN it is still dropped — a recorded gap.)
+                // (`CHECK` on a column is likewise recovered by both callers:
+                // the CREATE TABLE column loop, and the `AddColumn` arm, which
+                // plans it as an `ADD CHECK` clause of the same statement.)
                 _ => {}
             }
         }
@@ -8163,7 +8186,7 @@ impl<'a> Planner<'a> {
     }
 
     /// Convert SQL data type to internal DataType
-    fn sql_data_type_to_data_type(&self, data_type: &SqlDataType) -> Result<DataType> {
+    pub(crate) fn sql_data_type_to_data_type(&self, data_type: &SqlDataType) -> Result<DataType> {
         match data_type {
             SqlDataType::Boolean => Ok(DataType::Boolean),
             SqlDataType::SmallInt(_) | SqlDataType::Int2(_) => Ok(DataType::Int2),
@@ -8692,9 +8715,11 @@ impl<'a> Planner<'a> {
             None
         };
 
+        // The target's generated columns follow the columns they read.
+        let assignments = crate::generated_columns::finish_update_assignments(self.catalog, &table_name, assignments?)?;
         Ok(LogicalPlan::Update {
             table_name,
-            assignments: assignments?,
+            assignments,
             selection,
             returning,
         })

@@ -1727,6 +1727,12 @@ fn a_constraint_over_the_transactions_own_rows_is_refused() {
             "DELETE FROM s WHERE id = 1",
         ] {
             for sql in statements {
+                // 5.0: a table-level ADD UNIQUE / ADD CHECK over rows the transaction
+                // only INSERTED is validated over them instead of refused
+                // (`tests/constraints_over_staged_inserts.rs`).
+                if staged.starts_with("INSERT") && (sql.contains("s_v_key UNIQUE") || sql.contains("s_v_check CHECK")) {
+                    continue;
+                }
                 let db = EmbeddedDatabase::new_in_memory().unwrap();
                 db.execute("CREATE TABLE par (id INT PRIMARY KEY)").unwrap();
                 db.execute("CREATE TABLE s (id INT, v INT)").unwrap();

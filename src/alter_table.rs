@@ -40,6 +40,13 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+#[path = "alter_column.rs"]
+mod column_forms;
+#[path = "alter_generated.rs"]
+mod generated;
+#[path = "alter_staged.rs"]
+mod staged_rows;
+
 use crate::storage::alter_batch::{AlteredTable, ColumnMigration, RewriteLimit};
 use crate::storage::row_shape::{ColumnFill, RowShape};
 use crate::storage::{self, Catalog, DdlBatch, Transaction};
@@ -57,6 +64,9 @@ enum RowStep {
     AppendPerRow,
     /// The column at this position dropped.
     Remove(usize),
+    /// The value at this position replaced by the next of the row's values the
+    /// statement evaluated (`ALTER COLUMN … TYPE`).
+    ReplacePerRow(usize),
 }
 
 /// Apply `steps` to `tuple`, `per_row` being the row's evaluated values.
@@ -76,6 +86,15 @@ fn apply_steps(steps: &[RowStep], tuple: &mut Tuple, per_row: Option<&Vec<Value>
                 if *position < tuple.values.len() {
                     tuple.values.remove(*position);
                 }
+            }
+            RowStep::ReplacePerRow(position) => {
+                let value = per_row.and_then(|values| values.get(next)).ok_or_else(|| {
+                    Error::internal("ALTER TABLE: a row was written during the statement that holds its table")
+                })?;
+                if let Some(slot) = tuple.values.get_mut(*position) {
+                    *slot = value.clone();
+                }
+                next += 1;
             }
         }
     }
@@ -138,6 +157,11 @@ pub struct AlterStatement<'e> {
     own_rows: bool,
     /// Live branches that copy main's rows of the table as they change (phase B4).
     copies: u64,
+    /// The columns' statistics targets (`SET STATISTICS`), once a clause read them.
+    statistics_targets: Option<BTreeMap<String, i32>>,
+    statistics_changed: bool,
+    /// A clause changed a column's type: versions from before hold the old type.
+    type_changed: bool,
 }
 
 impl<'e> AlterStatement<'e> {
@@ -147,9 +171,12 @@ impl<'e> AlterStatement<'e> {
     }
 
     fn rewrites_rows(&self) -> bool {
-        self.steps
-            .iter()
-            .any(|step| matches!(step, RowStep::Remove(_) | RowStep::AppendPerRow))
+        self.steps.iter().any(|step| {
+            matches!(
+                step,
+                RowStep::Remove(_) | RowStep::AppendPerRow | RowStep::ReplacePerRow(_)
+            )
+        })
     }
 
     fn constraints_mut(&mut self, catalog: &Catalog<'_>) -> Result<&mut sql::TableConstraints> {
@@ -187,6 +214,7 @@ fn clause_table(plan: &sql::LogicalPlan) -> Option<&str> {
         | P::AlterTableDropColumn { table_name, .. }
         | P::AlterTableRenameColumn { table_name, .. }
         | P::AlterTableAlterColumnNullability { table_name, .. }
+        | P::AlterTableAlterColumn { table_name, .. }
         | P::AlterTableAddUnique { table_name, .. }
         | P::AlterTableAddPrimaryKey { table_name, .. }
         | P::AlterTableAddCheck { table_name, .. }
@@ -322,6 +350,9 @@ impl EmbeddedDatabase {
             publish_after: Vec::new(),
             own_rows: txn.is_some_and(|txn| txn.has_staged_rows(table)),
             copies: self.storage.branches_copying_main_rows(table)?,
+            statistics_targets: None,
+            statistics_changed: false,
+            type_changed: false,
         })
     }
 
@@ -346,7 +377,10 @@ impl EmbeddedDatabase {
             } => self.alter_rename_column(st, old_column_name, new_column_name),
             P::AlterTableAlterColumnNullability {
                 column_name, nullable, ..
-            } => Self::alter_set_nullability(st, column_name, *nullable),
+            } => self.alter_set_nullability(st, column_name, *nullable),
+            P::AlterTableAlterColumn {
+                column_name, action, ..
+            } => self.alter_column(st, column_name, action),
             P::AlterTableAddUnique {
                 constraint_name,
                 columns,
@@ -410,6 +444,10 @@ impl EmbeddedDatabase {
                 "Column '{}' already exists in table '{}'",
                 column_def.name, st.table
             )));
+        }
+        // `GENERATED ALWAYS AS (expr) STORED`: every row's value is computed here.
+        if let Some(expr) = column_def.default.as_ref().and_then(crate::generated_columns::unwrap) {
+            return self.alter_add_generated_column(st, column_def, expr);
         }
         let new_column = Column {
             name: column_def.name.clone(),
@@ -551,6 +589,7 @@ impl EmbeddedDatabase {
                 column_name
             )));
         }
+        Self::alter_refuse_generated_readers(st, column_name, "drop")?;
 
         // Refuse BEFORE anything changes: another table's foreign key depends on the
         // column and no CASCADE was given (PostgreSQL's rule, and the fail-closed one).
@@ -684,6 +723,7 @@ impl EmbeddedDatabase {
         let position = st.schema.columns.iter().position(|c| c.name == *old).ok_or_else(|| {
             Error::query_execution(format!("Column '{}' does not exist in table '{}'", old, st.table))
         })?;
+        Self::alter_refuse_generated_readers(st, old, "rename")?;
         let catalog = self.storage.catalog();
         let table = st.table.clone();
         // GH#34: an expression index keeps its key as SQL text over the column
@@ -760,24 +800,51 @@ impl EmbeddedDatabase {
         Ok(())
     }
 
-    /// `ALTER COLUMN … DROP NOT NULL` (and the SET NOT NULL spelling the plan allows).
-    fn alter_set_nullability(st: &mut AlterStatement<'_>, column_name: &str, nullable: bool) -> Result<()> {
+    /// `ALTER COLUMN … DROP NOT NULL` / `SET NOT NULL`. `SET NOT NULL` reads the
+    /// rows as the statement has them first: a NULL in the column refuses it (23502),
+    /// nothing written. An identity key stays as `CREATE TABLE` left it (an omitted
+    /// value reaches the allocator as NULL): it never holds a NULL.
+    fn alter_set_nullability(&self, st: &mut AlterStatement<'_>, column_name: &str, nullable: bool) -> Result<()> {
         let table = st.table.clone();
-        let column = st
+        let position = st
             .schema
             .columns
-            .iter_mut()
-            .find(|c| c.name == column_name)
+            .iter()
+            .position(|c| c.name == column_name)
+            .or_else(|| {
+                st.schema
+                    .columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(column_name))
+            })
             .ok_or_else(|| {
                 Error::query_execution(format!("Column '{}' does not exist in table '{}'", column_name, table))
             })?;
-        if nullable && column.primary_key {
+        let (name, primary_key, was_nullable) = st
+            .schema
+            .get_column_at(position)
+            .map(|c| (c.name.clone(), c.primary_key, c.nullable))
+            .ok_or_else(|| Error::internal("column index out of bounds"))?;
+        if nullable && primary_key {
             return Err(Error::query_execution(format!(
                 "Cannot drop NOT NULL from primary key column '{}'",
                 column_name
             )));
         }
-        column.nullable = nullable;
+        if !nullable {
+            if !was_nullable {
+                return Ok(());
+            }
+            let catalog = self.storage.catalog();
+            if st.identity_mut(&catalog)?.iter().any(|c| c.eq_ignore_ascii_case(&name)) {
+                return Ok(());
+            }
+            self.alter_refuse_null_in_column(st, position)?;
+        }
+        st.schema
+            .get_column_at_mut(position)
+            .ok_or_else(|| Error::internal("column index out of bounds"))?
+            .nullable = nullable;
         Ok(())
     }
 
@@ -885,6 +952,8 @@ impl EmbeddedDatabase {
                     name, st.table, e
                 )));
             }
+            // The rows this transaction inserted (`alter_staged`).
+            self.alter_index_own_inserted_rows(st, &index_name, &name)?;
         }
         st.constraints_mut(&catalog)?
             .add_unique(sql::UniqueConstraint::new(name, table, resolved, false));
@@ -1105,7 +1174,9 @@ impl EmbeddedDatabase {
         };
         let body = serde_json::to_string(expression)
             .map_err(|e| Error::query_execution(format!("could not store CHECK constraint \"{}\": {}", name, e)))?;
-        let rows = self.alter_current_rows(st)?;
+        let mut rows = self.alter_current_rows(st)?;
+        // And the rows this transaction inserted (`alter_staged`).
+        rows.extend(self.alter_own_inserted_rows(st)?);
         if !rows.is_empty() {
             let probe = sql::TableConstraints {
                 foreign_keys: Vec::new(),
@@ -1409,6 +1480,7 @@ impl EmbeddedDatabase {
                     origins.remove(*position);
                 }
                 RowStep::Remove(_) => return Err(Error::internal("ALTER TABLE column identity is out of bounds")),
+                RowStep::ReplacePerRow(_) => {}
             }
         }
         if origins.len() != st.schema.columns.len() {
@@ -1434,6 +1506,15 @@ impl EmbeddedDatabase {
                 column.storage_mode == ColumnStorageMode::Columnar
                     && !origins.iter().any(|origin| origin.as_ref() == Some(&column.name))
             })
+            .map(|column| column.name.clone())
+            .collect();
+        self.alter_settle_statistics_targets(&mut st, &net_renames)?;
+        // The columns the statement leaves the table without: their comments go.
+        let removed_columns: Vec<String> = st
+            .base
+            .columns
+            .iter()
+            .filter(|column| !origins.iter().any(|origin| origin.as_ref() == Some(&column.name)))
             .map(|column| column.name.clone())
             .collect();
         // A live child retains its old schema. Freeze its rows as logical values
@@ -1470,6 +1551,9 @@ impl EmbeddedDatabase {
             publish_first,
             publish_after,
             own_rows,
+            statistics_targets,
+            statistics_changed,
+            type_changed,
             ..
         } = st;
         let change = AlteredTable {
@@ -1482,9 +1566,12 @@ impl EmbeddedDatabase {
             drops,
             shape_changed,
             at: self.storage.next_timestamp(),
-            cut: None,
+            // A version from before a type change holds a value of the old type: a
+            // read older than the change is refused, as across a rename.
+            cut: type_changed.then_some(storage::table_layout::HistoryCut::TypeChanged),
         };
         if !change.changed()
+            && !statistics_changed
             && !constraints_changed
             && other_constraints.is_empty()
             && !identity_changed
@@ -1514,7 +1601,9 @@ impl EmbeddedDatabase {
 
         // The rows, when a clause rewrites them: each new image with its version at
         // the statement's timestamp, measured against the cap as it is staged.
-        let what = if steps.iter().any(|step| matches!(step, RowStep::Remove(_))) {
+        let what = if steps.iter().any(|step| matches!(step, RowStep::ReplacePerRow(_))) {
+            "ALTER COLUMN … TYPE"
+        } else if steps.iter().any(|step| matches!(step, RowStep::Remove(_))) {
             "DROP COLUMN"
         } else if steps.iter().any(|step| matches!(step, RowStep::AppendPerRow)) {
             "ADD COLUMN with a volatile default"
@@ -1619,6 +1708,12 @@ impl EmbeddedDatabase {
                 catalog.stage_identity_columns(&table, identity, &mut ddl)?;
             }
         }
+        if statistics_changed {
+            if let Some(targets) = &statistics_targets {
+                catalog.stage_column_statistics_targets(&table, targets, &mut ddl)?;
+            }
+        }
+        catalog.stage_column_comment_changes(&table, &net_renames, &removed_columns, &mut ddl)?;
         // Published after the schema and the constraints: the rewrite's snapshot, the
         // row cache once more, the indexes the statement retired and the ones it
         // registered hidden.

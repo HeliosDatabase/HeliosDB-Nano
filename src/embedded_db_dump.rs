@@ -324,6 +324,9 @@ impl DatabaseInterface for EmbeddedDatabase {
             }
         }
 
+        // The stored comments, as the statements that make them again.
+        objects.comments = crate::comments::comment_dump_entries(&self.storage)?;
+
         // User indexes from their durable definitions. A name a UNIQUE
         // constraint owns is carried by the table DDL already.
         let mut vector_names: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -859,6 +862,9 @@ impl DatabaseRestoreInterface for EmbeddedDatabase {
         }
         for view in &objects.views {
             self.execute(&sql_text::view_ddl(view))?;
+        }
+        for comment in &objects.comments {
+            self.execute(&comment.statement)?;
         }
         Ok(())
     }

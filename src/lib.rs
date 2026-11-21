@@ -249,6 +249,7 @@ pub mod cli; // CLI module
 pub mod compute;
 pub mod crypto;
 mod fk_update;
+pub mod generated_columns; // GENERATED ALWAYS AS (expr) STORED
 pub mod git_integration; // Git workflow integration
 pub mod graph; // Native graph adjacency lists & traversal (RAG-native)
 pub mod multi_tenant; // Multi-tenant support
@@ -317,11 +318,13 @@ pub mod ab_testing;
 mod alter_table;
 mod branch_schema; // sprinter 6bc4a4040eb7 (B3): schema DDL on a branch (the one gate)
 mod branch_writes; // sprinter 6bc4a4040eb7 (B2): executor half of writes on a branch
+mod comments; // COMMENT ON: stored, read back, carried by dumps
 mod copy_phase_stats;
 mod error;
 mod lock_census;
 mod sharded_lru;
 mod types;
+mod utility_ddl; // REINDEX, CREATE DOMAIN, CREATE TABLESPACE
 mod write_volume;
 // `config` was originally private but the encryption / sync
 // benchmarks reference its `KeySource` enum directly.  Promoted
@@ -2917,6 +2920,7 @@ impl EmbeddedDatabase {
                 | sql::LogicalPlan::AlterTableSetSchema { .. }
                 | sql::LogicalPlan::AlterTableRenameColumn { .. }
                 | sql::LogicalPlan::AlterTableAlterColumnNullability { .. }
+                | sql::LogicalPlan::AlterTableAlterColumn { .. }
                 | sql::LogicalPlan::AlterTableAddForeignKey { .. }
                 // ADD CONSTRAINT … UNIQUE changes what `ON CONFLICT (…)`
                 // resolves against (the target is validated at PLAN time), and
@@ -6021,72 +6025,15 @@ impl EmbeddedDatabase {
         Ok(Some((vec![row], Self::typed_result_schema(&column, DataType::Text))))
     }
 
-    /// `COMMENT ON <object> IS '…'` is accepted and not stored (GitHub #66).
-    ///
-    /// Dumps, migration tools and ORMs emit it beside the DDL it describes,
-    /// and a refusal stopped the script there. A comment changes no row and
-    /// no answer of a query; nothing reads it back yet (`pg_description` is
-    /// empty and there is no `obj_description()`), which the changelog says.
-    /// `COMMENT ON TABLE` and `COMMENT ON COLUMN` still check that their
-    /// target exists, as PostgreSQL does, unless `IF EXISTS` is given. The
-    /// forms the parser does not know (`INDEX`, `VIEW`, `FUNCTION`,
-    /// `SEQUENCE`, `CONSTRAINT`, `TYPE`, …) are accepted as written.
+    /// `COMMENT ON <object> IS '…'` stores the comment (`IS NULL` removes it):
+    /// see `comments`.
     fn try_handle_comment_statement(&self, sql: &str) -> Result<Option<u64>> {
-        let trimmed = sql.trim().trim_end_matches(';').trim_end();
-        let rest = match trimmed.get(..7) {
-            Some(word) if word.eq_ignore_ascii_case("COMMENT") => trimmed.get(7..).unwrap_or_default(),
-            _ => return Ok(None),
-        };
-        let on = rest.trim_start();
-        if rest.len() == on.len() || !on.get(..3).is_some_and(|word| word.eq_ignore_ascii_case("ON ")) {
-            return Ok(None);
-        }
-        let Ok(sqlparser::ast::Statement::Comment {
-            object_type,
-            object_name,
-            if_exists: false,
-            ..
-        }) = sql::Parser::new().parse_one(trimmed)
-        else {
-            return Ok(Some(0));
-        };
-        let catalog = self.storage.catalog();
-        let planner = sql::Planner::with_catalog(&catalog)
-            .with_current_schema(self.current_schema())
-            .with_search_path(self.current_search_path());
-        match object_type {
-            sqlparser::ast::CommentObject::Table => {
-                catalog.get_table_schema(&planner.resolve_table_ref(&object_name))?;
-            }
-            sqlparser::ast::CommentObject::Column => {
-                let mut table = object_name.0.clone();
-                let column = table
-                    .pop()
-                    .ok_or_else(|| Error::query_execution("COMMENT ON COLUMN needs table.column"))?;
-                if table.is_empty() {
-                    return Err(Error::query_execution("COMMENT ON COLUMN needs table.column"));
-                }
-                let table = planner.resolve_table_ref(&sqlparser::ast::ObjectName(table));
-                let schema = catalog.get_table_schema(&table)?;
-                let wanted = if column.quote_style.is_some() {
-                    column.value.clone()
-                } else {
-                    column.value.to_lowercase()
-                };
-                if !schema.columns.iter().any(|known| known.name == wanted) {
-                    return Err(sql::scope::undefined_column(Some(&table), &wanted));
-                }
-            }
-            _ => {}
-        }
-        Ok(Some(0))
+        self.comment_statement(sql)
     }
 
+    /// `CREATE TABLESPACE` is refused (0A000): see `utility_ddl`.
     fn try_handle_create_tablespace_statement(&self, sql: &str) -> Result<Option<u64>> {
-        if !sql::Parser::is_create_tablespace_statement(sql) {
-            return Ok(None);
-        }
-        Ok(Some(0))
+        Self::tablespace_statement(sql)
     }
 
     /// Round-2 pgrust-corpus compat: standard PostgreSQL `RESET name` /
@@ -6104,33 +6051,16 @@ impl EmbeddedDatabase {
         Ok(Some(0))
     }
 
-    /// Round-2 pgrust-corpus compat: PostgreSQL `REINDEX … name`. sqlparser
-    /// 0.53 has no REINDEX grammar, so it fails at the parse stage; this
-    /// accepts it as a no-op. Nano's index storage has no user-visible
-    /// rebuild need to satisfy, and PostgreSQL REINDEX is an idempotent,
-    /// safe-anytime maintenance command, so a success-returning no-op is a
-    /// faithful-enough surface (a real index rebuild would be a fast-follow,
-    /// not a blocker).
+    /// `REINDEX` rebuilds the named index, or the indexes of the named table,
+    /// from the table's rows: see `utility_ddl`.
     fn try_handle_reindex_statement(&self, sql: &str) -> Result<Option<u64>> {
-        if !sql::Parser::is_reindex_statement(sql) {
-            return Ok(None);
-        }
-        Ok(Some(0))
+        self.reindex_statement(sql)
     }
 
-    /// Round-2 pgrust-corpus compat: PostgreSQL `CREATE DOMAIN` / `DROP
-    /// DOMAIN`. sqlparser 0.53 has no DOMAIN object type, so both fail at
-    /// the parse stage; this accepts them as a parse-and-accept no-op so
-    /// dependent fixture loads proceed. Faithful base-type aliasing (so a
-    /// table can reference the domain as a column type) is intentionally
-    /// out of scope for this zero-regression pass -- it would touch the
-    /// type-resolution path -- and a table referencing an undefined domain
-    /// still fails on the unknown custom type exactly as before.
+    /// `CREATE DOMAIN` is refused (0A000); `DROP DOMAIN IF EXISTS` succeeds: see
+    /// `utility_ddl`.
     fn try_handle_domain_ddl_statement(&self, sql: &str) -> Result<Option<u64>> {
-        if !sql::Parser::is_domain_ddl_statement(sql) {
-            return Ok(None);
-        }
-        Ok(Some(0))
+        Self::domain_statement(sql)
     }
 
     /// Round-3 pgrust-corpus compat: PostgreSQL `ALTER TABLE … ATTACH/DETACH
@@ -10631,7 +10561,9 @@ impl EmbeddedDatabase {
         }
         // Spec R5.2: what a schema statement does over this transaction's own
         // staged rows. The params family asks the same two.
-        Self::refuse_constraint_over_staged_rows(&plan, Some(txn))?;
+        if !self.constraint_over_staged_inserts(&plan, Some(txn))? {
+            Self::refuse_constraint_over_staged_rows(&plan, Some(txn))?;
+        }
         if let Some(rows) = self.create_index_over_staged_rows(&plan, Some(txn))? {
             return Ok(rows);
         }
@@ -13033,7 +12965,8 @@ impl EmbeddedDatabase {
             sql::LogicalPlan::AlterTableAddColumn { .. }
             | sql::LogicalPlan::AlterTableDropColumn { .. }
             | sql::LogicalPlan::AlterTableRenameColumn { .. }
-            | sql::LogicalPlan::AlterTableAlterColumnNullability { .. } => {
+            | sql::LogicalPlan::AlterTableAlterColumnNullability { .. }
+            | sql::LogicalPlan::AlterTableAlterColumn { .. } => {
                 self.execute_alter_statement(std::slice::from_ref(&plan), Some(txn))
             }
             sql::LogicalPlan::AlterTableRename {
@@ -18066,6 +17999,7 @@ impl EmbeddedDatabase {
             | sql::LogicalPlan::AlterTableDropColumn { .. }
             | sql::LogicalPlan::AlterTableRenameColumn { .. }
             | sql::LogicalPlan::AlterTableAlterColumnNullability { .. }
+            | sql::LogicalPlan::AlterTableAlterColumn { .. }
             | sql::LogicalPlan::AlterTableAddUnique { .. }
             | sql::LogicalPlan::AlterTableAddPrimaryKey { .. }
             | sql::LogicalPlan::AlterTableAddCheck { .. }
@@ -22858,7 +22792,9 @@ impl EmbeddedDatabase {
                 | sql::LogicalPlan::AlterTableAddForeignKey { .. }
         ) {
             let answered = self.with_params_ddl_txn(session_txn, |txn| {
-                Self::refuse_constraint_over_staged_rows(plan, txn)?;
+                if !self.constraint_over_staged_inserts(plan, txn)? {
+                    Self::refuse_constraint_over_staged_rows(plan, txn)?;
+                }
                 self.create_index_over_staged_rows(plan, txn)
             })?;
             if let Some(rows) = answered {
@@ -22939,6 +22875,7 @@ impl EmbeddedDatabase {
             | sql::LogicalPlan::AlterTableDropColumn { .. }
             | sql::LogicalPlan::AlterTableRenameColumn { .. }
             | sql::LogicalPlan::AlterTableAlterColumnNullability { .. }
+            | sql::LogicalPlan::AlterTableAlterColumn { .. }
             | sql::LogicalPlan::AlterTableAddUnique { .. }
             | sql::LogicalPlan::AlterTableAddPrimaryKey { .. }
             | sql::LogicalPlan::AlterTableAddCheck { .. }
@@ -35026,6 +34963,7 @@ impl EmbeddedDatabase {
             | sql::LogicalPlan::AlterTableDropColumn { .. }
             | sql::LogicalPlan::AlterTableRenameColumn { .. }
             | sql::LogicalPlan::AlterTableAlterColumnNullability { .. }
+            | sql::LogicalPlan::AlterTableAlterColumn { .. }
             | sql::LogicalPlan::AlterTableRename { .. }
             | sql::LogicalPlan::AlterTableSetSchema { .. }
             | sql::LogicalPlan::AlterTableAddForeignKey { .. }

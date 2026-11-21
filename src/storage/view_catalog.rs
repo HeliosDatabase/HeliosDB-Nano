@@ -213,6 +213,7 @@ impl<'a> ViewCatalog<'a> {
         // R5.3: the delete and the entry are ONE write group.
         let mut ddl = super::DdlBatch::new(self.storage);
         ddl.delete(&key);
+        super::Catalog::stage_object_comment_drop("view", view_name, &mut ddl);
         ddl.log(super::WalOperation::DropView {
             name: view_name.to_string(),
         });

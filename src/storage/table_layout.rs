@@ -51,6 +51,9 @@ pub enum HistoryCut {
     Refreshed,
     /// Legacy representation boundary (`SET STORAGE`), not a logical-history cut.
     StorageMoved,
+    /// `ALTER COLUMN … TYPE` changed a column's type: an older version holds a value
+    /// of the old type. Appended: the record stores the variant by position.
+    TypeChanged,
 }
 
 /// One change of a table's layout, at the timestamp of its write group.
@@ -237,6 +240,7 @@ pub fn describe_cut(cause: HistoryCut, table: &str) -> String {
         HistoryCut::StorageMoved => {
             format!("table \"{table}\" had a column moved to other storage")
         }
+        HistoryCut::TypeChanged => format!("table \"{table}\" had a column's type changed"),
     }
 }
 

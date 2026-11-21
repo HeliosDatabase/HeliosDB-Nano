@@ -2,6 +2,12 @@
 //!
 //! Handles table schemas, row IDs, and metadata storage in RocksDB.
 
+#[path = "catalog_column_options.rs"]
+mod column_options;
+#[path = "catalog_comments.rs"]
+mod comments;
+pub use comments::{StoredComment, COMMENT_PREFIX};
+
 use super::compression::{CompressionConfig, CompressionStats};
 use super::statistics::TableStatistics;
 use super::StorageEngine;
@@ -3284,6 +3290,8 @@ impl<'a> Catalog<'a> {
         batch.delete(Self::table_constraints_key(table_name));
         batch.delete(Self::table_statistics_key(table_name));
         batch.delete(Self::identity_key(table_name));
+        batch.delete(Self::column_options_key(table_name));
+        self.stage_table_comments_drop(table_name, batch);
         batch.delete(super::index_snapshot::art_snapshot_key(table_name));
         batch.delete(super::index_snapshot::art_snapshot_marker_key(table_name));
 
@@ -3949,6 +3957,7 @@ impl<'a> Catalog<'a> {
     /// Spec R5.3: [`Self::drop_index_definition`], staged into the statement's batch.
     pub(crate) fn stage_index_definition_drop(index_name: &str, ddl: &mut super::DdlBatch<'_>) {
         ddl.delete(Self::index_metadata_key(index_name));
+        Self::stage_object_comment_drop("index", index_name, ddl);
     }
 
     /// The current tagged on-disk form of an index definition (magic, version
@@ -5801,6 +5810,16 @@ impl<'a> Catalog<'a> {
                 .map_err(|e| Error::query_execution(format!("identity serialize: {e}")))?;
             put(batch, Self::identity_key(new), value)?;
             batch.delete(Self::identity_key(old));
+        }
+        // The columns' options (`SET STATISTICS`).
+        if let Some(options) = self.storage.get(&Self::column_options_key(old))? {
+            put(batch, Self::column_options_key(new), options)?;
+            batch.delete(Self::column_options_key(old));
+        }
+        // The comments on the table, its columns and its constraints.
+        for (from, to, value) in self.table_comment_moves(old, new) {
+            batch.delete(from);
+            put(batch, to, value)?;
         }
 
         // Partition registry — reverse link: `old` is itself a child of `parent`.

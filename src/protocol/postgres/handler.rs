@@ -7176,6 +7176,13 @@ fn sqlstate_for_query_execution_message(message: &str) -> &'static str {
         return sqlstate::SYSTEM_ERROR; // 58000, before nested cause markers
     }
 
+    // Generated columns: a direct write, and an expression PostgreSQL refuses.
+    if message.contains(crate::generated_columns::GENERATED_COLUMN_WRITE_MARKER) {
+        return sqlstate::GENERATED_ALWAYS; // 428C9
+    }
+    if message.contains(crate::generated_columns::GENERATION_EXPRESSION_INVALID_MARKER) {
+        return sqlstate::INVALID_OBJECT_DEFINITION; // 42P17
+    }
     let lower = message.to_ascii_lowercase();
     let not_found = lower.contains("not found") || lower.contains("does not exist") || lower.contains("doesn't exist");
 

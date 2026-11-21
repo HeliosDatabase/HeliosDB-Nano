@@ -27,10 +27,12 @@ const UTILITY_STATEMENTS: &[&str] = &[
     "VACUUM",
     "VACUUM ANALYZE",
     "VACUUM VERSIONS",
-    "REINDEX TABLE t",
-    "CREATE DOMAIN d AS TEXT",
-    "DROP DOMAIN d",
-    "CREATE TABLESPACE ts LOCATION '/tmp/x'",
+    // 5.0: REINDEX rebuilds for real, and refuses a table the transaction has
+    // written (its staged rows are not in the rows a rebuild reads), so the
+    // statement names a table these transactions do not write. CREATE DOMAIN and
+    // CREATE TABLESPACE are refused (0A000) and left this list.
+    "REINDEX TABLE c",
+    "DROP DOMAIN IF EXISTS d",
     "RESET ALL",
     "RESET search_path",
     "ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (100)",
@@ -158,7 +160,7 @@ fn utility_query_inside_transaction_is_handled_on_the_query_path() {
         .unwrap();
 
     // Command-tag-only utility statements return no rows…
-    for stmt in ["VACUUM", "REINDEX TABLE t", "CREATE TABLESPACE ts2 LOCATION '/tmp/x'"] {
+    for stmt in ["VACUUM", "REINDEX TABLE c", "DROP DOMAIN IF EXISTS d"] {
         let (rows, _) = db
             .query_with_columns_for_session(s, stmt)
             .unwrap_or_else(|e| panic!("`{stmt}` on the query path inside a transaction must succeed, got: {e}"));
