@@ -5,6 +5,35 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.42.1] - 2026-11-21
+
+A compatibility fix. Data directories, standbys and configuration from 4.42.0 work
+unchanged; there is no upgrade step.
+
+### Fixed
+
+- **`SHOW ALL` and `pg_settings` spell `DateStyle` and `TimeZone` the way PostgreSQL
+  does.** 4.42.0 listed them as `datestyle` and `timezone`. A client that reads
+  session state from `SHOW ALL` and compares names case-sensitively, such as a
+  connection proxy tracking which settings a session changed, did not find them, and
+  `SELECT setting FROM pg_settings WHERE name = 'TimeZone'` returned no row. The names
+  are still case-insensitive everywhere else: `SET`, `SHOW timezone`, `SHOW TimeZone`
+  and `current_setting('TimeZone')` behave as before. Every other name in the list is
+  lower case, as in PostgreSQL.
+
+### Changed
+
+- A query that filtered `pg_settings` on the lower-case spelling
+  (`WHERE name = 'timezone'` or `'datestyle'`) now returns no row, as on PostgreSQL. Use
+  `'TimeZone'` and `'DateStyle'`, or compare with `lower(name)`.
+
+### Tests
+
+- `listen_notify`: the embedded-transaction case ran `begin()` and `commit()` in two
+  `spawn_blocking` calls. An embedded transaction belongs to the thread that began it,
+  so the test failed whenever the second call ran on another pool thread (seen once in
+  CI). It now runs the transaction on one thread.
+
 ## [4.42.0] - 2026-11-20
 
 Upgrading from 4.41.x: read `docs/guides/upgrade.md` first. Standbys are rebuilt, a data

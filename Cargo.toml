@@ -3,7 +3,7 @@ members = [".", "bindings/python"]
 
 [package]
 name = "heliosdb-nano"
-version = "4.42.0"
+version = "4.42.1"
 edition = "2021"
 rust-version = "1.88"
 authors = ["Daniel Moya <daniel.moya@HeliosDatabase.com>"]
