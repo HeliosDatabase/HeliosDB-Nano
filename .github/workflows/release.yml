@@ -4,15 +4,22 @@ on:
   push:
     tags:
       - 'v*'
-  # Manual run: (re)publish the container image for an EXISTING release from
-  # its attached binaries. Only the docker-image job runs; nothing is
-  # rebuilt, published to crates.io or attached to the release.
+  # Manual run for an EXISTING release: (re)publish its container image from
+  # its attached binaries. With build_binaries, first build the binaries from
+  # the tagged commit and attach them to the release (for a release whose tag
+  # run published the crate but stopped before the binaries). Nothing is ever
+  # published to crates.io from a manual run.
   workflow_dispatch:
     inputs:
       version:
-        description: 'Existing release tag to publish as a container image (e.g. v4.41.0)'
+        description: 'Existing release tag (e.g. v4.41.0)'
         required: true
         type: string
+      build_binaries:
+        description: 'Build the binaries from the tag and attach them to the release first'
+        required: false
+        default: false
+        type: boolean
       latest:
         description: 'Also move :latest (auto = only if this is the newest non-prerelease release)'
         required: false
@@ -86,27 +93,35 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: cargo publish --locked
 
-      # ── Create a GitHub Release with notes pulled from CHANGELOG.md ───────
-      # Looks for a `## [X.Y.Z] - YYYY-MM-DD` heading and includes the body
-      # up to the next `## ` heading.
-      - name: Extract release notes from CHANGELOG.md
-        id: notes
+      # ── Create a GitHub Release ───────────────────────────────────────────
+      # The body is the release's one-page notes (docs/release-notes/vX.Y.Z.md)
+      # when it exists, with its relative links pointed at the tagged files;
+      # otherwise the version's section of CHANGELOG.md. It is passed as a file:
+      # a 4.42.0-sized section passed inline exceeds the runner's argument
+      # limit, and GitHub refuses a release body over 125,000 characters.
+      - name: Write release notes
         run: |
           set -euo pipefail
           version="${GITHUB_REF#refs/tags/v}"
-          notes=$(awk -v ver="$version" '
-            $0 ~ "^## \\[" ver "\\]" {flag=1; next}
-            flag && /^## / {exit}
-            flag {print}
-          ' CHANGELOG.md)
-          if [ -z "$notes" ]; then
-            notes="See CHANGELOG.md for details."
+          base="https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_REF_NAME}"
+          page="docs/release-notes/v${version}.md"
+          if [ -f "$page" ]; then
+            sed -E -e "s#\]\(\.\./\.\./#](${base}/#g" \
+                   -e "s#\]\(\.\./#](${base}/docs/#g" \
+                   -e "s#\]\(([^)h\#][^):]*)\)#](${base}/docs/release-notes/\1)#g" \
+                   "$page" > release-notes.md
+          else
+            awk -v ver="$version" '
+              $0 ~ "^## \\[" ver "\\]" {flag=1; next}
+              flag && /^## / {exit}
+              flag {print}
+            ' CHANGELOG.md > release-notes.md
           fi
-          {
-            echo 'notes<<EOF'
-            echo "$notes"
-            echo 'EOF'
-          } >> "$GITHUB_OUTPUT"
+          if [ ! -s release-notes.md ] || [ "$(wc -c < release-notes.md)" -gt 120000 ]; then
+            echo "The notes of this release are in CHANGELOG.md." > release-notes.md
+          fi
+          printf '\n\nEvery change: [CHANGELOG.md](%s/CHANGELOG.md)\n' "$base" >> release-notes.md
+          wc -c release-notes.md
 
       - name: Create GitHub Release
         # v2 is the current major of action-gh-release (Node 20+ runtime).
@@ -114,7 +129,7 @@ jobs:
         with:
           tag_name: ${{ github.ref_name }}
           name: ${{ github.ref_name }}
-          body: ${{ steps.notes.outputs.notes }}
+          body_path: release-notes.md
           draft: false
           prerelease: ${{ contains(github.ref_name, '-') }}   # e.g. v3.23.0-rc.1
 
@@ -142,8 +157,12 @@ jobs:
   build-binaries:
     name: Binary (${{ matrix.target }})
     needs: publish
-    if: github.event_name == 'push'
+    if: >-
+      ${{ !cancelled() && ((github.event_name == 'push' && needs.publish.result == 'success')
+          || (github.event_name == 'workflow_dispatch' && inputs.build_binaries)) }}
     runs-on: ${{ matrix.os }}
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
     timeout-minutes: 90
     strategy:
       fail-fast: false   # one failing cell must not block the other artifacts
@@ -170,6 +189,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -213,7 +234,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
+          version="${RELEASE_TAG#v}"
           target="${{ matrix.target }}"
           name="heliosdb-nano-v${version}-${target}"
           bin="target/${target}/release/heliosdb-nano"
@@ -247,7 +268,9 @@ jobs:
   attach-binaries:
     name: Attach binaries to GitHub Release
     needs: [publish, build-binaries]
-    if: ${{ !cancelled() && github.event_name == 'push' && needs.publish.result == 'success' }}
+    if: >-
+      ${{ !cancelled() && ((github.event_name == 'push' && needs.publish.result == 'success')
+          || (github.event_name == 'workflow_dispatch' && inputs.build_binaries)) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -270,7 +293,7 @@ jobs:
         # assets to that release rather than creating a new one.
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name }}
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
           files: |
             dist/heliosdb-nano-*
             dist/SHA256SUMS
@@ -292,7 +315,8 @@ jobs:
     name: Docker image → ghcr.io
     needs: [publish, attach-binaries]
     if: >-
-      ${{ !cancelled() && (github.event_name == 'workflow_dispatch'
+      ${{ !cancelled() && ((github.event_name == 'workflow_dispatch'
+            && (!inputs.build_binaries || needs.attach-binaries.result == 'success'))
           || (needs.publish.result == 'success' && needs.attach-binaries.result == 'success')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
