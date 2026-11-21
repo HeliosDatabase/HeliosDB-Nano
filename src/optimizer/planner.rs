@@ -399,6 +399,7 @@ impl Planner {
             | LogicalPlan::DropFunction { .. }
             | LogicalPlan::DropProcedure { .. }
             | LogicalPlan::Call { .. }
+            | LogicalPlan::MergeInto { .. }
             | LogicalPlan::Explain { .. }
             | LogicalPlan::StartTransaction
             | LogicalPlan::Commit

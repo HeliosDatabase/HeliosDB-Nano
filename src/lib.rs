@@ -318,8 +318,11 @@ mod alter_table;
 mod branch_schema; // sprinter 6bc4a4040eb7 (B3): schema DDL on a branch (the one gate)
 mod branch_writes; // sprinter 6bc4a4040eb7 (B2): executor half of writes on a branch
 mod copy_phase_stats;
+mod cursor; // SQL cursors: DECLARE, FETCH, MOVE, CLOSE
 mod error;
 mod lock_census;
+mod merge_into; // MERGE INTO, the SQL-standard statement
+mod routine_body; // one statement of a routine body, run for its interpreter
 mod sharded_lru;
 mod types;
 mod write_volume;
@@ -5573,6 +5576,7 @@ impl EmbeddedDatabase {
         b"PG_BACKEND_PID".as_slice(),
         b"APPLICATION_NAME".as_slice(),
         b"PG_STAT_ACTIVITY".as_slice(),
+        b"PG_CURSORS".as_slice(),
         // sprinter 6bc4a4040eb7 (B1): `current_setting('heliosdb.branch')`
         // is the SESSION's branch. A branch session never touches the cache
         // (`result_cache_bypassed`), so this is belt-and-braces: no row that
@@ -7012,6 +7016,7 @@ impl EmbeddedDatabase {
     /// refused COMMIT leaves the block (and its queue) as it was.
     fn end_global_notifications(&self, commit: bool) {
         if !self.global_txn_active.load(std::sync::atomic::Ordering::Acquire) {
+            self.embedded_scoped.cursors().at_transaction_end(commit);
             crate::notify::hub().txn_end(self.embedded_scoped.backend_pid(), commit);
         }
     }
@@ -7967,21 +7972,7 @@ impl EmbeddedDatabase {
         body_sql: &str,
         txn: &storage::Transaction,
     ) -> Result<Vec<Vec<Value>>> {
-        let trimmed = body_sql.trim();
-        // `SET search_path = …` (and the other settings) in a body is a
-        // statement: the planner has no arm for it, the setting interceptor does.
-        if starts_with_icase(trimmed, "SET ") || starts_with_icase(trimmed, "RESET ") {
-            if self.try_handle_db_setting_statement_with_schema(trimmed)?.is_some() {
-                return Ok(vec![]);
-            }
-        }
-        if starts_with_icase(trimmed, "SELECT") || starts_with_icase(trimmed, "WITH") {
-            let tuples = self.query_in_transaction(trimmed, txn)?;
-            Ok(tuples.iter().map(|t| t.values.clone()).collect())
-        } else {
-            self.execute_in_transaction_no_fast_path(trimmed, txn)?;
-            Ok(vec![])
-        }
+        self.run_routine_body_statement(body_sql, txn)
     }
 
     /// Read one statement inside an explicit transaction, without going near the
@@ -9596,14 +9587,7 @@ impl EmbeddedDatabase {
                     if let Some(txn) = caller {
                         return handle.execute_routine_body_in_transaction(sql, txn);
                     }
-                    let sql_trimmed = sql.trim();
-                    if starts_with_icase(sql_trimmed, "SELECT") || starts_with_icase(sql_trimmed, "WITH") {
-                        let tuples = handle.query(sql, &[])?;
-                        Ok(tuples.iter().map(|t| t.values.clone()).collect())
-                    } else {
-                        handle.execute(sql)?;
-                        Ok(vec![])
-                    }
+                    handle.run_routine_body_statement_autocommit(sql)
                 })
             }),
         });
@@ -10494,6 +10478,8 @@ impl EmbeddedDatabase {
             sql::phase3::branching::BranchingParser::parse_drop_branch(branch_name, if_exists)?
         } else if sql::Parser::is_merge_branch(sql) {
             Self::plan_merge_branch(sql)?
+        } else if merge_into::is_merge_into(sql) {
+            sql::LogicalPlan::MergeInto { sql: sql.to_string() }
         } else if sql::Parser::is_use_branch(sql) {
             // Parse USE BRANCH statement
             let branch_name = sql::Parser::parse_use_branch_sql(sql)?;
@@ -12997,6 +12983,9 @@ impl EmbeddedDatabase {
                 table_name,
                 if_exists,
             } => self.execute_drop_trigger_plan(name, table_name, *if_exists),
+            sql::LogicalPlan::MergeInto { sql: merge_sql } => {
+                self.execute_merge_into(merge_sql, &[], txn).map(|(count, _)| count)
+            }
             sql::LogicalPlan::Call { name, args } => {
                 // Text family. The implementation is shared with the params
                 // family's arm in `execute_plan_with_params_inner` — see
@@ -14670,6 +14659,9 @@ impl EmbeddedDatabase {
     }
 
     pub fn execute(&self, sql: &str) -> Result<u64> {
+        if let Some(cursor) = self.try_cursor_statement(sql, &[])? {
+            return Ok(cursor.count);
+        }
         let statement = || self.run_layout_statement(self.in_transaction(), || self.execute_body(sql));
         // 4.42.0 R1: a wire session's bounded write stays on the worker up to its
         // fast path, which answers it there; what that path declines is offloaded
@@ -21559,6 +21551,9 @@ impl EmbeddedDatabase {
         if starts_with_icase(head, "MERGE") && sql::Parser::is_merge_branch(sql) {
             return Ok(Some(Self::plan_merge_branch(sql)?));
         }
+        if merge_into::is_merge_into(sql) {
+            return Ok(Some(sql::LogicalPlan::MergeInto { sql: sql.to_string() }));
+        }
         if starts_with_icase(head, "REFRESH") && sql::Parser::is_refresh_materialized_view(sql) {
             let (name, concurrent, incremental) = sql::Parser::parse_refresh_materialized_view_sql(sql)?;
             return Ok(Some(sql::LogicalPlan::RefreshMaterializedView {
@@ -21857,6 +21852,9 @@ impl EmbeddedDatabase {
     /// This method prevents SQL injection by treating parameters as data, not code.
     /// Even malicious input like `"'; DROP TABLE users; --"` is safely handled.
     pub fn execute_params(&self, sql: &str, params: &[Value]) -> Result<u64> {
+        if let Some(cursor) = self.try_cursor_statement(sql, params)? {
+            return Ok(cursor.count);
+        }
         self.execute_params_inner(sql, params, None)
     }
 
@@ -22114,6 +22112,9 @@ impl EmbeddedDatabase {
     /// # }
     /// ```
     pub fn execute_params_returning(&self, sql: &str, params: &[Value]) -> Result<(u64, Vec<Tuple>)> {
+        if let Some(cursor) = self.try_cursor_statement(sql, params)? {
+            return Ok((cursor.count, cursor.into_rows()));
+        }
         self.execute_params_returning_expecting(sql, params, None)
     }
 
@@ -22508,6 +22509,7 @@ impl EmbeddedDatabase {
                     // now runs on the caller's transaction and never re-enters
                     // that funnel, so the CALL itself has to say so.
                     | sql::LogicalPlan::Call { .. }
+                    | sql::LogicalPlan::MergeInto { .. }
             )
         {
             self.invalidate_result_cache();
@@ -22696,7 +22698,9 @@ impl EmbeddedDatabase {
         plan: &sql::LogicalPlan,
         session_txn: Option<&storage::Transaction>,
     ) -> bool {
-        matches!(plan, sql::LogicalPlan::Call { .. }) && session_txn.is_none() && !self.global_txn_visible()
+        matches!(plan, sql::LogicalPlan::Call { .. } | sql::LogicalPlan::MergeInto { .. })
+            && session_txn.is_none()
+            && !self.global_txn_visible()
     }
 
     /// Run one params-family plan inside an implicit statement transaction —
@@ -24054,7 +24058,12 @@ impl EmbeddedDatabase {
                         None => true,
                     })
                 };
+                // A MERGE action names the one row this statement is for.
+                let merge_row_gate = merge_into::take_row_gate(table_name);
                 for tuple in tuples {
+                    if !merge_into::row_gate_admits(merge_row_gate, tuple.row_id) {
+                        continue;
+                    }
                     let mut matches = row_matches(&tuple)?;
                     // Spec R5.4 (P12): a row this statement changes is locked for its
                     // transaction first, and changed as committed under the lock: a
@@ -24388,7 +24397,12 @@ impl EmbeddedDatabase {
                         None => true,
                     })
                 };
+                // A MERGE action names the one row this statement is for.
+                let merge_row_gate = merge_into::take_row_gate(table_name);
                 for tuple in tuples {
+                    if !merge_into::row_gate_admits(merge_row_gate, tuple.row_id) {
+                        continue;
+                    }
                     let mut matches = row_matches(&tuple)?;
                     // Spec R5.4 (P12): a row this statement changes is locked for its
                     // transaction first, and changed as committed under the lock: a
@@ -24623,6 +24637,24 @@ impl EmbeddedDatabase {
                 .try_handle_prepared_plan_with_params(plan, params, session_txn)?
                 .map(|(count, rows, _)| (count, rows))
                 .ok_or_else(|| Error::query_execution("SQL prepared utility was not handled")),
+            sql::LogicalPlan::MergeInto { sql: merge_sql } => {
+                // As CALL below: the statement runs in its caller's transaction.
+                let mut _merge_txn_guard = None;
+                let caller_txn: Option<&storage::Transaction> = match session_txn {
+                    Some(txn) => Some(txn),
+                    None if !GLOBAL_TXN_LOCK_HELD.with(|held| held.get()) => {
+                        _merge_txn_guard = self.lock_owned_global_txn();
+                        _merge_txn_guard.as_ref().and_then(|guard| guard.as_ref())
+                    }
+                    None => None,
+                };
+                match caller_txn {
+                    Some(txn) => self.execute_merge_into(merge_sql, params, txn),
+                    None => Err(Error::query_execution(
+                        "MERGE was NOT executed: no transaction is available for it on this path",
+                    )),
+                }
+            }
             sql::LogicalPlan::Call { name, args } => {
                 // Params family. Before this arm existed, `CALL` fell to the
                 // catch-all below, which built a `sql::Executor` — and an
@@ -24908,6 +24940,9 @@ impl EmbeddedDatabase {
     /// # }
     /// ```
     pub fn query(&self, sql: &str, _params: &[&dyn std::fmt::Display]) -> Result<Vec<Tuple>> {
+        if let Some(cursor) = self.try_cursor_statement(sql, &[])? {
+            return Ok(cursor.into_rows());
+        }
         // sprinter ccebc95977f1: off the async worker serving the client (`runtime_offload`).
         offload_statement(|| self.run_layout_statement(self.in_transaction(), || self.query_body(sql, _params)))
     }
@@ -25051,7 +25086,7 @@ impl EmbeddedDatabase {
                     || p.eq_ignore_ascii_case(b"UPDATE")
                     || p.eq_ignore_ascii_case(b"DELETE")
             });
-            if is_dml {
+            if is_dml || merge_into::is_merge_into(sql) {
                 let (_count, tuples) = self.execute_returning(sql)?;
                 self.invalidate_result_cache();
                 self.log_slow_query(sql, start.elapsed(), tuples.len() as u64);
@@ -25664,6 +25699,9 @@ impl EmbeddedDatabase {
     /// (GH#23). Every internal fast path answers with a real schema: the
     /// cached and the uncached branch describe a result identically.
     pub(crate) fn query_with_schema(&self, sql: &str) -> Result<(Vec<Tuple>, std::sync::Arc<Schema>)> {
+        if let Some(cursor) = self.try_cursor_statement(sql, &[])? {
+            return Ok(cursor.into_rows_and_schema());
+        }
         // Spec P1.4: reads only on a physical standby (`admit_on_physical_standby`).
         let _standby = self.admit_on_physical_standby(sql)?;
         // sprinter d03de7fc3b22: charge this CLIENT statement against the active
@@ -26061,6 +26099,9 @@ impl EmbeddedDatabase {
         if parenthesised {
             return self.rows_outcome(sql);
         }
+        if let Some(cursor) = self.try_cursor_statement(sql, &[])? {
+            return Ok(cursor.into_statement_outcome());
+        }
         match head.as_str() {
             "PRAGMA" => {
                 // `table_info(t)` has a fixed shape; the other pragmas answer
@@ -26096,6 +26137,12 @@ impl EmbeddedDatabase {
                 // left partially changed.
                 if sql::Parser::parse_merge_branch_abort(sql).is_some() {
                     self.rows_outcome(sql)
+                } else if let Some(schema) = self.merge_returning_schema_if_merge(sql)? {
+                    let (_, rows) = self.execute_returning(sql)?;
+                    Ok(StatementOutcome::Rows {
+                        columns: Self::column_names(&schema),
+                        rows,
+                    })
                 } else {
                     self.execute(sql).map(StatementOutcome::Affected)
                 }
@@ -26842,6 +26889,7 @@ impl EmbeddedDatabase {
             // listener calls directly rather than through
             // `handle_transaction_control_for_session`.
             self.end_session_transaction_scoped_state(session_id);
+            self.end_session_transaction_cursors(session_id, result.is_ok());
             // GH#40: a committed block delivers its NOTIFYs; a failed COMMIT
             // (which rolled the block back) drops them.
             self.end_session_notifications(session_id, result.is_ok());
@@ -26999,6 +27047,7 @@ impl EmbeddedDatabase {
             let result = self.rollback_transaction_for_session_inner(session_id);
             // sprinter f4f5d450e816: see `commit_transaction_for_session`.
             self.end_session_transaction_scoped_state(session_id);
+            self.end_session_transaction_cursors(session_id, false);
             // GH#40: a rolled-back block's NOTIFYs are never delivered.
             self.end_session_notifications(session_id, false);
             // Spec 03: `pg_advisory_xact_lock` locks end with the transaction —
@@ -28375,6 +28424,9 @@ impl EmbeddedDatabase {
 
     /// Execute a statement on behalf of a wire-protocol session.
     pub fn execute_for_session(&self, session_id: crate::session::SessionId, sql: &str) -> Result<u64> {
+        if let Some(cursor) = self.try_cursor_statement_for_session(session_id, sql, &[])? {
+            return Ok(cursor.count);
+        }
         let statement = || {
             self.run_layout_statement(self.session_has_open_transaction(session_id), || {
                 self.execute_for_session_body(session_id, sql)
@@ -28527,6 +28579,9 @@ impl EmbeddedDatabase {
         session_id: crate::session::SessionId,
         sql: &str,
     ) -> Result<(Vec<Tuple>, std::sync::Arc<Schema>)> {
+        if let Some(cursor) = self.try_cursor_statement_for_session(session_id, sql, &[])? {
+            return Ok(cursor.into_rows_and_schema());
+        }
         // Spec P1.4: reads only on a physical standby (`admit_on_physical_standby`).
         let _standby = self.admit_on_physical_standby(sql)?;
         // sprinter d03de7fc3b22: charge this CLIENT statement against the active
@@ -28648,6 +28703,9 @@ impl EmbeddedDatabase {
         session_id: crate::session::SessionId,
         sql: &str,
     ) -> Result<(u64, Vec<Tuple>)> {
+        if let Some(cursor) = self.try_cursor_statement_for_session(session_id, sql, &[])? {
+            return Ok((cursor.count, cursor.into_rows()));
+        }
         // sprinter ccebc95977f1: off the async worker serving the client (`runtime_offload`).
         offload_statement(|| {
             self.run_layout_statement(self.session_has_open_transaction(session_id), || {
@@ -28794,6 +28852,9 @@ impl EmbeddedDatabase {
         sql: &str,
         params: &[Value],
     ) -> Result<(u64, Vec<Tuple>)> {
+        if let Some(cursor) = self.try_cursor_statement_for_session(session_id, sql, params)? {
+            return Ok((cursor.count, cursor.into_rows()));
+        }
         self.execute_params_returning_for_session_expecting(session_id, sql, params, None)
     }
 
@@ -28931,6 +28992,9 @@ impl EmbeddedDatabase {
         sql: &str,
         params: &[Value],
     ) -> Result<u64> {
+        if let Some(cursor) = self.try_cursor_statement_for_session(session_id, sql, params)? {
+            return Ok(cursor.count);
+        }
         self.execute_params_for_session_inner(session_id, sql, params, None)
     }
 
@@ -29093,6 +29157,9 @@ impl EmbeddedDatabase {
         sql: &str,
         params: &[Value],
     ) -> Result<Vec<Tuple>> {
+        if let Some(cursor) = self.try_cursor_statement_for_session(session_id, sql, params)? {
+            return Ok(cursor.into_rows());
+        }
         self.query_params_for_session_inner(session_id, sql, params, None)
     }
 
@@ -29493,6 +29560,9 @@ impl EmbeddedDatabase {
     /// This method prevents SQL injection by treating parameters as data, not code.
     /// Even malicious input is safely handled as a literal value.
     pub fn query_params(&self, sql: &str, params: &[Value]) -> Result<Vec<Tuple>> {
+        if let Some(cursor) = self.try_cursor_statement(sql, params)? {
+            return Ok(cursor.into_rows());
+        }
         self.query_params_inner(sql, params, None)
     }
 
@@ -35061,6 +35131,7 @@ impl EmbeddedDatabase {
             | sql::LogicalPlan::DropFunction { .. }
             | sql::LogicalPlan::DropProcedure { .. }
             | sql::LogicalPlan::Call { .. }
+            | sql::LogicalPlan::MergeInto { .. }
             | sql::LogicalPlan::DualScan
             | sql::LogicalPlan::Noop
             | sql::LogicalPlan::DropRole { .. }

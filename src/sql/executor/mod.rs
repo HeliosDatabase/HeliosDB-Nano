@@ -5387,6 +5387,10 @@ impl<'a> Executor<'a> {
                  Issue DROP PROCEDURE through execute() or execute_params() (it is DDL, not a query).",
                 name
             ))),
+            LogicalPlan::MergeInto { .. } => Err(Error::query_execution(
+                "MERGE was NOT executed: this execution path cannot run it. Issue MERGE through \
+                 execute() or execute_params() (it changes rows, it is not a query).",
+            )),
             LogicalPlan::Call { name, .. } => {
                 // An `Executor` holds no `FunctionRegistry` handle, so it cannot run a
                 // procedure body — only `EmbeddedDatabase::execute_call_plan` can, and both

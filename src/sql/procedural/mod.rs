@@ -10,6 +10,8 @@
 //! are translated to, enabling cross-dialect compatibility and execution.
 
 pub mod ast;
+pub(crate) mod conditions;
+pub(crate) mod host_channel;
 pub mod parser;
 pub mod runtime;
 

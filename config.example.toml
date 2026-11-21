@@ -1016,6 +1016,11 @@ udf_max_call_depth = 32
 # unbounded wait. Default: 30000
 lock_timeout_ms = 30000
 
+# The most rows one SQL cursor (DECLARE ... CURSOR) may hold. A cursor keeps
+# the whole result of its query from DECLARE until it is closed; a query that
+# returns more rows fails at DECLARE with SQLSTATE 54000. 0 = no limit.
+cursor_max_rows = 100000
+
 # ============================================================================
 # LOCK CONFIGURATION (v3.1.0 - Multi-User ACID)
 # ============================================================================

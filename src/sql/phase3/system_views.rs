@@ -2967,6 +2967,13 @@ impl SystemViewRegistry {
             description: "One row per live backend (connection), joinable on pg_backend_pid()".to_string(),
         });
 
+        // pg_cursors: the SQL cursors the session reading it has open.
+        self.register_view(SystemViewSchema {
+            name: "pg_cursors".to_string(),
+            schema: crate::cursor::pg_cursors_schema(),
+            description: "The cursors this session has open (DECLARE ... CURSOR)".to_string(),
+        });
+
         // v07.2: pg_settings — one row per parameter of the ONE registry
         // (`sql::params`), PostgreSQL's column set, this session's values. The
         // embedded engine had no pg_settings at all, and the wire answered
@@ -4222,6 +4229,7 @@ impl SystemViewRegistry {
             // 32ed4b9e0002): the engine serving this query is what says WHICH
             // open database's backends the scan may see.
             "pg_stat_activity" => Ok(Self::execute_pg_stat_activity(storage)),
+            "pg_cursors" => Ok(crate::cursor::pg_cursors_rows()),
             "pg_mv_staleness" => Self::execute_pg_mv_staleness(storage),
             "pg_vector_index_stats" => Self::execute_pg_vector_index_stats(storage),
             // v10.2: this view never compared anything; it could only error,

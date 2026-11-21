@@ -340,9 +340,10 @@ async fn show_unknown_parameter_over_extended_protocol_is_not_an_empty_row() {
 // 2. sprinter e143ae12ea2d — an unimplemented statement kind
 // ===========================================================================
 
-/// `CLOSE cursor` parses (sqlparser's PostgreSQL dialect implements it) and
-/// reaches the planner's final arm, which is the code under test. (This test
-/// used `LISTEN` until GH#40 implemented it.) The refusal must be
+/// `ASSERT <condition>` parses and reaches the planner's final arm, which is
+/// the code under test. (This test used `LISTEN` until GH#40 implemented it,
+/// then `CLOSE cursor` until SQL cursors were implemented: `CLOSE` of an
+/// unknown cursor is now `34000`.) The refusal must be
 /// `0A000 feature_not_supported` — never `XX000`, which a pooler reads as a
 /// broken backend — and must not contain one byte of the Rust AST.
 #[tokio::test]
@@ -350,7 +351,7 @@ async fn unimplemented_statement_is_feature_not_supported_not_internal_error() {
     let (_addr, cs, _handle) = setup_server(ConnectionTimeouts::disabled()).await;
     let (client, task) = connect_client(&cs).await;
 
-    let db_error = expect_db_error(&client, "CLOSE wire_hygiene_cursor").await;
+    let db_error = expect_db_error(&client, "ASSERT 1 = 1").await;
 
     // The session must still be usable afterwards: an unimplemented statement
     // is a normal error, not a broken connection.
@@ -376,12 +377,8 @@ async fn unimplemented_statement_is_feature_not_supported_not_internal_error() {
         );
     }
     assert!(
-        message.contains("Close"),
+        message.contains("Assert"),
         "the message must name the statement KIND, got {message:?}"
-    );
-    assert!(
-        message.contains("wire_hygiene_cursor"),
-        "the message should name the object the user wrote, got {message:?}"
     );
     assert!(alive, "the connection must survive an unimplemented statement");
 }

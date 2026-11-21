@@ -761,6 +761,14 @@ pub enum LogicalPlan {
         if_exists: bool,
     },
 
+    /// `MERGE INTO target USING source ON … WHEN …` (the SQL-standard
+    /// statement; see `crate::merge_into`). The statement is resolved against
+    /// the catalog each time it runs, so the plan holds its text only.
+    MergeInto {
+        /// The statement as written.
+        sql: String,
+    },
+
     /// Merge a branch into another
     MergeBranch {
         /// Source branch
@@ -2539,6 +2547,7 @@ impl LogicalPlan {
             Self::Truncate { .. } => "Truncate",
             Self::CreateBranch { .. } => "CreateBranch",
             Self::MergeBranch { .. } => "MergeBranch",
+            Self::MergeInto { .. } => "MergeInto",
             Self::SystemView { .. } => "SystemView",
             Self::TableFunction { .. } => "TableFunction",
             Self::AlterTableMulti { .. } => "AlterTableMulti",
@@ -2895,6 +2904,8 @@ impl LogicalPlan {
             LogicalPlan::DropFunction { .. } => Arc::new(Schema { columns: vec![] }),
             LogicalPlan::DropProcedure { .. } => Arc::new(Schema { columns: vec![] }),
             LogicalPlan::Call { .. } => Arc::new(Schema { columns: vec![] }),
+            // The RETURNING shape needs the catalog: `merge_returning_schema`.
+            LogicalPlan::MergeInto { .. } => Arc::new(Schema { columns: vec![] }),
             // DualScan - empty schema (single row, no columns)
             // Used as input for SELECT without FROM, expressions are evaluated in Project
             LogicalPlan::DualScan => Arc::new(Schema { columns: vec![] }),

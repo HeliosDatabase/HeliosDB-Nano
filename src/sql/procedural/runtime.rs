@@ -8,6 +8,9 @@ use crate::sql::Evaluator;
 use crate::{DataType, Error, Result, Value};
 use std::collections::HashMap;
 
+mod pg_ext; // bare names bound as parameters, FOUND, records, RAISE, EXCEPTION
+pub(crate) use pg_ext::BLOCK_SAVEPOINT_PREFIX;
+
 /// Maximum recursion depth for procedure calls
 pub const MAX_CALL_DEPTH: usize = 100;
 
@@ -65,6 +68,21 @@ impl VariableScope {
         } else {
             None
         }
+    }
+
+    /// The variable `name` means, with its declared spelling: the exact
+    /// spelling first, then (unless `exact`, for a quoted name) any spelling
+    /// that differs in case only, innermost scope first.
+    pub fn find(&self, name: &str, exact: bool) -> Option<(&str, &Variable)> {
+        if let Some((declared, var)) = self.variables.get_key_value(name) {
+            return Some((declared.as_str(), var));
+        }
+        if !exact {
+            if let Some((declared, var)) = self.variables.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)) {
+                return Some((declared.as_str(), var));
+            }
+        }
+        self.parent.as_ref().and_then(|parent| parent.find(name, exact))
     }
 
     /// Set a variable's value (searches parent scopes)
@@ -125,6 +143,8 @@ pub struct ExecutionContext<'a> {
     /// The configured statement timeout (`[storage] statement_timeout_ms`),
     /// used when the session has not `SET statement_timeout`.
     pub default_statement_timeout_ms: Option<u64>,
+    /// Labels in scope, the row count, records and the error being handled.
+    pub(crate) pg: pg_ext::PgState,
 }
 
 /// What a loop does after one pass over its body.
@@ -152,7 +172,14 @@ impl<'a> ExecutionContext<'a> {
             positional_params: Vec::new(),
             max_loop_iterations: 0,
             default_statement_timeout_ms: None,
+            pg: pg_ext::PgState::default(),
         }
+    }
+
+    /// Name the routine being run, so its body can write `routine.variable`.
+    pub fn set_routine_name(&mut self, name: &str) {
+        let bare = name.rsplit('.').next().unwrap_or(name);
+        self.pg.routine_name = Some(bare.to_lowercase());
     }
 
     /// True when statements of the current list must stop running: RETURN,
@@ -206,6 +233,7 @@ impl ProceduralExecutor {
     /// no enclosing loop or block took (an unknown label, or one used outside
     /// any loop) instead of letting it silently end the routine.
     pub fn execute_routine(block: &ProceduralBlock, ctx: &mut ExecutionContext<'_>) -> Result<()> {
+        pg_ext::begin_routine(ctx);
         Self::execute_block(block, ctx)?;
         if ctx.exit_requested {
             return Err(Error::query_execution(match ctx.exit_label.as_deref() {
@@ -229,7 +257,9 @@ impl ProceduralExecutor {
     pub fn execute_block(block: &ProceduralBlock, ctx: &mut ExecutionContext<'_>) -> Result<()> {
         // Push new scope for this block
         ctx.push_scope();
+        let labelled = pg_ext::enter_label(ctx, block.label.as_deref());
         let result = Self::execute_block_in_scope(block, ctx);
+        pg_ext::leave_label(ctx, labelled);
         // Pop on every path, so an EXCEPTION handler further out sees its own scope.
         ctx.pop_scope();
         result?;
@@ -271,20 +301,27 @@ impl ProceduralExecutor {
                     not_null: decl.not_null,
                 },
             )?;
+            pg_ext::forget_record(ctx, &decl.name);
         }
 
-        // Execute statements with exception handling
+        if block.exception_handlers.is_empty() {
+            return Self::execute_statements(&block.statements, ctx);
+        }
+        // A block with an EXCEPTION clause is undone to its start when one of
+        // its handlers takes an error.
+        let mark = pg_ext::mark_block(ctx);
         match Self::execute_statements(&block.statements, ctx) {
-            Ok(()) => Ok(()),
-            Err(err) => {
-                // Check if any exception handler matches
-                if let Some(handler) = Self::find_matching_handler(&block.exception_handlers, &err) {
-                    Self::execute_statements(&handler.body, ctx)
-                } else {
-                    // No handler matched, re-raise the exception
+            Ok(()) => {
+                pg_ext::release_block(ctx, mark);
+                Ok(())
+            }
+            Err(err) => match pg_ext::matching_handler(&block.exception_handlers, &err) {
+                Some(handler) => pg_ext::run_handler(ctx, mark, handler, &err),
+                None => {
+                    pg_ext::release_block(ctx, mark);
                     Err(err)
                 }
-            }
+            },
         }
     }
 
@@ -317,9 +354,15 @@ impl ProceduralExecutor {
         if text.is_empty() {
             return Ok(Value::Null);
         }
-        // Borrow ends before `sql_executor` is borrowed mutably below.
-        let sql = format!("SELECT {}", ctx.interpolate(text));
-        let results = (ctx.sql_executor)(&sql).map_err(|e| Self::explain_eval_error(what, text, e))?;
+        if expr.text == ROW_COUNT_EXPR {
+            return Ok(pg_ext::row_count(ctx));
+        }
+        // Variables the expression names are bound as parameters; the count
+        // and FOUND of the routine's last statement are not this read's.
+        let sql = format!("SELECT {text}");
+        let results = pg_ext::run_sql(ctx, &sql)
+            .map_err(|e| Self::explain_eval_error(what, text, e))?
+            .rows;
         Ok(results
             .first()
             .and_then(|row| row.first())
@@ -336,9 +379,8 @@ impl ProceduralExecutor {
         let lower = msg.to_lowercase();
         if lower.contains("column") && (lower.contains("not found") || lower.contains("does not exist")) {
             Error::query_execution(format!(
-                "{} could not evaluate `{}`: {}. A routine body evaluates its expressions as SQL, \
-                 and the `$` sigil is mandatory — reference a parameter or declared variable as \
-                 `$name` or `$1`.",
+                "{} could not evaluate `{}`: {}. A routine body evaluates its expressions as SQL: \
+                 a name that is not a parameter or a declared variable in scope is read as a column.",
                 what, text, msg
             ))
         } else {
@@ -451,6 +493,8 @@ impl ProceduralExecutor {
         match stmt {
             ProceduralStatement::Assignment { target, value } => {
                 let val = Self::eval_expr(value, ctx, "assignment")?;
+                // The name as declared: an unquoted name matches in any case.
+                let target = &pg_ext::declared_name(ctx, target).unwrap_or_else(|| target.clone());
                 let declared = ctx
                     .scope
                     .get(target)
@@ -458,6 +502,7 @@ impl ProceduralExecutor {
                     .data_type
                     .clone();
                 let val = Self::cast_to_declared(ctx, val, declared.as_ref(), target)?;
+                pg_ext::forget_record(ctx, target);
                 ctx.scope.set(target, val)?;
             }
 
@@ -611,50 +656,25 @@ impl ProceduralExecutor {
             }
 
             ProceduralStatement::Execute { sql, into_variables } => {
-                // Compute the interpolated text BEFORE borrowing `sql_executor` mutably.
-                let sql = ctx.interpolate(sql);
-                let results = (ctx.sql_executor)(&sql)?;
-                if !into_variables.is_empty() && !results.is_empty() && !results[0].is_empty() {
-                    for (i, var_name) in into_variables.iter().enumerate() {
-                        if i < results[0].len() {
-                            ctx.scope.set(var_name, results[0][i].clone())?;
-                        }
-                    }
+                // A statement of the routine, or a DML statement with
+                // `RETURNING … INTO`. It sets the row count and FOUND.
+                let outcome = pg_ext::run_sql(ctx, sql)?;
+                pg_ext::set_row_count(ctx, outcome.row_count);
+                let found = outcome.row_count > 0;
+                if !into_variables.is_empty() {
+                    pg_ext::assign_into(ctx, into_variables, outcome, false)?;
                 }
+                pg_ext::set_found(ctx, found);
             }
 
             ProceduralStatement::Raise {
                 level,
-                message,
-                sqlstate,
-                detail: _,
-                hint: _,
+                condition,
+                format,
+                args,
+                options,
             } => {
-                let msg = if let Some(expr) = message {
-                    let val = ctx.evaluator.evaluate(expr, &crate::Tuple::new(vec![]))?;
-                    format!("{}", val)
-                } else {
-                    String::new()
-                };
-
-                match level {
-                    RaiseLevel::Exception => {
-                        let sqlstate_str = sqlstate
-                            .as_ref()
-                            .map(|s| format!(" [SQLSTATE: {}]", s))
-                            .unwrap_or_default();
-                        return Err(Error::query_execution(format!(
-                            "RAISE EXCEPTION:{} {}",
-                            sqlstate_str, msg
-                        )));
-                    }
-                    // Log at appropriate tracing level based on RAISE level
-                    RaiseLevel::Warning => tracing::warn!("[RAISE WARNING] {}", msg),
-                    RaiseLevel::Notice => tracing::info!("[RAISE NOTICE] {}", msg),
-                    RaiseLevel::Info => tracing::info!("[RAISE INFO] {}", msg),
-                    RaiseLevel::Log => tracing::debug!("[RAISE LOG] {}", msg),
-                    RaiseLevel::Debug => tracing::trace!("[RAISE DEBUG] {}", msg),
-                }
+                pg_ext::raise(ctx, *level, condition.as_deref(), format.as_deref(), args, options)?;
             }
 
             ProceduralStatement::Block(inner_block) => {
@@ -712,38 +732,51 @@ impl ProceduralExecutor {
                 }
             }
 
-            ProceduralStatement::SelectInto { query, variables } => {
-                // Execute query and store first row's columns into variables
-                let query = ctx.interpolate(query);
-                let results = (ctx.sql_executor)(&query)?;
-                if !results.is_empty() && !results[0].is_empty() {
-                    for (i, var_name) in variables.iter().enumerate() {
-                        if i < results[0].len() {
-                            ctx.scope.set(var_name, results[0][i].clone())?;
-                        }
-                    }
-                }
+            ProceduralStatement::SelectInto {
+                query,
+                variables,
+                strict,
+            } => {
+                // The first row goes into the targets (NULLs when there is
+                // none); STRICT wants exactly one row.
+                let outcome = pg_ext::run_sql(ctx, query)?;
+                let found = pg_ext::assign_into(ctx, variables, outcome, *strict)?;
+                pg_ext::set_row_count(ctx, u64::from(found));
+                pg_ext::set_found(ctx, found);
             }
 
             ProceduralStatement::ExecuteDynamic {
                 sql_expression,
                 into_variables,
-                using_parameters: _,
+                using_parameters,
+                strict,
             } => {
-                // Evaluate the SQL expression to get the SQL string
-                let sql_val = ctx.evaluator.evaluate(sql_expression, &crate::Tuple::new(vec![]))?;
-                let sql = match sql_val {
-                    Value::String(s) => s,
-                    other => other.to_string(),
-                };
-                // Execute the dynamic SQL
-                let results = (ctx.sql_executor)(&sql)?;
-                if !into_variables.is_empty() && !results.is_empty() && !results[0].is_empty() {
-                    for (i, var_name) in into_variables.iter().enumerate() {
-                        if i < results[0].len() {
-                            ctx.scope.set(var_name, results[0][i].clone())?;
-                        }
+                // The command is computed, then run with the USING values as
+                // its parameters: a value is never part of the command text
+                // unless the routine itself concatenates it in.
+                let command = match Self::eval_expr(sql_expression, ctx, "EXECUTE")? {
+                    Value::String(command) => command,
+                    Value::Null => {
+                        return Err(Error::sql_state(
+                            "22004",
+                            "query string argument of EXECUTE is null",
+                        ))
                     }
+                    other => {
+                        return Err(Error::sql_state(
+                            "42804",
+                            format!("the command of EXECUTE must be text, not {}", other.data_type()),
+                        ))
+                    }
+                };
+                let mut params = Vec::with_capacity(using_parameters.len());
+                for value in using_parameters {
+                    params.push(Self::eval_expr(value, ctx, "EXECUTE … USING")?);
+                }
+                let outcome = pg_ext::run_dynamic(ctx, &command, params)?;
+                pg_ext::set_row_count(ctx, outcome.row_count);
+                if !into_variables.is_empty() {
+                    pg_ext::assign_into(ctx, into_variables, outcome, *strict)?;
                 }
             }
 
@@ -785,13 +818,15 @@ impl ProceduralExecutor {
                 query,
                 body,
             } => {
-                // The query runs once; the body runs once per row. Until record
-                // variables exist, the loop variable receives the row's first
-                // column. A variable declared outside the loop keeps the last
+                // The query runs once; the body runs once per row. A loop
+                // variable with a scalar type receives the row's first column;
+                // any other holds the row. A variable declared outside the loop keeps the last
                 // row's value afterwards (PostgreSQL); an undeclared one is
                 // local to the loop.
-                let query = ctx.interpolate(query);
-                let rows = (ctx.sql_executor)(&query)?;
+                let outcome = pg_ext::run_sql(ctx, query)?;
+                let columns = outcome.columns;
+                let rows = outcome.rows;
+                let mut looped = false;
                 let declared = ctx.scope.get(record_variable).map(|v| v.data_type.clone());
                 ctx.push_scope();
                 let result = (|| -> Result<()> {
@@ -809,14 +844,16 @@ impl ProceduralExecutor {
                     let mut iterations = 0u64;
                     for row in rows {
                         Self::loop_tick(ctx, &mut iterations)?;
-                        let value = row.into_iter().next().unwrap_or(Value::Null);
-                        let value = Self::cast_to_declared(
+                        looped = true;
+                        // A loop variable without a scalar type holds the row:
+                        // `r.column` reads its fields.
+                        pg_ext::set_loop_row(
                             ctx,
-                            value,
-                            declared.as_ref().and_then(|d| d.as_ref()),
                             record_variable,
+                            &columns,
+                            row,
+                            declared.as_ref().and_then(|d| d.as_ref()),
                         )?;
-                        ctx.scope.set(record_variable, value)?;
                         if matches!(Self::run_loop_body(body, label.as_deref(), ctx)?, LoopFlow::Leave) {
                             break;
                         }
@@ -825,6 +862,7 @@ impl ProceduralExecutor {
                 })();
                 ctx.pop_scope();
                 result?;
+                pg_ext::set_found(ctx, looped);
             }
 
             ProceduralStatement::Call {
@@ -849,77 +887,6 @@ impl ProceduralExecutor {
             None => Err(Error::query_execution(
                 "case not found: no WHEN branch of the CASE statement matched and it has no ELSE",
             )),
-        }
-    }
-
-    /// Find a matching exception handler for an error
-    ///
-    /// Checks each handler's conditions against the error. Conditions are checked in order:
-    /// - Named conditions match against PostgreSQL exception names (e.g., "division_by_zero")
-    /// - SQLSTATE conditions match against the SQLSTATE code in the error
-    /// - OTHERS matches any exception
-    #[allow(clippy::indexing_slicing)]
-    // SAFETY: String slicing is guarded by `.find()` returning valid byte offsets
-    fn find_matching_handler<'a>(handlers: &'a [ExceptionHandler], error: &Error) -> Option<&'a ExceptionHandler> {
-        let error_msg = error.to_string();
-
-        // Extract SQLSTATE from error message if present
-        // Format: "RAISE EXCEPTION: [SQLSTATE: XXXXX] message"
-        let sqlstate = if let Some(start) = error_msg.find("[SQLSTATE:") {
-            let rest = &error_msg[start + 10..];
-            if let Some(end) = rest.find(']') {
-                Some(rest[..end].trim().to_string())
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        // Map common error patterns to PostgreSQL exception names
-        let exception_name = Self::error_to_exception_name(&error_msg);
-
-        for handler in handlers {
-            for condition in &handler.conditions {
-                let matches = match condition {
-                    ExceptionCondition::Others => true,
-                    ExceptionCondition::SqlState(state) => sqlstate.as_ref().map(|s| s == state).unwrap_or(false),
-                    ExceptionCondition::Named(name) => {
-                        let name_upper = name.to_uppercase();
-                        exception_name.as_ref().map(|n| n == &name_upper).unwrap_or(false)
-                    }
-                };
-
-                if matches {
-                    return Some(handler);
-                }
-            }
-        }
-
-        None
-    }
-
-    /// Map error message patterns to PostgreSQL exception names
-    fn error_to_exception_name(error_msg: &str) -> Option<String> {
-        let msg_lower = error_msg.to_lowercase();
-
-        // Common PostgreSQL exception name mappings
-        if msg_lower.contains("division by zero") || msg_lower.contains("divide by zero") {
-            Some("DIVISION_BY_ZERO".to_string())
-        } else if msg_lower.contains("null value") && msg_lower.contains("not allowed") {
-            Some("NOT_NULL_VIOLATION".to_string())
-        } else if msg_lower.contains("unique") && msg_lower.contains("violation") {
-            Some("UNIQUE_VIOLATION".to_string())
-        } else if msg_lower.contains("foreign key") && msg_lower.contains("violation") {
-            Some("FOREIGN_KEY_VIOLATION".to_string())
-        } else if msg_lower.contains("no data") || msg_lower.contains("not found") {
-            Some("NO_DATA_FOUND".to_string())
-        } else if msg_lower.contains("too many rows") {
-            Some("TOO_MANY_ROWS".to_string())
-        } else if msg_lower.contains("raise exception") {
-            Some("RAISE_EXCEPTION".to_string())
-        } else {
-            None
         }
     }
 }

@@ -2759,6 +2759,12 @@ pub struct SessionConfig {
     /// there, including a transaction left open. Readers never wait. Must be at least
     /// 1. This is a server setting; `[locks] timeout_ms` is the row-level wait.
     pub lock_timeout_ms: u64,
+    /// The most rows one SQL cursor may hold (default: 100000; 0 = no limit).
+    ///
+    /// `DECLARE … CURSOR` runs its query once and keeps the result until the
+    /// cursor is closed, so the result is bounded: a query that returns more
+    /// rows fails at `DECLARE` with SQLSTATE 54000 naming this setting.
+    pub cursor_max_rows: usize,
 }
 
 impl Default for SessionConfig {
@@ -2769,6 +2775,7 @@ impl Default for SessionConfig {
             cleanup_interval_secs: 300,
             udf_max_call_depth: 32,
             lock_timeout_ms: 30_000,
+            cursor_max_rows: 100_000,
         }
     }
 }

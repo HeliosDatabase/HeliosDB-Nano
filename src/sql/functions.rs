@@ -509,8 +509,8 @@ impl FunctionRegistry {
 
     fn reject_unevaluable_block(refuse: &dyn Fn(&str) -> Error, block: &ProceduralBlock) -> Result<()> {
         Self::reject_unevaluable_statements(refuse, &block.statements)?;
-        if !block.exception_handlers.is_empty() {
-            return Err(refuse("an EXCEPTION handler"));
+        for handler in &block.exception_handlers {
+            Self::reject_unevaluable_statements(refuse, &handler.body)?;
         }
         Ok(())
     }
@@ -527,6 +527,8 @@ impl FunctionRegistry {
             match stmt {
                 ProceduralStatement::Execute { .. }
                 | ProceduralStatement::SelectInto { .. }
+                | ProceduralStatement::Raise { .. }
+                | ProceduralStatement::ExecuteDynamic { .. }
                 | ProceduralStatement::Null
                 | ProceduralStatement::Return { .. }
                 | ProceduralStatement::Assignment { .. }
@@ -570,8 +572,6 @@ impl FunctionRegistry {
                 ProceduralStatement::ReturnNext { .. } | ProceduralStatement::ReturnQuery { .. } => {
                     return Err(refuse("RETURN NEXT / RETURN QUERY (set-returning functions)"))
                 }
-                ProceduralStatement::Raise { .. } => return Err(refuse("a RAISE statement")),
-                ProceduralStatement::ExecuteDynamic { .. } => return Err(refuse("EXECUTE of dynamic SQL")),
                 ProceduralStatement::Print { .. } => return Err(refuse("a PRINT statement")),
                 ProceduralStatement::OpenCursor { .. }
                 | ProceduralStatement::FetchCursor { .. }
@@ -608,6 +608,7 @@ impl FunctionRegistry {
         let evaluator = Evaluator::new(schema);
         let mut ctx = ExecutionContext::new(&evaluator, sql_executor);
         self.apply_procedural_limits(&mut ctx);
+        ctx.set_routine_name(&func.name);
 
         // Bind parameters to context
         for (i, param) in func.params.iter().enumerate() {
@@ -700,6 +701,7 @@ impl FunctionRegistry {
         let evaluator = Evaluator::new(schema);
         let mut ctx = ExecutionContext::new(&evaluator, sql_executor);
         self.apply_procedural_limits(&mut ctx);
+        ctx.set_routine_name(&proc.name);
 
         for (i, param) in proc.params.iter().enumerate() {
             if param.mode == ParamMode::Out {

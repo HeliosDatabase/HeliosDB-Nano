@@ -545,6 +545,7 @@ impl EmbeddedDatabase {
                 | LogicalPlan::Delete { .. }
                 | LogicalPlan::Truncate { .. }
                 | LogicalPlan::Call { .. }
+                | LogicalPlan::MergeInto { .. }
                 | LogicalPlan::MergeBranch { .. }
         ) || schema_statement_name(plan).is_some()
     }

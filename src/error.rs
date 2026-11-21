@@ -372,6 +372,7 @@ pub const ROW_LOCK_TIMEOUT_MARKER: &str = "could not obtain lock on row in relat
 /// let err = Error::query_timeout("Query exceeded 30s limit");
 /// ```
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     /// I/O error
     #[error("I/O error: {0}")]
@@ -472,9 +473,69 @@ pub enum Error {
     /// Generic error
     #[error("{0}")]
     Generic(String),
+
+    /// An error that carries its own SQLSTATE: what `RAISE` in a routine
+    /// produces, and what a statement reports when PostgreSQL defines the
+    /// exact code for the condition (`21000`, `25P01`, `42702`, ...). The
+    /// text shown is the message alone; the code, detail and hint travel
+    /// beside it to the client.
+    #[error("{message}")]
+    Raised {
+        /// The five-character SQLSTATE.
+        sqlstate: String,
+        /// The primary message.
+        message: String,
+        /// The optional DETAIL line.
+        detail: Option<String>,
+        /// The optional HINT line.
+        hint: Option<String>,
+    },
 }
 
 impl Error {
+    /// An error with an explicit SQLSTATE (see [`Error::Raised`]).
+    pub fn sql_state(sqlstate: impl Into<String>, message: impl Into<String>) -> Self {
+        Error::Raised {
+            sqlstate: sqlstate.into(),
+            message: message.into(),
+            detail: None,
+            hint: None,
+        }
+    }
+
+    /// A SQLSTATE as a `'static` string, for the wire paths that carry the
+    /// code that way. A code is five characters of `0-9A-Z`; anything else is
+    /// answered as `XX000`. The table of distinct codes seen is bounded, so
+    /// text chosen by a routine cannot grow it without limit: past the bound
+    /// an unseen code is reported as `P0001`.
+    pub(crate) fn static_sqlstate(code: &str) -> &'static str {
+        const LIMIT: usize = 4096;
+        static SEEN: std::sync::OnceLock<parking_lot::Mutex<std::collections::HashSet<&'static str>>> =
+            std::sync::OnceLock::new();
+        let well_formed = code.len() == 5 && code.bytes().all(|b| b.is_ascii_digit() || b.is_ascii_uppercase());
+        if !well_formed {
+            return "XX000";
+        }
+        let mut seen = SEEN.get_or_init(Default::default).lock();
+        if let Some(known) = seen.get(code) {
+            return known;
+        }
+        if seen.len() >= LIMIT {
+            return "P0001";
+        }
+        let leaked: &'static str = Box::leak(code.to_string().into_boxed_str());
+        seen.insert(leaked);
+        leaked
+    }
+
+    /// The SQLSTATE this error carries itself, if it is an [`Error::Raised`].
+    pub fn raised_sqlstate(&self) -> Option<&str> {
+        match self {
+            Error::Raised { sqlstate, .. } => Some(sqlstate.as_str()),
+            _ => None,
+        }
+    }
+
     /// Create a storage error
     pub fn storage(msg: impl Into<String>) -> Self {
         Error::Storage(msg.into())

@@ -492,6 +492,8 @@ pub struct SessionScopedState {
     /// statement's CommandComplete. Bounded; a session-less caller nobody
     /// drains keeps only the newest few.
     notices: parking_lot::Mutex<Vec<crate::SessionNotice>>,
+    /// The SQL cursors this session has open (`DECLARE … CURSOR`), by name.
+    cursors: crate::cursor::SessionCursors,
 }
 
 /// v07.3: a process-wide count of queued statement notices, so the listener's
@@ -554,6 +556,7 @@ impl SessionScopedState {
             cancel_requested: Arc::new(AtomicBool::new(false)),
             cancel_secret: AtomicI64::new(CANCEL_NOT_ARMED),
             notices: parking_lot::Mutex::new(Vec::new()),
+            cursors: crate::cursor::SessionCursors::new(engine_instance),
         });
         live_backends().insert(state.backend_pid, Arc::downgrade(&state));
         state
@@ -599,6 +602,7 @@ impl SessionScopedState {
             cancel_requested: Arc::new(AtomicBool::new(false)),
             cancel_secret: AtomicI64::new(CANCEL_NOT_ARMED),
             notices: parking_lot::Mutex::new(Vec::new()),
+            cursors: crate::cursor::SessionCursors::new(engine_instance),
         })
     }
 
@@ -623,6 +627,11 @@ impl SessionScopedState {
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| Some(n.saturating_sub(count)));
         }
         taken
+    }
+
+    /// The session's open SQL cursors.
+    pub(crate) fn cursors(&self) -> &crate::cursor::SessionCursors {
+        &self.cursors
     }
 
     /// `pg_backend_pid()`.

@@ -74,6 +74,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
             return Ok(());
         }
 
+        // MERGE INTO: its own parameter and result description.
+        if let Some(prepared) = self.sql_std_prepared_statement(&statement_name, &query, &param_types)? {
+            self.prepared_statements.store_statement(prepared)?;
+            self.send_message(BackendMessage::ParseComplete).await?;
+            return Ok(());
+        }
+
         // These executor utilities have custom grammar rather than a sqlparser
         // AST. Validate using the same pure planner as text/params, before the
         // generic syntax gate. Planning is optional at Parse (as for ordinary
@@ -590,6 +597,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
         // legacy statements) the substituted text is still rebuilt per
         // Execute because the catalog handlers extract WHERE filters from
         // the query text, which depends on the bound values.
+        if self.execute_sql_std_extended(&statement, &portal, &param_values).await? {
+            return Ok(());
+        }
+
         let maybe_catalog = statement.is_catalog != Some(false);
 
         tracing::debug!("Executing query: {} (params: {})", statement.query, param_values.len());
@@ -1015,7 +1026,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
     /// What moves when a statement's result shape may have: the plan-cache epoch
     /// (every schema statement clears the plan cache) and the storage engine's
     /// schema generation (every catalog funnel). Two atomic loads.
-    fn result_schema_stamp(&self) -> (u64, u64) {
+    pub(super) fn result_schema_stamp(&self) -> (u64, u64) {
         (
             self.database.wire_plan_epoch(),
             self.database.storage.schema_generation(),
@@ -1025,7 +1036,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
     /// The session's name resolution, as far as a result schema depends on it: its
     /// schema, `search_path` and branch. `None` for the default, with no lookup
     /// beyond the two flags every Execute already reads.
-    fn session_scope(&self) -> Option<String> {
+    pub(super) fn session_scope(&self) -> Option<String> {
         let schema_active = self.database.session_schema_active(self.session_id);
         let on_branch = self.database.session_on_branch(self.session_id);
         // Spec R5.4 (P11): a temp table can shadow a permanent one of its name.
@@ -1190,7 +1201,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
     /// Never fails: an unresolvable relation (or an unplannable statement)
     /// simply leaves its parameters at 705. Costs nothing for the common
     /// zero-parameter Parse, which returns before touching the catalog.
-    fn infer_param_types(&self, statement: &sqlparser::ast::Statement, param_count: usize) -> Vec<i32> {
+    pub(super) fn infer_param_types(&self, statement: &sqlparser::ast::Statement, param_count: usize) -> Vec<i32> {
         if param_count == 0 {
             return Vec::new();
         }
@@ -1452,7 +1463,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
     // Safety: every `b[..]` read below is guarded by the surrounding
     // `i < b.len()` loop condition (or a `.get()` for look-ahead).
     #[allow(clippy::indexing_slicing)]
-    fn count_parameters(query: &str) -> usize {
+    pub(super) fn count_parameters(query: &str) -> usize {
         let b = query.as_bytes();
         let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c >= 0x80;
         let mut max_param = 0usize;

@@ -3,6 +3,7 @@
 //! Multi-dialect parser for procedural SQL (PL/pgSQL, T-SQL, PL/SQL, DB2 PL).
 //! Automatically detects dialect based on syntax patterns or explicit specification.
 
+mod pg_ext; // RAISE, GET DIAGNOSTICS, EXECUTE, RETURNING … INTO
 use super::ast::*;
 use crate::sql::LogicalExpr;
 use crate::{DataType, Error, Result};
@@ -374,8 +375,12 @@ impl ProceduralParser {
         let is_constant = self.try_keyword("CONSTANT");
         self.skip_whitespace();
 
-        // Parse data type
-        let data_type = self.try_parse_data_type();
+        // Parse data type (RECORD, %ROWTYPE and %TYPE name no scalar type)
+        let data_type = if self.skip_untyped_declaration_type() {
+            None
+        } else {
+            self.try_parse_data_type()
+        };
 
         // Check for NOT NULL
         self.skip_whitespace();
@@ -509,6 +514,10 @@ impl ProceduralParser {
         // BEGIN (nested block)
         if self.check_keyword("BEGIN") || self.check_keyword("DECLARE") {
             return Ok(Some(self.parse_nested_block()?));
+        }
+
+        if let Some(statement) = self.try_parse_pg_statement()? {
+            return Ok(Some(statement));
         }
 
         // Assignment or SQL execution
@@ -783,93 +792,7 @@ impl ProceduralParser {
 
     /// Parse RAISE statement
     fn parse_raise_statement(&mut self) -> Result<ProceduralStatement> {
-        self.skip_whitespace();
-
-        let level = if self.try_keyword("EXCEPTION") {
-            RaiseLevel::Exception
-        } else if self.try_keyword("WARNING") {
-            RaiseLevel::Warning
-        } else if self.try_keyword("NOTICE") {
-            RaiseLevel::Notice
-        } else if self.try_keyword("INFO") {
-            RaiseLevel::Info
-        } else if self.try_keyword("LOG") {
-            RaiseLevel::Log
-        } else if self.try_keyword("DEBUG") {
-            RaiseLevel::Debug
-        } else {
-            RaiseLevel::Exception // Default
-        };
-
-        self.skip_whitespace();
-
-        // Check for SQLSTATE
-        let sqlstate = if self.try_keyword("SQLSTATE") {
-            self.skip_whitespace();
-            Some(self.parse_string_literal()?)
-        } else {
-            None
-        };
-
-        // Parse message (usually a string literal)
-        self.skip_whitespace();
-        let message = if self.peek_char() != Some(';') && !self.check_keyword("USING") {
-            Some(self.parse_text_literal(Stops::keywords(&["USING"])))
-        } else {
-            None
-        };
-
-        // Parse optional USING clause: USING DETAIL = expr, HINT = expr
-        let mut detail = None;
-        let mut hint = None;
-
-        self.skip_whitespace();
-        if self.try_keyword("USING") {
-            loop {
-                self.skip_whitespace();
-
-                if self.try_keyword("DETAIL") {
-                    self.skip_whitespace();
-                    if self.peek_char() == Some('=') {
-                        self.advance();
-                        self.skip_whitespace();
-                    }
-                    detail = Some(self.parse_text_literal(Stops {
-                        comma: true,
-                        ..Stops::default()
-                    }));
-                } else if self.try_keyword("HINT") {
-                    self.skip_whitespace();
-                    if self.peek_char() == Some('=') {
-                        self.advance();
-                        self.skip_whitespace();
-                    }
-                    hint = Some(self.parse_text_literal(Stops {
-                        comma: true,
-                        ..Stops::default()
-                    }));
-                } else {
-                    break;
-                }
-
-                self.skip_whitespace();
-                if self.peek_char() == Some(',') {
-                    self.advance();
-                } else {
-                    break;
-                }
-            }
-        }
-
-        self.eat_semicolon();
-
-        Ok(ProceduralStatement::Raise {
-            level,
-            message,
-            sqlstate,
-            detail,
-            hint,
-        })
+        self.parse_pg_raise()
     }
 
     /// Parse PRINT statement (T-SQL)
@@ -944,7 +867,15 @@ impl ProceduralParser {
         // `ProceduralStatement::SelectInto` a producer — the runtime arm has
         // always been implemented and never reachable.
         if let Some((query, variables)) = Self::split_select_into(&sql) {
-            return Ok(Some(ProceduralStatement::SelectInto { query, variables }));
+            let strict = pg_ext::select_into_is_strict(&sql);
+            return Ok(Some(ProceduralStatement::SelectInto {
+                query,
+                variables,
+                strict,
+            }));
+        }
+        if let Some((sql, into_variables)) = pg_ext::split_returning_into(&sql)? {
+            return Ok(Some(ProceduralStatement::Execute { sql, into_variables }));
         }
 
         Ok(Some(ProceduralStatement::Execute {

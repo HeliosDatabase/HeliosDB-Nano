@@ -22,6 +22,10 @@ pub struct PlExpr {
     pub text: String,
 }
 
+/// The expression text `GET DIAGNOSTICS target = ROW_COUNT` assigns from:
+/// the row count of the routine's last statement. Not SQL: no body can write it.
+pub const ROW_COUNT_EXPR: &str = "\u{1}row_count";
+
 impl PlExpr {
     /// An expression with the given SQL text.
     pub fn new(text: impl Into<String>) -> Self {
@@ -187,23 +191,30 @@ pub enum ProceduralStatement {
     /// RETURN QUERY (for set-returning functions)
     ReturnQuery { query: String },
 
-    /// RAISE (exception/notice)
+    /// `RAISE [level] 'format', args… [USING option = expr, …]`,
+    /// `RAISE [level] condition_name | SQLSTATE 'code' [USING …]`, or a bare
+    /// `RAISE` (re-raise the error being handled).
     Raise {
         level: RaiseLevel,
-        message: Option<LogicalExpr>,
-        sqlstate: Option<String>,
-        detail: Option<LogicalExpr>,
-        hint: Option<LogicalExpr>,
+        /// The SQLSTATE given by a condition name or `SQLSTATE 'code'`.
+        condition: Option<String>,
+        /// The format string; each `%` takes the next argument.
+        format: Option<String>,
+        args: Vec<PlExpr>,
+        /// `USING` options by upper-case name: MESSAGE, DETAIL, HINT, ERRCODE.
+        options: Vec<(String, PlExpr)>,
     },
 
     /// Execute SQL statement
     Execute { sql: String, into_variables: Vec<String> },
 
-    /// Execute dynamic SQL
+    /// `EXECUTE command [INTO [STRICT] targets] [USING values]`: the command
+    /// is computed, then run with the USING values bound as `$1`, `$2`, ….
     ExecuteDynamic {
-        sql_expression: LogicalExpr,
+        sql_expression: PlExpr,
         into_variables: Vec<String>,
-        using_parameters: Vec<LogicalExpr>,
+        using_parameters: Vec<PlExpr>,
+        strict: bool,
     },
 
     /// Nested block
@@ -216,7 +227,12 @@ pub enum ProceduralStatement {
     Print { message: LogicalExpr },
 
     /// SELECT INTO (fetch into variables)
-    SelectInto { query: String, variables: Vec<String> },
+    SelectInto {
+        query: String,
+        variables: Vec<String>,
+        /// `INTO STRICT`: exactly one row, or an error.
+        strict: bool,
+    },
 
     /// OPEN cursor
     OpenCursor { cursor_name: String, query: Option<String> },

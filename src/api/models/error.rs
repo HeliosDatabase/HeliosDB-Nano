@@ -153,6 +153,9 @@ impl From<Error> for ApiError {
             // Write-write conflict (serialization failure) — 409 Conflict; the
             // client retries the whole statement/transaction.
             Error::WriteConflict { .. } => ApiError::conflict(format!("{}", err)),
+            // An error raised with its own SQLSTATE (RAISE, or a statement's
+            // defined refusal): the caller's request could not be carried out.
+            Error::Raised { .. } => ApiError::unprocessable_entity(format!("{}", err)),
             Error::Encryption(_)
             | Error::VectorIndex(_)
             | Error::MultiTenant(_)

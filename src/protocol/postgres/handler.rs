@@ -414,6 +414,8 @@ use bytes::{BufMut, BytesMut};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
 use tokio::net::TcpStream;
+
+mod sql_std; // MERGE INTO and SQL cursors on the wire
 #[cfg(unix)]
 use tokio::net::UnixStream;
 
@@ -3408,6 +3410,7 @@ where
                     self.database.reset_session_branch(self.session_id);
                     // Reset session GUCs to their defaults.
                     self.database.reset_session_gucs(self.session_id);
+                    self.database.close_session_cursors(self.session_id);
                     let _ = self.database.set_session_synchronous_commit(self.session_id, None);
                     let _ = self.database.set_session_fast_autocommit(self.session_id, false);
                     // Back to `public` so a pooled connection can't inherit the
@@ -3552,6 +3555,10 @@ where
             self.send_query_result(&schema, &rows).await?;
             self.send_ready_for_query().await?;
             return Ok(());
+        }
+
+        if Self::is_sql_std_statement(trimmed) {
+            return self.handle_sql_std_simple(query).await;
         }
 
         // Execute query through database
@@ -4933,6 +4940,8 @@ where
             format!("UPDATE {}", affected)
         } else if starts_with_icase(trimmed, "DELETE") {
             format!("DELETE {}", affected)
+        } else if crate::merge_into::is_merge_into(trimmed) {
+            format!("MERGE {}", affected)
         } else if starts_with_icase(trimmed, "CREATE TABLE") {
             "CREATE TABLE".to_string()
         } else if starts_with_icase(trimmed, "CREATE SCHEMA") {
@@ -6879,6 +6888,10 @@ pub(crate) fn sqlstate_for_error(error: &Error) -> &'static str {
     if error.is_applied_publication_failure() {
         return sqlstate::SYSTEM_ERROR; // 58000
     }
+    // An error that carries its own SQLSTATE reports exactly that one.
+    if let Some(code) = error.raised_sqlstate() {
+        return Error::static_sqlstate(code);
+    }
 
     match error {
         Error::ConstraintViolation(message) => {
@@ -7633,6 +7646,9 @@ pub(super) struct WireErrorText {
 pub(crate) fn detail_hint_for_error(code: &str, error: &Error) -> (Option<String>, Option<String>) {
     use crate::network::protocol::sqlstate;
 
+    if let Error::Raised { detail, hint, .. } = error {
+        return (detail.clone(), hint.clone());
+    }
     let message = error.to_string();
     match code {
         sqlstate::SERIALIZATION_FAILURE => (

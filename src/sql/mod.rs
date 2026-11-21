@@ -28,6 +28,7 @@ pub mod query_cache;
 pub(crate) mod returning; // ONE binding of a RETURNING list for RowDescription + DataRow (GH#23)
 pub(crate) mod scope; // Plan-time range-table resolution: 42703 / 42P01 instead of per-row misses (GH#29)
 pub mod sequences;
+pub(crate) mod sql_scan; // Words and literals of a statement, for the grammars the SQL parser lacks
 pub mod settings;
 pub mod sqlite_compat;
 pub mod system_tables;
