@@ -14290,7 +14290,12 @@ async fn server_version_is_one_value_on_every_surface() {
         .await,
         "160000"
     );
-    for name in ["max_connections", "shared_buffers", "statement_timeout", "timezone"] {
+    for (name, listed) in [
+        ("max_connections", "max_connections"),
+        ("shared_buffers", "shared_buffers"),
+        ("statement_timeout", "statement_timeout"),
+        ("timezone", "TimeZone"),
+    ] {
         let shown = rs_scalar(&mut handler, &mut client, &format!("SHOW {name}")).await;
         assert!(!shown.starts_with("ERROR"), "SHOW {name}: {shown}");
         assert_eq!(
@@ -14302,7 +14307,7 @@ async fn server_version_is_one_value_on_every_surface() {
             rs_scalar(
                 &mut handler,
                 &mut client,
-                &format!("SELECT setting FROM pg_settings WHERE name = '{name}'")
+                &format!("SELECT setting FROM pg_settings WHERE name = '{listed}'")
             )
             .await,
             shown,
@@ -14387,16 +14392,17 @@ async fn partition_ddl_delivers_one_warning_notice() {
 
 /// The HeliosProxy contract: `SHOW ALL` is one text row per setting
 /// (`name, setting, description`) holding the seven names a proxy tracks,
-/// each value equal to `SHOW <name>`, and it follows SET, RESET and
-/// DISCARD ALL on the same connection.
+/// spelled as PostgreSQL spells them (`DateStyle`, `TimeZone`; the proxy
+/// compares names case-sensitively), each value equal to `SHOW <name>`, and it
+/// follows SET, RESET and DISCARD ALL on the same connection.
 #[tokio::test]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 async fn show_all_follows_set_reset_and_discard_all() {
     const TRACKED: [&str; 7] = [
         "search_path",
         "row_security",
-        "datestyle",
-        "timezone",
+        "DateStyle",
+        "TimeZone",
         "client_encoding",
         "standard_conforming_strings",
         "server_version",
@@ -14423,7 +14429,7 @@ async fn show_all_follows_set_reset_and_discard_all() {
             .into_iter()
             .map(|row| {
                 let text = |i: usize| String::from_utf8_lossy(row[i].as_ref().unwrap()).to_string();
-                (text(0).to_lowercase(), text(1))
+                (text(0), text(1))
             })
             .collect()
     }
