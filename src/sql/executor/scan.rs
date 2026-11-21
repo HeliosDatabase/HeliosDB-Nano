@@ -447,7 +447,7 @@ fn filter_tuples_with_evaluator(
 
 /// Correlated predicates need the current candidate row. Keep them intact
 /// while choosing an index bound; only uncorrelated subqueries can be run once.
-fn materialize_scan_predicate(
+pub(super) fn materialize_scan_predicate(
     executor: &Executor,
     predicate: &LogicalExpr,
     schema: &Schema,
@@ -488,7 +488,7 @@ fn correlated_candidate_matches(
     }
 }
 
-fn filter_scan_candidates(
+pub(super) fn filter_scan_candidates(
     executor: &Executor,
     tuples: Vec<Tuple>,
     schema: Arc<Schema>,
@@ -532,7 +532,7 @@ fn filter_scan_candidates(
 /// a miss the probe cannot vouch for declines to the filtered scan, which reads
 /// committed rows (and, inside a transaction, the write-set-merging scan). One
 /// `Acquire` load when nothing is staged anywhere, and only on the miss path.
-fn index_miss_is_authoritative(storage: &crate::storage::StorageEngine, table_name: &str) -> bool {
+pub(super) fn index_miss_is_authoritative(storage: &crate::storage::StorageEngine, table_name: &str) -> bool {
     !storage.has_uncommitted_index_removals_for_table(table_name)
 }
 

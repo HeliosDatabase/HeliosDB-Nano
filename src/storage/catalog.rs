@@ -234,11 +234,21 @@ pub(crate) fn teardown_index_structures(
             // definition and builds NOTHING (the `@@` operator scans). So there
             // is no backing structure to remove and this is not a silent skip:
             // deleting the definition is the entire drop.
-            tracing::info!(
-                "dropping index '{}': gin/gist indexes are DDL-only in this build; \
-                 removing the catalog definition (there is no backing index)",
-                index_name
-            );
+            // An expression index over a tree method has a tree (`index_form`).
+            if storage.art_indexes().index_exists(index_name) {
+                if let Err(e) = storage.art_indexes().drop_index(index_name) {
+                    return Err(Error::query_execution(format!(
+                        "Failed to drop index '{}': {}",
+                        index_name, e
+                    )));
+                }
+            } else {
+                tracing::info!(
+                    "dropping index '{}': gin/gist indexes are DDL-only in this build; \
+                     removing the catalog definition (there is no backing index)",
+                    index_name
+                );
+            }
         }
         None => {
             // `index_family` could not classify the tag. Only
@@ -769,6 +779,9 @@ impl<'a> Catalog<'a> {
                     }
                 }
                 None => validate_columns(&definition.table_name, std::slice::from_ref(&definition.column_name))?,
+            }
+            if super::index_form::register_shaped_definition(self, self.storage, name, definition)? {
+                continue;
             }
             match index_family(definition.index_type.as_deref()) {
                 Some(IndexFamily::Art) => {
@@ -4262,7 +4275,13 @@ impl<'a> Catalog<'a> {
             // R4.2 fast path: a valid snapshot whose index set matches the
             // registrations above is bulk-loaded directly into the trees —
             // no row scan, no tuple deserialization.
-            if let Some(snapshot) = art_snapshots.get(&table_name) {
+            // An expression index is rebuilt from the rows: what kinds of value
+            // its keys hold is learned by computing them (`index_form`).
+            let from_rows = art_manager
+                .table_index_shapes(&table_name)
+                .iter()
+                .any(|shape| shape.form.as_ref().is_some_and(|form| form.has_expression_part()));
+            if let Some(snapshot) = art_snapshots.get(&table_name).filter(|_| !from_rows) {
                 match self.load_table_from_snapshot(&table_name, &schema, snapshot) {
                     Ok(entries) => {
                         report.entries_loaded += entries;
@@ -4561,6 +4580,21 @@ impl<'a> Catalog<'a> {
     fn register_persisted_art_index(&self, index_name: &str, definition: &PersistedIndexDefinition) {
         let art_manager = self.storage.art_indexes();
         let table_name = definition.table_name.as_str();
+        // Multi-column, partial and expression indexes (`index_form`).
+        match super::index_form::register_shaped_definition(self, self.storage, index_name, definition) {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(
+                    "Index rebuild: index '{}' on '{}' FAILED to register ({}); it stays recorded, no query \
+                     reads through it and it enforces nothing until it is dropped and created again",
+                    index_name,
+                    table_name,
+                    e
+                );
+                return;
+            }
+        }
         if !matches!(definition.index_type.as_deref(), None | Some("art" | "btree" | "hash")) {
             // Vector families are reopened by `rebuild_vector_indexes`;
             // DDL-only families (gin / gist) never had a backing index.
@@ -4661,7 +4695,7 @@ impl<'a> Catalog<'a> {
     ///   (`create_fk_index` refuses a taken name; nothing re-registers a
     ///   manual tree), so evicting it would trade one missing index for
     ///   another. Left alone at warn — today's behaviour.
-    fn evict_mint_squatting_persisted_name(
+    pub(super) fn evict_mint_squatting_persisted_name(
         &self,
         index_name: &str,
         definition: &PersistedIndexDefinition,

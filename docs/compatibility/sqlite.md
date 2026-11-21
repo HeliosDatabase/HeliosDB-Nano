@@ -21,7 +21,9 @@ isn't covered.
 | `PRAGMA foreign_keys = …`, `journal_mode = …`, `synchronous = …`, `busy_timeout = …` | ✅ no-op | same as above | Parsed and acknowledged silently. Foreign keys are always on; journal mode is RocksDB-managed. |
 | Other `PRAGMA name [= value]` | ✅ no-op | `parse_pragma` | Unknown PRAGMAs return an empty result instead of raising. |
 | `executescript("a; b; c;")` | ✅ | PostgreSQL simple-query protocol + SDK split-on-`;` | Multi-statement strings work over the wire and via the SDK shim. |
-| Multi-column `CREATE INDEX` (B-tree) | ⚠️ partial | `src/sql/planner.rs` | Accepted; only the **leading column** is indexed today. Vector indexes (`USING hnsw|ivf|…`) still reject multi-column with a clearer error. |
+| Multi-column `CREATE INDEX` (B-tree) | ✅ | `src/sql/index_form_plan.rs`, `src/sql/executor/index_form_scan.rs` | Every column is indexed: equality on a leading run of the columns, plus a range on the next one, and `ORDER BY … LIMIT` on them read through the index (`EXPLAIN` names it). An index created before 5.0 holds its leading column only until it is dropped and created again. Vector indexes (`USING hnsw|ivf|…`) still reject multi-column with a clearer error. |
+| Partial index (`CREATE [UNIQUE] INDEX … WHERE …`) | ✅ | `src/storage/index_form.rs` | The predicate is kept: the index holds, and a UNIQUE one constrains, only the rows it is true for. Used by a query whose `WHERE` implies it. |
+| Expression index (`CREATE [UNIQUE] INDEX … (lower(c))`) | ✅ | `src/storage/index_form.rs` | Kept on every write, used when the query holds the same expression, may be UNIQUE. Immutable expressions only. |
 | `INTEGER` type affinity | ✅ | parser type mapping | Maps to `INT4` (or `BIGSERIAL` when paired with `PRIMARY KEY AUTOINCREMENT`). |
 | `BLOB` / `BOOLEAN` / `REAL` / `TEXT` types | ✅ | parser type mapping | Map to `BYTEA` / `BOOL` / `FLOAT4` / `TEXT` respectively. |
 | `\|\|` string concat, `IFNULL`, `COALESCE`, `LENGTH`, `IFNULL`, `LIKE` | ✅ | evaluator | Same semantics as PostgreSQL. |

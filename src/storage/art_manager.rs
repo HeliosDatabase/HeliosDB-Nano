@@ -13,6 +13,7 @@
 
 use super::art_index::{AdaptiveRadixTree, ArtIndexError, ArtIndexStats, ArtIndexType, ArtResult};
 use super::art_node::RowId;
+use super::index_form::IndexForm;
 use super::index_snapshot::ArtIndexSnapshot;
 use crate::{DataType, Schema, Tuple, Value};
 use serde::{Deserialize, Serialize};
@@ -155,6 +156,11 @@ struct IndexEntry {
     /// for a column-flag UNIQUE (which has no user-written constraint name),
     /// and for a constraint whose name is the minted one anyway.
     constraint_label: Option<String>,
+    /// What the index holds beyond a column list: a partial index's predicate,
+    /// an expression index's key expressions ([`IndexForm`]). `None` for an
+    /// index over plain columns of every row. Not persisted: compiled from the
+    /// index's durable definition when the index is registered.
+    form: Option<Arc<IndexForm>>,
     /// The actual tree, individually locked.
     tree: SharedArtIndex,
     /// Spec R5.4 (review F3): the keys of this (PRIMARY KEY / UNIQUE) index that an
@@ -178,9 +184,34 @@ impl IndexEntry {
             columns: tree.columns().to_vec(),
             index_type: tree.index_type(),
             constraint_label,
+            form: None,
             tree: Arc::new(RwLock::new(tree)),
             holds: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             hold_count: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// The entry of a partial or expression index over `form`.
+    fn with_form(tree: AdaptiveRadixTree, form: Arc<IndexForm>) -> Self {
+        let mut entry = Self::with_label(tree, None);
+        entry.form = Some(form);
+        entry
+    }
+
+    /// A partial or expression index's key for a row given as a map from column
+    /// name to value.
+    fn form_key_for_map(&self, row: &HashMap<String, Value>) -> FormKey {
+        match &self.form {
+            None => FormKey::Plain,
+            Some(form) => form.key_for_map(row).map_or(FormKey::NoEntry, FormKey::Key),
+        }
+    }
+
+    /// [`Self::form_key_for_map`] for a row given as its schema and tuple.
+    fn form_key_for_tuple(&self, schema: &Schema, tuple: &Tuple) -> FormKey {
+        match &self.form {
+            None => FormKey::Plain,
+            Some(form) => form.key_for_tuple(schema, tuple).map_or(FormKey::NoEntry, FormKey::Key),
         }
     }
 
@@ -427,6 +458,41 @@ pub(crate) struct StagedIndexKeys {
     pub(crate) row_id: RowId,
     pub(crate) committed: Option<Vec<u8>>,
     pub(crate) staged: Option<Vec<u8>>,
+}
+
+/// What a row's key in one index is, as far as the index's form decides it.
+enum FormKey {
+    /// An index over plain columns: the caller resolves them.
+    Plain,
+    /// A partial or expression index in which the row has no entry.
+    NoEntry,
+    /// A partial or expression index's key for the row.
+    Key(Vec<Value>),
+}
+
+/// What [`ArtIndexManager::form_unique_check_for_update`] found.
+#[derive(Debug)]
+pub enum FormUniqueCheck {
+    /// No partial or expression UNIQUE index objects to the row's new image.
+    Free,
+    /// The new image's key is another row's: the index's name, as a 23505 prints it.
+    Taken(String),
+    /// The key was taken out by a transaction that has not ended.
+    Held(KeyHold),
+}
+
+/// One index of a table as a reader sees it
+/// ([`ArtIndexManager::table_index_shapes`]).
+#[derive(Debug, Clone)]
+pub struct IndexShapeView {
+    /// The index's name.
+    pub name: String,
+    /// Its kind.
+    pub index_type: ArtIndexType,
+    /// Its key parts: column names, or the text of an expression.
+    pub columns: Vec<String>,
+    /// Its form, when it is a partial or expression index.
+    pub form: Option<Arc<IndexForm>>,
 }
 
 /// Metadata about a foreign key constraint
@@ -804,6 +870,13 @@ impl ArtIndexManager {
                 name,
                 tree.len()
             )));
+        }
+        // Keys loaded here were not computed here: what kinds of value an
+        // expression index holds is then unknown, and no query probes it.
+        if let Some(form) = &entry.form {
+            if !entries.is_empty() {
+                form.mark_classes_unknown();
+            }
         }
         let mut loaded = 0usize;
         for (key, row_ids) in entries {
@@ -1249,6 +1322,7 @@ impl ArtIndexManager {
                 indexes.get(name).is_some_and(|entry| {
                     entry.table == table
                         && entry.index_type == ArtIndexType::Unique
+                        && entry.form.is_none()
                         && Self::column_sets_match(&entry.columns, columns)
                 })
             })
@@ -1265,6 +1339,178 @@ impl ArtIndexManager {
     /// column-flag UNIQUE (which has no user-written name at all).
     fn violation_name<'a>(entry: &'a IndexEntry, index_name: &'a str) -> &'a str {
         entry.constraint_label.as_deref().unwrap_or(index_name)
+    }
+
+    /// Register a partial or expression index (`CREATE [UNIQUE] INDEX … WHERE
+    /// predicate`, `CREATE [UNIQUE] INDEX … (expression)`) under the name the
+    /// user gave it. The tree is empty; the caller backfills it. The registry
+    /// lists the form's key parts as the index's columns.
+    pub fn create_form_index(&self, name: &str, table: &str, unique: bool, form: Arc<IndexForm>) -> ArtResult<String> {
+        self.note_mutation();
+        let index_type = if unique {
+            ArtIndexType::Unique
+        } else {
+            ArtIndexType::Manual
+        };
+        let columns = form.part_names().to_vec();
+        let described = columns.join(", ");
+        self.register_index_entry(
+            name,
+            IndexNamePolicy::Refuse,
+            || format!("Index '{}' for {}({})", name, table, described),
+            |index_name| IndexEntry::with_form(AdaptiveRadixTree::new(index_name, table, columns, index_type), form),
+        )?;
+        if unique {
+            let mut unique_indexes = self.unique_indexes.write().unwrap_or_else(|e| e.into_inner());
+            unique_indexes
+                .entry(table.to_string())
+                .or_insert_with(Vec::new)
+                .push(name.to_string());
+        }
+        self.table_index_add(table, name);
+        self.stats.add_index(index_type);
+        Ok(name.to_string())
+    }
+
+    /// Every index of `table` a reader may take, with what it holds: its name,
+    /// kind, key parts and form. Never one a `CREATE INDEX` is still building.
+    /// In name order, so a choice among them is the same on every call.
+    pub fn table_index_shapes(&self, table: &str) -> Vec<IndexShapeView> {
+        let mut names = {
+            let table_indexes = self.table_indexes.read().unwrap_or_else(|e| e.into_inner());
+            table_indexes.get(table).cloned().unwrap_or_default()
+        };
+        names.sort();
+        let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
+        names
+            .iter()
+            .filter(|name| !self.is_index_hidden(name))
+            .filter_map(|name| {
+                indexes.get(name).map(|entry| IndexShapeView {
+                    name: name.clone(),
+                    index_type: entry.index_type,
+                    columns: entry.columns.clone(),
+                    form: entry.form.clone(),
+                })
+            })
+            .collect()
+    }
+
+    /// The form of a partial or expression index; `None` for any other index.
+    pub fn index_form(&self, name: &str) -> Option<Arc<IndexForm>> {
+        let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
+        indexes.get(name).and_then(|entry| entry.form.clone())
+    }
+
+    /// Does `table` have a partial or expression UNIQUE index?
+    pub fn has_form_unique_index(&self, table: &str) -> bool {
+        let names = self.unique_index_names(table);
+        if names.is_empty() {
+            return false;
+        }
+        let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
+        names
+            .iter()
+            .filter_map(|name| indexes.get(name))
+            .any(|entry| entry.form.is_some())
+    }
+
+    /// An UPDATE's check against the partial and expression UNIQUE indexes of
+    /// `table`, for a row whose image goes from `old_tuple` to `new_tuple`.
+    ///
+    /// `seen` is the statement's record of the keys rows updated earlier moved
+    /// onto (an index is named there by a one-element column list that no column
+    /// set can equal, its key as bytes) and takes this row's. A key another open
+    /// transaction (not `own`) took out of the index is reported as held: the
+    /// caller waits for that transaction and asks again.
+    ///
+    /// A row whose key does not change (or that has none: the predicate is not
+    /// true for it, or a key part is NULL) conflicts with nothing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn form_unique_check_for_update(
+        &self,
+        table: &str,
+        schema: &Schema,
+        old_tuple: &Tuple,
+        new_tuple: &Tuple,
+        row_id: Option<RowId>,
+        own: u64,
+        seen: &mut Vec<(Vec<String>, Vec<Value>, Option<RowId>)>,
+    ) -> FormUniqueCheck {
+        let names = self.unique_index_names(table);
+        if names.is_empty() {
+            return FormUniqueCheck::Free;
+        }
+        let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
+        for name in &names {
+            let Some(entry) = indexes.get(name) else {
+                continue;
+            };
+            if entry.form.is_none() {
+                continue;
+            }
+            let Some(new_key) = Self::entry_row_key(entry, schema, new_tuple) else {
+                continue;
+            };
+            if Self::entry_row_key(entry, schema, old_tuple).as_ref() == Some(&new_key) {
+                continue;
+            }
+            let label = Self::violation_name(entry, name).to_string();
+            let marker = vec![format!("\u{1}index:{name}")];
+            let key_value = vec![Value::Bytes(new_key.clone())];
+            let already = seen
+                .iter()
+                .find(|(columns, values, _)| columns == &marker && values == &key_value)
+                .map(|(_, _, row)| *row);
+            match already {
+                // This row's own entry, from an earlier look at it.
+                Some(row) if row.is_some() && row == row_id => continue,
+                Some(_) => return FormUniqueCheck::Taken(label),
+                None => {}
+            }
+            {
+                let tree = entry.tree.read().unwrap_or_else(|e| e.into_inner());
+                if entry.hold_count.load(Ordering::Acquire) != 0 {
+                    if let Some(&(owner, held_row)) = entry.holds.lock().get(&new_key) {
+                        if owner != own {
+                            return FormUniqueCheck::Held(KeyHold {
+                                index: name.clone(),
+                                key: new_key,
+                                owner,
+                                row_id: held_row,
+                            });
+                        }
+                    }
+                }
+                let taken = match row_id {
+                    Some(this) => tree.get_all(&new_key).into_iter().any(|holder| holder != this),
+                    None => tree.contains(&new_key),
+                };
+                if taken {
+                    return FormUniqueCheck::Taken(label);
+                }
+            }
+            seen.push((marker, key_value, row_id));
+        }
+        FormUniqueCheck::Free
+    }
+
+    /// Encode the leading `values` of a key of `total_parts` parts, as the full
+    /// key's encoding begins: a single-part key is the value's own encoding, a
+    /// multi-part key escapes each value and joins them with the separator (no
+    /// separator after the last one given).
+    pub fn encode_key_prefix(values: &[Value], total_parts: usize) -> Vec<u8> {
+        if total_parts <= 1 {
+            return Self::encode_key_from_values(values.iter().take(1));
+        }
+        let mut key = Vec::new();
+        for (i, value) in values.iter().enumerate() {
+            if i > 0 {
+                key.push(0);
+            }
+            Self::encode_value_into(&mut key, value, true);
+        }
+        key
     }
 
     /// Create a manual index (via CREATE INDEX ... USING ART)
@@ -1325,8 +1571,8 @@ impl ArtIndexManager {
                     name
                 )));
             };
-            if let Some(values) = Self::index_value_refs_from_tuple(&entry.columns, schema, tuple) {
-                let key = Self::encode_key_from_values(values.iter().copied());
+            if let Some(values) = Self::entry_values(&entry, schema, tuple) {
+                let key = Self::encode_key_from_values(values.iter().map(AsRef::as_ref));
                 index.insert(&key, row_id)?;
                 inserted += 1;
             }
@@ -1356,11 +1602,11 @@ impl ArtIndexManager {
                 .ok_or_else(|| ArtIndexError::IndexNotFound(name.to_string()))?
         };
         let key_of = |tuple: &Tuple| -> Option<Vec<u8>> {
-            let values = Self::index_value_refs_from_tuple(&entry.columns, schema, tuple)?;
-            if Self::key_is_null_distinct(entry.index_type, values.iter().copied()) {
+            let values = Self::entry_values(&entry, schema, tuple)?;
+            if Self::key_is_null_distinct(entry.index_type, values.iter().map(AsRef::as_ref)) {
                 return None;
             }
-            Some(Self::encode_key_from_values(values.iter().copied()))
+            Some(Self::encode_key_from_values(values.iter().map(AsRef::as_ref)))
         };
         let keys: Vec<StagedIndexKeys> = rows
             .iter()
@@ -1477,8 +1723,8 @@ impl ArtIndexManager {
                     name
                 )));
             };
-            if let Some(values) = Self::index_value_refs_from_tuple(&entry.columns, schema, tuple) {
-                let key = Self::encode_key_from_values(values.iter().copied());
+            if let Some(values) = Self::entry_values(&entry, schema, tuple) {
+                let key = Self::encode_key_from_values(values.iter().map(AsRef::as_ref));
                 index.insert(&key, row_id)?;
                 inserted += 1;
             }
@@ -1849,7 +2095,12 @@ impl ArtIndexManager {
         let mut changed = Vec::new();
         let mut indexes = self.indexes.write().unwrap_or_else(|e| e.into_inner());
         for (name, entry) in indexes.iter_mut() {
-            if entry.table != table || !entry.columns.iter().any(|c| c.eq_ignore_ascii_case(old)) {
+            // A partial or expression index keeps SQL text over the column
+            // names; ALTER TABLE refuses to rename a column one reads.
+            if entry.table != table
+                || entry.form.is_some()
+                || !entry.columns.iter().any(|c| c.eq_ignore_ascii_case(old))
+            {
                 continue;
             }
             for col in entry.columns.iter_mut() {
@@ -2007,7 +2258,9 @@ impl ArtIndexManager {
     pub fn find_column_index(&self, table: &str, column: &str) -> Option<String> {
         let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
         for (name, entry) in indexes.iter() {
-            if entry.table == table && entry.columns.len() == 1 {
+            // A partial or expression index does not answer for a column: it
+            // leaves rows out, or its key is not the column's value.
+            if entry.table == table && entry.columns.len() == 1 && entry.form.is_none() {
                 if let Some(col) = entry.columns.first() {
                     if col == column && !self.is_index_hidden(name) {
                         return Some(name.clone());
@@ -2344,15 +2597,27 @@ impl ArtIndexManager {
         }
     }
 
-    fn index_value_refs_from_tuple<'a>(
-        columns: &[String],
+    /// The key values of `entry` for one row: its columns' values, or, for a
+    /// partial or expression index, what its form computes. `None`: the row has
+    /// no entry in this index (a column does not resolve, or the form leaves the
+    /// row out).
+    fn entry_values<'a>(
+        entry: &IndexEntry,
         schema: &Schema,
         tuple: &'a Tuple,
-    ) -> Option<Vec<&'a Value>> {
-        let mut values = Vec::with_capacity(columns.len());
-        for column in columns {
+    ) -> Option<Vec<std::borrow::Cow<'a, Value>>> {
+        if let Some(form) = &entry.form {
+            return Some(
+                form.key_for_tuple(schema, tuple)?
+                    .into_iter()
+                    .map(std::borrow::Cow::Owned)
+                    .collect(),
+            );
+        }
+        let mut values = Vec::with_capacity(entry.columns.len());
+        for column in &entry.columns {
             let idx = schema.get_column_index(column)?;
-            values.push(tuple.values.get(idx)?);
+            values.push(std::borrow::Cow::Borrowed(tuple.values.get(idx)?));
         }
         Some(values)
     }
@@ -2529,18 +2794,26 @@ impl ArtIndexManager {
                 continue;
             };
             let cols = &entry.columns;
+            // A partial or expression index computes its key; the row may have none.
+            let form_key = entry.form_key_for_tuple(schema, tuple);
             let mut resolved: Vec<(usize, &Value)> = Vec::with_capacity(cols.len());
             let mut missing = false;
-            for column in cols {
-                let Some(sidx) = schema.get_column_index(column) else {
-                    missing = true;
-                    break;
-                };
-                let Some(v) = tuple.values.get(sidx) else {
-                    missing = true;
-                    break;
-                };
-                resolved.push((sidx, v));
+            match &form_key {
+                FormKey::NoEntry => continue,
+                FormKey::Key(values) => resolved.extend(values.iter().map(|v| (usize::MAX, v))),
+                FormKey::Plain => {
+                    for column in cols {
+                        let Some(sidx) = schema.get_column_index(column) else {
+                            missing = true;
+                            break;
+                        };
+                        let Some(v) = tuple.values.get(sidx) else {
+                            missing = true;
+                            break;
+                        };
+                        resolved.push((sidx, v));
+                    }
+                }
             }
             if missing {
                 continue;
@@ -2553,7 +2826,7 @@ impl ArtIndexManager {
             if Self::key_is_null_distinct(entry.index_type, resolved.iter().map(|(_, v)| *v)) {
                 continue;
             }
-            let key = if multi_index {
+            let key = if multi_index && matches!(form_key, FormKey::Plain) {
                 Self::encode_key_cached(frag_cache, &resolved)
             } else {
                 Self::encode_key_from_values(resolved.iter().map(|(_, v)| *v))
@@ -2859,13 +3132,23 @@ impl ArtIndexManager {
                 let mut has_null = false;
                 let mut values = Vec::new();
 
-                for col in columns {
-                    if let Some(v) = column_values.get(col) {
-                        if matches!(v, Value::Null) {
-                            has_null = true;
-                            break;
+                match entry.form_key_for_map(column_values) {
+                    // A partial or expression index: the row may have no key.
+                    FormKey::NoEntry => continue,
+                    FormKey::Key(key) => {
+                        has_null = key.iter().any(|v| matches!(v, Value::Null));
+                        values = key;
+                    }
+                    FormKey::Plain => {
+                        for col in columns {
+                            if let Some(v) = column_values.get(col) {
+                                if matches!(v, Value::Null) {
+                                    has_null = true;
+                                    break;
+                                }
+                                values.push(v.clone());
+                            }
                         }
-                        values.push(v.clone());
                     }
                 }
 
@@ -2911,9 +3194,9 @@ impl ArtIndexManager {
 
         if let Some(pk_name) = pk_name {
             if let Some(entry) = indexes.get(&pk_name) {
-                if let Some(values) = Self::index_value_refs_from_tuple(&entry.columns, schema, tuple) {
+                if let Some(values) = Self::entry_values(entry, schema, tuple) {
                     if !values.iter().any(|v| matches!(**v, Value::Null)) {
-                        let key = Self::encode_key_from_values(values.iter().copied());
+                        let key = Self::encode_key_from_values(values.iter().map(AsRef::as_ref));
                         let tree = entry.tree.read().unwrap_or_else(|e| e.into_inner());
                         if tree.contains(&key) {
                             return Err(ArtIndexError::DuplicateKey(format!(
@@ -2928,11 +3211,11 @@ impl ArtIndexManager {
 
         for unique_name in &unique_names {
             if let Some(entry) = indexes.get(unique_name) {
-                if let Some(values) = Self::index_value_refs_from_tuple(&entry.columns, schema, tuple) {
+                if let Some(values) = Self::entry_values(entry, schema, tuple) {
                     if values.iter().any(|v| matches!(**v, Value::Null)) {
                         continue;
                     }
-                    let key = Self::encode_key_from_values(values.iter().copied());
+                    let key = Self::encode_key_from_values(values.iter().map(AsRef::as_ref));
                     let tree = entry.tree.read().unwrap_or_else(|e| e.into_inner());
                     if tree.contains(&key) {
                         return Err(ArtIndexError::DuplicateKey(format!(
@@ -3019,6 +3302,7 @@ impl ArtIndexManager {
         // Metadata filter first; tree locks taken one at a time.
         indexes.values().any(|entry| {
             if entry.table != table
+                || entry.form.is_some()
                 || !matches!(entry.index_type, ArtIndexType::PrimaryKey | ArtIndexType::Unique)
                 || !Self::column_sets_match(&entry.columns, columns)
             {
@@ -3119,19 +3403,31 @@ impl ArtIndexManager {
                 continue;
             };
             if let Some(arbiter) = arbiter {
-                if !Self::column_sets_match(&entry.columns, arbiter) {
+                // A partial or expression index is never the arbiter a column
+                // list names: its key is not those columns' values.
+                if entry.form.is_some() || !Self::column_sets_match(&entry.columns, arbiter) {
                     continue;
                 }
             }
+            let form_key = entry.form_key_for_map(column_values);
             let mut values = Vec::with_capacity(entry.columns.len());
             let mut usable = true;
-            for column in &entry.columns {
-                match column_values.get(column) {
-                    Some(Value::Null) | None => {
-                        usable = false;
-                        break;
+            match &form_key {
+                FormKey::NoEntry => usable = false,
+                FormKey::Key(key) => {
+                    usable = !key.iter().any(|v| matches!(v, Value::Null));
+                    values.extend(key.iter());
+                }
+                FormKey::Plain => {
+                    for column in &entry.columns {
+                        match column_values.get(column) {
+                            Some(Value::Null) | None => {
+                                usable = false;
+                                break;
+                            }
+                            Some(v) => values.push(v),
+                        }
                     }
-                    Some(v) => values.push(v),
                 }
             }
             if !usable || values.len() != entry.columns.len() {
@@ -3172,12 +3468,15 @@ impl ArtIndexManager {
         names
             .iter()
             .filter_map(|name| {
-                indexes.get(name).map(|entry| EnforcedUniqueIndex {
-                    index_name: name.clone(),
-                    label: Self::violation_name(entry, name).to_string(),
-                    columns: entry.columns.clone(),
-                    is_primary_key: matches!(entry.index_type, ArtIndexType::PrimaryKey),
-                })
+                indexes
+                    .get(name)
+                    .filter(|entry| entry.form.is_none())
+                    .map(|entry| EnforcedUniqueIndex {
+                        index_name: name.clone(),
+                        label: Self::violation_name(entry, name).to_string(),
+                        columns: entry.columns.clone(),
+                        is_primary_key: matches!(entry.index_type, ArtIndexType::PrimaryKey),
+                    })
             })
             .collect()
     }
@@ -3194,7 +3493,7 @@ impl ArtIndexManager {
         let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
         let mut best: Option<(u8, &String, &IndexEntry)> = None;
         for (name, entry) in indexes.iter() {
-            if entry.table != table || !Self::column_sets_match(&entry.columns, columns) {
+            if entry.table != table || entry.form.is_some() || !Self::column_sets_match(&entry.columns, columns) {
                 continue;
             }
             // Spec R5.3: an index still being built answers for none of its rows yet.
@@ -3296,7 +3595,7 @@ impl ArtIndexManager {
         names
             .iter()
             .filter_map(|name| indexes.get(name))
-            .any(|entry| entry.columns == columns)
+            .any(|entry| entry.form.is_none() && entry.columns == columns)
     }
 
     /// Does any PK/UNIQUE index of `table` include `column`?
@@ -3317,7 +3616,11 @@ impl ArtIndexManager {
         names
             .iter()
             .filter_map(|name| indexes.get(name))
-            .any(|entry| entry.columns.iter().any(|c| c.eq_ignore_ascii_case(column)))
+            .any(|entry| match &entry.form {
+                // A partial or expression UNIQUE index: any column it reads.
+                Some(form) => form.referenced_columns().iter().any(|c| c.eq_ignore_ascii_case(column)),
+                None => entry.columns.iter().any(|c| c.eq_ignore_ascii_case(column)),
+            })
     }
 
     /// Every column set on `table` that a live PK/UNIQUE ART index enforces.
@@ -3341,6 +3644,9 @@ impl ArtIndexManager {
         names
             .iter()
             .filter_map(|name| indexes.get(name))
+            // A partial or expression UNIQUE index is not a column set: see
+            // `form_unique_check_for_update`.
+            .filter(|entry| entry.form.is_none())
             .map(|entry| entry.columns.clone())
             .collect()
     }
@@ -3378,13 +3684,13 @@ impl ArtIndexManager {
                     name
                 )));
             };
-            let Some(values) = Self::index_value_refs_from_tuple(&entry.columns, schema, tuple) else {
+            let Some(values) = Self::entry_values(&entry, schema, tuple) else {
                 continue;
             };
             if values.iter().any(|v| matches!(**v, Value::Null)) {
                 continue;
             }
-            let key = Self::encode_key_from_values(values.iter().copied());
+            let key = Self::encode_key_from_values(values.iter().map(AsRef::as_ref));
             if index.contains(&key) {
                 return Err(ArtIndexError::DuplicateKey(format!(
                     "Duplicate key value violates UNIQUE constraint \"{}\"",
@@ -3526,11 +3832,16 @@ impl ArtIndexManager {
             };
 
             // Extract values for indexed columns
-            let values: Vec<Value> = entry
-                .columns
-                .iter()
-                .filter_map(|col| column_values.get(col).cloned())
-                .collect();
+            let values: Vec<Value> = match entry.form_key_for_map(column_values) {
+                // A partial or expression index: the row may have no key.
+                FormKey::NoEntry => continue,
+                FormKey::Key(key) => key,
+                FormKey::Plain => entry
+                    .columns
+                    .iter()
+                    .filter_map(|col| column_values.get(col).cloned())
+                    .collect(),
+            };
 
             // NULLs are DISTINCT under PK/UNIQUE (`key_is_null_distinct`):
             // no key is written, so the second NULL row is not a "duplicate".
@@ -3931,20 +4242,34 @@ impl ArtIndexManager {
 
             let mut resolved: Vec<(usize, &Value)> = Vec::with_capacity(entry.columns.len());
             let mut missing = false;
-            for column in &entry.columns {
-                let Some(idx) = schema.get_column_index(column) else {
-                    missing = true;
-                    break;
-                };
-                let Some(value) = tuple.values.get(idx) else {
-                    missing = true;
-                    break;
-                };
-                // Record the value even for an index that later bails on a
-                // missing column — the undo log needs every value we resolved
-                // (byte-for-byte the pre-change accumulation order).
-                indexed_values.entry(column.clone()).or_insert_with(|| value.clone());
-                resolved.push((idx, value));
+            // A partial or expression index computes its key. The columns it
+            // reads go into the returned map, which is what a later removal of
+            // this row's entries (a rollback) is given to find the key again.
+            let form_key = entry.form_key_for_tuple(schema, tuple);
+            if let Some(form) = &entry.form {
+                for column in form.referenced_columns() {
+                    if let Some(value) = schema.get_column_index(column).and_then(|i| tuple.values.get(i)) {
+                        indexed_values.entry(column.clone()).or_insert_with(|| value.clone());
+                    }
+                }
+            }
+            match &form_key {
+                FormKey::NoEntry => missing = true,
+                FormKey::Key(values) => resolved.extend(values.iter().map(|v| (usize::MAX, v))),
+                FormKey::Plain => {
+                    for column in &entry.columns {
+                        let Some(idx) = schema.get_column_index(column) else {
+                            missing = true;
+                            break;
+                        };
+                        let Some(value) = tuple.values.get(idx) else {
+                            missing = true;
+                            break;
+                        };
+                        indexed_values.entry(column.clone()).or_insert_with(|| value.clone());
+                        resolved.push((idx, value));
+                    }
+                }
             }
 
             // NULLs are DISTINCT under PK/UNIQUE (`key_is_null_distinct`).
@@ -3955,7 +4280,7 @@ impl ArtIndexManager {
                 && resolved.len() == entry.columns.len()
                 && !Self::key_is_null_distinct(entry.index_type, resolved.iter().map(|(_, v)| *v))
             {
-                let key = if multi_index {
+                let key = if multi_index && matches!(form_key, FormKey::Plain) {
                     Self::encode_key_cached(&mut frag_cache, &resolved)
                 } else {
                     Self::encode_key_from_values(resolved.iter().map(|(_, v)| *v))
@@ -4085,11 +4410,16 @@ impl ArtIndexManager {
                 continue;
             };
 
-            let values: Vec<Value> = entry
-                .columns
-                .iter()
-                .filter_map(|col| column_values.get(col).cloned())
-                .collect();
+            let values: Vec<Value> = match entry.form_key_for_map(column_values) {
+                // A partial or expression index: the row may have no key.
+                FormKey::NoEntry => continue,
+                FormKey::Key(key) => key,
+                FormKey::Plain => entry
+                    .columns
+                    .iter()
+                    .filter_map(|col| column_values.get(col).cloned())
+                    .collect(),
+            };
 
             // A NULL-bearing key was never written to an enforcing tree
             // (`key_is_null_distinct`), so there is nothing to remove — and
@@ -4168,6 +4498,17 @@ impl ArtIndexManager {
                     let Some(tuple) = tuple else {
                         return Ok(None);
                     };
+                    match entry.form_key_for_tuple(schema, tuple) {
+                        FormKey::Plain => {}
+                        // A partial or expression index: the row may have no key.
+                        FormKey::NoEntry => return Ok(None),
+                        FormKey::Key(values) => {
+                            if Self::key_is_null_distinct(entry.index_type, values.iter()) {
+                                return Ok(None);
+                            }
+                            return Ok(Some((Self::encode_key_from_values(values.iter()), None)));
+                        }
+                    }
                     let values: Vec<&Value> = entry
                         .columns
                         .iter()
@@ -4282,18 +4623,25 @@ impl ArtIndexManager {
                 continue;
             };
 
+            let form_key = entry.form_key_for_tuple(schema, tuple);
             let mut resolved: Vec<(usize, &Value)> = Vec::with_capacity(entry.columns.len());
             let mut missing = false;
-            for column in &entry.columns {
-                let Some(sidx) = schema.get_column_index(column) else {
-                    missing = true;
-                    break;
-                };
-                let Some(v) = tuple.values.get(sidx) else {
-                    missing = true;
-                    break;
-                };
-                resolved.push((sidx, v));
+            match &form_key {
+                FormKey::NoEntry => continue,
+                FormKey::Key(values) => resolved.extend(values.iter().map(|v| (usize::MAX, v))),
+                FormKey::Plain => {
+                    for column in &entry.columns {
+                        let Some(sidx) = schema.get_column_index(column) else {
+                            missing = true;
+                            break;
+                        };
+                        let Some(v) = tuple.values.get(sidx) else {
+                            missing = true;
+                            break;
+                        };
+                        resolved.push((sidx, v));
+                    }
+                }
             }
             if missing {
                 continue;
@@ -4304,7 +4652,7 @@ impl ArtIndexManager {
                 continue;
             }
 
-            let key = if multi_index {
+            let key = if multi_index && matches!(form_key, FormKey::Plain) {
                 Self::encode_key_cached(&mut frag_cache, &resolved)
             } else {
                 Self::encode_key_from_values(resolved.iter().map(|(_, v)| *v))
@@ -4470,15 +4818,27 @@ impl ArtIndexManager {
                 continue;
             }
             if let Some(arbiter) = arbiter {
-                if !Self::column_sets_match(&entry.columns, arbiter) {
+                if entry.form.is_some() || !Self::column_sets_match(&entry.columns, arbiter) {
                     continue;
                 }
             }
+            let form_key = entry.form_key_for_map(column_values);
             let mut values = Vec::with_capacity(entry.columns.len());
-            for column in &entry.columns {
-                match column_values.get(column) {
-                    Some(Value::Null) | None => break,
-                    Some(v) => values.push(v),
+            match &form_key {
+                FormKey::NoEntry => continue,
+                FormKey::Key(key) => {
+                    if key.iter().any(|v| matches!(v, Value::Null)) {
+                        continue;
+                    }
+                    values.extend(key.iter());
+                }
+                FormKey::Plain => {
+                    for column in &entry.columns {
+                        match column_values.get(column) {
+                            Some(Value::Null) | None => break,
+                            Some(v) => values.push(v),
+                        }
+                    }
                 }
             }
             if values.len() != entry.columns.len() {
@@ -4520,7 +4880,11 @@ impl ArtIndexManager {
                 continue;
             }
 
-            for column_name in &entry.columns {
+            let columns = match &entry.form {
+                Some(form) => form.referenced_columns(),
+                None => entry.columns.as_slice(),
+            };
+            for column_name in columns {
                 let Some(idx) = schema.get_column_index(column_name) else {
                     return true;
                 };
@@ -4548,7 +4912,11 @@ impl ArtIndexManager {
                 continue;
             }
 
-            for indexed_column in &entry.columns {
+            let columns = match &entry.form {
+                Some(form) => form.referenced_columns(),
+                None => entry.columns.as_slice(),
+            };
+            for indexed_column in columns {
                 if column_names
                     .iter()
                     .any(|name| name.eq_ignore_ascii_case(indexed_column))
@@ -4585,14 +4953,11 @@ impl ArtIndexManager {
     /// index; `None` when it holds none there (a column the row does not have, or
     /// a NULL under PK/UNIQUE, which is never entered: `key_is_null_distinct`).
     fn entry_row_key(entry: &IndexEntry, schema: &Schema, tuple: &Tuple) -> Option<Vec<u8>> {
-        let mut values: Vec<&Value> = Vec::with_capacity(entry.columns.len());
-        for column in &entry.columns {
-            values.push(tuple.values.get(schema.get_column_index(column)?)?);
-        }
-        if Self::key_is_null_distinct(entry.index_type, values.iter().copied()) {
+        let values = Self::entry_values(entry, schema, tuple)?;
+        if Self::key_is_null_distinct(entry.index_type, values.iter().map(AsRef::as_ref)) {
             return None;
         }
-        Some(Self::encode_key_from_values(values.iter().copied()))
+        Some(Self::encode_key_from_values(values.iter().map(AsRef::as_ref)))
     }
 
     /// The value the dense-int statistics count for this row in this index:

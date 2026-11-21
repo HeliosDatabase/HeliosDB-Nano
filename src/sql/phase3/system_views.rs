@@ -5527,61 +5527,47 @@ impl SystemViewRegistry {
         // definition that is not UNIQUE), of a table in this listing and not
         // redefined by the session's branch. An index still being built has no
         // definition until its group is written, exactly when it becomes visible.
-        let mut manual: Vec<(String, String, String)> = Vec::new();
+        // A multi-column index lists every column; a partial one its predicate;
+        // one over an expression its key text. A UNIQUE one is listed here when it
+        // is partial or over an expression (`index_form`).
+        let mut manual: Vec<(String, String, crate::storage::index_form::IndexDefinitionText)> = Vec::new();
         // GH#34: indexes over an expression, with their access method.
-        let mut expression: Vec<(String, String, String, String)> = Vec::new();
+        let mut expression: Vec<(String, String, crate::storage::index_form::IndexDefinitionText)> = Vec::new();
         for (index_name, definition) in catalog.list_index_definitions()? {
+            let text = crate::storage::index_form::IndexDefinitionText::of(&definition, &str::to_owned);
             if definition.index_type.as_deref() == Some("expression") {
                 if !listed.contains(definition.table_name.as_str()) || catalog.branch_overrides(&definition.table_name)
                 {
                     continue;
                 }
-                for option in &definition.options {
-                    if let crate::sql::logical_plan::IndexOption::Expression { method, key, .. } = option {
-                        expression.push((
-                            definition.table_name.clone(),
-                            index_name.clone(),
-                            method.clone(),
-                            key.clone(),
-                        ));
-                    }
-                }
+                expression.push((definition.table_name.clone(), index_name.clone(), text));
                 continue;
             }
             if crate::storage::index_family(definition.index_type.as_deref()) != Some(crate::storage::IndexFamily::Art)
             {
                 continue;
             }
-            if crate::sql::executor::ddl::unique_index_columns(&definition.options, &definition.column_name).is_some() {
+            if text.unique && text.predicate.is_none() {
                 continue;
             }
             if !listed.contains(definition.table_name.as_str()) || catalog.branch_overrides(&definition.table_name) {
                 continue;
             }
-            manual.push((definition.table_name, index_name, definition.column_name));
+            manual.push((definition.table_name, index_name, text));
         }
-        manual.sort();
-        for (table_key, index_name, column) in manual {
+        manual.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        expression.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        for (table_key, index_name, text) in manual.into_iter().chain(expression) {
             let (schema_name, bare_table) = crate::sql::Planner::split_schema_key(&table_key);
             let indexdef = format!(
-                "CREATE INDEX {} ON {}.{} USING btree ({})",
-                index_name, schema_name, bare_table, column
-            );
-            rows.push(Tuple::new(vec![
-                Value::String(schema_name),
-                Value::String(bare_table),
-                Value::String(index_name),
-                Value::Null,
-                Value::String(indexdef),
-            ]));
-        }
-
-        expression.sort();
-        for (table_key, index_name, method, key) in expression {
-            let (schema_name, bare_table) = crate::sql::Planner::split_schema_key(&table_key);
-            let indexdef = format!(
-                "CREATE INDEX {} ON {}.{} USING {} ({})",
-                index_name, schema_name, bare_table, method, key
+                "CREATE {}INDEX {} ON {}.{} USING {} ({}){}",
+                if text.unique { "UNIQUE " } else { "" },
+                index_name,
+                schema_name,
+                bare_table,
+                text.method,
+                text.key,
+                text.where_clause()
             );
             rows.push(Tuple::new(vec![
                 Value::String(schema_name),

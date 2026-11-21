@@ -109,6 +109,7 @@ pub mod row_cache;
 pub mod art_index;
 pub mod art_manager;
 pub mod art_node;
+pub mod index_form;
 
 // Durable index snapshots (R4.2)
 pub mod index_snapshot;

@@ -1488,7 +1488,12 @@ impl<'a> Planner<'a> {
             match &col.expr {
                 Expr::Identifier(ident) => {
                     let name = Self::normalize_ident(ident);
-                    keys.push(name.clone());
+                    // Spelled so the key text reads back as the same column.
+                    keys.push(if ident.quote_style.is_some() {
+                        ident.to_string()
+                    } else {
+                        name.clone()
+                    });
                     if !referenced.contains(&name) {
                         referenced.push(name);
                     }
@@ -2259,13 +2264,10 @@ impl<'a> Planner<'a> {
                 // namespace-collapse; only the TARGET table is schema-resolved).
                 let table = self.resolve_table_ref(&create_index.table_name);
 
-                // Extract column name. We support single-column B-tree / HNSW
-                // indexes natively; multi-column B-tree indexes are accepted
-                // (sqlite3 apps rely on them for query planning) but we only
-                // index the leading column today — the others are recorded for
-                // catalog visibility but not used by the executor. Vector
-                // indexes (HNSW, IVF, …) are rejected when multi-column since
-                // the algorithm can't span columns.
+                // Extract the key. A B-tree index may have several columns
+                // (every one is indexed, see `index_form_plan`); vector indexes
+                // (HNSW, IVF, …) are rejected when multi-column since the
+                // algorithm can't span columns.
                 if create_index.columns.is_empty() {
                     return Err(Error::query_execution("At least one column required for index"));
                 }
@@ -2306,15 +2308,6 @@ impl<'a> Planner<'a> {
                     if is_vector_index {
                         return Err(Error::query_execution(
                             "Vector indexes (HNSW/IVF) require a VECTOR column, not an expression",
-                        ));
-                    }
-                    if create_index.unique {
-                        // Uniqueness over an expression would need the key
-                        // computed on every write; nothing does that yet, and
-                        // a UNIQUE index that checks nothing would be a
-                        // silent wrong answer. Fail closed.
-                        return Err(Error::query_execution(
-                            "CREATE UNIQUE INDEX on an expression is not supported",
                         ));
                     }
                     Some(self.expression_index_option(index_type.as_deref(), &create_index.columns)?)
@@ -2367,15 +2360,6 @@ impl<'a> Planner<'a> {
                     }
                 };
 
-                if create_index.columns.len() > 1 {
-                    tracing::debug!(
-                        "Composite index {:?} on {:?}({} cols): only the leading column is indexed",
-                        index_name,
-                        table,
-                        create_index.columns.len()
-                    );
-                }
-
                 // Parse WITH options from SQL
                 let mut options = self.parse_index_options(&create_index.with)?;
 
@@ -2405,14 +2389,15 @@ impl<'a> Planner<'a> {
                     // rule than the user asked for and reject rows PostgreSQL
                     // accepts. `CREATE UNIQUE INDEX … ("repo","login","periodStart")`
                     // is the shape Prisma emits for a composite `@@unique`.
+                    // A UNIQUE index over an expression keeps its key in the
+                    // `Expression` option; the column list is for plain columns.
                     let mut unique_columns = Vec::with_capacity(create_index.columns.len());
                     for col in &create_index.columns {
                         match &col.expr {
                             Expr::Identifier(ident) => unique_columns.push(Self::normalize_ident(ident)),
                             _ => {
-                                return Err(Error::query_execution(
-                                    "CREATE UNIQUE INDEX accepts column names only (no expressions)",
-                                ))
+                                unique_columns.clear();
+                                break;
                             }
                         }
                     }
@@ -2422,6 +2407,14 @@ impl<'a> Planner<'a> {
                     }
                 }
 
+                // Multi-column keys and the WHERE predicate of a partial index.
+                crate::sql::index_form_plan::add_form_options(
+                    self,
+                    &create_index,
+                    index_type.as_deref(),
+                    expression.is_some(),
+                    &mut options,
+                )?;
                 let index_type = if let Some(expression) = expression {
                     options.push(expression);
                     Some("expression".to_string())

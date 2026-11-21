@@ -644,7 +644,8 @@ impl EmbeddedDatabase {
                     }
                     // GH#34: an index over an expression that reads the
                     // column goes with it, as in PostgreSQL.
-                    sql::logical_plan::IndexOption::Expression { columns, .. } => {
+                    sql::logical_plan::IndexOption::Expression { columns, .. }
+                    | sql::logical_plan::IndexOption::Predicate { columns, .. } => {
                         columns.iter().any(|column| names_column(column))
                     }
                     _ => false,
@@ -693,13 +694,15 @@ impl EmbeddedDatabase {
             if definition.table_name != table {
                 continue;
             }
+            // A partial index keeps its predicate the same way.
             let reads_old = definition.options.iter().any(|option| {
                 matches!(option, sql::logical_plan::IndexOption::Expression { columns, .. }
+                    | sql::logical_plan::IndexOption::Predicate { columns, .. }
                     if columns.iter().any(|column| column.eq_ignore_ascii_case(old)))
             });
             if reads_old {
                 return Err(Error::query_execution(format!(
-                    "renaming column \"{old}\" of table \"{table}\", which the expression index \"{name}\" \
+                    "renaming column \"{old}\" of table \"{table}\", which the expression or partial index \"{name}\" \
                      reads, {}; drop the index first",
                     crate::error::UNSUPPORTED_STATEMENT_KIND_MARKER
                 )));

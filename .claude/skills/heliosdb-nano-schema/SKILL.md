@@ -51,6 +51,13 @@ CREATE INDEX idx_posts_author ON posts(author_id);
 CREATE INDEX idx_posts_published ON posts(published) WHERE published = TRUE;
 ```
 
+Index forms (5.0+), all btree, all visible in `EXPLAIN` as `Index Scan using <name>` when a query reads through them:
+
+- **Multi-column** `CREATE INDEX i ON t (a, b)`: every column is indexed. Used for equality on a leading run of the columns, plus a range on the next one, and for `ORDER BY a, b LIMIT n` over `NOT NULL` whole-number/text columns. A condition that skips `a` does not use it.
+- **Partial** `CREATE [UNIQUE] INDEX i ON t (c) WHERE predicate`: holds only the rows the predicate is true for; a UNIQUE one constrains only those rows (the soft-delete rule `WHERE deleted_at IS NULL`). Used only when the query's `WHERE` implies the predicate (same condition, `IS NOT NULL` from a comparison, a tighter whole-number range).
+- **Expression** `CREATE [UNIQUE] INDEX i ON t (lower(email))`: kept on every write, used when the query compares the same expression with a constant, may be UNIQUE. Immutable expressions only (`now()`, `random()`, subqueries: `42P17`).
+- Not supported: `ON CONFLICT (…)` naming a partial or expression index's key (the conflict is a plain `23505`; a target-less `ON CONFLICT DO NOTHING` works); renaming a column a predicate or expression reads (drop the index first). On a branch, a partial or expression UNIQUE index is checked at `MERGE BRANCH`, not per write.
+
 ### Recipe 2: Multi-op `ALTER TABLE` in one statement
 ```sql
 ALTER TABLE posts

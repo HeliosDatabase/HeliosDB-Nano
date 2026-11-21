@@ -341,33 +341,33 @@ impl DatabaseInterface for EmbeddedDatabase {
                 continue;
             }
             let tag = definition.index_type.as_deref();
+            // How the definition reads as SQL: every column of a multi-column
+            // index, an expression index's key text, UNIQUE, and a partial
+            // index's predicate, which follows the key list (see `IndexDump::key`).
+            let text = crate::storage::index_form::IndexDefinitionText::of(&definition, &quote_ident);
+            let key = match &text.predicate {
+                Some(predicate) => format!("{}) WHERE ({}", text.key, predicate),
+                None => text.key.clone(),
+            };
             if tag == Some("expression") {
-                for option in &definition.options {
-                    if let crate::sql::logical_plan::IndexOption::Expression { method, key, .. } = option {
-                        objects.indexes.push(IndexDump {
-                            table: definition.table_name.clone(),
-                            name: name.clone(),
-                            unique: false,
-                            method: method.clone(),
-                            key: key.clone(),
-                            with_options: String::new(),
-                        });
-                    }
-                }
+                objects.indexes.push(IndexDump {
+                    table: definition.table_name.clone(),
+                    name: name.clone(),
+                    unique: text.unique,
+                    method: text.method.clone(),
+                    key,
+                    with_options: String::new(),
+                });
                 continue;
             }
             match crate::storage::index_family(tag) {
                 Some(crate::storage::IndexFamily::Art) => {
-                    let unique =
-                        crate::sql::executor::ddl::unique_index_columns(&definition.options, &definition.column_name);
-                    let columns = unique.clone().unwrap_or_else(|| vec![definition.column_name.clone()]);
-                    let key: Vec<String> = columns.iter().map(|c| quote_ident(c)).collect();
                     objects.indexes.push(IndexDump {
                         table: definition.table_name.clone(),
                         name,
-                        unique: unique.is_some(),
-                        method: if tag == Some("hash") { "hash" } else { "btree" }.to_string(),
-                        key: key.join(", "),
+                        unique: text.unique,
+                        method: text.method.clone(),
+                        key,
                         with_options: String::new(),
                     });
                 }

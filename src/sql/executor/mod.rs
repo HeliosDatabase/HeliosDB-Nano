@@ -19,6 +19,8 @@ pub mod aggregate;
 pub mod ddl;
 pub mod explain;
 pub mod filter;
+mod index_form_ddl;
+mod index_form_scan;
 pub mod join;
 pub mod phase3;
 pub mod project;
@@ -3827,6 +3829,10 @@ impl<'a> Executor<'a> {
                 if let Some(result) = scan::try_index_range_scan_for_scan(self, &scan_plan, predicate)? {
                     return Ok(result);
                 }
+                // Multi-column, partial and expression indexes.
+                if let Some(result) = index_form_scan::try_form_index_for_scan(self, &scan_plan, predicate)? {
+                    return Ok(result);
+                }
                 scan::handle_filtered_scan(self, plan)
             }
             LogicalPlan::FilteredScan { .. } => scan::handle_filtered_scan(self, plan),
@@ -3867,6 +3873,10 @@ impl<'a> Executor<'a> {
                 }
                 // R4.4: index range scan for Filter(Scan) range predicates.
                 if let Some(result) = scan::try_index_range_scan_for_scan(self, input, predicate)? {
+                    return Ok(result);
+                }
+                // Multi-column, partial and expression indexes.
+                if let Some(result) = index_form_scan::try_form_index_for_scan(self, input, predicate)? {
                     return Ok(result);
                 }
                 let mut input_op = self.plan_to_operator(input)?;
@@ -4208,6 +4218,10 @@ impl<'a> Executor<'a> {
                     // R4.4: ORDER BY indexed_col ASC LIMIT k via ordered
                     // index iteration (no sort, no full scan).
                     if let Some(ordered) = self.try_index_ordered_topk(input, *limit, *offset)? {
+                        return Ok(ordered);
+                    }
+                    // The same over a multi-column or expression index.
+                    if let Some(ordered) = index_form_scan::try_ordered_topk(self, input, *limit, *offset)? {
                         return Ok(ordered);
                     }
                     if let Some(topk) = self.try_storage_direct_topk(input, *limit, *offset)? {

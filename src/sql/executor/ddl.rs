@@ -28,7 +28,7 @@ pub fn debug_next_before_vector_backfill(
     NEXT_BEFORE_VECTOR_BACKFILL.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }
 
-fn empty_ddl_result(executor: &Executor) -> Box<dyn PhysicalOperator> {
+pub(super) fn empty_ddl_result(executor: &Executor) -> Box<dyn PhysicalOperator> {
     Box::new(
         ScanOperator::new(
             "".to_string(),
@@ -70,8 +70,8 @@ pub(crate) fn unique_index_columns(
 ///
 /// `unique_columns` is `Some` only for `CREATE UNIQUE INDEX`, and then it is the
 /// COMPLETE key (one entry for the single-column spelling, several for a
-/// composite one) — a unique index must constrain every column it names, while
-/// an ordinary composite index deliberately indexes only its leading column.
+/// composite one). An ordinary multi-column index, a partial index and an
+/// expression index are built by `index_form_ddl`, not here.
 ///
 /// Spec R5.3 (decision 7): the index is registered HIDDEN — writers maintain it,
 /// the read path's index choice skips it — and becomes visible in `ddl`'s
@@ -175,7 +175,7 @@ fn create_art_secondary_index(
 /// Spec R5.3: the index this statement registered goes again if its batch is not
 /// written. Registered only once the registration succeeded, so a statement never
 /// drops an index of the same name it failed to register.
-fn drop_index_unless_written(
+pub(super) fn drop_index_unless_written(
     art_manager: &Arc<crate::storage::ArtIndexManager>,
     name: &str,
     ddl: &mut crate::storage::DdlBatch<'_>,
@@ -319,7 +319,7 @@ fn backfill_vector_index(
 /// Spec R5.3: the index's `meta:index:` definition and its logical-WAL
 /// `CreateIndex` entry, staged into the statement's batch: ONE write group, which
 /// is what makes the index reachable (at open, on a standby, by `DROP INDEX`).
-fn stage_index_definition(
+pub(super) fn stage_index_definition(
     storage: &crate::storage::StorageEngine,
     name: &str,
     table_name: &str,
@@ -421,6 +421,19 @@ pub(super) fn handle_create_index(executor: &Executor, plan: &LogicalPlan) -> Re
     } = plan
     {
         if let Some(storage) = executor.storage() {
+            // Multi-column, partial and expression indexes.
+            if let Some(result) = super::index_form_ddl::try_create(
+                executor,
+                storage,
+                name,
+                table_name,
+                column_name,
+                index_type.as_deref(),
+                options,
+                *if_not_exists,
+            )? {
+                return Ok(result);
+            }
             let family = index_family(index_type.as_deref());
             if family == Some(IndexFamily::Art) {
                 // `CREATE UNIQUE INDEX` arrives as `IndexOption::Unique(true)`

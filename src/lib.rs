@@ -17861,6 +17861,7 @@ impl EmbeddedDatabase {
             table_name,
             column_name,
             index_type,
+            options,
             ..
         } = plan
         else {
@@ -17869,7 +17870,12 @@ impl EmbeddedDatabase {
         let Some(txn) = txn.filter(|txn| txn.has_staged_changes(table_name)) else {
             return Ok(None);
         };
-        let family = storage::index_family(index_type.as_deref());
+        // An expression index over a tree method is a tree index (`index_form`).
+        let family = if storage::index_form::is_tree_definition(index_type.as_deref(), options) {
+            Some(storage::IndexFamily::Art)
+        } else {
+            storage::index_family(index_type.as_deref())
+        };
         let vector = family == Some(storage::IndexFamily::Vector);
         if !vector && family != Some(storage::IndexFamily::Art) {
             return Ok(None);
@@ -32814,6 +32820,16 @@ impl EmbeddedDatabase {
         let branch_view = self.storage.branch_view()?;
         if branch_view.is_none() {
             self.wait_out_holds_on_moved_keys(table_name, schema, old_tuple, new_tuple, index_unique_sets, active_txn)?;
+            // Partial and expression UNIQUE indexes: their keys are not column values.
+            storage::index_form::enforce_form_unique_on_update(
+                &self.storage,
+                table_name,
+                schema,
+                old_tuple,
+                new_tuple,
+                seen_table_keys,
+                active_txn,
+            )?;
         }
         // The row being updated, so no pass can report it as its own duplicate.
         // `new_tuple` carries the id on the UPDATE arms (it is a clone of the

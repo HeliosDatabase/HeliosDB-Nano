@@ -1153,12 +1153,18 @@ impl SystemViewRegistry {
                 Value::String(index_name.clone()),
                 Value::Null,
                 Value::String(format!(
-                    "CREATE {}INDEX {} ON public.{} USING {} ({})",
+                    "CREATE {}INDEX {} ON public.{} USING {} ({}){}",
                     unique,
                     index_name,
                     table_name,
                     using,
-                    columns.join(", ")
+                    columns.join(", "),
+                    // A partial index's predicate.
+                    storage
+                        .art_indexes()
+                        .index_form(&index_name)
+                        .and_then(|form| form.predicate_sql().map(|sql| format!(" WHERE ({sql})")))
+                        .unwrap_or_default()
                 )),
             ]);
             results.push(tuple);

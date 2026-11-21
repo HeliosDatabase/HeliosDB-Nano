@@ -187,7 +187,11 @@ pub struct IndexDump {
     /// Access method (`btree`, `hash`, `gin`, `hnsw`, …).
     pub method: String,
     /// The key list exactly as it goes between the parentheses, already
-    /// quoted (`"a", "b"`, `lower(email)`, `"emb" vector_cosine_ops`).
+    /// quoted (`"a", "b"`, `lower(email)`, `"emb" vector_cosine_ops`). A partial
+    /// index carries its predicate here too, after the key list:
+    /// `"email") WHERE (deleted_at IS NULL`, so the statement reads
+    /// `… ("email") WHERE (deleted_at IS NULL);` and the stored layout of a
+    /// dump does not change.
     pub key: String,
     /// Extra `WITH (…)` options, verbatim, or empty.
     pub with_options: String,

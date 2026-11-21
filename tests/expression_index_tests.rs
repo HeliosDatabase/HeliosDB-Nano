@@ -6,11 +6,11 @@
 //! mem0's pgvector store from initialising (it issues the statement
 //! unconditionally).
 //!
-//! The index is now accepted and RECORDED (persisted, listed in `pg_indexes`,
-//! dropped by `DROP INDEX` / `DROP TABLE`, kept across a reopen) but has no
-//! backing structure: no plan reads through it, so every query answers from
-//! the rows. `CREATE UNIQUE INDEX` on an expression is refused, because
-//! nothing would check it.
+//! The index is accepted and recorded (persisted, listed in `pg_indexes`,
+//! dropped by `DROP INDEX` / `DROP TABLE`, kept across a reopen). One over a
+//! btree is also kept and read through, and may be UNIQUE: see
+//! `tests/index_expression.rs`. One `USING gin` is still only recorded, and a
+//! UNIQUE one there is refused, because nothing would check it.
 //!
 //! Every case runs through both executor families: `db.execute()` /
 //! `db.query()` and `db.execute_params()` / `db.query_params()`.
@@ -174,8 +174,15 @@ fn unsupported_shapes_fail_explicitly() {
     for params in [false, true] {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         setup(&db, params);
-        let err = run(&db, "CREATE UNIQUE INDEX u ON mem0 (lower(email))", params).unwrap_err();
-        assert!(err.to_string().contains("expression"), "{err}");
+        // A UNIQUE index over an expression is supported on a btree since 5.0
+        // (`tests/index_expression.rs`); what has no tree to check it is refused.
+        let err = run(
+            &db,
+            "CREATE UNIQUE INDEX u ON mem0 USING gin (to_tsvector('simple', email))",
+            params,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("UNIQUE"), "{err}");
         let err = run(&db, "CREATE INDEX bad ON mem0 (lower(nope))", params).unwrap_err();
         assert!(err.to_string().contains("nope"), "{err}");
         // Refused statements leave nothing behind.

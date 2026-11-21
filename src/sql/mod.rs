@@ -14,6 +14,7 @@ pub mod evaluator;
 pub mod executor;
 pub mod features;
 pub mod functions;
+pub(crate) mod index_form_plan; // CREATE INDEX: multi-column keys, partial predicates, expression keys
 pub mod interpolate; // Shared `$`-placeholder scanner + SQL-literal renderer for routine bodies
 pub mod like_match; // v01.7: the one LIKE matcher of every route
 pub mod logical_plan;

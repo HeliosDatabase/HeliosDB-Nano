@@ -1031,6 +1031,15 @@ impl<'a> MaterializedViewCatalog<'a> {
             // Durable user names precede generated constraint names, exactly
             // as on reopen. No best-effort decoder/registration is used here.
             for (name, definition) in &definitions {
+                // Multi-column, partial and expression indexes (`index_form`).
+                if super::index_form::register_shaped_definition(
+                    &super::Catalog::new(storage),
+                    storage,
+                    name,
+                    definition,
+                )? {
+                    continue;
+                }
                 validate_columns(std::slice::from_ref(&definition.column_name))?;
                 match super::catalog::index_family(definition.index_type.as_deref()) {
                     Some(super::catalog::IndexFamily::Art) => {

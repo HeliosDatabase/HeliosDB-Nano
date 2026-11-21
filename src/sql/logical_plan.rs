@@ -2371,25 +2371,24 @@ pub enum IndexOption {
     /// planner, so `CREATE UNIQUE INDEX u4_v ON u4 (v)` — the statement Prisma
     /// emits for every `@unique` — built an ordinary index and enforced nothing.
     Unique(bool),
-    /// The FULL column list of a multi-column `CREATE UNIQUE INDEX`.
+    /// The FULL column list of a multi-column index.
     ///
-    /// `LogicalPlan::CreateIndex` carries a single `column_name` because an
-    /// ordinary composite index deliberately indexes only its leading column
-    /// (the others are recorded for catalog visibility). A UNIQUE index cannot
-    /// do that — constraining the leading column alone rejects rows PostgreSQL
-    /// accepts — so the whole key travels here, alongside `Unique(true)`, and is
-    /// persisted and replicated with it. Absent for the single-column case,
-    /// where `column_name` is the whole key.
+    /// `LogicalPlan::CreateIndex` carries a single `column_name` (the leading
+    /// column), so the whole key of a multi-column index travels here and is
+    /// persisted and replicated with it: alongside `Unique(true)` for a
+    /// `CREATE UNIQUE INDEX`, alone for an ordinary one (since 5.0; a record
+    /// written before holds the leading column only). The name is historical.
+    /// Absent for the single-column case, where `column_name` is the whole key.
     UniqueColumns(Vec<String>),
     /// GH#34: an index whose key includes an EXPRESSION —
     /// `CREATE INDEX ON t ((payload->>'user_id'))`, `ON t (lower(email))`,
     /// `USING gin (to_tsvector('simple', body))`.
     ///
-    /// Such an index is recorded under the `expression` index-type tag, which
-    /// [`crate::storage::index_family`] classifies as DDL-only: the definition
-    /// is persisted, replicated, listed in `pg_indexes` and dropped like any
-    /// other index, but no backing structure is built, so the planner never
-    /// reads through it and every query answers from the rows themselves.
+    /// Such an index is recorded under the `expression` index-type tag. One
+    /// over a tree method (`btree`, `hash`) is built, kept on every write and
+    /// read through (see `crate::storage::index_form`); one over `gin` / `gist`
+    /// is only recorded: persisted, replicated, listed in `pg_indexes` and
+    /// dropped like any other index, with no backing structure.
     /// `method` is the access method the user named (`btree` when none),
     /// `key` the rendered key list for `indexdef`, and `columns` the table
     /// columns the key refers to (checked against the table at CREATE).
@@ -2399,6 +2398,16 @@ pub enum IndexOption {
         /// The key list as `pg_indexes.indexdef` shows it.
         key: String,
         /// The table columns the key expressions read.
+        columns: Vec<String>,
+    },
+    /// `CREATE INDEX … WHERE predicate`: a partial index. The index holds only
+    /// the rows for which the predicate is true, a UNIQUE one enforces
+    /// uniqueness among those rows only, and a query reads through it only when
+    /// its own predicate implies this one (see `crate::storage::index_form`).
+    Predicate {
+        /// The predicate as SQL text.
+        sql: String,
+        /// The table columns the predicate reads.
         columns: Vec<String>,
     },
 }

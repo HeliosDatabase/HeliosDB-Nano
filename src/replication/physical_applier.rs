@@ -155,7 +155,7 @@ use super::physical_vector::StandbyVectorHook;
 use crate::sql::TableConstraints;
 use crate::storage::keyspace::{classify, KeyClass};
 use crate::storage::layout_epochs::LayoutChange;
-use crate::storage::{index_family, ArtIndexType, IndexFamily, StorageEngine, UncommittedWriteHold};
+use crate::storage::{ArtIndexType, IndexFamily, StorageEngine, UncommittedWriteHold};
 use crate::{Schema, Tuple, Value};
 
 pub use super::physical::RawOp;
@@ -1640,7 +1640,7 @@ impl PhysicalApplier {
                     continue;
                 }
             };
-            match index_family(definition.index_type.as_deref()) {
+            match crate::storage::index_form::definition_family(&definition) {
                 Some(IndexFamily::Art) => {
                     let table = definition.table_name.clone();
                     if work.rederive.contains(&table)

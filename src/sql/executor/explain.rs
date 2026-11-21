@@ -144,6 +144,17 @@ fn annotate_index_range_scans(executor: &Executor, plan: &LogicalPlan, node: &mu
         node.details.insert("index".to_string(), index_name.to_string());
     }
 
+    // A multi-column, partial or expression index (`index_form_scan`).
+    fn annotate_form(node: &mut PlanNode, table_name: &str, spec: &super::index_form_scan::FormScanSpec) {
+        node.node_type = "IndexScan".to_string();
+        node.operation = format!(
+            "Index Scan using {} on {} ({})",
+            spec.index_name, table_name, spec.display
+        );
+        node.details.insert("index".to_string(), spec.index_name.clone());
+        node.details.insert("condition".to_string(), spec.display.clone());
+    }
+
     fn annotate_in_list(node: &mut PlanNode, table_name: &str, index_name: &str, n: usize) {
         node.node_type = "IndexInListProbe".to_string();
         node.operation = format!("Index IN Probe ({n} values) using {index_name} on {table_name}");
@@ -217,6 +228,10 @@ fn annotate_index_range_scans(executor: &Executor, plan: &LogicalPlan, node: &mu
                     annotate(node, table_name, &spec);
                     return;
                 }
+                if let Some(spec) = super::index_form_scan::explain_spec(executor, table_name, schema, predicate) {
+                    annotate_form(node, table_name, &spec);
+                    return;
+                }
             }
             if let Some(child) = node.children.first_mut() {
                 annotate_index_range_scans(executor, input, child);
@@ -235,6 +250,8 @@ fn annotate_index_range_scans(executor: &Executor, plan: &LogicalPlan, node: &mu
                 annotate_in_list(node, table_name, &index_name, n);
             } else if let Some(spec) = range_spec(table_name, schema, predicate) {
                 annotate(node, table_name, &spec);
+            } else if let Some(spec) = super::index_form_scan::explain_spec(executor, table_name, schema, predicate) {
+                annotate_form(node, table_name, &spec);
             }
         }
         LogicalPlan::Limit { input, .. } => {
@@ -254,6 +271,22 @@ fn annotate_index_range_scans(executor: &Executor, plan: &LogicalPlan, node: &mu
                     sort_node
                         .details
                         .insert("order".to_string(), format!("{} ASC", spec.column_name));
+                    return;
+                }
+            }
+            if let Ok(Some(spec)) = super::index_form_scan::ordered_detect(executor, input) {
+                if let Some(sort_node) = find_node_mut(node, "Sort") {
+                    sort_node.node_type = "IndexOrderedScan".to_string();
+                    sort_node.operation = format!(
+                        "Index Ordered Scan using {} on {} (ORDER BY {} ASC, no sort)",
+                        spec.index_name,
+                        spec.table_name(),
+                        spec.order_display
+                    );
+                    sort_node.details.insert("index".to_string(), spec.index_name.clone());
+                    sort_node
+                        .details
+                        .insert("order".to_string(), format!("{} ASC", spec.order_display));
                     return;
                 }
             }

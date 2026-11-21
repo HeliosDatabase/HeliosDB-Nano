@@ -7176,6 +7176,12 @@ fn sqlstate_for_query_execution_message(message: &str) -> &'static str {
         return sqlstate::SYSTEM_ERROR; // 58000, before nested cause markers
     }
 
+    // An index expression or predicate that is not immutable: 42P17
+    // invalid_object_definition, as PostgreSQL reports it.
+    if message.contains(crate::storage::index_form::NOT_IMMUTABLE_MARKER) {
+        return "42P17";
+    }
+
     let lower = message.to_ascii_lowercase();
     let not_found = lower.contains("not found") || lower.contains("does not exist") || lower.contains("doesn't exist");
 

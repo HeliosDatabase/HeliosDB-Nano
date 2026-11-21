@@ -172,11 +172,10 @@ fn unnamed_index_on_a_plain_column_is_named_table_column_idx() {
     }
 }
 
-/// Multi-column: PostgreSQL joins every indexed column into the name.
-/// (Only the leading column is actually indexed by this engine, but the NAME
-/// must still describe the statement the user wrote — otherwise
+/// Multi-column: PostgreSQL joins every indexed column into the name, so
 /// `CREATE INDEX ON docs (status, owner)` and `CREATE INDEX ON docs (status)`
-/// would fight over one name.)
+/// do not fight over one name. (Every column is indexed since 5.0: see
+/// `tests/index_composite.rs`.)
 #[test]
 fn unnamed_multi_column_index_names_every_column() {
     for params_family in [false, true] {
