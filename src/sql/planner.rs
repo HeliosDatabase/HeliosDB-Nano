@@ -1952,8 +1952,19 @@ impl<'a> Planner<'a> {
         None
     }
 
-    /// Convert a SQL statement to a logical plan
+    /// Convert a SQL statement to a logical plan, and check it against the
+    /// role running the statement. A view body is not checked here: its scans
+    /// are marked, and the statement that reads the view answers for them.
     pub fn statement_to_plan(&self, statement: Statement) -> Result<LogicalPlan> {
+        let plan = self.statement_to_plan_unchecked(statement)?;
+        if let (Some(catalog), true) = (self.catalog, self.view_expansion_stack.is_empty()) {
+            crate::privileges::gate::check_plan(catalog.storage(), &plan)?;
+        }
+        Ok(plan)
+    }
+
+    /// [`Self::statement_to_plan`] without the privilege check.
+    fn statement_to_plan_unchecked(&self, statement: Statement) -> Result<LogicalPlan> {
         match statement {
             Statement::Query(query) => self.top_level_query_to_plan(*query),
             Statement::Insert(insert) => {
@@ -4470,6 +4481,7 @@ impl<'a> Planner<'a> {
                         // shape before the statement is consumed.
                         let view_writes_out_its_select_list = Self::statement_writes_out_its_select_list(&stmt);
                         let view_plan = view_planner.statement_to_plan(stmt)?;
+                        crate::privileges::views::mark_expansion(&view_key, &view_plan);
 
                         // GH#29 (c2): the expanded body answers to the view's
                         // alias — or its bare name — at runtime, exactly like a

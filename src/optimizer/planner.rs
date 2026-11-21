@@ -359,6 +359,7 @@ impl Planner {
             | LogicalPlan::AlterRole { .. }
             | LogicalPlan::GrantPrivileges { .. }
             | LogicalPlan::RevokePrivileges { .. }
+            | LogicalPlan::AccessControl(_)
             | LogicalPlan::Noop
             | LogicalPlan::Notification(_)
             | LogicalPlan::CreateExtension { .. }

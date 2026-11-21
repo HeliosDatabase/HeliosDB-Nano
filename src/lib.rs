@@ -255,6 +255,7 @@ pub mod multi_tenant; // Multi-tenant support
 pub mod network;
 pub mod notify; // GH#40: LISTEN / UNLISTEN / NOTIFY / pg_notify (process-wide registry)
 pub mod optimizer;
+pub mod privileges; // GRANT / REVOKE enforcement: who may run which statement
 pub mod protocol;
 pub mod protocols; // Protocol integration layer (adapters)
 pub mod query_trace;
@@ -2897,6 +2898,7 @@ impl EmbeddedDatabase {
                 | sql::LogicalPlan::DropRole { .. }
                 | sql::LogicalPlan::GrantPrivileges { .. }
                 | sql::LogicalPlan::RevokePrivileges { .. }
+                | sql::LogicalPlan::AccessControl(_)
                 // Routine DDL. Again NOT about plan shape: `udf_bridge` makes a
                 // user-defined function CALLABLE from the evaluator, and
                 // `query_is_non_deterministic` only knows the built-in volatile
@@ -4496,6 +4498,8 @@ impl EmbeddedDatabase {
         plan: &sql::LogicalPlan,
         mut run: impl FnMut(&sql::LogicalPlan) -> Result<T>,
     ) -> Result<T> {
+        // Privileges: a prepared statement is checked each time it runs.
+        crate::privileges::gate::check_plan(&self.storage, plan)?;
         match run(plan) {
             Err(error)
                 if storage::layout_epochs::is_layout_changed(&error)
@@ -5464,7 +5468,9 @@ impl EmbeddedDatabase {
     /// Both are one atomic load on the common (main, no tenant) path.
     #[inline]
     fn result_cache_bypassed(&self) -> bool {
-        self.has_effective_tenant_context() || self.storage.is_branch_active()
+        self.has_effective_tenant_context()
+            || self.storage.is_branch_active()
+            || crate::privileges::access::role_override_active()
     }
 
     /// Drop cached query results if the storage catalog changed since the last cache
@@ -10366,7 +10372,10 @@ impl EmbeddedDatabase {
         offload_statement(|| {
             let _routine_engine = sql::sequences::EngineScope::enter(&self.storage);
             sql::udf_bridge::with_caller_transaction(self.storage.instance_id(), Some(txn), || {
-                self.execute_in_transaction_inner_body(sql, txn, skip_fast_paths)
+                // Privileges: the body admits its plan once it has one.
+                crate::privileges::ownership::run_admitted(&self.storage, None, || {
+                    self.execute_in_transaction_inner_body(sql, txn, skip_fast_paths)
+                })
             })
         })
     }
@@ -10583,6 +10592,9 @@ impl EmbeddedDatabase {
         } else if let Some(plan) = Self::try_parse_ha_command(sql)? {
             // HA Switchover commands (ha-tier1 feature)
             plan
+        } else if let Some(plan) = self.try_plan_access_statement(sql)? {
+            // GRANT / REVOKE / SET ROLE / ALTER … OWNER TO.
+            plan
         } else {
             // Regular SQL - parse with cache
             let (statement, _) = self.parse_cached(sql)?;
@@ -10595,6 +10607,10 @@ impl EmbeddedDatabase {
                 .with_search_path(self.current_search_path());
             planner.statement_to_plan(statement)?
         };
+
+        // Privileges: the one gate for a plan of the text family, whichever
+        // branch above built it. Before any row policy is applied.
+        crate::privileges::ownership::admit(&self.storage, &plan)?;
 
         // Invalidate SQL metadata caches on DDL operations that can alter schemas,
         // constraints, indexes, triggers, or materialized-view shape.
@@ -14706,6 +14722,8 @@ impl EmbeddedDatabase {
         // for the autocommit case — it has already installed ITS session's backend,
         // and overwriting it here would make every connection share one `lastval()`.
         let _scoped = SessionScopedStateGuard::install_if_absent(&self.embedded_scoped);
+        // Privileges: checked here, before any fast path or cache answers.
+        self.privilege_precheck(sql)?;
         // sprinter d15933f528b0: and THIS is the database that statement runs
         // against. Sequence state is per-engine now, so `nextval`/`setval`/
         // `currval` — evaluated inside the storage-less, session-less
@@ -15291,6 +15309,10 @@ impl EmbeddedDatabase {
         // answers rather than declining (`None`): the caller's generic
         // fallback would render the rows as INSERTs only to have each refused.
         if let Err(e) = self.refuse_write_on_physical_standby("COPY FROM") {
+            return Some(Err(e));
+        }
+        // Privileges: this path never plans, so INSERT is checked here.
+        if let Err(e) = crate::privileges::gate::check_relation(&self.storage, table_name, "INSERT", columns) {
             return Some(Err(e));
         }
         if rows.is_empty() {
@@ -21508,6 +21530,13 @@ impl EmbeddedDatabase {
                 layout: storage::LayoutStamp::empty(),
             });
         }
+        // GRANT / REVOKE / SET ROLE / ALTER … OWNER TO. Not cached.
+        if let Some(plan) = self.try_plan_access_statement(sql)? {
+            return Ok(StampedPlan {
+                plan: std::sync::Arc::new(plan),
+                layout: storage::LayoutStamp::empty(),
+            });
+        }
 
         // Spec R5.6: what the planning resolves, with its layout epochs.
         let collector = storage::layout_epochs::StampCollector::start();
@@ -21916,6 +21945,8 @@ impl EmbeddedDatabase {
         // for the autocommit case — it has already installed ITS session's backend,
         // and overwriting it here would make every connection share one `lastval()`.
         let _scoped = SessionScopedStateGuard::install_if_absent(&self.embedded_scoped);
+        // Privileges: checked here, before any fast path or cache answers.
+        self.privilege_precheck(sql)?;
         // sprinter d15933f528b0: and THIS is the database that statement runs
         // against. Sequence state is per-engine now, so `nextval`/`setval`/
         // `currval` — evaluated inside the storage-less, session-less
@@ -22048,6 +22079,8 @@ impl EmbeddedDatabase {
         // branch binding, so the handle's session must be installed first; the
         // per-row fallback (`execute_params`) installs the same one.
         let _scoped = SessionScopedStateGuard::install_if_absent(&self.embedded_scoped);
+        // Privileges: checked here, before any fast path or cache answers.
+        self.privilege_precheck(sql)?;
         let (handled, _branch_scope) = self.branch_statement_gate(sql, self.global_txn_visible())?;
         if handled.is_some() {
             return Ok(0);
@@ -22176,6 +22209,8 @@ impl EmbeddedDatabase {
         // for the autocommit case — it has already installed ITS session's backend,
         // and overwriting it here would make every connection share one `lastval()`.
         let _scoped = SessionScopedStateGuard::install_if_absent(&self.embedded_scoped);
+        // Privileges: checked here, before any fast path or cache answers.
+        self.privilege_precheck(sql)?;
         // sprinter d15933f528b0: and THIS is the database that statement runs
         // against. Sequence state is per-engine now, so `nextval`/`setval`/
         // `currval` — evaluated inside the storage-less, session-less
@@ -22784,7 +22819,11 @@ impl EmbeddedDatabase {
     ) -> Result<(u64, Vec<Tuple>)> {
         let _routine_engine = sql::sequences::EngineScope::enter(&self.storage);
         sql::udf_bridge::with_caller_transaction(self.storage.instance_id(), session_txn, || {
-            self.execute_plan_with_params_inner_body(plan, params, session_txn, original_sql, expected)
+            // Privileges: the one gate for a plan of the params family (it may
+            // come from a plan cache another role filled).
+            crate::privileges::ownership::run_admitted(&self.storage, Some(plan), || {
+                self.execute_plan_with_params_inner_body(plan, params, session_txn, original_sql, expected)
+            })
         })
     }
 
@@ -24941,6 +24980,8 @@ impl EmbeddedDatabase {
         // for the autocommit case — it has already installed ITS session's backend,
         // and overwriting it here would make every connection share one `lastval()`.
         let _scoped = SessionScopedStateGuard::install_if_absent(&self.embedded_scoped);
+        // Privileges: checked here, before any fast path or cache answers.
+        self.privilege_precheck(sql)?;
         // sprinter d15933f528b0: and THIS is the database that statement runs
         // against. Sequence state is per-engine now, so `nextval`/`setval`/
         // `currval` — evaluated inside the storage-less, session-less
@@ -25496,6 +25537,9 @@ impl EmbeddedDatabase {
         sql: &str,
     ) -> Option<(std::sync::Arc<Vec<Tuple>>, std::sync::Arc<Schema>)> {
         let _identity_override = self.session_statement_context_guard(session_id).ok()?;
+        // Privileges: a refused statement is not served from the cache; the
+        // uncached path reports the refusal.
+        self.privilege_precheck(sql).ok()?;
         // sprinter d03de7fc3b22: this fast path answers the PostgreSQL
         // simple-query handler WITHOUT entering `query_with_schema_for_session`,
         // so it is the one read route that reaches no `max_qps` charge site —
@@ -25690,6 +25734,8 @@ impl EmbeddedDatabase {
         // for the autocommit case — it has already installed ITS session's backend,
         // and overwriting it here would make every connection share one `lastval()`.
         let _scoped = SessionScopedStateGuard::install_if_absent(&self.embedded_scoped);
+        // Privileges: checked here, before any fast path or cache answers.
+        self.privilege_precheck(sql)?;
         // sprinter d15933f528b0: and THIS is the database that statement runs
         // against. Sequence state is per-engine now, so `nextval`/`setval`/
         // `currval` — evaluated inside the storage-less, session-less
@@ -27098,6 +27144,8 @@ impl EmbeddedDatabase {
         // keys the result cache for everything below, including every early
         // return.
         let _identity_override = self.session_statement_context_guard(session_id)?;
+        // Privileges: checked here, before any fast path or cache answers.
+        self.privilege_precheck(sql)?;
         // sprinter 6bc4a4040eb7 (B1): the per-statement branch gate, on THIS
         // session's backend (installed just above) — `USE BRANCH` /
         // `SET|RESET|SHOW heliosdb.branch` bind this connection only, and a
@@ -27307,6 +27355,8 @@ impl EmbeddedDatabase {
         let _advisory = self.advisory_context_guard(session_id, sql);
         // HDB-009: identity for `current_user` and the result-cache key.
         let _identity_override = self.session_statement_context_guard(session_id)?;
+        // Privileges: checked here, before any fast path or cache answers.
+        self.privilege_precheck(sql)?;
         // sprinter 6bc4a4040eb7 (B1): the per-statement branch gate, on THIS
         // session's backend (installed just above) — `USE BRANCH` /
         // `SET|RESET|SHOW heliosdb.branch` bind this connection only, and a
@@ -28406,6 +28456,8 @@ impl EmbeddedDatabase {
         let _advisory = self.advisory_context_guard(session_id, sql);
         // HDB-009: identity for `current_user` and the result-cache key.
         let _identity_override = self.session_statement_context_guard(session_id)?;
+        // Privileges: checked here, before any fast path or cache answers.
+        self.privilege_precheck(sql)?;
         // sprinter 6bc4a4040eb7 (B1): the per-statement branch gate, on THIS
         // session's backend (installed just above) — `USE BRANCH` /
         // `SET|RESET|SHOW heliosdb.branch` bind this connection only, and a
@@ -28541,6 +28593,8 @@ impl EmbeddedDatabase {
         let _advisory = self.advisory_context_guard(session_id, sql);
         // HDB-009: identity for `current_user` and the result-cache key.
         let _identity_override = self.session_statement_context_guard(session_id)?;
+        // Privileges: checked here, before any fast path or cache answers.
+        self.privilege_precheck(sql)?;
         // sprinter 6bc4a4040eb7 (B1): the per-statement branch gate, on THIS
         // session's backend (installed just above) — `USE BRANCH` /
         // `SET|RESET|SHOW heliosdb.branch` bind this connection only, and a
@@ -28675,6 +28729,8 @@ impl EmbeddedDatabase {
         let _advisory = self.advisory_context_guard(session_id, sql);
         // HDB-009: identity for `current_user` and the result-cache key.
         let _identity_override = self.session_statement_context_guard(session_id)?;
+        // Privileges: checked here, before any fast path or cache answers.
+        self.privilege_precheck(sql)?;
         // sprinter 6bc4a4040eb7 (B1): the per-statement branch gate, on THIS
         // session's backend (installed just above) — `USE BRANCH` /
         // `SET|RESET|SHOW heliosdb.branch` bind this connection only, and a
@@ -28839,6 +28895,8 @@ impl EmbeddedDatabase {
         let _advisory = self.advisory_context_guard(session_id, sql);
         // HDB-009: identity for `current_user` and the result-cache key.
         let _identity_override = self.session_statement_context_guard(session_id)?;
+        // Privileges: checked here, before any fast path or cache answers.
+        self.privilege_precheck(sql)?;
         // sprinter 6bc4a4040eb7 (B1): the per-statement branch gate, on THIS
         // session's backend (installed just above) — `USE BRANCH` /
         // `SET|RESET|SHOW heliosdb.branch` bind this connection only, and a
@@ -28994,6 +29052,8 @@ impl EmbeddedDatabase {
         let _advisory = self.advisory_context_guard(session_id, sql);
         // HDB-009: identity for `current_user` and the result-cache key.
         let _identity_override = self.session_statement_context_guard(session_id)?;
+        // Privileges: checked here, before any fast path or cache answers.
+        self.privilege_precheck(sql)?;
         // sprinter 6bc4a4040eb7 (B1): the per-statement branch gate, on THIS
         // session's backend (installed just above) — `USE BRANCH` /
         // `SET|RESET|SHOW heliosdb.branch` bind this connection only, and a
@@ -29129,6 +29189,8 @@ impl EmbeddedDatabase {
         let _advisory = self.advisory_context_guard(session_id, sql);
         // HDB-009: identity for `current_user` and the result-cache key.
         let _identity_override = self.session_statement_context_guard(session_id)?;
+        // Privileges: checked here, before any fast path or cache answers.
+        self.privilege_precheck(sql)?;
         // sprinter 6bc4a4040eb7 (B1): the per-statement branch gate, on THIS
         // session's backend (installed just above) — `USE BRANCH` /
         // `SET|RESET|SHOW heliosdb.branch` bind this connection only, and a
@@ -29278,6 +29340,8 @@ impl EmbeddedDatabase {
         let _advisory = self.advisory_context_guard(session_id, sql);
         // HDB-009: identity for `current_user` and the result-cache key.
         let _identity_override = self.session_statement_context_guard(session_id)?;
+        // Privileges: checked here, before any fast path or cache answers.
+        self.privilege_precheck(sql)?;
         // sprinter 6bc4a4040eb7 (B1): the per-statement branch gate, on THIS
         // session's backend (installed just above) — `USE BRANCH` /
         // `SET|RESET|SHOW heliosdb.branch` bind this connection only, and a
@@ -29542,6 +29606,8 @@ impl EmbeddedDatabase {
         // for the autocommit case — it has already installed ITS session's backend,
         // and overwriting it here would make every connection share one `lastval()`.
         let _scoped = SessionScopedStateGuard::install_if_absent(&self.embedded_scoped);
+        // Privileges: checked here, before any fast path or cache answers.
+        self.privilege_precheck(sql)?;
         // sprinter d15933f528b0: and THIS is the database that statement runs
         // against. Sequence state is per-engine now, so `nextval`/`setval`/
         // `currval` — evaluated inside the storage-less, session-less
@@ -29874,6 +29940,8 @@ impl EmbeddedDatabase {
         // for the autocommit case — it has already installed ITS session's backend,
         // and overwriting it here would make every connection share one `lastval()`.
         let _scoped = SessionScopedStateGuard::install_if_absent(&self.embedded_scoped);
+        // Privileges: checked here, before any fast path or cache answers.
+        self.privilege_precheck(sql)?;
         // sprinter d15933f528b0: and THIS is the database that statement runs
         // against. Sequence state is per-engine now, so `nextval`/`setval`/
         // `currval` — evaluated inside the storage-less, session-less
@@ -35068,6 +35136,7 @@ impl EmbeddedDatabase {
             | sql::LogicalPlan::AlterRole { .. }
             | sql::LogicalPlan::GrantPrivileges { .. }
             | sql::LogicalPlan::RevokePrivileges { .. }
+            | sql::LogicalPlan::AccessControl(_)
             | sql::LogicalPlan::DropIndex { .. }
             | sql::LogicalPlan::AlterTableAddUnique { .. }
             | sql::LogicalPlan::AlterTableAddPrimaryKey { .. }

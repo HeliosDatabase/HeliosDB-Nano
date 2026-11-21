@@ -410,12 +410,11 @@ pub fn is_reserved_role_name(name: &str) -> bool {
 
 /// A persisted SQL role (`CREATE ROLE` / `CREATE USER`).
 ///
-/// *** NOT A SECURITY BOUNDARY. *** No code path consults these attribute
-/// bits to authorise anything: `rolsuper`, `rolbypassrls` and friends are
-/// recorded so `pg_roles` / `pg_authid` can report what was asked for, and
-/// nothing else reads them. `password` is likewise stored verbatim and is
-/// NOT wired into wire authentication (`AuthManager` still knows only the
-/// `--password` users); it is never emitted by any catalog view.
+/// The attribute bits are reported by `pg_roles` / `pg_authid` and decide
+/// what the role may do (`crate::privileges`): `rolsuper` bypasses every
+/// check, `rolcreaterole` / `rolcreatedb` allow role and database DDL,
+/// `rolinherit` passes on the privileges of the roles it is a member of.
+/// `password` holds a verifier; it is never emitted by any catalog view.
 ///
 /// FIELD DISCIPLINE: this struct is bincode-encoded, which is positional.
 /// New fields must be APPENDED at the end (and old records re-read only by a
@@ -465,8 +464,9 @@ impl RoleRecord {
 /// One grantee's privilege set on one object, as recorded by `GRANT` /
 /// `REVOKE`.
 ///
-/// *** STORED, INTROSPECTABLE, NOT ENFORCED. *** No DML choke point reads
-/// this. A row here means "somebody ran GRANT", never "access is restricted".
+/// Enforced by `crate::privileges`, which also keeps column grants, owners
+/// and role memberships as records of other object types in this namespace
+/// (see `crate::privileges::catalog`).
 ///
 /// FIELD DISCIPLINE: bincode-positional, append-only — see `RoleRecord`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -7459,17 +7459,11 @@ impl<'a> Catalog<'a> {
     // -------------------------------------------------------------------
     // SQL ROLES + ACL RECORDS (HC4 storage slice).
     //
-    // *** NO PRIVILEGE IS ENFORCED ANYWHERE IN THIS BUILD. ***
-    //
-    // These records exist so that `CREATE/ALTER/DROP ROLE` and
-    // `GRANT`/`REVOKE` stop being silent no-ops and so the catalog views
-    // (`pg_roles` / `pg_user` / `pg_authid` /
-    // `information_schema.table_privileges` / `role_table_grants`) report
-    // what was actually asked for instead of two fabricated all-privilege
-    // superusers and permanently-empty grant views. NOTHING reads an
-    // `AclRecord` to decide whether a statement is allowed — there is no
-    // check at any DML choke point. Treat this as an introspection catalog,
-    // never as a security boundary.
+    // These records are what `CREATE/ALTER/DROP ROLE` and `GRANT`/`REVOKE`
+    // write, what the catalog views (`pg_roles` / `pg_user` / `pg_authid` /
+    // `information_schema.table_privileges` / `role_table_grants`) report,
+    // and what `crate::privileges` reads to decide whether a statement is
+    // allowed.
     //
     // Storage follows the existing `meta:`-prefix pattern exactly
     // (`register_schema`, `save_sequence`, `register_enum_type`,
@@ -7663,7 +7657,8 @@ impl<'a> Catalog<'a> {
     /// already-held privilege has its grantable flag OR-ed with `grantable`
     /// (PostgreSQL: re-granting WITH GRANT OPTION upgrades, never downgrades).
     ///
-    /// STORES ONLY. Nothing consults the result to authorise a statement.
+    /// Stores only: who may issue the grant is decided by the caller
+    /// (`crate::privileges::statement`).
     pub fn grant_privileges(
         &self,
         object_type: &str,

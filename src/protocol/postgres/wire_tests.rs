@@ -2388,8 +2388,9 @@ async fn wire_role_ddl_command_tags() {
 }
 
 /// `SET ROLE <x>` used to be acked with `SET` and zero effect — telling a
-/// client it had dropped to a restricted identity when it had not. It now
-/// errors 0A000. `SET ROLE NONE` stays a genuine no-op ack.
+/// client it had dropped to a restricted identity when it had not. It is run
+/// on the session now (5.0; through 4.42 it was refused with 0A000): a role
+/// that does not exist is 42704, never an ack. `SET ROLE NONE` acks.
 #[tokio::test]
 async fn wire_set_role_errors_but_set_role_none_still_acks() {
     let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
@@ -2403,8 +2404,8 @@ async fn wire_set_role_errors_but_set_role_none_still_acks() {
         let out = drain(&mut client).await;
         assert_eq!(
             sqlstates(&out),
-            vec!["0A000".to_string()],
-            "{sql} must raise feature_not_supported, not a silent SET ack"
+            vec!["42704".to_string()],
+            "{sql} names a role that does not exist: undefined_object, not a silent SET ack"
         );
         assert!(
             !command_tags(&out).iter().any(|t| t == "SET"),
@@ -14160,6 +14161,8 @@ async fn row_security_off_is_42501_for_a_role_without_bypassrls_over_the_wire() 
         .unwrap();
     db.execute("INSERT INTO rso VALUES (1, 'alice'), (2, 'bob')").unwrap();
     db.execute("CREATE ROLE plain LOGIN").unwrap();
+    // 5.0: privileges are enforced, so the role is granted what the test reads.
+    db.execute("GRANT SELECT ON rso TO plain").unwrap();
     let tenant = db
         .tenant_manager
         .register_tenant("rso".to_string(), IsolationMode::SharedSchema);

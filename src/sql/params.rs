@@ -708,7 +708,7 @@ pub fn current_value(name: &str) -> Option<String> {
             )
         }
         "session_authorization" => {
-            return Some(crate::session_login_user_tls().map_or_else(|| "heliosdb".to_string(), |l| l.to_string()))
+            return Some(crate::privileges::access::session_user_name())
         }
         "search_path" => {
             let mut path = crate::session_search_path_tls();

@@ -97,19 +97,17 @@ columns in `pg_attribute`), and as `information_schema.tables` rows with
 
 ### Privileges
 
-> **Roles and grants are stored and introspectable. Privileges are NOT
-> enforced.** HeliosDB Nano performs no permission check on any read or write
-> path. A row in `table_privileges` means "somebody ran `GRANT`" — it does not
-> mean access is restricted. Do not use these views to audit access, and do not
-> treat a successful `GRANT` as a security control. Enforcement is a tracked
-> follow-up.
+Roles and grants are stored, introspectable and **enforced**: a statement runs
+only if the session's role may run it (see [`privileges.md`](privileges.md)).
+A row in `table_privileges` is a grant that takes effect.
 
 `CREATE ROLE` / `ALTER ROLE` / `DROP ROLE` (and the `CREATE USER` /
-`ALTER USER` / `DROP USER` spellings) are real DDL and persist to the catalog,
-and `GRANT` / `REVOKE` persist an ACL record instead of silently discarding it.
-`table_privileges` and `role_table_grants` report those records. `role_table_grants`
-mirrors `table_privileges` exactly, because there is no session identity to
-filter by yet (`current_user` is still a hardcoded literal).
+`ALTER USER` / `DROP USER` spellings) persist to the catalog, and `GRANT` /
+`REVOKE` persist an ACL record. `table_privileges` and `role_table_grants`
+report the table-level records, with the role that issued each grant as
+`grantor` (`helios` for a grant issued through the embedded API, which is not a
+role). `role_table_grants` mirrors `table_privileges` exactly; it is not yet
+filtered to the current role.
 
 Under the default configuration a `GRANT`/`REVOKE` that names a role or table
 which does not exist is an ERROR. Set `[authentication] legacy_acl_noop = true`
@@ -119,12 +117,12 @@ to restore the pre-4.20 leniency (unknown names skipped, statement succeeds).
 |------|--------|-------|
 | `information_schema.table_privileges` | **Populated** | One row per stored (grantee, table, privilege) |
 | `information_schema.role_table_grants` | **Populated** | Mirrors `table_privileges` (no session identity) |
-| `information_schema.column_privileges` | **Always empty** | Column-level grants are rejected at plan time |
+| `information_schema.column_privileges` | **Always empty** | Column grants are stored and enforced, but not surfaced here yet (`has_column_privilege` answers) |
 | `information_schema.role_column_grants` | **Always empty** | Same |
 | `information_schema.usage_privileges` | **Always empty** | Sequence grants are stored but not surfaced here yet |
 | `information_schema.role_usage_grants` | **Always empty** | Same |
-| `information_schema.role_routine_grants` | **Always empty** | No routine grants |
-| `information_schema.applicable_roles` | **Always empty** | Role membership is rejected at plan time |
+| `information_schema.role_routine_grants` | **Always empty** | Routine grants are stored and enforced, but not surfaced here yet (`has_function_privilege` answers) |
+| `information_schema.applicable_roles` | **Always empty** | Role membership is stored and enforced, but not surfaced here yet (`pg_has_role` answers) |
 | `information_schema.enabled_roles` | **Always empty** | Same |
 | `information_schema.administrable_role_authorizations` | **Always empty** | Same |
 
@@ -137,9 +135,8 @@ failed as unknown relations everywhere else.
 These used to return two FABRICATED superusers (`postgres` oid 10, `helios` oid
 11) with every attribute bit `true`, regardless of configuration. They now
 report the persisted role catalog: the two virtual built-ins are still listed
-for backward compatibility (and their bits remain as meaningless as before,
-since nothing enforces them), followed by every created role with its REAL
-bits. `pg_authid` is now registered on the live route — it previously existed
+(both are superusers), followed by every created role with its REAL bits,
+which decide what the role may do. `pg_authid` is now registered on the live route — it previously existed
 only in a dead registry and failed as an unknown relation. Neither view ever
 emits a stored password: `rolpassword` renders `********` or NULL.
 
@@ -158,8 +155,7 @@ SELECT * FROM information_schema.does_not_exist;
 --         views), columns, schemata, views, key_column_usage,
 --         table_constraints, constraint_column_usage,
 --         referential_constraints, check_constraints, sequences,
---         table_privileges and role_table_grants — the last two report
---         STORED grants; HeliosDB does NOT enforce SQL privileges.
+--         table_privileges and role_table_grants.
 --         These resolve but are ALWAYS EMPTY: view_table_usage,
 --         view_column_usage, routines, parameters, triggers, domains,
 --         character_sets, collations, column_privileges,

@@ -269,8 +269,8 @@ pub(crate) use catalog::physical_vector_family;
 // (`Catalog::drop_table_taking_partition_children`).
 pub(crate) use catalog::teardown_index_structures;
 pub use catalog::{PersistedSeqState, PersistedSequence, DEFAULT_SEQUENCE_CACHE};
-// Role / ACL catalog (HC4 storage slice). STORED AND INTROSPECTABLE ONLY —
-// nothing in the engine enforces a privilege; see `AclRecord`'s doc comment.
+// Role / ACL catalog (HC4 storage slice). Read and enforced by
+// `crate::privileges`.
 pub use catalog::{
     is_reserved_role_name, AclRecord, RoleRecord, BUILTIN_HELIOS_ROLE_OID, BUILTIN_POSTGRES_ROLE_OID, FIRST_ROLE_OID,
     RESERVED_ROLE_NAMES,

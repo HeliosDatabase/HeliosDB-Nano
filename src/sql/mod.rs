@@ -4,8 +4,8 @@
 //! the logical plan structures.
 
 // Role/privilege catalog rows shared by BOTH catalog surfaces (wire
-// interceptor + phase-3 registry). STORED AND INTROSPECTABLE ONLY — nothing
-// in this build enforces a privilege; see the module docs.
+// interceptor + phase-3 registry). What they report is enforced by
+// `crate::privileges`.
 pub mod acl_views;
 pub mod compiled; // RAG-native compiled query plan cache (idea 4)
 pub mod constraints;

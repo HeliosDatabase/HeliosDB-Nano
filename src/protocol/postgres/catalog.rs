@@ -283,8 +283,7 @@ impl PgCatalog {
                          views), columns, schemata, views, key_column_usage, \
                          table_constraints, constraint_column_usage, \
                          referential_constraints, check_constraints, sequences, \
-                         table_privileges and role_table_grants — the last two report \
-                         STORED grants; HeliosDB does NOT enforce SQL privileges. \
+                         table_privileges and role_table_grants. \
                          These resolve but are ALWAYS EMPTY: view_table_usage, \
                          view_column_usage, routines, parameters, triggers, domains, \
                          character_sets, collations, column_privileges, \
@@ -1277,7 +1276,7 @@ impl PgCatalog {
         // registry uses for `pg_roles` / `pg_user` / `pg_authid` — so `\du` and
         // `SELECT * FROM pg_roles` can never disagree. The two virtual built-ins
         // are still listed (compatibility), followed by every persisted role
-        // with its REAL attribute bits. Those bits are RECORDED, NOT ENFORCED.
+        // with its REAL attribute bits.
         if q.contains("pg_catalog.pg_roles") && q.contains("rolname") && q.contains("rolsuper") {
             let schema = Schema::new(crate::sql::acl_views::psql_du_columns());
             let rows = crate::sql::acl_views::psql_du_rows(&catalog)?;

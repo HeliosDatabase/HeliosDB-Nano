@@ -413,23 +413,26 @@ of that name, on every dialect Nano accepts (including SQLite drop-in apps,
 which SQLite itself would have resolved to the column). Quote it —
 `SELECT "current_role" FROM audit` — to read the column.
 
-This is identity **reporting**, not access control: no privilege or row-access
-decision is made from these functions, `SET ROLE` / `SET SESSION
-AUTHORIZATION` are refused because identity switching is not implemented, and
-the multi-tenant API's RLS policies are a separate system with their own
-session context. That refusal carries SQLSTATE `0A000` on the **PostgreSQL
-wire in the default configuration** (`[authentication] legacy_acl_noop =
-false`; set it to `true` and the PG wire silently acknowledges both statements
-instead of refusing them); the embedded API and the MySQL wire have no
-interceptor for them at all and refuse them with a plain engine error carrying
-no SQLSTATE.
+`current_user` is also the role a statement is checked as: privileges are
+enforced (see [`../compatibility/privileges.md`](../compatibility/privileges.md)).
+`SET ROLE` switches to a role the session may become and `RESET ROLE` returns;
+after `SET ROLE`, `current_user` and `current_role` answer the new role and
+`session_user` still answers the login. `SET SESSION AUTHORIZATION` is for
+superusers. A switch the session may not make is refused with SQLSTATE `42501`,
+an unknown role with `42704`; `SET LOCAL ROLE` is refused with `0A000`. The
+multi-tenant API's RLS policies are a separate system with their own session
+context.
 
-Identity reporting does not reach the catalog: `pg_tables.tableowner`,
-`pg_roles` / `pg_user` and ACL grantors still report the literal service role,
-so a wire login is a name no ownership surface knows about. In particular
-`SELECT … FROM pg_tables WHERE tableowner = current_user` matched every table
-before these functions were made real and now matches none — filter on a
-literal owner name instead until ownership is tracked per role.
+A login that names no role in the catalog (the account given at start, or any
+name on a `trust` listener, such as `postgres` or the MySQL client's `root`) is
+the server's own account and is not restricted. A login that names a role
+created with `CREATE ROLE` is checked as that role. Under `trust` the name is
+whatever the client sent, so privileges are a boundary only on a `password`,
+`md5` or `scram-sha-256` listener.
+
+The catalog's ownership columns do not follow yet: `pg_tables.tableowner` and
+`pg_class.relowner` still report the bootstrap role for every table, whoever
+owns it.
 
 ## See also
 

@@ -2508,24 +2508,20 @@ pub struct AuthenticationConfig {
     pub users_file: Option<PathBuf>,
     /// Compatibility escape for the pre-4.20 `GRANT`/`REVOKE` behaviour.
     ///
-    /// **HeliosDB does not enforce SQL privileges either way.** Roles and
-    /// grants are persisted and introspectable (`pg_roles`, `pg_authid`,
-    /// `information_schema.table_privileges`, MySQL `SHOW GRANTS`); no
-    /// privilege is checked at any read or write path. This flag only decides
-    /// how *strict* the statements are about names.
+    /// This flag only decides how *strict* `GRANT`/`REVOKE` are about names.
+    /// It does not change what a stored grant allows: privileges are enforced
+    /// either way.
     ///
-    /// * `false` (default): `GRANT`/`REVOKE` naming a role or table that does
-    ///   not exist raise an error, and `SET ROLE <x>` over the PostgreSQL wire
-    ///   raises `0A000 feature_not_supported` instead of silently acking — on
-    ///   the simple query path AND the extended (Parse/Bind/Execute) path, which
-    ///   is what psycopg3 / JDBC / sqlx / node-postgres use.
+    /// * `false` (default): `GRANT`/`REVOKE` naming a role or object that does
+    ///   not exist raise an error.
     /// * `true`: unknown grantees/objects are skipped and the statement
-    ///   succeeds (grants whose grantee AND object exist are still stored),
-    ///   and `SET ROLE` goes back to the silent `SET` acknowledgement.
+    ///   succeeds (grants whose grantee AND object exist are still stored).
+    ///
+    /// `SET ROLE` is not affected by it any more: it switches the session's
+    /// role, or is refused, in both settings.
     ///
     /// Set it to `true` only to unblock a pre-existing script or restore that
-    /// depended on the old always-succeed behaviour. The old `SET ROLE` ack in
-    /// particular was a false claim that the session had dropped privileges.
+    /// depended on the old always-succeed behaviour.
     pub legacy_acl_noop: bool,
 }
 

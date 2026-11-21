@@ -1208,6 +1208,8 @@ pub struct MySqlHandler<S: AsyncRead + AsyncWrite + Unpin + Send> {
     username: Option<String>,
     current_database: Option<String>,
     in_transaction: bool,
+    /// First word of the statement being run, for the wording of a privilege refusal.
+    statement_verb: String,
     prepared_statements: HashMap<u32, PreparedStatement>,
     next_stmt_id: u32,
     last_row_count: u64,
@@ -1317,7 +1319,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
         tls_kx_group: Option<String>,
     ) -> Self {
         let session_id = database
-            .create_wire_session("mysql_wire")
+            .create_network_session("mysql_wire")
             .expect("wire session creation is infallible");
         Self {
             database,
@@ -1332,6 +1334,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
             username: None,
             current_database: None,
             in_transaction: false,
+            statement_verb: String::new(),
             prepared_statements: HashMap::new(),
             next_stmt_id: 1,
             last_row_count: 0,
@@ -1893,6 +1896,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
         // Apply MySQL-to-PostgreSQL SQL translation
         let translated = super::translator::translate(&raw_sql);
         let sql = translated.as_str();
+        self.statement_verb = crate::privileges::mysql::statement_verb(sql);
 
         // Always log CREATE TABLE translation at INFO level for diagnostics
         let is_create = raw_sql.to_ascii_uppercase().contains("CREATE TABLE");
@@ -2137,6 +2141,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
     async fn send_statement_error(&mut self, msg: &str) -> Result<()> {
         if self.in_transaction {
             let _ = self.database.clear_session_transaction_failure(self.session_id);
+        }
+        // A privilege refusal is reported in MySQL's own code and wording.
+        let user = self.username.clone().unwrap_or_default();
+        if let Some((code, state, text)) = crate::privileges::mysql::translate(msg, &user, &self.statement_verb) {
+            return self.send_error(code, state, &text).await;
         }
         let (code, state) = map_error_code(msg);
         self.send_error(code, state, msg).await

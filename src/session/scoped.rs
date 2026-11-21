@@ -336,6 +336,9 @@ impl BranchBinding {
 /// set of plain `Session` fields.
 #[derive(Debug)]
 pub struct SessionScopedState {
+    /// Who this session's statements are checked as (the network mark,
+    /// `SET ROLE`, `SET SESSION AUTHORIZATION`).
+    access: crate::privileges::SessionAccess,
     /// `pg_backend_pid()`. Immutable for the life of the connection.
     backend_pid: i32,
     /// sprinter 32ed4b9e0002: the OPEN DATABASE this backend belongs to —
@@ -525,6 +528,7 @@ impl SessionScopedState {
     /// `EmbeddedDatabase`) is served by.
     pub fn new_for_engine(engine_instance: u64) -> Arc<Self> {
         let state = Arc::new(Self {
+            access: crate::privileges::SessionAccess::default(),
             backend_pid: next_backend_pid(),
             engine_instance,
             backend_start: std::time::SystemTime::now()
@@ -570,6 +574,7 @@ impl SessionScopedState {
     /// still runs the registry removal, which is a no-op for an unlisted pid.
     pub fn new_request_scoped(engine_instance: u64) -> Arc<Self> {
         Arc::new(Self {
+            access: crate::privileges::SessionAccess::default(),
             backend_pid: next_backend_pid(),
             engine_instance,
             backend_start: std::time::SystemTime::now()
@@ -926,8 +931,18 @@ impl SessionScopedState {
     /// the view and `current_user` can never disagree.
     pub fn set_username(&self, name: &str) {
         let mut slot = self.username.write();
+        if slot.as_str() != name {
+            // A different identity: it is classified again, and a role the
+            // previous identity switched to does not carry over.
+            self.access.reset_login();
+        }
         slot.clear();
         slot.push_str(name);
+    }
+
+    /// Who this session's statements are checked as.
+    pub fn access(&self) -> &crate::privileges::SessionAccess {
+        &self.access
     }
 
     /// Stamp the peer address a listener accepted the connection from.

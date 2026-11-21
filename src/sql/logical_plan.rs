@@ -1109,9 +1109,8 @@ pub enum LogicalPlan {
     /// and vanish while reporting success — a security-relevant
     /// misrepresentation, since a client could not tell a stored grant from a
     /// discarded one. They now plan to [`LogicalPlan::GrantPrivileges`] /
-    /// [`LogicalPlan::RevokePrivileges`], which persist an ACL record. That
-    /// record is INTROSPECTABLE ONLY: no DML choke point reads it, so no
-    /// privilege is enforced either way. The variant itself is KEPT (it is
+    /// [`LogicalPlan::RevokePrivileges`], which persist an ACL record that
+    /// `crate::privileges` enforces. The variant itself is KEPT (it is
     /// still reachable for other accept-as-no-op statements, and removing it
     /// would shift every later variant's on-disk bincode discriminant).
     ///
@@ -1178,8 +1177,7 @@ pub enum LogicalPlan {
     ///
     /// (An earlier revision of this comment said "HeliosDB has NO SQL-level
     /// role catalog yet"; that stopped being true when the roles workstream
-    /// landed in the same release. Privileges are still NOT ENFORCED anywhere —
-    /// that part has not changed.)
+    /// landed in the same release.)
     ///
     /// APPENDED after every pre-existing variant, for the bincode reason
     /// documented on [`LogicalPlan::Noop`] and repeated on `CreateTableAs`
@@ -1203,12 +1201,9 @@ pub enum LogicalPlan {
     /// `CREATE ROLE <name> [WITH] <options…>` (and the `CREATE USER` spelling,
     /// which the parser rewrites to `CREATE ROLE … LOGIN`).
     ///
-    /// *** STORES A CATALOG RECORD; ENFORCES NOTHING. *** The attribute bits
-    /// below are persisted so `pg_roles` / `pg_authid` / `pg_user` report what
-    /// the user actually asked for instead of two fabricated all-privilege
-    /// superusers. No code path consults `superuser`, `bypassrls` or any other
-    /// bit to authorise a statement, and `password` is NOT wired into wire
-    /// authentication.
+    /// The attribute bits below are persisted, reported by `pg_roles` /
+    /// `pg_authid` / `pg_user`, and decide what the role may do
+    /// (`crate::privileges`). `password` is stored as a verifier.
     ///
     /// APPEND-ONLY: declared after [`LogicalPlan::DropRole`] for the bincode
     /// reason documented on [`LogicalPlan::Noop`] — `LogicalPlan` is persisted
@@ -1247,8 +1242,7 @@ pub enum LogicalPlan {
     /// `Option<…>`: `None` means "the statement did not mention this
     /// attribute", so an ALTER only touches what it names.
     ///
-    /// *** RECORDS ATTRIBUTES; ENFORCES NOTHING *** — see
-    /// [`LogicalPlan::CreateRole`].
+    /// See [`LogicalPlan::CreateRole`].
     ///
     /// APPEND-ONLY — see [`LogicalPlan::Noop`].
     AlterRole {
@@ -1271,12 +1265,9 @@ pub enum LogicalPlan {
 
     /// `GRANT <privileges> ON <objects> TO <grantees> [WITH GRANT OPTION]`.
     ///
-    /// *** THIS WRITES AN ACL RECORD. IT DOES NOT ENFORCE ONE. *** Before this
-    /// variant, GRANT planned to [`LogicalPlan::Noop`] and vanished while
-    /// reporting success. It now persists what was granted so the privilege
-    /// views can report it — but no DML choke point reads those records, so a
-    /// GRANT still confers nothing and a REVOKE still removes nothing at
-    /// execution time. Enforcement is a named follow-up (ROADMAP_V5).
+    /// Writes an ACL record, which `crate::privileges` enforces. This is the
+    /// form the SQL parser understands (tables and sequences, no column list);
+    /// every other grant is a [`LogicalPlan::AccessControl`].
     ///
     /// APPEND-ONLY — see [`LogicalPlan::Noop`].
     GrantPrivileges {
@@ -1435,6 +1426,14 @@ pub enum LogicalPlan {
     /// GH#40: `LISTEN` / `UNLISTEN` / `NOTIFY`. No output rows.
     /// APPEND-ONLY — see [`LogicalPlan::Noop`].
     Notification(crate::notify::NotifyCommand),
+
+    /// An access-control statement the SQL parser has no grammar for, or that
+    /// carries more than the plan-level `GRANT` can (column lists, `GRANTED
+    /// BY`, `CASCADE`): grants on any object kind, role membership, `SET ROLE`,
+    /// `SET SESSION AUTHORIZATION`, `ALTER … OWNER TO`, `ALTER ROLE … RENAME`.
+    /// Appended last, like every variant since the materialized-view plans
+    /// were first persisted.
+    AccessControl(Box<crate::privileges::statement::AccessStatement>),
 }
 
 /// Function/Procedure parameter
@@ -2523,6 +2522,7 @@ impl LogicalPlan {
             Self::AlterRole { .. } => "AlterRole",
             Self::GrantPrivileges { .. } => "GrantPrivileges",
             Self::RevokePrivileges { .. } => "RevokePrivileges",
+            Self::AccessControl(_) => "AccessControl",
             Self::DropIndex { .. } => "DropIndex",
             Self::AlterTableAddUnique { .. } => "AlterTableAddUnique",
             Self::AlterTableAddPrimaryKey { .. } => "AlterTableAddPrimaryKey",
@@ -2980,12 +2980,12 @@ impl LogicalPlan {
             | LogicalPlan::DropSchema { .. }
             | LogicalPlan::DropRole { .. }
             // Role / ACL DDL: no output rows. `GRANT`/`REVOKE` write a catalog
-            // record and report a command tag; they never return a result set,
-            // and — deliberately — they never enforce anything.
+            // record and report a command tag; they never return a result set.
             | LogicalPlan::CreateRole { .. }
             | LogicalPlan::AlterRole { .. }
             | LogicalPlan::GrantPrivileges { .. }
             | LogicalPlan::RevokePrivileges { .. }
+            | LogicalPlan::AccessControl(_)
             // DROP INDEX returns no rows, exactly like DROP TABLE.
             | LogicalPlan::DropIndex { .. }
             // ALTER TABLE … ADD [CONSTRAINT] UNIQUE / PRIMARY KEY / CHECK:

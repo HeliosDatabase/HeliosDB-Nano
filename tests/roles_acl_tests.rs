@@ -1,12 +1,10 @@
-//! Roles / ACL surface — regression coverage.
+//! Roles / ACL surface — regression coverage for the CATALOG.
 //!
-//! # NOTHING HERE TESTS ENFORCEMENT, BECAUSE THERE IS NONE
-//!
-//! HeliosDB Nano persists roles and grants so that introspection tells the
-//! truth. It does **not** check a privilege at any read or write path. Every
-//! assertion below is about what the CATALOG records and reports. If you are
-//! looking for "role X cannot read table Y", it does not exist in this build
-//! and no test in this file implies it does.
+//! This file is about what the catalog records and reports: roles, their
+//! attributes, grants, and the views over them. Since 5.0 the recorded grants
+//! are also enforced; that is tested in `tests/privilege_*.rs`, not here.
+//! Every statement below runs through the embedded API, which is not a role
+//! and is not checked.
 //!
 //! Two things are covered:
 //!
@@ -600,12 +598,14 @@ fn role_ddl_negative_matrix() {
             run(&db, "CREATE ROLE member IN ROLE app", params_family).is_err(),
             "role membership must error, not be silently discarded"
         );
-        // ALTER ROLE … RENAME / SET are unimplemented and say so.
-        assert!(run(&db, "ALTER ROLE app RENAME TO app2", params_family).is_err());
+        // ALTER ROLE … SET is unimplemented and says so. (5.0: RENAME TO is
+        // implemented; this used to assert that it errors.)
         assert!(
             run(&db, "ALTER ROLE app SET search_path TO x", params_family).is_err(),
             "per-role GUCs are unimplemented and must error rather than be dropped"
         );
+        run(&db, "ALTER ROLE app RENAME TO app2", params_family).expect("ALTER ROLE … RENAME TO renames the role");
+        assert_eq!(role_attr(&db, "app2", "rolname"), "app2");
     }
 }
 
@@ -620,8 +620,8 @@ fn db_with_role_and_table(params_family: bool) -> EmbeddedDatabase {
     db
 }
 
-/// The headline: a GRANT is STORED and reported, on both families. It is still
-/// not enforced — this asserts the catalog, not access control.
+/// The headline: a GRANT is STORED and reported, on both families. This
+/// asserts the catalog; enforcement is tested in `tests/privilege_*.rs`.
 #[test]
 fn grant_is_stored_and_reported_on_both_families() {
     for params_family in [false, true] {
@@ -750,19 +750,7 @@ fn grant_negative_matrix() {
             .to_lowercase();
         assert!(err.contains("does not exist"), "got {err}");
 
-        // Unmodelled shapes are refused rather than half-stored.
-        assert!(
-            run(&db, "GRANT SELECT ON ALL TABLES IN SCHEMA public TO app", params_family).is_err(),
-            "ALL TABLES IN SCHEMA is unimplemented and must error"
-        );
-        assert!(
-            run(&db, "GRANT USAGE ON SCHEMA public TO app", params_family).is_err(),
-            "schema grants are unimplemented and must error"
-        );
-        assert!(
-            run(&db, "GRANT SELECT (id) ON orders TO app", params_family).is_err(),
-            "column-level grants are unimplemented and must error"
-        );
+        // A privilege that does not exist for the object kind is refused.
         assert!(
             run(&db, "GRANT USAGE ON orders TO app", params_family).is_err(),
             "USAGE is not a table privilege"
@@ -772,6 +760,23 @@ fn grant_negative_matrix() {
         assert!(
             stored_grants(&db, "app", "orders").is_empty(),
             "a rejected GRANT must store nothing"
+        );
+
+        // 5.0: these three shapes used to be refused as unimplemented. They
+        // are stored now; a schema grant and a column grant are not table
+        // grants and do not appear in `table_privileges`.
+        run(&db, "GRANT USAGE ON SCHEMA public TO app", params_family).expect("a schema grant");
+        run(&db, "GRANT SELECT (id) ON orders TO app", params_family).expect("a column grant");
+        assert!(
+            stored_grants(&db, "app", "orders").is_empty(),
+            "a schema grant and a column grant are not table grants"
+        );
+        run(&db, "GRANT SELECT ON ALL TABLES IN SCHEMA public TO app", params_family)
+            .expect("ALL TABLES IN SCHEMA");
+        assert_eq!(
+            stored_grants(&db, "app", "orders"),
+            vec![("SELECT".to_string(), "NO".to_string())],
+            "ALL TABLES IN SCHEMA grants on each table of the schema"
         );
     }
 }
@@ -912,7 +917,7 @@ fn grants_report_the_real_schema() {
     assert_eq!(
         text(&rows[0].values[2]),
         "helios",
-        "grantor is the constant built-in until session identity lands"
+        "a grant issued through the embedded API, which is not a role, records the service grantor"
     );
 }
 
@@ -964,8 +969,8 @@ fn persistence_restart() {
 
 /// `[authentication] legacy_acl_noop = true` restores the pre-4.20 leniency:
 /// a GRANT naming an unknown role succeeds as a no-op instead of erroring.
-/// It does NOT restore "store nothing", and it changes no enforcement (there
-/// is none either way).
+/// It does NOT restore "store nothing", and it does not change what a stored
+/// grant allows.
 #[test]
 fn legacy_acl_noop_flag() {
     let mut config = Config::default();

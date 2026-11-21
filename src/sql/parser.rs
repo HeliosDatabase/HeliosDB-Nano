@@ -259,7 +259,10 @@ impl Parser {
         // TABLE and quote-aware so string literals / multi-row VALUES are safe.
         processed_sql = Self::preprocess_strip_trailing_commas(&processed_sql);
 
-        // Preprocess to remove SECURITY DEFINER/INVOKER (not supported by sqlparser)
+        // SECURITY DEFINER is refused: a routine runs with its caller's rights,
+        // and stripping the clause would silently change what it may do.
+        crate::privileges::statement::refuse_security_definer(&processed_sql)?;
+        // Preprocess to remove SECURITY INVOKER (not supported by sqlparser)
         processed_sql = Self::preprocess_remove_security_clause(&processed_sql);
 
         // Preprocess to remove STORAGE clauses from column definitions (not supported by sqlparser)
@@ -2266,6 +2269,7 @@ impl Parser {
     ///
     /// Returns: (name, or_replace, params, language, body)
     pub fn parse_pg_create_procedure(sql: &str) -> Result<(String, bool, Vec<(String, String)>, String, String)> {
+        crate::privileges::statement::refuse_security_definer(sql)?;
         let cleaned = sql.trim().to_string();
         let upper = cleaned.to_uppercase();
 

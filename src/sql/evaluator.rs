@@ -785,7 +785,7 @@ impl Evaluator {
     /// `SET ROLE` / `SET SESSION AUTHORIZATION` stay refused (0A000) rather than
     /// letting a session rewrite what these functions answer.
     fn session_identity() -> String {
-        crate::session_login_user_tls().map_or_else(|| "heliosdb".to_string(), |login| login.to_string())
+        crate::privileges::access::current_user_name()
     }
 
     /// Evaluate a scalar function
@@ -814,6 +814,9 @@ impl Evaluator {
             fun
         };
         let fun_dispatch = fun_dispatch.strip_prefix("pg_catalog.").unwrap_or(fun_dispatch);
+        if crate::privileges::functions::is_access_function(fun_dispatch) {
+            return crate::privileges::functions::evaluate(fun_dispatch, &arg_values);
+        }
         match fun_dispatch {
             // JSONB extraction functions
             "jsonb_extract_path" | "json_extract_path" => self.jsonb_extract_path(&arg_values),
@@ -1071,7 +1074,8 @@ impl Evaluator {
             // 0.53 does not lower to a function — it arrives as an identifier,
             // so the PLANNER lowers that one itself (`expr_to_logical`'s
             // `Expr::Identifier` arm) and it lands here too.
-            "current_user" | "session_user" | "current_role" | "user" => Ok(Value::String(Self::session_identity())),
+            "current_user" | "current_role" | "user" => Ok(Value::String(Self::session_identity())),
+            "session_user" => Ok(Value::String(crate::privileges::access::session_user_name())),
             // Random UUID v4 — the default for Postgres 13+ PK columns.
             "gen_random_uuid" | "pg_catalog.gen_random_uuid" | "uuid_generate_v4" => {
                 Ok(Value::Uuid(uuid::Uuid::new_v4()))
@@ -1090,6 +1094,7 @@ impl Evaluator {
                         ))
                     }
                 };
+                crate::privileges::gate::check_sequence_call("nextval", &name)?;
                 // SEQ-5: propagate the real error (NO-CYCLE overflow /
                 // out-of-range) with the PostgreSQL message instead of clamping
                 // to the boundary. The durable cached-block reservation lives in
@@ -1282,6 +1287,7 @@ impl Evaluator {
                         ))
                     }
                 };
+                crate::privileges::gate::check_sequence_call("currval", &name)?;
                 match crate::session_currval(&name) {
                     Some(v) => Ok(Value::Int8(v)),
                     None => Err(Error::query_execution(
@@ -1295,6 +1301,7 @@ impl Evaluator {
                     Some(Value::Null) => return Ok(Value::Null),
                     _ => return Err(Error::query_execution("setval() requires (text, integer) arguments")),
                 };
+                crate::privileges::gate::check_sequence_call("setval", &name)?;
                 let value = match arg_values.get(1) {
                     Some(Value::Int8(n)) => *n,
                     Some(Value::Int4(n)) => *n as i64,

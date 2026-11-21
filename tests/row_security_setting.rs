@@ -133,6 +133,8 @@ fn row_security_off_unfiltered_for_bypassrls_and_superusers() {
     let db = seeded();
     db.execute("CREATE ROLE dumper BYPASSRLS LOGIN").unwrap();
     db.execute("CREATE ROLE plain LOGIN").unwrap();
+    // 5.0: privileges are enforced, so the roles are granted what the test reads.
+    db.execute("GRANT SELECT ON orders TO dumper, plain").unwrap();
     for (user, bypass) in [("dumper", true), ("postgres", true), ("plain", false)] {
         let sid = session(&db, user);
         db.execute_for_session(sid, "SET row_security = off").unwrap();

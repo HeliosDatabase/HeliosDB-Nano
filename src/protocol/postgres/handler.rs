@@ -452,6 +452,9 @@ enum StartupError {
     /// / 53300 here (`InitProcess`), which every pooler understands as "retry
     /// later" rather than "this backend is broken".
     TooManyConnections(String),
+    /// The authenticated role does not hold `CONNECT` on the database it asked
+    /// for (42501). Raised after authentication, like the two above.
+    InsufficientPrivilege(String),
 }
 
 impl StartupError {
@@ -485,6 +488,11 @@ impl StartupError {
             Self::TooManyConnections(wire_message) => (
                 Error::query_execution(wire_message.clone()),
                 crate::network::protocol::sqlstate::TOO_MANY_CONNECTIONS,
+                wire_message,
+            ),
+            Self::InsufficientPrivilege(wire_message) => (
+                Error::query_execution(wire_message.clone()),
+                crate::network::protocol::sqlstate::INSUFFICIENT_PRIVILEGE,
                 wire_message,
             ),
         }
@@ -707,7 +715,7 @@ impl PgConnectionHandler<BufWriter<TcpStream>> {
         }
 
         let session_id = database
-            .create_wire_session("pg_wire")
+            .create_network_session("pg_wire")
             .expect("wire session creation is infallible");
         let policy = ConnectionPolicy::embedded_default(&database);
         Self {
@@ -744,7 +752,7 @@ impl PgConnectionHandler<BufWriter<UnixStream>> {
     /// Create a new connection handler bound to a Unix domain socket stream.
     pub fn new_unix(stream: UnixStream, database: Arc<EmbeddedDatabase>, auth_manager: Arc<AuthManager>) -> Self {
         let session_id = database
-            .create_wire_session("pg_wire")
+            .create_network_session("pg_wire")
             .expect("wire session creation is infallible");
         let policy = ConnectionPolicy::embedded_default(&database);
         Self {
@@ -845,7 +853,7 @@ impl PgConnectionHandler<BufWriter<SecureConnection<TcpStream>>> {
         }
 
         let session_id = database
-            .create_wire_session("pg_wire")
+            .create_network_session("pg_wire")
             .expect("wire session creation is infallible");
         let policy = ConnectionPolicy::embedded_default(&database);
         Self {
@@ -1727,6 +1735,10 @@ where
                     return Err(StartupError::TooManyConnections(format!(
                         "too many connections for database \"{requested}\""
                     )));
+                }
+                // Privileges: a role in the catalog needs CONNECT on the database.
+                if let Err(refusal) = self.database.check_connect_privilege(&login, &requested) {
+                    return Err(StartupError::InsufficientPrivilege(refusal));
                 }
             }
 
@@ -2720,7 +2732,7 @@ where
     #[cfg(feature = "ha-tier1")]
     fn release_database_for_promotion(&mut self, placeholder: Arc<EmbeddedDatabase>) {
         let _ = self.database.destroy_session(self.session_id);
-        if let Ok(session_id) = placeholder.create_wire_session("pg_wire") {
+        if let Ok(session_id) = placeholder.create_network_session("pg_wire") {
             self.session_id = session_id;
         }
         self.catalog = PgCatalog::with_database(Arc::clone(&placeholder));
@@ -2975,31 +2987,19 @@ where
                 }
                 Ok(None) => {}
             }
-            // HC4: `SET ROLE <x>` / `SET SESSION AUTHORIZATION <x>` used to fall
-            // through to the generic `CommandComplete("SET")` below and be
-            // acked with ZERO effect. A client — or a pooler, or a hardening
-            // check — that believed it had dropped to a restricted role kept
-            // full access. That is a false security claim, so it now errors.
-            //
-            // `SET ROLE NONE` / `SET SESSION AUTHORIZATION DEFAULT` keep the ack:
-            // "go back to the default identity" is genuinely satisfied when
-            // there is only one identity.
-            if let Some(target) = Self::parse_set_role_target(trimmed) {
-                if !target.is_reset && !self.database.storage.config().authentication.legacy_acl_noop {
-                    self.send_error(
-                        "ERROR",
-                        crate::network::protocol::sqlstate::FEATURE_NOT_SUPPORTED,
-                        &format!(
-                            "{} is not supported: HeliosDB stores roles and grants but does not enforce \
-                             privileges or switch session identity",
-                            target.statement
-                        ),
-                        None,
-                        None,
-                    )
-                    .await?;
+            // `SET ROLE <x>` / `SET SESSION AUTHORIZATION <x>`: run on THIS
+            // session, which decides whether its role may switch. Never the
+            // generic ack below: a client that believes it dropped to a
+            // restricted role must have done so, or be told it did not.
+            if Self::parse_set_role_target(trimmed).is_some() {
+                if let Err(e) = self.database.execute_for_session(self.session_id, trimmed) {
+                    self.send_error("ERROR", sqlstate_for_error(&e), &e.to_string(), None, None)
+                        .await?;
                     return Ok(());
                 }
+                self.send_command_complete("SET").await?;
+                self.send_ready_for_query().await?;
+                return Ok(());
             }
             if EmbeddedDatabase::is_search_path_statement(trimmed) {
                 // `SET search_path` is a per-session schema selector: store it on
@@ -3082,6 +3082,29 @@ where
             }
             // Handle generic SET commands for client compatibility (e.g., SET client_encoding = 'UTF8').
             self.send_command_complete("SET").await?;
+            self.send_ready_for_query().await?;
+            return Ok(());
+        } else if starts_with_icase(trimmed, "RESET ")
+            && matches!(
+                trimmed[6..]
+                    .trim()
+                    .trim_end_matches(';')
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .to_ascii_lowercase()
+                    .as_str(),
+                "role" | "session authorization"
+            )
+        {
+            // `RESET ROLE` / `RESET SESSION AUTHORIZATION`: back to the role
+            // this session authenticated as.
+            if let Err(e) = self.database.execute_for_session(self.session_id, trimmed) {
+                self.send_error("ERROR", sqlstate_for_error(&e), &e.to_string(), None, None)
+                    .await?;
+                return Ok(());
+            }
+            self.send_command_complete("RESET").await?;
             self.send_ready_for_query().await?;
             return Ok(());
         } else if starts_with_icase(trimmed, "RESET ")
@@ -5354,10 +5377,7 @@ where
                 if !target.is_empty() && !target.starts_with([' ', '\t', '\n', '\r', '=']) {
                     return None;
                 }
-                return Some(SetRoleTarget {
-                    statement: "SET SESSION AUTHORIZATION",
-                    is_reset: Self::is_role_reset_target(target),
-                });
+                return Some(SetRoleTarget);
             }
             tail = after;
         } else if starts_with_icase(tail, "LOCAL ") {
@@ -5370,19 +5390,9 @@ where
             if !target.is_empty() && !target.starts_with([' ', '\t', '\n', '\r', '=']) {
                 return None;
             }
-            return Some(SetRoleTarget {
-                statement: "SET ROLE",
-                is_reset: Self::is_role_reset_target(target),
-            });
+            return Some(SetRoleTarget);
         }
         None
-    }
-
-    /// `NONE` / `DEFAULT` (and an empty tail) mean "return to the default
-    /// identity", which is genuinely a no-op here — there is only one identity.
-    fn is_role_reset_target(target: &str) -> bool {
-        let target = target.trim().trim_start_matches('=').trim();
-        target.is_empty() || target.eq_ignore_ascii_case("NONE") || target.eq_ignore_ascii_case("DEFAULT")
     }
 
     /// v01.4: classify `DEALLOCATE [PREPARE] { name | ALL }`. `None` when the
@@ -6879,6 +6889,11 @@ pub(crate) fn sqlstate_for_error(error: &Error) -> &'static str {
     if error.is_applied_publication_failure() {
         return sqlstate::SYSTEM_ERROR; // 58000
     }
+    // A statement the role may not run (the privilege gate), whatever error
+    // kind carried the refusal out.
+    if crate::privileges::gate::is_permission_error(error) {
+        return sqlstate::INSUFFICIENT_PRIVILEGE; // 42501
+    }
 
     match error {
         Error::ConstraintViolation(message) => {
@@ -7522,6 +7537,10 @@ fn sqlstate_for_query_execution_message(message: &str) -> &'static str {
         // (column_default_for_update, src/sql/planner.rs) — a deliberate
         // refusal, not an internal fault.
         sqlstate::FEATURE_NOT_SUPPORTED // 0A000
+    } else if message.contains(crate::privileges::statement::DEPENDENT_PRIVILEGES_EXIST) {
+        "2BP01" // dependent_objects_still_exist
+    } else if message_names_a_role(&lower) && lower.contains(crate::privileges::statement::ROLE_MEMBERSHIP_CYCLE) {
+        "42P17" // invalid_object_definition: a role grant that closes a cycle
     } else if message_names_a_role(&lower) && (lower.contains("is reserved") || lower.contains("built-in role")) {
         sqlstate::INSUFFICIENT_PRIVILEGE // 42501
     } else if message_names_a_role(&lower) && lower.contains("already exists") {
@@ -7578,19 +7597,9 @@ fn sqlstate_for_query_execution_message(message: &str) -> &'static str {
     }
 }
 
-/// A recognised `SET ROLE` / `SET SESSION AUTHORIZATION` statement.
-///
-/// Exists because acknowledging those with `CommandComplete("SET")` and doing
-/// nothing — the pre-4.20 behaviour — told a client it had dropped to a
-/// restricted identity when it had not. HeliosDB has no session identity to
-/// switch to and enforces no privileges, so the honest answer is an error.
-pub(super) struct SetRoleTarget {
-    /// Canonical statement name, for the error message.
-    statement: &'static str,
-    /// `NONE` / `DEFAULT`: "return to the default identity", which IS a
-    /// genuine no-op here and keeps the plain `SET` acknowledgement.
-    is_reset: bool,
-}
+/// A recognised `SET ROLE` / `SET SESSION AUTHORIZATION` statement. It is run
+/// on the session, never acknowledged with a bare `CommandComplete("SET")`.
+pub(super) struct SetRoleTarget;
 
 /// Detail/hint fields for the ErrorResponse, keyed on the mapped SQLSTATE.
 ///

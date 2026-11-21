@@ -1,15 +1,11 @@
 //! Role / privilege catalog rows — the SINGLE source of truth shared by both
 //! catalog surfaces.
 //!
-//! # This module reports privileges. It does not enforce them.
+//! # This module reports privileges. `crate::privileges` enforces them.
 //!
 //! HeliosDB Nano persists roles (`CREATE/ALTER/DROP ROLE`) and ACL records
-//! (`GRANT`/`REVOKE`) so that introspection tells the truth about what was
-//! asked for. **No privilege is checked at any DML choke point.** A row in
-//! `information_schema.table_privileges` means "somebody ran GRANT", never
-//! "access to this table is restricted". Enforcement is a named follow-up
-//! (ROADMAP_V5); until it lands, treat every view built here as documentation
-//! of intent, not as a security control.
+//! (`GRANT`/`REVOKE`). The builders here turn them into catalog rows; the
+//! privilege gate reads the same records to decide whether a statement runs.
 //!
 //! # Why one module
 //!
@@ -29,11 +25,10 @@
 //! `postgres` (oid 10) and `helios` (oid 11) are synthesized here, never
 //! persisted, and cannot be created, altered or dropped. They exist because
 //! `pg_namespace.nspowner` / `pg_class.relowner` have always reported owner
-//! 10, and because drivers expect at least one login role to be listed. Their
-//! all-true attribute bits are RETAINED for backward compatibility with
-//! pre-4.20 output — and they are exactly as meaningless as they were before,
-//! because nothing enforces them. Persisted roles, by contrast, report their
-//! REAL bits: a `CREATE ROLE analyst` shows `rolsuper = false`.
+//! 10, and because drivers expect at least one login role to be listed. Both
+//! are superusers, which is what their all-true attribute bits say. Persisted
+//! roles report their REAL bits: a `CREATE ROLE analyst` shows
+//! `rolsuper = false`.
 
 use crate::storage::{AclRecord, Catalog, RoleRecord, BUILTIN_HELIOS_ROLE_OID, BUILTIN_POSTGRES_ROLE_OID};
 use crate::{Column, DataType, Result, Tuple, Value};
@@ -77,7 +72,7 @@ fn builtin_roles() -> Vec<RoleRecord> {
     let builtin = |oid: u32, name: &str| RoleRecord {
         oid,
         name: name.to_string(),
-        // All-true, exactly as pre-4.20 output — and exactly as unenforced.
+        // All-true: both built-ins are superusers.
         rolsuper: true,
         rolinherit: true,
         rolcreaterole: true,

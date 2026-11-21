@@ -39,15 +39,6 @@ pub use window::WindowOperator;
 
 type IntRangeBounds = (Option<(i64, bool)>, Option<(i64, bool)>);
 
-/// The grantor recorded on every stored ACL row.
-///
-/// Constant until session identity lands: the authenticated wire username
-/// never reaches SQL today (`current_user` / `session_user` are hardcoded
-/// literals — see the ROADMAP_V5 session-identity follow-up), so deriving a
-/// per-statement grantor would be fabrication. `helios` matches the built-in
-/// role the catalog already reports as owning everything.
-const ACL_DEFAULT_GRANTOR: &str = "helios";
-
 /// Create a schema for COUNT(*) fast path results (single Int8 column).
 fn count_star_schema() -> Arc<Schema> {
     Arc::new(Schema {
@@ -4753,8 +4744,8 @@ impl<'a> Executor<'a> {
             // the params family (`execute_plan_with_params_inner`'s catch-all →
             // `Executor::execute`). Nothing family-specific may be added here.
             //
-            // *** THESE ARMS WRITE AND READ A CATALOG. THEY ENFORCE NOTHING. ***
-            // No privilege is checked at any DML choke point in this build.
+            // Who may run them is decided by `crate::privileges`: role DDL at
+            // the gate, grants where they execute.
             // ---------------------------------------------------------------
             LogicalPlan::CreateRole {
                 name,
@@ -4881,12 +4872,7 @@ impl<'a> Executor<'a> {
                 // This is a REFERENTIAL check on the ACL catalog, not a
                 // privilege check — it stops the catalog from keeping grant
                 // rows that name a role nobody can see any more.
-                if !catalog.list_acls_for_grantee(name)?.is_empty() {
-                    return Err(Error::query_execution(format!(
-                        "role \"{name}\" cannot be dropped because some objects depend on it \
-                         (revoke its privileges first)"
-                    )));
-                }
+                crate::privileges::statement::before_drop_role(&catalog, name)?;
                 catalog.delete_role(name)?;
                 self.empty_ddl_result()
             }
@@ -4899,32 +4885,15 @@ impl<'a> Executor<'a> {
                 with_grant_option,
             } => {
                 let catalog = self.acl_catalog("GRANT")?;
-                let privileges = Self::resolve_acl_privileges(privileges, *all_privileges, object_type)?;
-                let lenient = Self::legacy_acl_noop(self.storage);
-                for grantee in grantees {
-                    if !Self::acl_grantee_exists(&catalog, grantee)? {
-                        if lenient {
-                            continue;
-                        }
-                        return Err(Error::query_execution(format!("role \"{grantee}\" does not exist")));
-                    }
-                    for object in objects {
-                        if !Self::acl_object_exists(&catalog, object_type, object)? {
-                            if lenient {
-                                continue;
-                            }
-                            return Err(Self::acl_missing_object_error(object_type, object));
-                        }
-                        catalog.grant_privileges(
-                            object_type,
-                            object,
-                            grantee,
-                            ACL_DEFAULT_GRANTOR,
-                            &privileges,
-                            *with_grant_option,
-                        )?;
-                    }
-                }
+                let statement = crate::privileges::statement::grant_from_plan(
+                    privileges,
+                    *all_privileges,
+                    object_type,
+                    objects,
+                    grantees,
+                    *with_grant_option,
+                );
+                crate::privileges::statement::execute(catalog.storage(), &statement)?;
                 self.empty_ddl_result()
             }
             LogicalPlan::RevokePrivileges {
@@ -4935,27 +4904,19 @@ impl<'a> Executor<'a> {
                 grantees,
             } => {
                 let catalog = self.acl_catalog("REVOKE")?;
-                let privileges = Self::resolve_acl_privileges(privileges, *all_privileges, object_type)?;
-                let lenient = Self::legacy_acl_noop(self.storage);
-                for grantee in grantees {
-                    if !Self::acl_grantee_exists(&catalog, grantee)? {
-                        if lenient {
-                            continue;
-                        }
-                        return Err(Error::query_execution(format!("role \"{grantee}\" does not exist")));
-                    }
-                    for object in objects {
-                        if !Self::acl_object_exists(&catalog, object_type, object)? {
-                            if lenient {
-                                continue;
-                            }
-                            return Err(Self::acl_missing_object_error(object_type, object));
-                        }
-                        // Revoking a privilege that was never granted succeeds
-                        // silently (PostgreSQL warns and succeeds).
-                        catalog.revoke_privileges(object_type, object, grantee, &privileges)?;
-                    }
-                }
+                let statement = crate::privileges::statement::revoke_from_plan(
+                    privileges,
+                    *all_privileges,
+                    object_type,
+                    objects,
+                    grantees,
+                );
+                crate::privileges::statement::execute(catalog.storage(), &statement)?;
+                self.empty_ddl_result()
+            }
+            LogicalPlan::AccessControl(statement) => {
+                let catalog = self.acl_catalog("this statement")?;
+                crate::privileges::statement::execute(catalog.storage(), statement)?;
                 self.empty_ddl_result()
             }
             LogicalPlan::CreateEnumType { name, labels } => {
@@ -5091,8 +5052,7 @@ impl<'a> Executor<'a> {
                 // with zero effect — same empty-result shape as CreateSchema
                 // above. GRANT/REVOKE NO LONGER LAND HERE: they plan to
                 // `GrantPrivileges` / `RevokePrivileges` and persist an ACL
-                // record instead of vanishing while reporting success. (That
-                // record is introspectable only; nothing enforces it.)
+                // record instead of vanishing while reporting success.
                 Ok(Box::new(
                     ScanOperator::new(
                         String::new(),
@@ -5547,17 +5507,6 @@ impl<'a> Executor<'a> {
         Ok(storage.catalog())
     }
 
-    /// `[authentication] legacy_acl_noop` — the documented compatibility
-    /// escape for deployments whose scripts relied on GRANT/REVOKE succeeding
-    /// against roles and tables that do not exist. When true, an unknown
-    /// grantee or object is skipped instead of erroring; grants whose grantee
-    /// AND object both exist are still stored. It does NOT re-enable the old
-    /// "store nothing" behaviour, and it changes no enforcement (there is
-    /// none, either way).
-    fn legacy_acl_noop(storage: Option<&StorageEngine>) -> bool {
-        storage.is_some_and(|s| s.config().authentication.legacy_acl_noop)
-    }
-
     /// A DDL-shaped empty result (zero columns, zero rows) — the same shape
     /// `DROP SEQUENCE` / `CREATE SCHEMA` return.
     fn empty_ddl_result(&self) -> Result<Box<dyn PhysicalOperator>> {
@@ -5571,55 +5520,6 @@ impl<'a> Executor<'a> {
             )
             .with_timeout(self.timeout_ctx()),
         ))
-    }
-
-    /// Expand `GRANT/REVOKE ALL` for the object type, or validate an explicit
-    /// list. The "what does ALL mean" rule lives in exactly one place
-    /// (`sql::acl_views::all_privileges_for`) so the executor and the views
-    /// can never disagree about it.
-    fn resolve_acl_privileges(privileges: &[String], all_privileges: bool, object_type: &str) -> Result<Vec<String>> {
-        if !all_privileges {
-            if privileges.is_empty() {
-                return Err(Error::query_execution("GRANT/REVOKE requires at least one privilege"));
-            }
-            return Ok(privileges.to_vec());
-        }
-        let all = crate::sql::acl_views::all_privileges_for(object_type).ok_or_else(|| {
-            Error::query_execution(format!(
-                "GRANT/REVOKE ALL PRIVILEGES is not defined for object type '{object_type}'"
-            ))
-        })?;
-        Ok(all.iter().map(|p| (*p).to_string()).collect())
-    }
-
-    /// True if `grantee` names something a grant can be recorded against: the
-    /// `public` pseudo-role, a virtual built-in, or a persisted role.
-    fn acl_grantee_exists(catalog: &crate::storage::Catalog<'_>, grantee: &str) -> Result<bool> {
-        if crate::storage::is_reserved_role_name(grantee) {
-            return Ok(true);
-        }
-        catalog.role_exists(grantee)
-    }
-
-    /// True if the GRANT target exists in the catalog.
-    fn acl_object_exists(catalog: &crate::storage::Catalog<'_>, object_type: &str, object: &str) -> Result<bool> {
-        match object_type {
-            "table" => catalog.table_exists(object),
-            "sequence" => catalog.sequence_exists(object),
-            other => Err(Error::query_execution(format!(
-                "GRANT/REVOKE on object type '{other}' is not supported (tables and sequences only)"
-            ))),
-        }
-    }
-
-    /// The missing-object error for a GRANT/REVOKE target. Table wording is
-    /// deliberately the engine's standard `Table 'x' does not exist` so the PG
-    /// wire's message-shape classifier maps it to 42P01 undefined_table.
-    fn acl_missing_object_error(object_type: &str, object: &str) -> Error {
-        match object_type {
-            "sequence" => Error::query_execution(format!("sequence \"{object}\" does not exist")),
-            _ => Error::query_execution(format!("Table '{object}' does not exist")),
-        }
     }
 
     /// Get timeout context (for submodules)

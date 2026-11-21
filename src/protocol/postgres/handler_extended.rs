@@ -81,6 +81,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
         // constraints and durable effects belong exclusively to Execute.
         if crate::EmbeddedDatabase::try_preparse_executor_ddl(&query)?.is_some()
             || crate::sql::Parser::try_parse_alter_column_storage(&query)?.is_some()
+            || crate::privileges::statement::is_access_statement(&query)
         {
             let planned = self
                 .database
