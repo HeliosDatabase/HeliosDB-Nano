@@ -66,7 +66,8 @@ impl ParamContext {
 /// One known parameter.
 #[derive(Debug, Clone, Copy)]
 pub struct ParamDef {
-    /// Lower-case name.
+    /// Lower-case name: the lookup key. [`display_name`] gives the spelling
+    /// `SHOW ALL` and `pg_settings` print.
     pub name: &'static str,
     /// `pg_settings.category`.
     pub category: &'static str,
@@ -596,6 +597,21 @@ pub fn find(name: &str) -> Option<&'static ParamDef> {
         .and_then(|i| PARAMS.get(i))
 }
 
+/// The spelling PostgreSQL prints for `name` in `SHOW ALL` and
+/// `pg_settings.name`. Parameter names are case-insensitive for `SET`, `SHOW`
+/// and `current_setting()`, and the registry is keyed in lower case, but
+/// PostgreSQL lists three of them in mixed case, and a client that reads
+/// `SHOW ALL` or `pg_settings` (a proxy tracking session state, a driver
+/// reading `pg_settings WHERE name = 'TimeZone'`) compares the name as written.
+pub fn display_name(name: &str) -> &str {
+    match name {
+        "datestyle" => "DateStyle",
+        "intervalstyle" => "IntervalStyle",
+        "timezone" => "TimeZone",
+        other => other,
+    }
+}
+
 /// The description shown by `SHOW ALL` and `pg_settings.short_desc`.
 pub fn description(def: &ParamDef) -> String {
     if has_no_effect(def.name) {
@@ -751,7 +767,7 @@ pub fn show_all_rows(mut value_of: impl FnMut(&str) -> Option<String>) -> Vec<(S
         .iter()
         .map(|def| {
             (
-                def.name.to_string(),
+                display_name(def.name).to_string(),
                 value_of(def.name).unwrap_or_default(),
                 description(def),
             )
@@ -792,7 +808,7 @@ pub fn pg_settings_rows() -> Vec<Vec<crate::Value>> {
                 .or_else(|| default_value(def.name).as_ref().map(render_value))
                 .unwrap_or_else(|| setting.clone());
             vec![
-                text(def.name),
+                text(display_name(def.name)),
                 Value::String(setting),
                 opt(def.unit),
                 text(def.category),
@@ -841,6 +857,36 @@ mod tests {
         assert!(pg_version_function_string().contains(&pg_server_version_string()));
         assert_eq!(current_value("server_version_num").as_deref(), Some("160000"));
         assert!(pg_server_version_string().starts_with(PG_COMPAT_VERSION));
+    }
+
+    #[test]
+    fn listed_names_use_the_postgresql_spelling() {
+        let shown: Vec<String> = show_all_rows(current_value)
+            .into_iter()
+            .map(|(name, _, _)| name)
+            .collect();
+        let listed: Vec<String> = pg_settings_rows()
+            .into_iter()
+            .map(|row| match &row[0] {
+                crate::Value::String(name) => name.clone(),
+                other => panic!("pg_settings.name is {other:?}"),
+            })
+            .collect();
+        assert_eq!(shown, listed, "SHOW ALL and pg_settings list the same names");
+        for name in ["DateStyle", "TimeZone"] {
+            assert!(shown.iter().any(|n| n == name), "{name} missing from SHOW ALL");
+        }
+        for name in ["datestyle", "timezone"] {
+            assert!(!shown.iter().any(|n| n == name), "{name} listed in lower case");
+        }
+        for name in &shown {
+            if !matches!(name.as_str(), "DateStyle" | "TimeZone") {
+                assert_eq!(*name, name.to_ascii_lowercase(), "{name} is not lower case");
+            }
+        }
+        // The lookup key stays lower case.
+        assert!(find("datestyle").is_some() && find("timezone").is_some());
+        assert_eq!(current_value("timezone").as_deref(), Some("UTC"));
     }
 
     #[test]

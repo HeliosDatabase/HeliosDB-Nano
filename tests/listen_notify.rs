@@ -295,19 +295,28 @@ async fn embedded_api_sends_to_wire_listeners_and_refuses_listen() {
     );
 
     // The embedded global transaction: delivered at commit, dropped at rollback.
+    // `begin()` binds the transaction to the calling thread (only that thread may
+    // commit it), and two `spawn_blocking` calls may land on different pool
+    // threads, so one dedicated thread runs the whole transaction and waits for
+    // the go-ahead to commit while the listener is checked for silence.
     let db2 = Arc::clone(&db);
-    tokio::task::spawn_blocking(move || {
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    let (began_tx, began_rx) = tokio::sync::oneshot::channel::<()>();
+    let txn_thread = std::thread::spawn(move || {
         db2.begin().expect("begin");
         db2.execute("NOTIFY emb, 'txn'").expect("notify");
         db2.execute("NOTIFY emb, 'txn'").expect("notify");
-    })
-    .await
-    .expect("blocking");
+        began_tx.send(()).expect("signal");
+        go_rx.recv().expect("go-ahead");
+        db2.commit().expect("commit");
+    });
+    began_rx.await.expect("transaction open");
     assert_quiet(&mut a_inbox).await;
-    let db2 = Arc::clone(&db);
-    tokio::task::spawn_blocking(move || db2.commit().expect("commit"))
+    go_tx.send(()).expect("go-ahead");
+    tokio::task::spawn_blocking(move || txn_thread.join())
         .await
-        .expect("blocking");
+        .expect("blocking")
+        .expect("transaction thread");
     assert_eq!(next(&mut a_inbox).await.2, "txn");
     assert_quiet(&mut a_inbox).await;
 
