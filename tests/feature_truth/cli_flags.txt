@@ -1,0 +1,120 @@
+# Command-line flags, for tests/feature_truth_cli.rs.
+#
+# One flag per line: `subcommand path --flag | owning package | note`.
+#
+# [known_dead]     the flag is accepted and nothing acts on it.
+# [not_exercised]  no test or test script passes the flag to its subcommand. Not known
+#                  to be dead, not shown to work. The owner removes the line together
+#                  with the test that passes the flag.
+#
+# The test fails when a flag exists that is neither passed by a test nor listed here,
+# when a listed flag no longer exists, and when a [not_exercised] flag gains a test.
+
+[known_dead]
+dump --connection | admin-cli | accepted; the dump always reads the data directory
+restore --connection | admin-cli | accepted; the restore always writes the data directory
+start --dump-schedule | admin-cli | accepted; no dump is ever scheduled
+
+[not_exercised]
+archive gaps --config | ha-online
+archive prune --config | ha-online
+archive prune --disk-reserve | ha-online
+archive prune --recovery-window | ha-online
+dump --compression | backup
+dump --data-only | backup
+dump --schema-only | backup
+dump --tables | backup
+promote --allow-insecure-replication-remote | ha-online
+promote --physical-frame-timeout-secs | ha-online
+promote --physical-max-chunk-bytes | ha-online
+promote --physical-max-file-bytes | ha-online
+promote --physical-max-files | ha-online
+promote --physical-max-total-bytes | ha-online
+promote --physical-operation-timeout-secs | ha-online
+promote --primary-client-cert | ha-online
+promote --primary-client-key | ha-online
+promote --primary-server-name | ha-online
+promote --primary-tls-insecure-skip-verify | ha-online
+recover --allow-insecure-replication-remote | ha-online
+recover --physical-frame-timeout-secs | ha-online
+recover --physical-max-chunk-bytes | ha-online
+recover --physical-max-file-bytes | ha-online
+recover --physical-max-files | ha-online
+recover --physical-max-total-bytes | ha-online
+recover --physical-operation-timeout-secs | ha-online
+recover --primary-client-cert | ha-online
+recover --primary-client-key | ha-online
+recover --primary-server-name | ha-online
+recover --primary-tls-insecure-skip-verify | ha-online
+repl --dump-file | backup
+repl --dump-on-shutdown | backup
+restore --input | backup
+restore --target | backup
+restore --verify | backup
+resync --expected-history | ha-online
+resync --max-reconnects | ha-online
+resync --physical-frame-timeout-secs | ha-online
+resync --physical-max-chunk-bytes | ha-online
+resync --physical-max-file-bytes | ha-online
+resync --physical-max-files | ha-online
+resync --physical-max-total-bytes | ha-online
+resync --physical-operation-timeout-secs | ha-online
+resync --poll-byte-limit | ha-online
+resync --poll-interval-ms | ha-online
+resync --primary-ca | ha-online
+resync --primary-client-cert | ha-online
+resync --primary-client-key | ha-online
+resync --primary-server-name | ha-online
+resync --primary-tls | ha-online
+resync --primary-tls-insecure-skip-verify | ha-online
+resync --reconnect-delay-ms | ha-online
+resync --resume-existing | ha-online
+standby verify --allow-insecure-replication-remote | ha-online
+standby verify --physical-frame-timeout-secs | ha-online
+standby verify --physical-max-chunk-bytes | ha-online
+standby verify --physical-max-file-bytes | ha-online
+standby verify --physical-max-files | ha-online
+standby verify --physical-max-total-bytes | ha-online
+standby verify --physical-operation-timeout-secs | ha-online
+standby verify --primary-client-cert | ha-online
+standby verify --primary-client-key | ha-online
+standby verify --primary-server-name | ha-online
+standby verify --primary-tls-insecure-skip-verify | ha-online
+start --allow-remote-mcp | mcp-governed
+start --archive | ha-online
+start --archive-disk-reserve | ha-online
+start --archive-fsync-bytes | ha-online
+start --archive-max-bytes | ha-online
+start --archive-poll-ms | ha-online
+start --archive-prune-interval-secs | ha-online
+start --archive-recovery-window | ha-online
+start --archive-segment-max-bytes | ha-online
+start --archive-segment-max-secs | ha-online
+start --archive-source | ha-online
+start --authentication-timeout | sessions-audit
+start --idle-in-transaction-session-timeout | sessions-audit
+start --idle-session-timeout | sessions-audit
+start --join-memory-limit-mb | runtime-config
+start --max-connections-warn-percent | sessions-audit
+start --mysql-tls-cert | runtime-config
+start --mysql-tls-key | runtime-config
+start --mysql-tls-post-quantum | runtime-config
+start --physical-frame-timeout-secs | ha-online
+start --physical-max-chunk-bytes | ha-online
+start --physical-max-file-bytes | ha-online
+start --physical-max-files | ha-online
+start --physical-max-sessions | ha-online
+start --physical-max-total-bytes | ha-online
+start --physical-operation-timeout-secs | ha-online
+start --physical-wal-retention-secs | ha-online
+start --physical-wal-retention-size-mb | ha-online
+start --primary-server-name | ha-online
+start --primary-tls-insecure-skip-verify | ha-online
+start --replication-tls-post-quantum | ha-online
+start --snapshot-export-lease-secs | ha-online
+start --snapshot-export-max-leases | ha-online
+start --tcp-keepalives-count | sessions-audit
+start --tcp-keepalives-idle | sessions-audit
+start --tcp-keepalives-interval | sessions-audit
+start --tls-post-quantum | runtime-config
+stop --no-wait | admin-cli

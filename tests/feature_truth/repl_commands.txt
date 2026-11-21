@@ -1,0 +1,40 @@
+# Shell backslash commands, for tests/feature_truth_repl.rs.
+#
+# [known_stubs]  `\command | owning package | text of today's output that shows it | note`
+#                The command runs and does not do what its name says. The test checks
+#                that the text is still printed; when it is not, the line must go.
+# [setup]        `\command | owning package | shell line | shell line …`
+#                Lines run before the command's examples, for a command that needs
+#                something to act on before its stub shows.
+#
+# The test fails when a command that is not listed prints one of the stub phrases
+# (see the test), and when a listed command no longer prints its text.
+
+[known_stubs]
+# Says it does nothing.
+\password | admin-cli | nothing changed for | prints where passwords are set; changes nothing
+\set | shell-attach | shell variables are not supported | no shell variables; the command only says so
+\doc | ai-baas | Document storage not yet implemented
+\doc chunks | ai-baas | Document chunking not yet implemented
+\doc rechunk | ai-baas | Document rechunking not yet implemented
+\rag | ai-baas | RAG search not yet implemented
+\session-new | ai-baas | Agent sessions not yet implemented
+\session | ai-baas | Agent sessions not yet implemented
+\session-delete | ai-baas | Agent sessions not yet implemented
+\session-clear | ai-baas | Agent messages not yet implemented
+\session fork | ai-baas | Agent session forking not yet implemented
+\session context | ai-baas | Agent context retrieval not yet implemented
+\session memory | ai-baas | Agent memory search not yet implemented
+\session summarize | ai-baas | Agent memory summarization not yet implemented
+\ai infer | ai-baas | Batch schema inference not yet implemented
+\ai generate | ai-baas | Schema generation not yet implemented
+\ai embed | ai-baas | Embeddings not yet implemented
+\tenant rls delete | rls | Policy deletion not yet implemented | says "would delete" and the policy stays
+# Answers with a fixed text whatever the database holds. No phrase gives these away:
+# they were found by reading the output.
+\show lsn | shell-attach | display toggled | says a display was toggled; nothing is displayed afterwards
+\ai templates | ai-baas | Available Templates: | a list compiled into the shell
+\ai template | ai-baas | Template:  | prints SQL compiled into the shell, or "not found"; creates nothing
+
+[setup]
+\tenant rls delete | rls | \tenant rls create customers isolation tenant_id=current_tenant() ALL

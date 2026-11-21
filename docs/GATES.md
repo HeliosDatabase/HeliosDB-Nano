@@ -261,6 +261,53 @@ compile/type), then a fix pass on blockers/majors. Cheap relative to a gate cycl
 — unfiltered rows instead of an error — before anything compiled. The class (silent
 wrong results) is precisely what test suites miss when nobody thought to write the test.
 
+### 12. SQL Logic Test — the correctness score, with a floor
+`tests/slt_runner.rs` reads the public SQL Logic Test corpus as published (records,
+`skipif` / `onlyif`, `hash-threshold`, `rowsort` / `valuesort`, labels) and runs it through
+the embedded API, the PostgreSQL wire and the MySQL wire. The ordinary suite runs the
+small corpus in `tests/fixtures/slt/` through all three interfaces against
+`tests/fixtures/slt/baseline.json`; the public corpus is a separate run because it is
+1.1 GB and is not in the repository:
+
+```bash
+scripts/slt_fetch_corpus.sh            # pinned revision, checked against a pinned digest
+scripts/slt_run.sh embedded pgwire mysqlwire
+```
+
+It writes `docs/correctness/sqllogictest.md` and one JSON document per interface, and
+fails when a corpus directory passes fewer records than
+`docs/correctness/sqllogictest_baseline.json` holds (`SLT_BASELINE=update` raises the
+floor; it never lowers it). Each script runs in its own process with a time limit per
+record, so a record that hangs or kills the process costs one record and is listed on the
+page. The corpus is never edited to make a record pass. Defect class: a query that
+returns the wrong rows without an error, which no feature test looks for.
+
+### 13. Crash torture — acknowledged means durable, a statement is all or nothing
+`tests/crash_torture.rs` runs a seeded workload in a worker process, kills it with
+SIGKILL (by itself at a named point of an operation, or from outside at a seeded moment),
+reopens the database in a fresh process and compares it with a model: every acknowledged
+operation present, the operation in flight wholly present or wholly absent, the sum of
+balances unchanged, index lookups equal to full reads, the foreign key enforced, no
+generated id reused, the branch and the time-travel read of the opening state still
+answering. A fixed seed list runs in the ordinary suite; three deliberate faults in the
+worker prove the checker fails when it should. The long run:
+
+```bash
+scripts/crash_torture_run.sh 2000 1 3600     # iterations, first seed, time budget in seconds
+```
+
+writes `docs/correctness/crash-recovery.md`. A failing seed is replayed with
+`CRASH_TORTURE_SEED=<seed> scripts/crash_torture_run.sh 1`. Limit: a process crash. The
+operating system stays up, so this does not test power loss.
+
+### 14. Feature truth — nothing accepted and then ignored
+`tests/feature_truth_{config,cli,repl,rest}.rs` enumerate what the product accepts (the
+keys of the configuration, every flag in `--help`, the shell's command registry, the
+routes in `src/api/routes/`) and compare it with the lists in `tests/feature_truth/`. A new
+key, flag, command or route fails the test until a test sets it or it is listed as a
+known gap with its owner; a listed gap that was closed fails the test until its line is
+removed. Defect class: an option that parses, is documented, and does nothing.
+
 ## Merge / release criteria
 
 - One reviewable unit per commit on a wave branch; **wave gate** (suites + doc + clippy

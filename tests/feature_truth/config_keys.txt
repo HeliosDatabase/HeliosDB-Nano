@@ -1,0 +1,107 @@
+# Configuration keys, for tests/feature_truth_config.rs.
+#
+# One key per line: `section.key | owning package | note`.
+#
+# [known_inert]      nothing acts on the key and the loader does not warn about it
+#                    (keys the loader does warn about are INERT_KEYS in src/config.rs).
+#                    The owner wires the key or moves it to INERT_KEYS, and removes the line.
+# [no_test_sets_it]  the source reads the key, and no test sets it: nothing shows that
+#                    changing it changes anything. The owner removes the line together
+#                    with the test that sets the key and checks the effect.
+#
+# The test fails when a key exists that is in neither list, not in INERT_KEYS and not set
+# by a test; when a key's name appears nowhere in src/ outside src/config.rs and it is not
+# listed as inert; when a listed key no longer exists; and when a [no_test_sets_it] key
+# gains a test.
+
+[known_inert]
+# Nothing outside src/config.rs names these keys, so nothing can be reading them.
+compression.default_type | runtime-config | no reader in the source
+compression.enable_alp | runtime-config | no reader in the source
+compression.enable_fsst | runtime-config | no reader in the source
+compression.min_size_bytes | runtime-config | no reader in the source
+materialized_views.auto_refresh_default | ai-baas | no reader in the source
+materialized_views.enable_delta_tracking | ai-baas | no reader in the source
+materialized_views.enable_scheduler | ai-baas | no reader in the source
+materialized_views.delta_retention_hours | ai-baas | no reader in the source
+vector.enable_pq | ai-baas | no reader in the source
+vector.pq_subvectors | ai-baas | no reader in the source
+vector.pq_bits | ai-baas | no reader in the source
+session.cleanup_interval_secs | sessions-audit | no reader in the source
+locks.deadlock_check_interval_ms | sessions-audit | no reader in the source
+locks.max_lock_holders | sessions-audit | no reader in the source
+dump.auto_dump_enabled | admin-cli | no reader in the source
+dump.max_dump_size_mb | backup | no reader in the source
+dump.keep_dumps | backup | no reader in the source
+resource_quotas.max_concurrent_queries | mcp-governed | no reader in the source
+resource_quotas.query_timeout_secs | mcp-governed | no reader in the source
+# Named in the 5.0 research as accepted and never acted on: the whole of [audit],
+# [compression] and [dump], and encryption.rotation_interval_days. The source does name
+# these (the modules exist; nothing wires them to the configuration that is loaded).
+audit.enabled | sessions-audit | module not wired to the loaded configuration
+audit.log_ddl | sessions-audit | module not wired to the loaded configuration
+audit.log_dml | sessions-audit | module not wired to the loaded configuration
+audit.log_select | sessions-audit | module not wired to the loaded configuration
+audit.log_transactions | sessions-audit | module not wired to the loaded configuration
+audit.log_auth | sessions-audit | module not wired to the loaded configuration
+audit.retention_days | sessions-audit | module not wired to the loaded configuration
+audit.async_buffer_size | sessions-audit | module not wired to the loaded configuration
+audit.enable_checksums | sessions-audit | module not wired to the loaded configuration
+audit.max_query_length | sessions-audit | module not wired to the loaded configuration
+audit.capture_metadata.capture_client_ip | sessions-audit | module not wired to the loaded configuration
+audit.capture_metadata.capture_application_name | sessions-audit | module not wired to the loaded configuration
+audit.capture_metadata.capture_database_name | sessions-audit | module not wired to the loaded configuration
+audit.capture_metadata.capture_execution_time | sessions-audit | module not wired to the loaded configuration
+audit.capture_metadata.capture_custom_fields | sessions-audit | module not wired to the loaded configuration
+compression.level | runtime-config | module not wired to the loaded configuration
+dump.schedule | admin-cli | module not wired to the loaded configuration
+dump.compression | backup | module not wired to the loaded configuration
+dump.dump_dir | backup | module not wired to the loaded configuration
+encryption.rotation_interval_days | backup | module not wired to the loaded configuration
+
+[no_test_sets_it]
+storage.transaction_isolation | runtime-config
+storage.slow_query_threshold_ms | runtime-config
+storage.version_gc_max_per_cycle | runtime-config
+storage.rocksdb_min_write_buffer_number_to_merge | runtime-config
+encryption.zke.enabled | backup
+encryption.zke.mode | backup
+encryption.zke.require_key_hash | backup
+encryption.zke.replay_protection | backup
+encryption.zke.nonce_window_secs | backup
+encryption.zke.max_cached_nonces | backup
+server.idle_timeout_secs | sessions-audit
+server.tcp_keepalives_idle | sessions-audit
+server.tcp_keepalives_interval | sessions-audit
+server.tcp_keepalives_count | sessions-audit
+server.max_connections_warn_percent | sessions-audit
+server.copy_max_buffered_rows | pgwire-rest
+server.copy_max_record_bytes | pgwire-rest
+replication.startup_timeout_secs | ha-online
+replication.standby_hosts | ha-online
+replication.sync_timeout_ms | ha-online
+replication.archive.segment_max_bytes | ha-online
+replication.archive.segment_max_secs | ha-online
+replication.archive.poll_ms | ha-online
+replication.tls_enabled | ha-online
+replication.tls_cert_path | ha-online
+replication.tls_key_path | ha-online
+replication.tls_ca_path | ha-online
+replication.tls_post_quantum | ha-online
+replication.primary_tls_client_cert_path | ha-online
+replication.primary_tls_client_key_path | ha-online
+replication.snapshot_export_lease_secs | ha-online
+replication.snapshot_export_max_leases | ha-online
+replication.archive_source | ha-online
+replication.promote_fence_timeout | ha-online
+performance.lock_census | runtime-config
+performance.copy_phase_stats | runtime-config
+performance.insert_select_txn_batch_rows | runtime-config
+materialized_views.enable_incremental | ai-baas
+vector.default_index_type | ai-baas
+session.timeout_secs | sessions-audit
+session.max_sessions_per_user | sessions-audit
+api.http_auth_max_failures | pgwire-rest
+api.http_auth_failure_window_secs | pgwire-rest
+api.http_auth_max_tracked_peers | pgwire-rest
+api.http_auth_max_in_flight | pgwire-rest

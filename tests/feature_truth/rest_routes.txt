@@ -1,0 +1,3 @@
+# see tests/feature_truth_rest.rs
+[known_stubs]
+[not_stubs]
