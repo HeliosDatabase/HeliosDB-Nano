@@ -1213,7 +1213,7 @@ The run of the release (`docs/benchmarks/RELEASE_4_42_0.md`; pg35 numbers below 
   table. The filter is now estimated from the index its equality names, by counting the rows the
   index holds under that value (a literal or a bound parameter of the column's own type; the
   fewest of an `AND` chain's terms). The estimate chooses the join strategy only.
-  pg35 `4-table JOIN` 641 / 858 / 58.7 µs, against PostgreSQL 18.4's 522 µs: it was the one category
+  pg35 `4-table JOIN` 687 / 894 / 58.2 µs, against PostgreSQL 18.4's 520 µs: it was the one category
   slower than PostgreSQL, in 4.41.1 too, and **4.42.0 is now faster than PostgreSQL 18.4 in all 35
   categories**. `tests/join_pushed_filter_estimate.rs` checks 17 join shapes for the same answer
   with the index nested loop available and switched off.
@@ -1221,12 +1221,11 @@ The run of the release (`docs/benchmarks/RELEASE_4_42_0.md`; pg35 numbers below 
   Before running a statement that is not answered from a cache, the engine looks in its text for
   anything that makes its result unfit for the result cache (`nextval`, `now(`, the advisory-lock
   and replication probes: 27 markers), and it walked the whole text once per marker: 6.5 µs for a
-  130-byte join statement. One pass now, same markers. pg35 `INNER JOIN` 28.9 / 29.6 / 23.6,
-  `LEFT JOIN` 20.6 / 22.6 / 17.6, `UPDATE+subquery` 124 / 200 / 155.
-- **Not explained:** `IN subquery` measured 6.1 µs against 5.0 for the build before the passes
-  in this run, and 6.0 against 6.1 in the run before it. The category has two modes about 1 µs apart
-  across runs of every build measured; the release build was in the slower one in all of its
-  eight rounds. It is listed as slower below.
+  130-byte join statement. One pass now, same markers. pg35 `INNER JOIN` 28.1 / 29.3 / 25.3,
+  `LEFT JOIN` 21.4 / 21.0 / 18.4, `UPDATE+subquery` 137 / 201 / 152.
+- **`IN subquery` has two modes about 1 µs apart** across runs of every build measured. In the
+  run of the release it measured 5.16 / 6.19 / 5.65 µs (median of 2 rounds); the best of eight
+  rounds is 4.54 µs for 4.41.1 and 4.88 µs for 4.42.0 (1.07×).
 
 **The pg35 baseline.** `benches/public/pg35_baseline.json` holds, for each of the 35 categories,
 the best time per statement a release has reached under the strict harness and the release that
@@ -1237,16 +1236,16 @@ baseline (`check`, `--fail-over 1.15` to gate on it) and prints it (`table`). Be
 of each release (4.41.1's harness binary is the same file in all four release-benchmark runs;
 4.42.0's was run six more rounds):
 
-- **4.42.0 sets a new baseline in 9 categories:** ALTER TABLE (863 µs → 252 µs), INSERT..SELECT
-  (1.27 ms → 162 µs), UPSERT (61.0 µs → 60.1 µs), INNER JOIN (22.8 µs → 22.0 µs), LEFT JOIN (17.2 µs
-  → 16.7 µs), 4-table JOIN (570 µs → 56.1 µs), Window funcs (19.2 µs → 18.4 µs), LIKE/BETWEEN/IN
-  (9.99 µs → 9.82 µs), Transaction ctl (47.0 µs → 35.4 µs).
-- **The baseline stays with 4.41.1 in 26:** 4.42.0 is within 15% of it in 13 and more than 15%
-  slower in 13: INSERT single 3.81×, UPDATE point 3.76×, DELETE point 2.94×, CREATE TABLE 1.58×,
-  DROP TABLE 1.49×, SET/SHOW/RESET 1.40×, TRUNCATE 1.40×, REFRESH MATVIEW 1.36×, Prepared stmts
-  1.28×, IN subquery 1.27×, INSERT multi-row 1.25×, DISTINCT 1.22×, UPDATE+subquery 1.19×. The first
-  three are the one-row writes that record history (see below); the rest carry the work every
-  statement now does to be atomic.
+- **4.42.0 sets a new baseline in 9 categories:** ALTER TABLE (863 µs → 252 µs), DROP TABLE
+  (141 µs → 108 µs), CREATE/DROP VIEW (117 µs → 116 µs), INSERT..SELECT (1.27 ms → 159 µs), UPSERT
+  (61.0 µs → 60.7 µs), INNER JOIN (22.8 µs → 22.5 µs), LEFT JOIN (17.2 µs → 17.0 µs), 4-table JOIN
+  (570 µs → 51.9 µs), Transaction ctl (47.0 µs → 37.6 µs).
+- **The baseline stays with 4.41.1 in 26:** 4.42.0 is within 15% of it in 12 and more than 15%
+  slower in 14: INSERT single 3.80×, UPDATE point 3.57×, DELETE point 3.07×, TRUNCATE 1.41×,
+  SET/SHOW/RESET 1.39×, REFRESH MATVIEW 1.39×, DISTINCT 1.38×, Aggregation 1.35×, CREATE TABLE
+  1.34×, Prepared stmts 1.30×, INSERT multi-row 1.22×, Scalar subquery 1.18×, UPDATE+subquery
+  1.17×, Point lookup 1.15×. The first three are the one-row writes that record history (see
+  below); the rest carry the work every statement now does to be atomic.
 - With two rounds, a 15% line is not settled everywhere: the report names the categories whose
   class depends on which rounds are paired. Best times are compared for that reason.
 
@@ -1264,8 +1263,8 @@ row in 4.41.1 and finds it in 4.42.0; after an `UPDATE` both return the old valu
 
 The release build measures the same over 1 to 64 clients
 (`docs/benchmarks/RELEASE_4_42_0.md`, 4 alternating rounds of 20 s): prepared
-0.74 / 0.59 / 0.65 / 0.68 / 0.62 / 0.47 / 0.45 of 4.41.1 at 1 / 2 / 4 / 8 / 16 / 32 / 64 clients, as
-text 0.62 / 0.54 / 0.58 / 0.65 / 0.59 / 0.50 / 0.46. The table below is the earlier measurement that
+0.74 / 0.58 / 0.64 / 0.67 / 0.63 / 0.50 / 0.48 of 4.41.1 at 1 / 2 / 4 / 8 / 16 / 32 / 64 clients, as
+text 0.61 / 0.53 / 0.58 / 0.64 / 0.59 / 0.50 / 0.45. The table below is the earlier measurement that
 shows what the two performance changes above bought.
 
 `benches/public/wire_pk_ab.sh` with `examples/wire_pk_bench.rs` (a `tokio-postgres` client; no
@@ -1283,8 +1282,8 @@ this release without the two performance changes above. Ops/s:
 | | 64 | 143,561 | 56,022 | 73,759 | 0.51 | 12.3 ms | 4.3 ms |
 
 - **With `[storage] time_travel_enabled = false`** 4.42.0 writes what 4.41.1 wrote. The release
-  build, started with a configuration file holding only that setting, measures 0.90 / 0.96 / 0.95 of
-  4.41.1 prepared and 0.91 / 0.96 / 0.94 as text at 1 / 16 / 64 clients (12,280 / 102,924 / 134,791
+  build, started with a configuration file holding only that setting, measures 0.89 / 0.93 / 0.91 of
+  4.41.1 prepared and 0.94 / 0.94 / 0.93 as text at 1 / 16 / 64 clients (12,360 / 100,117 / 132,689
   ops/s prepared, 2 rounds). A store that does not use `AS OF`, branches from the past or
   `VERSIONS BETWEEN` can run that way.
 - **Not improved in this release:** a prepared primary-key `SELECT` at 16 clients measures 0.92 of

@@ -112,6 +112,11 @@ tables are the mean of the two runs, with each run's ratio beside it.
   toolchain matches, your build should match it byte for byte. A different toolchain gives a
   different binary and slightly different numbers; the ratios between the two releases are what
   should agree.
+- **Source.** The report's header gives each side's commit and the number of uncommitted
+  files in the tree that was built. For the published 4.42.0 run those two files are
+  `.gitignore` and an untracked note, neither of them read by the build: every source file
+  measured has the content it has at commit `4784e773`, and the release tag adds only
+  documentation and CI changes on top of it.
 - **pg35 receipts.** `out/pg35/arms/*/strict-receipt.json` is the harness's own record of each
   run: the binary and source hashes it ran, the PostgreSQL instance it measured, and every
   category's result check. A run whose result disagrees with the oracle produces no number.

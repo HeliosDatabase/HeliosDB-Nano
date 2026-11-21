@@ -133,11 +133,40 @@ Nano is one of four products in the HeliosDB family. SDKs and integrations are c
 
 **Performance:** [what's fast, and where we're still improving](docs/PERFORMANCE.md) — honest strengths + transparent limits.
 
-**Benchmark (wire-to-wire):** [**vs PostgreSQL, 2026-08-28**](docs/benchmarks/heliosdb-nano-vs-postgresql-2026-08-28.md) runs Nano as a TCP server with `pgbench` driving both: Nano leads on indexed point-reads across all three query protocols (1.33×–2.22×) and on `SELECT 1` (1.84×–2.84×); PostgreSQL leads on `COPY` above ~50k rows (1.28× at 100k) and on `DROP TABLE` (2.05×), and **PostgreSQL keeps scaling from 32→64 clients (+32–41%) where Nano plateaus**.
+### Benchmarks against PostgreSQL 18.4 (release 4.42.0, reproducible)
 
-**Benchmark (embedded, `pg35`):** [the 35-category suite, its history & evolution](docs/benchmarks/PG35_BENCHMARK.md) runs Nano *embedded and in-memory* against a *networked, fsyncing* PostgreSQL, so its large margins include deployment effects, not just engine speed. Read the methodology note before quoting those ratios.
+Two benchmarks, answering different questions. Both are measured against PostgreSQL 18.4
+(`fsync=on`, `synchronous_commit=on`) on the same Linux x86_64 host (32 logical CPUs), with the
+binaries identified by SHA-256 and every number taken from the run's own output.
 
-**Release 4.42.0:** [release notes](docs/release-notes/v4.42.0.md) (what changed, what breaks, how to upgrade, FAQ) and the [release benchmark](docs/benchmarks/RELEASE_4_42_0.md) against 4.41.1 and PostgreSQL 18.4, including what got slower, with [how to reproduce it](docs/benchmarks/REPRODUCING.md).
+- **Server against server (`pgbench`, both engines over TCP).** PostgreSQL 18.4 is faster than
+  Nano 4.42.0 in most cells. Nano leads with one client (`SELECT 1` 1.35×, indexed point read as
+  text 1.26×) and on a 10,000-row `COPY` (1.38×). PostgreSQL leads at 8 to 64 clients
+  (`SELECT 1` 1.07–1.26×, indexed point read 1.06–1.35× as text), in the extended and prepared
+  protocols at every client count (1.16–1.93×), on `COPY` of 50,000 and 100,000 rows
+  (1.38×, 1.65×) and on `DROP TABLE` of 100,000 rows (2.47×). Nano ran with its default
+  `durable_commit = false`, so its write cells are not like for like on durability.
+- **`pg35`, 35 kinds of SQL statement.** Nano 4.42.0 is faster in all 35 categories (3.0× for
+  `ORDER BY … LIMIT` to about 1,000× for a one-row `DELETE`). Nano runs *embedded in the test
+  process and in memory*, PostgreSQL as a *server over TCP that syncs every commit*: the margins
+  measure deployment as much as engine speed. Use them to compare Nano releases, not as a
+  server-to-server result.
+- **Against 4.41.1:** 4.42.0 sets a new best time in 9 pg35 categories and is more than 15%
+  slower than 4.41.1's best in 14, most of all in one-row writes (3–3.8×), which now record
+  history so `AS OF` is correct. The release benchmark lists every category and the reason.
+
+| File | What it is |
+|---|---|
+| [`docs/benchmarks/RELEASE_4_42_0.md`](docs/benchmarks/RELEASE_4_42_0.md) | The 4.42.0 release benchmark: pg35, one-row `UPDATE` over the wire, pgbench, against 4.41.1 and PostgreSQL 18.4 |
+| [`docs/benchmarks/results/release-4.42.0/summary.json`](docs/benchmarks/results/release-4.42.0/summary.json) | Every number of that run as JSON, with commits, binary checksums and the PostgreSQL settings |
+| [`docs/benchmarks/REPRODUCING.md`](docs/benchmarks/REPRODUCING.md) | How to rerun it, and how to check you measured the same binaries and reference |
+| [`docs/benchmarks/PG35_BENCHMARK.md`](docs/benchmarks/PG35_BENCHMARK.md) | The pg35 suite: methodology and history |
+| [`tests/pg35_benchmark.rs`](tests/pg35_benchmark.rs), [`tests/pg35_support/`](tests/pg35_support/) | The pg35 harness: the 35 categories and the result checks |
+| [`benches/public/pg35_run.py`](benches/public/pg35_run.py), [`benches/public/release_bench.sh`](benches/public/release_bench.sh) | The runners that build, run and report |
+| [`benches/public/pg35_baseline.json`](benches/public/pg35_baseline.json), [`pg35_baseline.py`](benches/public/pg35_baseline.py) | The best time each category has reached, and the tool that checks a run against it |
+| [`docs/benchmarks/bench-engines.sh`](docs/benchmarks/bench-engines.sh) | The pgbench comparison |
+
+**Release 4.42.0:** [release notes](docs/release-notes/v4.42.0.md) (what changed, what breaks, how to upgrade, FAQ). Older wire measurement: [vs PostgreSQL, 2026-08-28](docs/benchmarks/heliosdb-nano-vs-postgresql-2026-08-28.md) (4.19.0; superseded by the 4.42.0 run above).
 
 ## Start the Server
 

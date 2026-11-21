@@ -11,8 +11,10 @@ take a single figure as gospel.
 ## Where Nano is genuinely strong
 
 Against **PostgreSQL 18.4** on our 35-category `pg35` suite (200 customers / 500
-orders / 1000 items shapes), Nano wins the large majority of categories — most by
-a wide margin, not a hair:
+orders / 1000 items shapes), Nano 4.42.0 is faster in all 35 categories. Nano runs
+embedded in the test process and in memory, PostgreSQL as a server over TCP that syncs
+every commit, so these margins include the deployment, not only the engine. Server
+against server, PostgreSQL is ahead in most cells (see *Known limits* below).
 
 - **Point operations** (PK lookup, INSERT/UPDATE/DELETE by key) — typically
   *orders of magnitude* faster (in-process, no network round-trip, ART index).
@@ -40,27 +42,27 @@ current focus, and we'd rather name them than hide them:
   slower than 4.41.1 was, because every one-row `UPDATE` and `DELETE` now records the
   row's history for `AS OF`. The release benchmark has the numbers and the setting
   that turns it off (`docs/benchmarks/RELEASE_4_42_0.md`).
-- **Prepared / extended-protocol statements** — was the one shape where PostgreSQL led.
-  v4.2.0 removed the session-mutex serialization on parameterized autocommit reads, and
-  measured 2026-08-28 at v4.19.0 Nano is ahead on both (extended 1.33×–1.57×, prepared
-  1.64×–2.39×). It remains Nano's *weakest* read shape, and since most drivers default to
-  the extended protocol, a typical application sees less of the advantage than a
-  `simple`-only benchmark implies.
-
-None of these are regressions — they're the frontier of an already-winning suite.
+- **Prepared / extended-protocol statements** — Nano's weakest read shape. Server against
+  server in the 4.42.0 release run, PostgreSQL is ahead at every client count (see below).
+  Most drivers default to the extended protocol.
 
 ## Known limits — where PostgreSQL is ahead
 
-Measured, not estimated. Sources: `docs/benchmarks/heliosdb-nano-vs-postgresql-2026-08-28.md`
+Measured, not estimated. Source: the pgbench section of
+[`docs/benchmarks/RELEASE_4_42_0.md`](benchmarks/RELEASE_4_42_0.md) (Nano 4.42.0 and
+PostgreSQL 18.4 as servers on the same host, `pgbench` from the `postgres:18.4-bookworm` image),
 and `perf/pagination_depth_curve.json`.
 
-- **Concurrency above ~32 clients.** Nano plateaus across the c=32→64 step (`SELECT 1`
-  −1.8%, indexed simple +0.4%, prepared −3.2%) while PostgreSQL gains **+32% to +41%**.
-  Nano still leads in absolute terms at c=64, but the lead is shrinking, and extrapolating
-  it past c=64 is not supported by any data we have.
-- **Bulk load above ~50k rows.** COPY 100k: 171 ms vs PostgreSQL 134 ms (1.28×). Nano is
-  faster at 10k (50 ms vs 92 ms); the crossover sits between 10k and 50k.
-- **`DROP TABLE` on a large table.** 100k rows: 133 ms vs PostgreSQL 65 ms (2.05×).
+- **Server-to-server reads at 8 clients and more.** `SELECT 1`: PostgreSQL 1.07–1.26× at 8 to
+  64 clients (Nano 1.35× at 1 client). Indexed point read as text: PostgreSQL 1.06–1.35× at 8 to
+  64 clients (Nano 1.26× at 1 client); extended protocol 1.16–1.93× and prepared 1.38–1.87× at
+  every client count.
+- **Concurrency above ~32 clients.** From 32 to 64 clients Nano's indexed point read gains
+  at most 2% in any protocol while PostgreSQL's gains 9–26%.
+- **Bulk load above ~10k rows.** `COPY` of 50,000 rows: 108 ms against PostgreSQL's 78 ms
+  (1.38×); 100,000 rows: 180 ms against 109 ms (1.65×). Nano is faster at 10,000 (55 ms against
+  76 ms).
+- **`DROP TABLE` on a large table.** 100,000 rows: 148 ms against PostgreSQL's 60 ms (2.47×).
 - **Sequential-scan analytics** — filter/aggregate/join/top-k over *unindexed* columns.
   Our own SQLite mirror puts Nano at 0.35×–0.58× on those shapes at 10k rows.
 - **`LIMIT … OFFSET` at depth** — cost is linear in the offset; use keyset pagination.
@@ -68,7 +70,6 @@ and `perf/pagination_depth_curve.json`.
 Note on durability when reading the write-side numbers: Nano defaults to
 `durable_commit = false` while the PostgreSQL side ran `synchronous_commit = on`, so the
 COPY and DROP comparisons are not like-for-like on durability — if anything they flatter Nano.
-Our internal goal is to turn "wins most categories" into "wins them all."
 
 ## Known limits we're transparent about
 

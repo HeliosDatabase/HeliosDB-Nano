@@ -10,13 +10,14 @@ The harness is committed: [`tests/pg35_benchmark.rs`](../../tests/pg35_benchmark
 the per-category history lives in
 [`perf/v358_program/pg35_category_history.json`](../../perf/v358_program/pg35_category_history.json).
 
-> **Read this honestly.** At 300 iterations Nano wins **all 35 categories** — 30
-> of them by enormous margins (10×–35,000×), the four point/aggregate categories,
-> and the five near-parity join/top-k categories (1.1×–5×). The category that
-> used to classify as a PostgreSQL win, **Prepared stmts**, was the one that
-> exposed a *real* `ROLLBACK TO SAVEPOINT` correctness bug (fixed in v3.60.3) —
-> not a measurement artifact. With that fixed it is a decisive Nano win (~157×).
-> See *The category that found a real bug* below.
+> **Read this honestly.** In the 4.42.0 release run Nano is faster than PostgreSQL 18.4 in
+> all 35 categories, from 3.0× (`ORDER BY … LIMIT`) to about 1,000× (a one-row `DELETE`). Nano
+> runs embedded in the test process and in memory; PostgreSQL is a server reached over TCP that
+> syncs every commit. The margins therefore include the network round trip and the commit sync,
+> not only engine speed: use pg35 to compare Nano releases with each other. Server against
+> server (`pgbench`), PostgreSQL 18.4 is ahead of Nano in most cells; see the pgbench section of
+> [`RELEASE_4_42_0.md`](RELEASE_4_42_0.md). The figures further down this page (v3.60.3 and
+> earlier) are history.
 
 ## Current release — v4.42.0 (2026-11-20)
 
