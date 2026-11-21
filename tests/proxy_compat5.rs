@@ -6,7 +6,8 @@
 //! the reason. Remove the `#[ignore]` in the commit that fixes it.
 //!
 //! 1. `SHOW ALL` and `row_security` (on by default, PostgreSQL semantics), with PostgreSQL's
-//!    spelling of the names (`DateStyle`, `TimeZone`; fixed in 4.42.1): runs.
+//!    spelling of the names (`DateStyle`, `TimeZone`) and the command tag `SHOW` (both fixed in
+//!    4.42.1): runs.
 //! 2. A statement that starts with a block comment returns its rows: runs.
 //! 3. The type of an array parameter in `ParameterDescription`: open (`pgwire-rest`).
 //! 4. Session restore: `set_config` and `DISCARD ALL` run; SQL-level `PREPARE` / `EXECUTE`,
@@ -140,6 +141,19 @@ async fn item1_show_all_uses_postgresql_names() {
     }
     for name in ["datestyle", "timezone"] {
         assert!(!names.contains(&name), "SHOW ALL lists {name} in lower case");
+    }
+}
+
+/// The Proxy trusts a `SHOW ALL` reply only when its CommandComplete tag is exactly `SHOW`
+/// (fixed in 4.42.1: 4.42.0 sent `SELECT 56` on the simple protocol).
+#[tokio::test]
+async fn item1_show_command_tag_is_show() {
+    let port = server().await;
+    for sql in ["SHOW ALL", "SHOW TimeZone", "SHOW search_path"] {
+        let tags = tokio::task::spawn_blocking(move || command_tags(port, sql))
+            .await
+            .expect("blocking");
+        assert_eq!(tags, vec!["SHOW".to_string()], "{sql}");
     }
 }
 

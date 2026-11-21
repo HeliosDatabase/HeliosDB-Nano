@@ -14480,6 +14480,48 @@ async fn show_all_follows_set_reset_and_discard_all() {
     }
 }
 
+/// The HeliosProxy contract, continued: the CommandComplete tag of `SHOW ALL`
+/// and `SHOW <name>` is exactly `SHOW`, as PostgreSQL sends, on the simple and
+/// the extended protocol (4.42.0 sent `SELECT n` on the simple protocol).
+#[tokio::test]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+async fn show_command_tag_is_show_on_both_protocols() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+    let statements = [
+        "SHOW ALL",
+        "show all;",
+        "SHOW TimeZone",
+        "SHOW search_path",
+        "SHOW row_security",
+        "SHOW work_mem",
+        "SHOW server_version",
+        "SHOW idle_session_timeout",
+    ];
+    for sql in statements {
+        handler.handle_single_query(sql).await.unwrap();
+        let out = drain(&mut client).await;
+        assert!(error_sqlstate(&out).is_none(), "simple {sql}");
+        assert_eq!(command_tags(&out), vec!["SHOW".to_string()], "simple {sql}");
+    }
+    for (i, sql) in statements.iter().enumerate() {
+        let stmt = format!("s_tag{i}");
+        let portal = format!("p_tag{i}");
+        handler
+            .handle_parse_extended(stmt.clone(), (*sql).to_string(), vec![])
+            .await
+            .unwrap();
+        handler
+            .handle_bind_extended(portal.clone(), stmt, vec![], vec![], vec![])
+            .await
+            .unwrap();
+        handler.handle_execute_extended(portal, 0).await.unwrap();
+        let out = drain(&mut client).await;
+        assert!(error_sqlstate(&out).is_none(), "extended {sql}");
+        assert_eq!(command_tags(&out), vec!["SHOW".to_string()], "extended {sql}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // v01.4 (GitHub #54 part 2): DEALLOCATE reaches protocol-level prepared
 // statements; an unknown statement name is SQLSTATE 26000.

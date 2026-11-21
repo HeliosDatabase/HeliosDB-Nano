@@ -3178,7 +3178,9 @@ where
             let param = trimmed[5..].trim().trim_end_matches(';').trim();
             if param.eq_ignore_ascii_case("all") {
                 let (schema, rows) = self.show_all_result();
-                self.send_query_result(&schema, &rows).await?;
+                // PostgreSQL's tag for SHOW is `SHOW`, not `SELECT n`; a proxy
+                // that reads session state from SHOW ALL checks it.
+                self.send_query_result_tagged(&schema, &rows, "SHOW").await?;
                 self.send_ready_for_query().await?;
                 return Ok(());
             }
@@ -3229,7 +3231,7 @@ where
             let schema = Schema::new(vec![crate::Column::new(&col_name, crate::DataType::Text)]);
             let row = Tuple::new(vec![Value::String(value)]);
             let rows = vec![row];
-            self.send_query_result(&schema, &rows).await?;
+            self.send_query_result_tagged(&schema, &rows, "SHOW").await?;
             self.send_ready_for_query().await?;
             return Ok(());
         } else if starts_with_icase(trimmed, "PRAGMA ") || trimmed.eq_ignore_ascii_case("PRAGMA") {
@@ -3945,16 +3947,18 @@ where
     /// RowDescription and every DataRow, so the advertised type and the
     /// encoded text form of each column come from the same premise (GH#23).
     async fn send_query_result(&mut self, schema: &Schema, rows: &[Tuple]) -> Result<()> {
+        let tag = format!("SELECT {}", rows.len());
+        self.send_query_result_tagged(schema, rows, &tag).await
+    }
+
+    /// [`send_query_result`](Self::send_query_result) with the CommandComplete
+    /// tag given (`SHOW` for SHOW and SHOW ALL, as PostgreSQL sends).
+    async fn send_query_result_tagged(&mut self, schema: &Schema, rows: &[Tuple], tag: &str) -> Result<()> {
         let plan = super::codec::wire_plan(schema, &[]);
         let fields = super::codec::field_descriptions(schema, &plan);
         self.send_message(BackendMessage::RowDescription { fields }).await?;
-
         self.send_data_rows_direct(rows, &plan).await?;
-
-        // Send CommandComplete
-        let tag = format!("SELECT {}", rows.len());
-        self.send_command_complete(&tag).await?;
-
+        self.send_command_complete(tag).await?;
         Ok(())
     }
 
@@ -5008,6 +5012,11 @@ where
             "SAVEPOINT".to_string()
         } else if starts_with_icase(trimmed, "RELEASE ") {
             "RELEASE".to_string()
+        // PostgreSQL tags SHOW and SHOW ALL `SHOW`. A SHOW the extended protocol
+        // runs through the engine fell through to `OK <rows>`. SHOW BRANCHES is
+        // this engine's own statement and keeps its tag.
+        } else if pg_first_word_is(trimmed, "SHOW") && !crate::sql::Parser::is_show_branches(trimmed) {
+            "SHOW".to_string()
         } else {
             format!("OK {}", affected)
         }
