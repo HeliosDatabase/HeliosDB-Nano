@@ -133,17 +133,22 @@ fn fenced_before_insert_recipe_refuses_before_any_trigger_publication() {
             );
             assert_eq!(image(&db), before, "complete durable image must remain unchanged");
 
-            // AFTER bodies are the existing inert surface; this change must
-            // not introduce a function-read requirement for those definitions.
-            execute(
+            // AFTER triggers run their function now (they were inert), so one
+            // that names the unresolved function is refused the same way, and
+            // nothing is registered for it either.
+            let error = execute(
                 &db,
                 params,
                 &format!(
-                    "CREATE TRIGGER still_inert AFTER INSERT ON after_rows FOR EACH ROW EXECUTE FUNCTION {target}()"
+                    "CREATE TRIGGER also_refused AFTER INSERT ON after_rows FOR EACH ROW EXECUTE FUNCTION {target}()"
                 ),
             )
-            .unwrap();
-            assert!(!db.trigger_registry.has_row_mutations("after_rows"));
+            .unwrap_err();
+            assert!(matches!(error, Error::Storage(_)), "{error}");
+            assert!(!db
+                .trigger_registry
+                .trigger_exists("after_rows", "also_refused")
+                .unwrap());
             execute(&db, params, "INSERT INTO after_rows VALUES (9)").unwrap();
             assert_eq!(observed(&db, params, "after_rows"), 9);
             eprintln!("ROUTINE_TRIGGER_FENCE_CELL params={params} tt={history}");
@@ -152,7 +157,7 @@ fn fenced_before_insert_recipe_refuses_before_any_trigger_publication() {
 }
 
 #[test]
-fn ordinary_missing_and_unsupported_recipes_stay_inert_and_healthy_recipe_rewrites() {
+fn a_missing_function_is_refused_and_existing_functions_run() {
     for params in [false, true] {
         for history in [false, true] {
             let dir = tempfile::tempdir().unwrap();
@@ -171,12 +176,23 @@ fn ordinary_missing_and_unsupported_recipes_stay_inert_and_healthy_recipe_rewrit
                 ("unsupported_recipe", unsupported, 7),
                 ("healthy_recipe", healthy, 14),
             ] {
-                execute(&db, params, &format!("CREATE TRIGGER recipe_{table} BEFORE INSERT ON {table} FOR EACH ROW EXECUTE FUNCTION {function}()")).unwrap();
-                assert!(db
-                    .trigger_registry
-                    .trigger_exists(table, &format!("recipe_{table}"))
-                    .unwrap());
-                assert_eq!(db.trigger_registry.has_row_mutations(table), expected == 14);
+                let created = execute(&db, params, &format!("CREATE TRIGGER recipe_{table} BEFORE INSERT ON {table} FOR EACH ROW EXECUTE FUNCTION {function}()"));
+                // Triggers run their function now: one that names a function
+                // that does not exist is refused (it was accepted and inert).
+                let exists = table != "missing_recipe";
+                assert_eq!(created.is_ok(), exists, "{created:?}");
+                assert_eq!(
+                    db.trigger_registry
+                        .trigger_exists(table, &format!("recipe_{table}"))
+                        .unwrap(),
+                    exists
+                );
+                assert_eq!(
+                    db.trigger_registry
+                        .exec_info(table, &format!("recipe_{table}"))
+                        .is_some(),
+                    exists
+                );
                 execute(&db, params, &format!("INSERT INTO {table} VALUES (7)")).unwrap();
                 assert_eq!(observed(&db, params, table), expected);
             }

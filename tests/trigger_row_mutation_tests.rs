@@ -1,47 +1,17 @@
-//! What triggers actually do in HeliosDB Nano — pinned, on BOTH executor families.
+//! Triggers on BOTH executor families: the cases this file has always held.
 //!
-//! READ THIS BEFORE CHANGING ANY ASSERTION.
-//!
-//! TRIGGER BODIES ARE STILL NOT EXECUTED. `Planner::create_trigger_to_plan`
-//! (`src/sql/planner.rs`) hardcodes `let body = vec![]`, so
-//! `TriggerRegistry::execute_triggers`' `for stmt in &trigger_def.body` loop is
-//! structurally unreachable, and the DML call sites pass an `executor_fn` that discards
-//! the `TriggerRowContext`. Nothing in this file changes that. A side-effecting trigger
-//! body (`INSERT INTO audit …`) performs NO side effect, on any interface.
-//!
-//! WHAT DOES HAVE AN EFFECT is one narrow mechanism: a `BEFORE INSERT … FOR EACH ROW
-//! EXECUTE FUNCTION f()` whose function body is top-level `NEW.<col> = <expr>` and/or
-//! `RETURN NULL`. At CREATE TRIGGER time that body is textually resolved into a
-//! `TriggerRowMutation` recipe, and the recipe is applied to the NEW tuple before the row
-//! is written. This suite pins that mechanism, and pins the four things that changed:
-//!
-//!   1. `CREATE TRIGGER` / `DROP TRIGGER` now work over the PARAMS family
-//!      (`execute_params`), i.e. the PostgreSQL extended query protocol used by psycopg
-//!      with bound params / JDBC / sqlx / Drizzle / node-postgres, and by REST. They used
-//!      to be a hard error: `Operator not yet implemented: CreateTrigger { … }`.
-//!   2. The row rewrite now applies identically on BOTH families, so a REST insert and a
-//!      psql insert into the same table finally produce the SAME row — and
-//!      `INSERT … RETURNING` (which always routes through the params family) reflects it.
-//!   3. Triggers now survive a restart: the definition and the compiled recipe are both
-//!      persisted, and the LIVE registry is repopulated at open.
-//!   4. The rewrite now honours the trigger's `WHEN` clause and its `enabled` flag, and
-//!      `DROP TABLE` deregisters the table's triggers.
-//!   5. The rewrite now runs BEFORE the CHECK and UNIQUE gates on BOTH families, as
-//!      PostgreSQL does. The text family used to run it after, so a rewrite into a
-//!      CHECK violation was PERSISTED over psql while being rejected over psycopg.
+//! Until 5.0 this file pinned that trigger bodies did NOT run, with one exception (a
+//! `BEFORE INSERT` row trigger made of `NEW.<col> = <expr>` assignments was turned into a
+//! row rewrite at CREATE TRIGGER). Triggers run their function now, so the cases that
+//! pinned "nothing happens" assert what happens instead (each says what it used to pin),
+//! and the row-rewrite cases are unchanged: the same rows result, now from running the
+//! function. The suites written for the new behaviour are `tests/trigger_row_events.rs`,
+//! `trigger_raise_and_nesting.rs`, `trigger_ddl_lifecycle.rs`, `trigger_write_routes.rs`,
+//! `trigger_dialect_forms.rs` and `trigger_catalog_views.rs`.
 //!
 //! HOW TO MAINTAIN THIS FILE. Every test asserts unconditionally. Never wrap an assertion
 //! in `if result.is_ok()`, and never assert `rows.len() > 0` against `SELECT COUNT(*)` — a
 //! count query returns exactly one row whether the count is 0 or 10,000. Use `rows_in()`.
-//!
-//! IF A "STILL UNIMPLEMENTED" TEST STARTS FAILING BECAUSE ROWS APPEARED IN `trg_audit`:
-//! trigger bodies have been implemented. Do NOT relax the test — rewrite this suite with
-//! real body coverage (per-row firing counts, BEFORE vs AFTER ordering, OLD, statement-level
-//! transition tables, cascade depth, rollback) and update every doc that still says bodies
-//! do not run: `README.md`, `AGENTS.md`, `docs/llms.txt`, `CHANGELOG.md`,
-//! `docs/plans/ROADMAP_V5.md`, `.claude/skills/heliosdb-nano-schema/SKILL.md` (Recipe 5),
-//! `.claude/skills/heliosdb-nano-overview/SKILL.md`, `.claude/skills/_index/verb-map.md`,
-//! and the three `examples/trigger_*.rs` demos.
 
 use heliosdb_nano::{EmbeddedDatabase, Value};
 
@@ -89,7 +59,7 @@ fn create_fn(db: &EmbeddedDatabase, name: &str, body: &str) {
 const REWRITE_BODY: &str = "BEGIN NEW.tag = 'set-by-trigger'; RETURN NEW; END";
 /// The other: drop the row entirely.
 const SKIP_BODY: &str = "BEGIN RETURN NULL; END";
-/// A body with a real side effect. It NEVER runs.
+/// A body with a side effect: an audit row per firing.
 const SIDE_EFFECT_BODY: &str = "BEGIN INSERT INTO trg_audit (note) VALUES ('fired'); RETURN NEW; END";
 
 fn create_trigger_sql(name: &str, clause: &str, func: &str) -> String {
@@ -248,37 +218,42 @@ fn drop_trigger_missing_errors_on_both_families_unless_if_exists() {
 }
 
 #[test]
-fn drop_trigger_without_on_table_still_does_not_parse() {
+fn drop_trigger_without_on_table_finds_the_trigger_by_name() {
+    // Was: a parse error. Triggers run now, and the MySQL / SQLite spelling is taken.
     let db = mem_db();
     create_tables(&db);
-    // The SQLite spelling (`DROP TRIGGER <name>`) omits `ON <table>`; this parser requires it.
+    db.execute("DROP TRIGGER IF EXISTS whatever")
+        .expect("IF EXISTS tolerates a missing trigger, text family");
+    db.execute_params("DROP TRIGGER IF EXISTS whatever", &[])
+        .expect("IF EXISTS tolerates a missing trigger, params family");
     assert!(
-        db.execute("DROP TRIGGER IF EXISTS whatever").is_err(),
-        "DROP TRIGGER without ON <table> must not parse, text family"
+        db.execute("DROP TRIGGER whatever").is_err(),
+        "a missing trigger is an error"
     );
-    assert!(
-        db.execute_params("DROP TRIGGER IF EXISTS whatever", &[]).is_err(),
-        "DROP TRIGGER without ON <table> must not parse, params family"
-    );
+    create_fn(&db, "trg_fn", SIDE_EFFECT_BODY);
+    create_trigger_text(&db, "trg", "AFTER INSERT ON trg_t FOR EACH ROW", "trg_fn").expect("create");
+    db.execute_params("DROP TRIGGER trg", &[]).expect("found by name");
+    assert!(!db.trigger_registry.has_triggers_for_table("trg_t"));
 }
 
 #[test]
-fn sqlite_style_inline_body_still_does_not_parse() {
-    let db = mem_db();
-    create_tables(&db);
-    let sql = "CREATE TRIGGER trg AFTER INSERT ON trg_t FOR EACH ROW
-               BEGIN INSERT INTO trg_audit (note) VALUES ('fired'); END";
-
-    let err = db
-        .execute(sql)
-        .expect_err("SQLite inline body must not parse")
-        .to_string();
-    assert!(err.contains("EXECUTE"), "parser should demand EXECUTE, got: {err}");
-    assert!(db.execute_params(sql, &[]).is_err(), "same on the params family");
-    assert!(
-        !db.trigger_registry.has_triggers_for_table("trg_t"),
-        "nothing registered"
-    );
+fn sqlite_style_inline_body_runs() {
+    // Was: a parse error ("Expected EXECUTE"). Inline bodies run now.
+    for params_family in [false, true] {
+        let db = mem_db();
+        create_tables(&db);
+        let sql = "CREATE TRIGGER trg AFTER INSERT ON trg_t FOR EACH ROW
+                   BEGIN INSERT INTO trg_audit (note) VALUES ('fired'); END";
+        if params_family {
+            db.execute_params(sql, &[]).expect("inline body, params family");
+        } else {
+            db.execute(sql).expect("inline body, text family");
+        }
+        assert!(db.trigger_registry.has_triggers_for_table("trg_t"));
+        db.execute("INSERT INTO trg_t (id, tag) VALUES (1, 'a')")
+            .expect("insert");
+        assert_eq!(rows_in(&db, "trg_audit"), 1);
+    }
 }
 
 #[test]
@@ -692,7 +667,8 @@ fn a_when_clause_evaluating_to_null_does_not_fire() {
 // ===========================================================================
 
 #[test]
-fn a_side_effecting_body_never_runs_on_either_family() {
+fn a_side_effecting_body_runs_on_either_family() {
+    // Was: no audit row (bodies did not run). The function runs once per inserted row now.
     let db = mem_db();
     create_tables(&db);
     create_fn(&db, "trg_fn", SIDE_EFFECT_BODY);
@@ -706,16 +682,21 @@ fn a_side_effecting_body_never_runs_on_either_family() {
     assert_eq!(rows_in(&db, "trg_t"), 2, "the inserts themselves happen");
     assert_eq!(
         rows_in(&db, "trg_audit"),
-        0,
-        "trigger BODIES are not executed — no audit row on either family"
+        2,
+        "one audit row per inserted row, on either family"
     );
 }
 
 #[test]
-fn after_triggers_do_nothing_observable_on_either_family() {
+fn after_triggers_fire_for_insert_update_and_delete_on_either_family() {
+    // Was: no audit row. AFTER row triggers run their function now.
     let db = mem_db();
     create_tables(&db);
-    create_fn(&db, "trg_fn", SIDE_EFFECT_BODY);
+    create_fn(
+        &db,
+        "trg_fn",
+        "BEGIN INSERT INTO trg_audit (note) VALUES (TG_OP); RETURN NULL; END",
+    );
     create_trigger_text(&db, "ai", "AFTER INSERT ON trg_t FOR EACH ROW", "trg_fn").expect("after insert");
     create_trigger_text(&db, "au", "AFTER UPDATE ON trg_t FOR EACH ROW", "trg_fn").expect("after update");
     create_trigger_text(&db, "ad", "AFTER DELETE ON trg_t FOR EACH ROW", "trg_fn").expect("after delete");
@@ -726,27 +707,36 @@ fn after_triggers_do_nothing_observable_on_either_family() {
         .expect("update");
     db.execute("DELETE FROM trg_t WHERE id = 1").expect("delete");
 
-    assert_eq!(rows_in(&db, "trg_audit"), 0, "AFTER trigger bodies never run");
+    assert_eq!(rows_in(&db, "trg_audit"), 3, "one audit row per event");
+    assert_eq!(
+        rows_in(&db, "trg_t"),
+        0,
+        "an AFTER trigger's NULL return changes nothing"
+    );
 }
 
 #[test]
-fn statement_level_triggers_do_nothing() {
+fn statement_level_triggers_fire_once_per_statement() {
+    // Was: no audit row. A statement-level trigger runs once, whatever the row count.
     let db = mem_db();
     create_tables(&db);
-    create_fn(&db, "trg_fn", SIDE_EFFECT_BODY);
+    create_fn(
+        &db,
+        "trg_fn",
+        "BEGIN INSERT INTO trg_audit (note) VALUES ('fired'); RETURN NULL; END",
+    );
     create_trigger_text(&db, "trg", "AFTER INSERT ON trg_t FOR EACH STATEMENT", "trg_fn").expect("create trigger");
 
     db.execute("INSERT INTO trg_t (id, tag) VALUES (1, 'a'), (2, 'b')")
         .expect("insert");
 
     assert_eq!(rows_in(&db, "trg_t"), 2);
-    assert_eq!(rows_in(&db, "trg_audit"), 0, "FOR EACH STATEMENT has no route at all");
+    assert_eq!(rows_in(&db, "trg_audit"), 1);
 }
 
 #[test]
-fn the_rewrite_remains_insert_only_on_both_families() {
-    // A `BEFORE UPDATE` NEW-assignment recipe is registered but never applied: this
-    // increment is PARITY between the families, not an expansion of the mechanism.
+fn a_before_update_trigger_changes_the_row_on_both_families() {
+    // Was: BEFORE UPDATE did nothing. It runs its function now.
     let db = mem_db();
     create_tables(&db);
     db.execute("INSERT INTO trg_t (id, tag) VALUES (1, 'original')")
@@ -763,13 +753,13 @@ fn the_rewrite_remains_insert_only_on_both_families() {
 
     assert_eq!(
         first_text(&db, "SELECT tag FROM trg_t WHERE id = 11"),
-        "original",
-        "BEFORE UPDATE rewrite is not implemented, text family"
+        "set-by-trigger",
+        "text family"
     );
     assert_eq!(
         first_text(&db, "SELECT tag FROM trg_t WHERE id = 12"),
-        "original",
-        "BEFORE UPDATE rewrite is not implemented, params family"
+        "set-by-trigger",
+        "params family"
     );
 }
 
@@ -790,18 +780,14 @@ fn an_update_only_trigger_does_not_fire_on_insert() {
 }
 
 #[test]
-fn pg_trigger_catalog_view_still_does_not_exist() {
+fn pg_trigger_lists_the_trigger() {
+    // Was: no such view. See tests/trigger_catalog_views.rs for the columns.
     let db = mem_db();
     create_tables(&db);
     create_fn(&db, "trg_fn", SIDE_EFFECT_BODY);
     create_trigger_text(&db, "trg", BEFORE_INSERT_ROW, "trg_fn").expect("create trigger");
 
-    // Trigger introspection is still absent: no `pg_trigger`, and
-    // `pg_class.relhastriggers` is hardcoded `false`.
-    assert!(
-        db.query("SELECT * FROM pg_trigger", &[]).is_err(),
-        "pg_trigger is still not implemented"
-    );
+    assert_eq!(db.query("SELECT * FROM pg_trigger", &[]).expect("pg_trigger").len(), 1);
 }
 
 // ===========================================================================
@@ -1052,19 +1038,33 @@ fn a_conditional_assignment_is_not_applied_to_every_row() {
 }
 
 #[test]
-fn a_return_that_is_not_the_last_statement_registers_no_recipe() {
+fn a_return_null_before_other_statements_skips_the_row() {
+    // Was: the row was stored unchanged (no recipe). The function runs now: RETURN NULL
+    // ends it and skips the row, as in PostgreSQL.
     with_trigger_body("BEGIN RETURN NULL; NEW.tag = 'late'; END", |db, insert| {
         insert("INSERT INTO trg_t (id, tag) VALUES (1, 'original')");
-        assert_eq!(first_text(db, "SELECT tag FROM trg_t WHERE id = 1"), "original");
+        assert_eq!(rows_in(db, "trg_t"), 0);
     });
 }
 
 #[test]
-fn return_nullif_is_not_return_null() {
-    with_trigger_body("BEGIN RETURN NULLIF(NEW, NEW); END", |db, insert| {
-        insert("INSERT INTO trg_t (id, tag) VALUES (1, 'original')");
-        assert_eq!(rows_in(db, "trg_t"), 1);
-    });
+fn returning_a_whole_record_expression_is_an_error_not_a_silent_result() {
+    // Was: the row was stored (the body was not run). A trigger function returns NEW, OLD
+    // or NULL; any other whole-record expression fails the statement.
+    for params_family in [false, true] {
+        let db = mem_db();
+        create_tables(&db);
+        create_fn(&db, "body_fn", "BEGIN RETURN NULLIF(NEW, NEW); END");
+        create_trigger_text(&db, "trg", BEFORE_INSERT_ROW, "body_fn").expect("create trigger");
+        let sql = "INSERT INTO trg_t (id, tag) VALUES (1, 'original')";
+        let done = if params_family {
+            db.execute_params(sql, &[])
+        } else {
+            db.execute(sql)
+        };
+        assert!(done.is_err(), "the statement fails");
+        assert_eq!(rows_in(&db, "trg_t"), 0);
+    }
 }
 
 #[test]
@@ -1091,15 +1091,24 @@ fn a_semicolon_inside_a_string_is_part_of_one_assignment() {
 }
 
 #[test]
-fn an_assignment_that_cannot_be_converted_cancels_the_whole_recipe() {
-    // The second assignment is not an expression; the first must not be applied alone.
-    with_trigger_body(
+fn a_function_body_that_does_not_parse_never_stores_a_half_changed_row() {
+    // Was: the trigger was accepted and did nothing. Now CREATE TRIGGER refuses a function
+    // whose body does not parse (or, failing that, the INSERT fails): never a silent row.
+    let db = mem_db();
+    create_tables(&db);
+    create_fn(
+        &db,
+        "body_fn",
         "BEGIN NEW.tag = 'half'; NEW.id = (SELECT; RETURN NEW; END",
-        |db, insert| {
-            insert("INSERT INTO trg_t (id, tag) VALUES (1, 'original')");
-            assert_eq!(first_text(db, "SELECT tag FROM trg_t WHERE id = 1"), "original");
-        },
     );
+    let created = create_trigger_text(&db, "trg", BEFORE_INSERT_ROW, "body_fn");
+    let inserted = db.execute("INSERT INTO trg_t (id, tag) VALUES (1, 'original')");
+    assert!(created.is_err() || inserted.is_err(), "one of the two statements fails");
+    if created.is_ok() {
+        assert_eq!(rows_in(&db, "trg_t"), 0);
+    } else {
+        assert_eq!(first_text(&db, "SELECT tag FROM trg_t WHERE id = 1"), "original");
+    }
 }
 
 #[test]

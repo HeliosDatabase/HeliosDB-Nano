@@ -5804,6 +5804,10 @@ fn single_value_to_pg_text(value: &Value, codec: Option<&super::codec::ColumnCod
 /// `Planner::repair_sqlparser_string` re-decodes exactly this mangling —
 /// but identifiers and `E'…'` literals did not.
 pub(crate) fn pg_split_sql_respecting_quotes(sql: &str) -> Vec<String> {
+    // A CREATE TRIGGER with an inline body (`BEGIN …; …; END`) is one statement.
+    if crate::sql::trigger_syntax::is_inline_trigger(sql) {
+        return vec![sql.trim().to_string()];
+    }
     let mut statements = Vec::new();
     let mut current = String::new();
     let mut in_single_quote = false;
@@ -7170,6 +7174,15 @@ fn message_names_a_column(lower: &str) -> bool {
 /// * `Division by zero` matches no arm here and returns XX000;
 ///   `sqlstate::DIVISION_BY_ZERO` (22012) exists with no caller.
 fn sqlstate_for_query_execution_message(message: &str) -> &'static str {
+    // Trigger errors carry their class in the message: RAISE EXCEPTION (its
+    // own SQLSTATE or P0001), the nesting limit, a refused trigger form or
+    // write route, a function a trigger runs. One emitter module each.
+    if let Some(code) = crate::sql::trigger_exec::sqlstate_for_message(message) {
+        return code;
+    }
+    if message.contains(crate::trigger_runtime::TRIGGER_DEPENDS_MARKER) {
+        return "2BP01";
+    }
     use crate::network::protocol::sqlstate;
 
     if message.contains(crate::error::APPLIED_PUBLICATION_FAILURE_MARKER) {

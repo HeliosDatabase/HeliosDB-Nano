@@ -34,7 +34,7 @@ Every view marked **Populated** below, plus the ten privilege/role views,
 resolves identically on the embedded API, the REPL, the Python binding
 and both wires — they all reach the same registry.
 
-**Eight views do NOT.** `routines`, `parameters`, `triggers`, `domains`,
+**Seven views do NOT.** `routines`, `parameters`, `domains`,
 `character_sets`, `collations`, `view_table_usage` and `view_column_usage`
 are not registered in that registry: they are answered only by the
 PostgreSQL-wire interceptor (`src/protocol/postgres/catalog.rs`), which
@@ -157,11 +157,11 @@ SELECT * FROM information_schema.does_not_exist;
 --         HeliosDB Nano populates catalog_name, tables (base tables AND
 --         views), columns, schemata, views, key_column_usage,
 --         table_constraints, constraint_column_usage,
---         referential_constraints, check_constraints, sequences,
+--         referential_constraints, check_constraints, sequences, triggers,
 --         table_privileges and role_table_grants — the last two report
 --         STORED grants; HeliosDB does NOT enforce SQL privileges.
 --         These resolve but are ALWAYS EMPTY: view_table_usage,
---         view_column_usage, routines, parameters, triggers, domains,
+--         view_column_usage, routines, parameters, domains,
 --         character_sets, collations, column_privileges,
 --         usage_privileges, role_column_grants, role_usage_grants,
 --         role_routine_grants, applicable_roles, enabled_roles,

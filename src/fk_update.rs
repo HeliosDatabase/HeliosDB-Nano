@@ -803,6 +803,17 @@ impl EmbeddedDatabase {
                             }
                             staged_child_write = true;
                             if action == ReferentialAction::Cascade && new.is_none() {
+                                // The child's DELETE row triggers fire for a cascaded delete.
+                                if !self.trigger_fk_child_row(
+                                    txn,
+                                    &fk.table_name,
+                                    &child_schema,
+                                    &fk.columns,
+                                    &current_child,
+                                    None,
+                                )? {
+                                    continue;
+                                }
                                 self.stage_fk_child_delete(
                                     txn,
                                     view.as_ref(),
@@ -872,6 +883,17 @@ impl EmbeddedDatabase {
                                     value;
                             }
                             if current_child.values == updated.values {
+                                continue;
+                            }
+                            // The child's UPDATE row triggers fire for the action's update.
+                            if !self.trigger_fk_child_row(
+                                txn,
+                                &fk.table_name,
+                                &child_schema,
+                                &fk.columns,
+                                &current_child,
+                                Some(&mut updated),
+                            )? {
                                 continue;
                             }
                             Self::check_not_null_for_materialized_insert(&updated.values, &child_schema)?;

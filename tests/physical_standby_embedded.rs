@@ -588,9 +588,11 @@ fn routines_views_and_triggers_from_the_primary_are_usable_without_a_restart() {
         db.trigger_registry.trigger_exists("items", "items_tag").unwrap(),
         "CREATE TRIGGER did not reach the registry"
     );
+    // Triggers run their function now: what follows the definition is the record of the
+    // function it runs (it was the compiled rewrite recipe).
     assert!(
-        db.trigger_registry.has_row_mutations("items"),
-        "the trigger's rewrite recipe did not follow its definition"
+        db.trigger_registry.exec_info("items", "items_tag").is_some(),
+        "the function the trigger runs did not follow its definition"
     );
     let view = "SELECT id FROM small_items ORDER BY id";
     for _ in 0..3 {
@@ -629,8 +631,8 @@ fn routines_views_and_triggers_from_the_primary_are_usable_without_a_restart() {
     );
     assert!(!db.trigger_registry.trigger_exists("items", "items_tag").unwrap());
     assert!(
-        !db.trigger_registry.has_row_mutations("items"),
-        "a dropped trigger's recipe stayed attached"
+        db.trigger_registry.exec_info("items", "items_tag").is_none(),
+        "a dropped trigger's function record stayed attached"
     );
     let redefined = values(db.query(view, &[]).unwrap());
     assert_eq!(redefined, values(standby.primary().query(view, &[]).unwrap()));

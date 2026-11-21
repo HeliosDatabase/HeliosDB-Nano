@@ -329,16 +329,14 @@ automatically after `git clone`; install globally with
   `psql -h 127.0.0.1 -p 5432`, `mysql -h 127.0.0.1 -P 3306`.
 - heliosdb-nano-schema — DDL: tables, constraints, B-tree + HNSW indexes,
   views, materialized views; introspection. `\d`, `\dt`,
-  `\dS`, `\dmv`, `CREATE INDEX … USING hnsw`. Also documents why trigger
-  BODIES still never execute (`CREATE TRIGGER` registers and persists, but
-  no body runs on any route — no audit rows, no cascades; `AFTER`,
-  `FOR EACH STATEMENT`, `INSTEAD OF` and `OLD` do nothing, and there is no
-  trigger introspection). The one exception with a real effect is a
-  `BEFORE INSERT … FOR EACH ROW` body of the form `NEW.<col> = <expr>` /
-  `RETURN NULL`, which rewrites or drops the inserted row; since 4.20.0 it
-  behaves identically on every interface (including the PG extended
-  protocol, REST and `INSERT … RETURNING`), honours `WHEN`, and survives a
-  restart.
+  `\dS`, `\dmv`, `CREATE INDEX … USING hnsw`. Also documents triggers: they
+  run their PL/pgSQL function on every route (row and statement level,
+  `BEFORE` and `AFTER`, `INSERT` / `UPDATE [OF]` / `DELETE` / `TRUNCATE`,
+  `WHEN`, `NEW` / `OLD`, the `TG_` variables, `RAISE`), MySQL and SQLite
+  inline bodies run too, and `information_schema.triggers` and `pg_trigger`
+  list them. `INSTEAD OF`, constraint/deferrable triggers and `REFERENCING`
+  are refused at `CREATE TRIGGER`; a trigger created before 5.0 keeps its
+  old behaviour until it is re-created.
   User-defined SCALAR functions ARE callable: `CREATE FUNCTION dbl(x INT)
   RETURNS INT AS $$ SELECT $1 * 2 $$ LANGUAGE sql` + `SELECT dbl(21)`,
   in a select list / `WHERE` / with a `public.` qualifier / with bound

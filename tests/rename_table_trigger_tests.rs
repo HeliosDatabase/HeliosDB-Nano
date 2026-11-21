@@ -81,14 +81,16 @@ fn persisted_trigger_tables(db: &EmbeddedDatabase) -> Vec<String> {
         .collect()
 }
 
-/// Table names carried by the PERSISTED row-rewrite recipes.
+/// Table names carried by the PERSISTED trigger sidecar records. Since triggers run
+/// their function the sidecar holds the function a trigger runs (it held the compiled
+/// row-rewrite recipe before); it lives under the same key and moves the same way.
 fn persisted_recipe_tables(db: &EmbeddedDatabase) -> Vec<String> {
     db.storage
         .catalog()
-        .load_all_trigger_row_mutations()
-        .expect("load_all_trigger_row_mutations")
+        .load_all_trigger_exec()
+        .expect("load_all_trigger_exec")
         .into_iter()
-        .map(|(table, _trigger, _recipe)| table)
+        .map(|(table, _trigger, _function)| table)
         .collect()
 }
 

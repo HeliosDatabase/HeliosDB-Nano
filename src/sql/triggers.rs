@@ -8,10 +8,11 @@ use super::logical_plan::{
     LogicalExpr, LogicalPlan, TransitionTable, TriggerCharacteristics, TriggerEvent, TriggerFor, TriggerTiming,
     TriggerType,
 };
+use super::trigger_exec::TriggerExecInfo;
 use crate::{Error, Result, Schema, Tuple, Value};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, RwLock};
 
 /// Maximum cascading depth for trigger execution (PostgreSQL compatible)
@@ -368,8 +369,36 @@ pub struct TriggerRegistry {
     /// traffic for the feature. Always written under the `row_mutations` write
     /// guard, so it can never disagree with the map.
     row_mutation_count: Arc<AtomicUsize>,
+    /// What each trigger runs (its function and arguments, or its inline
+    /// body), keyed like `triggers`. A trigger without an entry was created by
+    /// a build that did not record it and never fires.
+    exec_info: Arc<RwLock<HashMap<(String, String), Arc<TriggerExecInfo>>>>,
+    /// `exec_info.len()`, mirrored into an atomic: a database without a
+    /// trigger that runs answers "does this table have one" with one load.
+    exec_count: Arc<AtomicUsize>,
+    /// Bumped after every change to `triggers` or `exec_info`.
+    generation: Arc<AtomicU64>,
+    /// Per table: its triggers that run, in firing order, as of `generation`.
+    firing_cache: Arc<RwLock<FiringCache>>,
     /// Storage key prefix for triggers
     storage_prefix: &'static str,
+}
+
+/// The generation the entries were computed at, and the entries.
+type FiringCache = (u64, HashMap<String, Option<Arc<TableTriggers>>>);
+
+/// One trigger that runs a function.
+#[derive(Debug, Clone)]
+pub struct FiringTrigger {
+    pub definition: TriggerDefinition,
+    pub exec: Arc<TriggerExecInfo>,
+}
+
+/// The enabled triggers of one table that run a function, in firing order
+/// (by name, as PostgreSQL fires triggers of the same kind).
+#[derive(Debug, Clone, Default)]
+pub struct TableTriggers {
+    pub triggers: Vec<FiringTrigger>,
 }
 
 impl TriggerRegistry {
@@ -379,8 +408,118 @@ impl TriggerRegistry {
             triggers: Arc::new(RwLock::new(HashMap::new())),
             row_mutations: Arc::new(RwLock::new(HashMap::new())),
             row_mutation_count: Arc::new(AtomicUsize::new(0)),
+            exec_info: Arc::new(RwLock::new(HashMap::new())),
+            exec_count: Arc::new(AtomicUsize::new(0)),
+            generation: Arc::new(AtomicU64::new(0)),
+            firing_cache: Arc::new(RwLock::new((0, HashMap::new()))),
             storage_prefix: "trigger:",
         }
+    }
+
+    /// Call after any change to the definitions or to what they run.
+    fn changed(&self) {
+        self.generation.fetch_add(1, AtomicOrdering::AcqRel);
+    }
+
+    /// Record what a trigger runs.
+    pub fn register_exec(&self, table_name: &str, trigger_name: &str, info: TriggerExecInfo) {
+        if let Ok(mut guard) = self.exec_info.write() {
+            guard.insert((table_name.to_string(), trigger_name.to_string()), Arc::new(info));
+            self.exec_count.store(guard.len(), AtomicOrdering::Release);
+        }
+        self.changed();
+    }
+
+    /// Forget what a trigger runs (DROP TRIGGER).
+    pub fn drop_exec(&self, table_name: &str, trigger_name: &str) {
+        if let Ok(mut guard) = self.exec_info.write() {
+            guard.remove(&(table_name.to_string(), trigger_name.to_string()));
+            self.exec_count.store(guard.len(), AtomicOrdering::Release);
+        }
+        self.changed();
+    }
+
+    /// What a trigger runs, when that was recorded.
+    pub fn exec_info(&self, table_name: &str, trigger_name: &str) -> Option<Arc<TriggerExecInfo>> {
+        self.exec_info
+            .read()
+            .ok()?
+            .get(&(table_name.to_string(), trigger_name.to_string()))
+            .cloned()
+    }
+
+    /// Every recorded `(table, trigger, what it runs)`.
+    pub fn list_exec(&self) -> Vec<(String, String, Arc<TriggerExecInfo>)> {
+        self.exec_info
+            .read()
+            .map(|guard| {
+                guard
+                    .iter()
+                    .map(|((table, trigger), info)| (table.clone(), trigger.clone(), info.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Does any trigger of this database run a function? One atomic load.
+    #[inline]
+    pub fn has_exec_triggers(&self) -> bool {
+        self.exec_count.load(AtomicOrdering::Acquire) != 0
+    }
+
+    /// The enabled triggers of `table_name` that run a function, in firing
+    /// order; `None` when it has none.
+    ///
+    /// One atomic load for a database without such a trigger; otherwise a
+    /// cached lookup that is recomputed after a trigger of any table changes.
+    pub fn firing_triggers(&self, table_name: &str) -> Option<Arc<TableTriggers>> {
+        if !self.has_exec_triggers() {
+            return None;
+        }
+        let generation = self.generation.load(AtomicOrdering::Acquire);
+        if let Ok(cache) = self.firing_cache.read() {
+            if cache.0 == generation {
+                if let Some(hit) = cache.1.get(table_name) {
+                    return hit.clone();
+                }
+            }
+        }
+        let mut found: Vec<FiringTrigger> = Vec::new();
+        if let (Ok(triggers), Ok(exec)) = (self.triggers.read(), self.exec_info.read()) {
+            for (key, definition) in triggers.iter() {
+                if key.0 == table_name && definition.enabled {
+                    if let Some(info) = exec.get(key) {
+                        found.push(FiringTrigger {
+                            definition: definition.clone(),
+                            exec: info.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        found.sort_by(|a, b| a.definition.name.cmp(&b.definition.name));
+        let entry = (!found.is_empty()).then(|| Arc::new(TableTriggers { triggers: found }));
+        if let Ok(mut cache) = self.firing_cache.write() {
+            if cache.0 != generation {
+                cache.0 = generation;
+                cache.1.clear();
+            }
+            cache.1.insert(table_name.to_string(), entry.clone());
+        }
+        entry
+    }
+
+    /// Replace a registered definition in place (ENABLE/DISABLE, RENAME).
+    pub fn replace_trigger(&self, definition: TriggerDefinition) -> Result<()> {
+        let key = (definition.table_name.clone(), definition.name.clone());
+        let mut triggers = self
+            .triggers
+            .write()
+            .map_err(|e| Error::Generic(format!("Failed to acquire write lock: {}", e)))?;
+        triggers.insert(key, definition);
+        drop(triggers);
+        self.changed();
+        Ok(())
     }
 
     /// Register a BEFORE-row NEW-mutation recipe for a trigger.
@@ -560,6 +699,8 @@ impl TriggerRegistry {
         }
 
         triggers.insert(key, definition);
+        drop(triggers);
+        self.changed();
         Ok(())
     }
 
@@ -581,7 +722,15 @@ impl TriggerRegistry {
             .write()
             .map_err(|e| Error::Generic(format!("Failed to acquire write lock: {}", e)))?;
 
-        Ok(triggers.remove(&key).is_some())
+        let removed = triggers.remove(&key).is_some();
+        drop(triggers);
+        // What the trigger runs goes with its definition.
+        if let Ok(mut exec) = self.exec_info.write() {
+            exec.remove(&key);
+            self.exec_count.store(exec.len(), AtomicOrdering::Release);
+        }
+        self.changed();
+        Ok(removed)
     }
 
     /// Get a specific trigger
@@ -688,12 +837,16 @@ impl TriggerRegistry {
             .write()
             .map_err(|e| Error::Generic(format!("Failed to acquire write lock: {}", e)))?;
 
-        if let Some(trigger) = triggers.get_mut(&key) {
-            trigger.enabled = true;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        let found = match triggers.get_mut(&key) {
+            Some(trigger) => {
+                trigger.enabled = true;
+                true
+            }
+            None => false,
+        };
+        drop(triggers);
+        self.changed();
+        Ok(found)
     }
 
     /// Disable a trigger
@@ -714,12 +867,16 @@ impl TriggerRegistry {
             .write()
             .map_err(|e| Error::Generic(format!("Failed to acquire write lock: {}", e)))?;
 
-        if let Some(trigger) = triggers.get_mut(&key) {
-            trigger.enabled = false;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        let found = match triggers.get_mut(&key) {
+            Some(trigger) => {
+                trigger.enabled = false;
+                true
+            }
+            None => false,
+        };
+        drop(triggers);
+        self.changed();
+        Ok(found)
     }
 
     /// List all triggers in the database
@@ -795,6 +952,11 @@ impl TriggerRegistry {
             mutations.retain(|key, _| key.0 != table_name);
             self.row_mutation_count.store(mutations.len(), AtomicOrdering::Release);
         }
+        if let Ok(mut exec) = self.exec_info.write() {
+            exec.retain(|key, _| key.0 != table_name);
+            self.exec_count.store(exec.len(), AtomicOrdering::Release);
+        }
+        self.changed();
 
         Ok(count)
     }
@@ -838,6 +1000,15 @@ impl TriggerRegistry {
             }
             self.row_mutation_count.store(mutations.len(), AtomicOrdering::Release);
         }
+        if let Ok(mut exec) = self.exec_info.write() {
+            let moving: Vec<(String, String)> = exec.keys().filter(|(table, _)| table == old_table).cloned().collect();
+            for key in moving {
+                if let Some(info) = exec.remove(&key) {
+                    exec.insert((new_table.to_string(), key.1), info);
+                }
+            }
+        }
+        self.changed();
         Ok(count)
     }
 

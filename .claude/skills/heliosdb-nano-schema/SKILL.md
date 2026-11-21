@@ -1,13 +1,13 @@
 ---
 name: heliosdb-nano-schema
-description: Define and inspect schema in HeliosDB-Nano. Covers CREATE/ALTER/DROP TABLE with PK/FK/UNIQUE/CHECK/DEFAULT constraints, regular and HNSW vector indexes, views, materialized views, stored procedures, and introspection through Postgres (`pg_class`, `information_schema`), SQLite (`sqlite_master`, `PRAGMA table_info`), and Nano-specific (`\d`, `\dt`, `\dS`, `\dmv`) surfaces. Also documents why `CREATE TRIGGER` succeeds but trigger bodies never run, what user-defined functions can and cannot do (scalar calls work, under the `$`-sigil rule), and the one rule that makes `CREATE PROCEDURE` + `CALL` actually work — read this before proposing a trigger or a user-defined function. Use this when the user asks "create a table", "add an index", "describe", "what columns does X have", or anything about triggers, functions, or stored procedures.
+description: Define and inspect schema in HeliosDB-Nano. Covers CREATE/ALTER/DROP TABLE with PK/FK/UNIQUE/CHECK/DEFAULT constraints, regular and HNSW vector indexes, views, materialized views, stored procedures, and introspection through Postgres (`pg_class`, `information_schema`), SQLite (`sqlite_master`, `PRAGMA table_info`), and Nano-specific (`\d`, `\dt`, `\dS`, `\dmv`) surfaces. Also documents triggers (they run their function: what works and the limits), what user-defined functions can and cannot do (scalar calls work, under the `$`-sigil rule), and the one rule that makes `CREATE PROCEDURE` + `CALL` actually work — read this before proposing a trigger or a user-defined function. Use this when the user asks "create a table", "add an index", "describe", "what columns does X have", or anything about triggers, functions, or stored procedures.
 allowed-tools: Bash(heliosdb-nano *), Bash(psql *), Read
 ---
 
 # Schema (DDL & Introspection)
 
 ## When to use
-Any DDL operation: `CREATE`, `ALTER`, `DROP` against tables/indexes/views/functions; or asking the database what schema exists. Also read this before answering any trigger, function, or stored-procedure question — triggers are **not implemented** (Recipe 5) and user-defined functions are **callable only in scalar position, and only with `$`-sigil parameters** (Recipe 6). `CREATE TRIGGER` returning `OK` does not mean it works; `CREATE FUNCTION` does work for scalar calls but NOT for `SELECT * FROM f()`, overloading, `CALL f()` or catalog introspection. Stored procedures *do* work, under the same `$`-sigil rule.
+Any DDL operation: `CREATE`, `ALTER`, `DROP` against tables/indexes/views/functions; or asking the database what schema exists. Also read this before answering any trigger, function, or stored-procedure question — triggers run their function (Recipe 5 has the working forms and the limits) and user-defined functions are **callable only in scalar position, and only with `$`-sigil parameters** (Recipe 6). `CREATE FUNCTION` works for scalar calls but NOT for `SELECT * FROM f()`, overloading, `CALL f()` or catalog introspection. Stored procedures *do* work, under the same `$`-sigil rule.
 
 ## Verbs
 
@@ -21,7 +21,7 @@ Any DDL operation: `CREATE`, `ALTER`, `DROP` against tables/indexes/views/functi
 | drop index | SQL | `DROP INDEX [IF EXISTS] idx_t_c` (4.21.0+; MySQL's `DROP INDEX i ON t` also accepted). A PK/UNIQUE/FK backing index is **refused**. Through 4.19.0 the statement was planned as `DROP TABLE` and could destroy a table sharing the index's name; 4.20.0 made it a loud error |
 | create view | SQL | `CREATE VIEW v AS SELECT …` |
 | create materialized view | SQL | `CREATE MATERIALIZED VIEW mv AS SELECT … WITH (auto_refresh = true)` |
-| create trigger | SQL | ⚠️ **registered, persisted, but the BODY never runs** — see "Triggers" below before writing any `CREATE TRIGGER` |
+| create trigger | SQL | runs its function on every route — see Recipe 5 for the forms and the limits |
 | create function | SQL | ✅ scalar calls work — `CREATE FUNCTION f(x INT) RETURNS INT AS $$ SELECT $1 * 2 $$ LANGUAGE sql` + `SELECT f(1)`. The `$` sigil is MANDATORY (a bare `x` is a column ref). No `SELECT * FROM f()`, no overloading, no `pg_proc` row. See Recipe 6 |
 | create procedure | SQL | ✅ works — `CREATE PROCEDURE p(a INT) LANGUAGE sql AS $$…$a…$$` + `CALL p(1)`. Either language (sql or plpgsql); params need the `$` sigil. See Recipe 6 |
 | list tables | REPL / SQL | `\dt` / `SELECT * FROM pg_tables` |
@@ -127,106 +127,106 @@ Inspect with `\dmv` (REPL), `SELECT * FROM pg_matviews` (one row per materialise
 pg_mv_staleness()`. No view projects the `auto_refresh` flag, so the opt-in cannot be read back
 over the wire.
 
-### Recipe 5: Triggers — NOT IMPLEMENTED (read this instead of writing one)
+### Recipe 5: Triggers — they run their function
 
-**Do not propose a trigger as a solution.** `CREATE TRIGGER` is accepted and the
-trigger is registered, but **no trigger body is ever executed**. Nothing fires on
-INSERT/UPDATE/DELETE, and there is no error, no warning, and no log line — an audit
-trigger just silently produces nothing. Use the application layer, an explicit second
-statement in the same transaction, or a `CREATE PROCEDURE` invoked with `CALL`.
-
-Procedures are a real escape hatch — they execute and their arguments bind, in either
-language, on every client path — with one rule: the body must reference parameters with a
-`$` sigil (`$p_id` or `$1`), never a bare name. See Recipe 6 for the working form, and for
-the two things to know before recommending it: through 4.11.0 `CALL` was a **silent no-op**
-over the PostgreSQL extended protocol and the REST layer (fixed), and `CALL` inside an
-explicit `BEGIN` on the embedded API / REPL is refused with an error.
-A user-defined FUNCTION is a *partial* alternative: `SELECT f(x)` works in scalar position
-(under the `$`-sigil rule), but it cannot perform a side effect for you the way a procedure
-body can, and `CALL f()` does not exist. See Recipe 6.
-
-What each form actually does today:
+A trigger fires and runs its function, on every route (embedded `execute` and
+`execute_params`, both PostgreSQL protocols, the MySQL wire, REST, `INSERT … SELECT`,
+`ON CONFLICT`, `RETURNING`, procedures, foreign-key actions on a child table).
 
 ```sql
--- (1) SQLite / MySQL inline body → PARSE ERROR. This grammar does not exist here.
-CREATE TRIGGER posts_audit AFTER UPDATE ON posts FOR EACH ROW
-BEGIN INSERT INTO audit_log (op) VALUES ('update'); END;
--- ERROR: SQL parse error: … Expected: EXECUTE, found: BEGIN
--- (`CREATE TRIGGER IF NOT EXISTS …` is also a parse error — no such clause.)
+CREATE TABLE posts (id SERIAL PRIMARY KEY, title TEXT, status TEXT);
+CREATE TABLE audit_log (seq SERIAL PRIMARY KEY, line TEXT);
 
--- (2) PostgreSQL form → SUCCEEDS, registers, then does nothing whatsoever.
+-- AFTER row trigger: an audit row per changed row. TG_OP tells the events apart.
 CREATE FUNCTION audit_posts() RETURNS TRIGGER AS $$
 BEGIN
-    INSERT INTO audit_log (table_name, op) VALUES ('posts', 'update');
-    RETURN NEW;
-END
-$$ LANGUAGE plpgsql;                                     -- OK
+  IF TG_OP = 'DELETE' THEN
+    INSERT INTO audit_log (line) VALUES ('deleted ' || OLD.id);
+    RETURN OLD;
+  END IF;
+  INSERT INTO audit_log (line) VALUES (lower(TG_OP) || ' ' || NEW.id || ' ' || NEW.title);
+  RETURN NEW;
+END $$ LANGUAGE plpgsql;
+CREATE TRIGGER posts_audit AFTER INSERT OR UPDATE OR DELETE ON posts
+  FOR EACH ROW EXECUTE FUNCTION audit_posts();
 
-CREATE TRIGGER posts_audit AFTER UPDATE ON posts
-FOR EACH ROW EXECUTE FUNCTION audit_posts();             -- OK, registered
-
-UPDATE posts SET title = 'x' WHERE id = 1;               -- OK
-SELECT COUNT(*) FROM audit_log;                          -- 0  ← body never ran
+-- BEFORE row trigger: change the row, refuse it, or skip it.
+CREATE FUNCTION check_post() RETURNS TRIGGER AS $$
+BEGIN
+  IF NEW.title IS NULL THEN RAISE EXCEPTION 'post % needs a title', NEW.id; END IF;
+  IF NEW.status = 'spam' THEN RETURN NULL; END IF;      -- the row is not written
+  NEW.status := coalesce(NEW.status, 'draft');          -- what is stored
+  RETURN NEW;
+END $$ LANGUAGE plpgsql;
+CREATE TRIGGER posts_check BEFORE INSERT OR UPDATE OF title, status ON posts
+  FOR EACH ROW WHEN (NEW.status IS DISTINCT FROM 'archived') EXECUTE FUNCTION check_post();
 ```
 
-This holds for every timing (`BEFORE` / `AFTER` / `INSTEAD OF`), every event, both
-`FOR EACH ROW` and `FOR EACH STATEMENT`, and with or without a `WHEN (…)` clause —
-all of them parse and register, none of them execute. It is true on EVERY interface:
-embedded `execute()`/`execute_params()`, the PostgreSQL simple and extended query
-protocols, the MySQL wire, the REPL and REST.
+What works:
 
-**The one exception that does have an effect.** A `BEFORE INSERT … FOR EACH ROW
-EXECUTE FUNCTION f()` whose function body contains literal `NEW.<col> = <expr>`
-assignments and/or `RETURN NULL` rewrites (or skips) the row being inserted:
+- Row-level `BEFORE` / `AFTER` for `INSERT`, `UPDATE [OF cols]`, `DELETE`; statement-level
+  `BEFORE` / `AFTER` for those and `TRUNCATE`; several events per trigger; `WHEN (…)`;
+  literal arguments (`EXECUTE FUNCTION f('a', 1)` → `TG_ARGV[0]`, `TG_NARGS`). Triggers of
+  one kind fire in name order. `AFTER` row triggers run when all rows of the statement are
+  in place, then the `AFTER` statement triggers.
+- In the function: `NEW.col`, `OLD.col`, `NEW.col := expr` (kept from a `BEFORE` row
+  trigger), `TG_OP`, `TG_NAME`, `TG_WHEN`, `TG_LEVEL`, `TG_TABLE_NAME`, `TG_TABLE_SCHEMA`,
+  `TG_NARGS`, `TG_ARGV[n]`, `IF` / loops / `SELECT … INTO`, and any SQL statement.
+- Return value: `BEFORE` row + `RETURN NULL` skips the row (it is not counted and has no
+  `RETURNING` row); `RETURN NEW` stores `NEW` as the function left it; an `AFTER` trigger's
+  return value is ignored; ending without `RETURN` is an error.
+- `RAISE EXCEPTION 'text %', value` (optionally `RAISE EXCEPTION SQLSTATE '23514' '…'`)
+  fails the statement with `P0001` or that SQLSTATE; nothing of the statement stays,
+  including what the trigger functions wrote. `RAISE NOTICE` / `WARNING` reach a PostgreSQL
+  client as notices.
+- The function's SQL runs in the firing statement's transaction (commits and rolls back
+  with it, also to a savepoint) and fires the triggers of the tables it writes to. A chain
+  deeper than 64 levels is stopped with SQLSTATE `54001`.
+- Managing them: `CREATE OR REPLACE TRIGGER`, `DROP TRIGGER [IF EXISTS] name [ON table]`,
+  `ALTER TABLE t ENABLE | DISABLE TRIGGER name | ALL | USER`,
+  `ALTER TRIGGER name ON t RENAME TO new_name`. `CREATE OR REPLACE FUNCTION` changes what
+  an existing trigger does at once. `DROP FUNCTION` of a function a trigger runs is refused
+  (`2BP01`) unless `CASCADE`. `CREATE TRIGGER` naming a missing function is refused.
+- Durable: definition, function, arguments, `WHEN`, column list and enabled state survive a
+  restart and follow `ALTER TABLE … RENAME` and `DROP TABLE`.
+- Listing: `SELECT * FROM information_schema.triggers` (a row per trigger and event) and
+  `SELECT tgname, tgrelname, tgfname, tgenabled FROM pg_trigger`.
+- MySQL and SQLite forms run on the same machinery:
 
 ```sql
-CREATE FUNCTION force_draft() RETURNS TRIGGER AS $$
-BEGIN NEW.published = FALSE; RETURN NEW; END
-$$ LANGUAGE plpgsql;
-
-CREATE TRIGGER posts_draft BEFORE INSERT ON posts FOR EACH ROW
-EXECUTE FUNCTION force_draft();
--- INSERT INTO posts (id, author_id, title, published) VALUES (1, 1, 'x', TRUE);
---   → the row is stored with published = FALSE
--- A body of `BEGIN RETURN NULL; END` instead makes the INSERT silently store nothing.
+-- MySQL
+CREATE TRIGGER posts_bi BEFORE INSERT ON posts FOR EACH ROW SET NEW.status = 'draft';
+CREATE TRIGGER posts_bu BEFORE UPDATE ON posts FOR EACH ROW BEGIN
+  IF NEW.title = '' THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'empty title'; END IF;
+  INSERT INTO audit_log (line) VALUES (OLD.title);
+END;
+-- SQLite
+CREATE TRIGGER IF NOT EXISTS posts_guard BEFORE DELETE ON posts WHEN OLD.status = 'locked'
+BEGIN SELECT RAISE(ABORT, 'locked posts stay'); END;
+DROP TRIGGER posts_guard;            -- no ON <table> needed
 ```
-This is a text scan of the function body, not execution: **INSERT only** (not
-`BEFORE UPDATE` / `BEFORE DELETE`, which register the recipe but never apply it), no
-`OLD`, and no side effects — an `INSERT`/`UPDATE`/`RAISE` inside the body is ignored.
 
-Since **4.20.0** this exception is uniform and durable:
+Limits to know before proposing one:
 
-- it applies identically on BOTH DML executor families, so a REST / JDBC / sqlx /
-  psycopg-with-bound-params insert and a `psql` simple-query insert into the same table
-  finally produce the SAME row, and `INSERT … RETURNING` (which always routes through the
-  params family) reflects the rewrite. Through 4.19.0 it applied on the text family only.
-- `CREATE TRIGGER` / `DROP TRIGGER` sent over the PostgreSQL **extended** query protocol
-  used to fail outright with `Operator not yet implemented: CreateTrigger { … }`; they now
-  succeed. A migration tool that previously caught that error will now see the statement
-  pass — and create a trigger whose body does not run.
-- the trigger's `WHEN (…)` clause and its enabled flag are honoured (before 4.20.0 the
-  rewrite hit every row regardless of the predicate). `WHEN` false, NULL, or unevaluable
-  all mean "not fired". Multiple recipes on one table fire in trigger-name order.
-- it survives a restart (both the definition and the compiled recipe are persisted).
-  Caveat: a trigger created after the last checkpoint and lost to a crash comes back
-  definition-only, i.e. inert — `DROP TRIGGER` and re-create it.
-
-**`DROP TABLE` deregisters the table's triggers (since 4.20.0).** In-memory
-registrations and the persisted records both go. Before 4.20.0 the registration outlived
-the table, so re-creating the table and its trigger failed with
-`Trigger 'x' already exists on table 't'` and the name stayed burned for the lifetime of
-the process.
-
-**No trigger introspection exists either**: there is no `pg_trigger` view,
-`information_schema.triggers` is always empty by design, psql's `\d` reports
-`relhastriggers = false` (the column does not exist on `pg_class` on any other
-route), and no REPL meta-command lists triggers. There is also no
-`ALTER TABLE … ENABLE/DISABLE TRIGGER` surface, so the enabled flag the rewrite now
-honours is only reachable from the library API.
-
-Registration IS durable since 4.20.0. (Documentation correction: releases through 4.19.0
-claimed a registered trigger "survives exactly one restart". It survived none — WAL replay
-registered it into a registry the SQL executor never reads.)
+- Refused at `CREATE TRIGGER` with `0A000` (never accepted and left idle): `INSTEAD OF`
+  triggers on views, `CONSTRAINT` / `DEFERRABLE` triggers, `REFERENCING` transition tables,
+  a trigger function not written in `plpgsql`, and in inline bodies `DECLARE`, loops, `CASE`
+  statements, `CALL`, `@user` variables, `SET` of anything but `NEW.col`,
+  `RAISE(ROLLBACK | FAIL, …)`, `FOLLOWS` / `PRECEDES`, `CREATE TEMP TRIGGER`.
+- Local variables in a trigger function follow the procedure rule: declare them, read them
+  as `$name` (`SELECT count(*) INTO n FROM t; … VALUES ($n)`). `NEW.col`, `OLD.col` and the
+  `TG_` names are written bare.
+- In a `BEFORE INSERT` trigger a generated key (`SERIAL`) the statement did not supply is
+  still `NULL`; an `AFTER` trigger sees the stored key.
+- A foreign-key action fires the child table's row triggers, not its statement triggers.
+- A table with a trigger does not use the single-row fast paths or the bulk `COPY` path;
+  expect ordinary statement speed on such a table. Tables without a trigger are unaffected.
+- A dump does not carry triggers; it lists each one as not carried. Re-create them after a
+  restore.
+- A trigger created by a build before 5.0 has no function recorded. It keeps its old
+  behaviour exactly (a `BEFORE INSERT` row trigger made only of `NEW.col = …` assignments
+  still rewrites the row; any other trigger does not fire) and the server names it in a
+  warning at open. `CREATE OR REPLACE TRIGGER … EXECUTE FUNCTION …` makes it run.
 
 ### Recipe 6: User-defined functions — scalar calls work, under the `$`-sigil rule
 
@@ -448,7 +448,7 @@ DROP INDEX IF EXISTS idx_posts_status;      -- 4.21.0+; never touches a same-nam
 -- (Through 4.19.0 DROP INDEX was planned as DROP TABLE — `DROP INDEX IF EXISTS posts`
 --  silently dropped the TABLE `posts`. Never issue it against pre-4.20 builds.)
 DROP VIEW IF EXISTS user_stats;
-DROP TRIGGER IF EXISTS posts_audit ON posts;   -- works; `ON <table>` is mandatory
+DROP TRIGGER IF EXISTS posts_audit ON posts;   -- `ON <table>` may be left out when the name is used once
 ```
 
 ## Pitfalls
@@ -458,7 +458,7 @@ DROP TRIGGER IF EXISTS posts_audit ON posts;   -- works; `ON <table>` is mandato
 - **FK violations inside a single transaction** were fixed in v3.22.1 — older versions could see phantom violations during cascading deletes.
 - **`PRAGMA foreign_keys = ON;` is a no-op-with-ack** — Nano enforces FKs by default; the PRAGMA exists only for sqlite3 source compatibility.
 - **HNSW indexes require explicit `dim`** in `WITH (...)`. Mismatched embedding dimensions will fail at insert time, not at index creation.
-- **Trigger BODIES never execute** — row-level *and* statement-level, every timing, every event, every interface. `CREATE TRIGGER` returning `OK` only means it was registered and persisted. The sole exception is the `BEFORE INSERT … FOR EACH ROW` `NEW.<col> = <expr>` / `RETURN NULL` row rewrite. See Recipe 5; never rely on a trigger body for correctness.
+- **Triggers run, with limits** — `INSTEAD OF`, constraint/deferrable triggers and `REFERENCING` are refused at `CREATE TRIGGER`; local variables in a trigger function need the `$name` form; a table with a trigger leaves the fast paths; a trigger created before 5.0 keeps its old behaviour until re-created. See Recipe 5.
 - **User-defined functions are SCALAR-only, and the `$` sigil is mandatory** — `SELECT f(x)` works in a `SELECT` list, a `WHERE` clause and through bound parameters, on the embedded API and both wires, and survives a restart. But `SELECT * FROM f()` fails as a missing table, `CALL f()` fails (`Procedure 'f' does not exist`), there is no `PERFORM`, no overloading, no non-`public` qualifier, and `pg_proc` / `information_schema.routines` stay empty. A body that writes `x` instead of `$1` fails with a column error. PL/pgSQL `IF`/loops/`:=` inside a FUNCTION body are refused with an explicit error. See Recipe 6.
 - **Procedures work in either language, but the `$` sigil is mandatory** — a *bare* parameter name fails with `Column 'n' not found in schema` in both `LANGUAGE sql` and `LANGUAGE plpgsql`, deliberately, so a variable can never shadow a column. (plpgsql binding is new; through 4.10.2 a plpgsql body substituted nothing at all.) An argument a body never mentions is silently discarded, and a `$`-token inside a string literal, comment or `$tag$…$tag$` block is data, not a placeholder. `CALL` now runs the body on every client path and reports 0 rows affected — through 4.11.0 it was a silent no-op (returning 1 row affected, and "succeeding" for a missing procedure) over the PG extended protocol and the REST layer. On the embedded API / REPL only, `CALL` inside an explicit `BEGIN` is refused with an error. See Recipe 6.
 - **`information_schema.routines`, `information_schema.parameters` and `pg_proc` never report a user-defined routine** — so no ORM or catalog client can discover one. `pg_proc` is registered everywhere and returns zero rows. `routines` and `parameters` return zero rows over the PostgreSQL and MySQL wires, but on the embedded API / REPL / Python binding they are *unknown relations* and raise an error — they are not registered in the phase-3 view registry.

@@ -162,6 +162,17 @@ impl FunctionRegistry {
             .store(statement_timeout_ms.unwrap_or(0), Ordering::Relaxed);
     }
 
+    /// `(max loop iterations, statement timeout in ms)` as a routine body
+    /// gets them (see [`Self::set_procedural_limits`]).
+    pub(crate) fn procedural_limits(&self) -> (u64, Option<u64>) {
+        use std::sync::atomic::Ordering;
+        let timeout = self.default_statement_timeout_ms.load(Ordering::Relaxed);
+        (
+            self.max_loop_iterations.load(Ordering::Relaxed),
+            (timeout > 0).then_some(timeout),
+        )
+    }
+
     fn apply_procedural_limits(&self, ctx: &mut ExecutionContext<'_>) {
         use std::sync::atomic::Ordering;
         ctx.max_loop_iterations = self.max_loop_iterations.load(Ordering::Relaxed);

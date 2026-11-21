@@ -939,6 +939,10 @@ fn decode_binary_param(payload: &mut Bytes, mysql_type: u8, unsigned: bool) -> R
 /// (`pg_split_sql_respecting_quotes`) already tracked both regions; only this
 /// one did not.
 fn split_sql_respecting_quotes(sql: &str) -> Vec<String> {
+    // A CREATE TRIGGER with an inline body (`BEGIN …; …; END`) is one statement.
+    if crate::sql::trigger_syntax::is_inline_trigger(sql) {
+        return vec![sql.trim().to_string()];
+    }
     let mut statements = Vec::new();
     let mut current = String::new();
     let mut in_single_quote = false;
@@ -4188,6 +4192,11 @@ fn value_to_mysql_string(v: &Value) -> String {
 
 /// Map an error message to the appropriate MySQL error code and SQL state.
 fn map_error_code(err_msg: &str) -> (u16, &'static str) {
+    // A trigger's SIGNAL / RAISE (ER_SIGNAL_EXCEPTION with its SQLSTATE), and
+    // the trigger forms and write routes that are refused.
+    if let Some(state) = crate::sql::trigger_exec::sqlstate_for_message(err_msg) {
+        return (if state == "0A000" { 1235 } else { 1644 }, state);
+    }
     if err_msg.contains(crate::error::APPLIED_PUBLICATION_FAILURE_MARKER) {
         return (1105, "HY000"); // applied rows: system error, before nested causes
     }

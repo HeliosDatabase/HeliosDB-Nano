@@ -230,7 +230,11 @@ impl Parser {
         // SQLite-compat preprocessing: ?-placeholders, INSERT OR REPLACE/IGNORE,
         // INTEGER PRIMARY KEY AUTOINCREMENT, DATETIME('now'). Runs before any
         // other rewrite so downstream stages see canonical PostgreSQL syntax.
-        let sql_compat = crate::sql::sqlite_compat::translate(&sql_no_comments)?;
+        // Trigger statements the grammar cannot take as written (literal
+        // EXECUTE FUNCTION arguments, inline bodies, ALTER TRIGGER): see
+        // `trigger_syntax`. First, so no later rewrite reads a trigger body.
+        let sql_triggers = crate::sql::trigger_syntax::preprocess(&sql_no_comments)?;
+        let sql_compat = crate::sql::sqlite_compat::translate(&sql_triggers)?;
 
         // HC4: `CREATE/ALTER/DROP USER` → `CREATE/ALTER/DROP ROLE`. sqlparser
         // 0.53 has no USER grammar in its CREATE/ALTER/DROP dispatch at all, so

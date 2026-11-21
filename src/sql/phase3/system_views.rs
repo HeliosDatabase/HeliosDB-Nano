@@ -2601,6 +2601,21 @@ impl SystemViewRegistry {
 
         // pg_views — the PG-native view catalogue. Same 4-column shape the
         // deleted wire stub advertised, now with rows.
+        // The trigger catalogs: real rows, from the stored definitions.
+        self.register_view(SystemViewSchema {
+            name: "information_schema.triggers".to_string(),
+            schema: Schema {
+                columns: crate::sql::trigger_views::information_schema_triggers_columns(),
+            },
+            description: "SQL-standard trigger catalogue: one row per trigger and event".to_string(),
+        });
+        self.register_view(SystemViewSchema {
+            name: "pg_trigger".to_string(),
+            schema: Schema {
+                columns: crate::sql::trigger_views::pg_trigger_columns(),
+            },
+            description: "PG-compat trigger catalogue: one row per trigger".to_string(),
+        });
         self.register_view(SystemViewSchema {
             name: "pg_views".to_string(),
             schema: Schema {
@@ -4262,6 +4277,10 @@ impl SystemViewRegistry {
             "information_schema.catalog_name" => Self::execute_information_schema_catalog_name(),
             "information_schema.views" => Self::execute_information_schema_views(storage),
             "information_schema.check_constraints" => Self::execute_information_schema_check_constraints(storage),
+            "information_schema.triggers" => {
+                crate::sql::trigger_views::information_schema_triggers_rows(&storage.catalog())
+            }
+            "pg_trigger" => crate::sql::trigger_views::pg_trigger_rows(&storage.catalog()),
             "pg_views" => Self::execute_pg_views(storage),
             "pg_indexes" => Self::execute_pg_indexes(storage),
             "information_schema.sequences" => Self::execute_information_schema_sequences(storage),

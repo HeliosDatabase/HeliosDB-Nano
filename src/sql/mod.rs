@@ -33,6 +33,9 @@ pub mod sqlite_compat;
 pub mod system_tables;
 pub mod system_views;
 pub mod temp_tables; // sprinter 1703dba8e82d: session-private CREATE TEMPORARY TABLE
+pub mod trigger_exec; // what a trigger runs, and the trigger function's world
+pub mod trigger_syntax;
+pub mod trigger_views; // rows of information_schema.triggers and pg_trigger // trigger statements the grammar cannot take as written
 pub mod triggers;
 pub mod type_inference; // Named-counter store for CREATE SEQUENCE / nextval / currval / setval
                         // Process-scoped handle that lets the session-less evaluator invoke a

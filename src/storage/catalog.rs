@@ -377,6 +377,14 @@ const ACL_FORMAT_VERSION: u8 = 1;
 /// turns that into a loud, skippable "not in a recognised format".
 const TRIGGER_ROWMUT_MAGIC: &[u8; 4] = b"HTRM";
 const TRIGGER_ROWMUT_FORMAT_VERSION: u8 = 1;
+/// A trigger's sidecar key (`trigger_rowmut:{table}:{trigger}`) holds ONE of
+/// two records, told apart by their magic: the rewrite recipe of a trigger
+/// created by an older build (`HTRM`), or what the trigger runs — its
+/// function and arguments, or its inline body (`HTRX`). Sharing the key
+/// means every place that already carries the sidecar (rename, drop,
+/// physical standby, physical snapshot) carries both.
+const TRIGGER_EXEC_MAGIC: &[u8; 4] = b"HTRX";
+const TRIGGER_EXEC_FORMAT_VERSION: u8 = 1;
 
 /// PostgreSQL's `FirstNormalObjectId`. The first OID handed to a
 /// user-created role; everything below it is reserved for built-ins.
@@ -629,6 +637,9 @@ impl<'a> Catalog<'a> {
                     .ok_or_else(|| {
                         Error::storage(format!("physical snapshot trigger_rowmut:{suffix}: malformed key"))
                     })?;
+                if bytes.starts_with(TRIGGER_EXEC_MAGIC) {
+                    return Ok(None);
+                }
                 let mutation = Self::decode_tagged::<crate::sql::triggers::TriggerRowMutation>(
                     TRIGGER_ROWMUT_MAGIC,
                     TRIGGER_ROWMUT_FORMAT_VERSION,
@@ -636,8 +647,9 @@ impl<'a> Catalog<'a> {
                     "trigger row mutation",
                 )
                 .map_err(|e| Error::storage(format!("physical snapshot trigger_rowmut:{suffix}: {e}")))?;
-                Ok((table.to_string(), name.to_string(), mutation))
+                Ok(Some((table.to_string(), name.to_string(), mutation)))
             })
+            .filter_map(Result::transpose)
             .collect()
     }
 
@@ -8257,6 +8269,7 @@ impl<'a> Catalog<'a> {
     ) -> Result<Option<crate::sql::triggers::TriggerRowMutation>> {
         let key = Self::trigger_row_mutation_key(table_name, trigger_name);
         match self.storage.get(&key)? {
+            Some(value) if value.starts_with(TRIGGER_EXEC_MAGIC) => Ok(None),
             Some(value) => Self::decode_tagged(
                 TRIGGER_ROWMUT_MAGIC,
                 TRIGGER_ROWMUT_FORMAT_VERSION,
@@ -8287,6 +8300,9 @@ impl<'a> Catalog<'a> {
                 );
                 continue;
             };
+            if value.starts_with(TRIGGER_EXEC_MAGIC) {
+                continue;
+            }
             match Self::decode_tagged::<crate::sql::triggers::TriggerRowMutation>(
                 TRIGGER_ROWMUT_MAGIC,
                 TRIGGER_ROWMUT_FORMAT_VERSION,
@@ -8296,6 +8312,73 @@ impl<'a> Catalog<'a> {
                 Ok(mutation) => out.push((table_name.to_string(), trigger_name.to_string(), mutation)),
                 Err(e) => tracing::warn!(
                     "persisted trigger row mutation 'trigger_rowmut:{}' is unreadable and was skipped: {}",
+                    suffix,
+                    e
+                ),
+            }
+        }
+        Ok(out)
+    }
+
+    // === What a trigger runs (`TriggerExecInfo`) ===
+
+    /// Stage the record of what a trigger runs into the statement's batch
+    /// (the same write group as its definition).
+    pub(crate) fn stage_trigger_exec(
+        table_name: &str,
+        trigger_name: &str,
+        info: &crate::sql::trigger_exec::TriggerExecInfo,
+        ddl: &mut super::DdlBatch<'_>,
+    ) -> Result<()> {
+        let value = Self::encode_tagged(
+            TRIGGER_EXEC_MAGIC,
+            TRIGGER_EXEC_FORMAT_VERSION,
+            info,
+            "trigger function reference",
+        )?;
+        ddl.put(Self::trigger_row_mutation_key(table_name, trigger_name), &value)
+    }
+
+    /// What one trigger runs, when that was recorded.
+    pub fn load_trigger_exec(
+        &self,
+        table_name: &str,
+        trigger_name: &str,
+    ) -> Result<Option<crate::sql::trigger_exec::TriggerExecInfo>> {
+        let key = Self::trigger_row_mutation_key(table_name, trigger_name);
+        match self.storage.get(&key)? {
+            Some(value) if value.starts_with(TRIGGER_EXEC_MAGIC) => Self::decode_tagged(
+                TRIGGER_EXEC_MAGIC,
+                TRIGGER_EXEC_FORMAT_VERSION,
+                &value,
+                "trigger function reference",
+            )
+            .map(Some),
+            _ => Ok(None),
+        }
+    }
+
+    /// Every recorded `(table, trigger, what it runs)`. An unreadable record is
+    /// warned about and skipped: its trigger then does not fire and is listed
+    /// with the triggers that need re-creating.
+    pub fn load_all_trigger_exec(&self) -> Result<Vec<(String, String, crate::sql::trigger_exec::TriggerExecInfo)>> {
+        let mut out = Vec::new();
+        for (suffix, value) in self.storage.meta_blobs_with_prefix("trigger_rowmut:")? {
+            if !value.starts_with(TRIGGER_EXEC_MAGIC) {
+                continue;
+            }
+            let Some((table_name, trigger_name)) = suffix.rsplit_once(':') else {
+                continue;
+            };
+            match Self::decode_tagged::<crate::sql::trigger_exec::TriggerExecInfo>(
+                TRIGGER_EXEC_MAGIC,
+                TRIGGER_EXEC_FORMAT_VERSION,
+                &value,
+                "trigger function reference",
+            ) {
+                Ok(info) => out.push((table_name.to_string(), trigger_name.to_string(), info)),
+                Err(e) => tracing::warn!(
+                    "the record of what trigger '{}' runs is unreadable and was skipped: {}",
                     suffix,
                     e
                 ),

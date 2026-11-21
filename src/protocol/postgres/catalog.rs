@@ -263,6 +263,7 @@ impl PgCatalog {
                 || query_lower.contains("information_schema.applicable_roles")
                 || query_lower.contains("information_schema.enabled_roles")
                 || query_lower.contains("information_schema.administrable_role_authorizations")
+                || query_lower.contains("information_schema.triggers")
             {
                 return Ok(None);
             } else if query_lower.contains("information_schema.routines") {
@@ -282,11 +283,11 @@ impl PgCatalog {
                          HeliosDB Nano populates catalog_name, tables (base tables AND \
                          views), columns, schemata, views, key_column_usage, \
                          table_constraints, constraint_column_usage, \
-                         referential_constraints, check_constraints, sequences, \
+                         referential_constraints, check_constraints, sequences, triggers, \
                          table_privileges and role_table_grants — the last two report \
                          STORED grants; HeliosDB does NOT enforce SQL privileges. \
                          These resolve but are ALWAYS EMPTY: view_table_usage, \
-                         view_column_usage, routines, parameters, triggers, domains, \
+                         view_column_usage, routines, parameters, domains, \
                          character_sets, collations, column_privileges, \
                          usage_privileges, role_column_grants, role_usage_grants, \
                          role_routine_grants, applicable_roles, enabled_roles, \
@@ -2153,18 +2154,6 @@ impl PgCatalog {
     /// reply rather than an error.
     fn known_empty_information_schema_view(name: &str) -> Option<(Schema, Vec<Tuple>)> {
         let cols: &[(&str, DataType)] = match name {
-            "triggers" => &[
-                ("trigger_catalog", DataType::Text),
-                ("trigger_schema", DataType::Text),
-                ("trigger_name", DataType::Text),
-                ("event_manipulation", DataType::Text),
-                ("event_object_catalog", DataType::Text),
-                ("event_object_schema", DataType::Text),
-                ("event_object_table", DataType::Text),
-                ("action_statement", DataType::Text),
-                ("action_orientation", DataType::Text),
-                ("action_timing", DataType::Text),
-            ],
             "parameters" => &[
                 ("specific_catalog", DataType::Text),
                 ("specific_schema", DataType::Text),

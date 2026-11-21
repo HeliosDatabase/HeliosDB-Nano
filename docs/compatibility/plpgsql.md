@@ -230,7 +230,9 @@ are executed through a fresh autocommit path, so under a wire `BEGIN` (or the em
 `ROLLBACK` of the enclosing transaction. This is long-standing behaviour, not new; it is tracked
 in `docs/plans/ROADMAP_V5.md` §2.11.
 
-Within that rule a procedure is a legitimate replacement for a trigger. It is **not** a
+Triggers run their function (see the schema skill's trigger recipe and `README.md`): a trigger
+function is PL/pgSQL with `NEW`, `OLD` and the `TG_` variables written bare and local variables
+in the `$name` form used here. A procedure is still the tool for work a client starts. It is **not** a
 replacement for a callable function — the body is a SQL statement to run, not an expression to
 evaluate, and `CALL` returns no value.
 
