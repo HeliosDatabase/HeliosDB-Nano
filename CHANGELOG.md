@@ -7,8 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [4.42.1] - 2026-11-21
 
-A compatibility fix. Data directories, standbys and configuration from 4.42.0 work
-unchanged; there is no upgrade step.
+Two PostgreSQL wire compatibility fixes for clients that read session state from
+`SHOW ALL`. Data directories, standbys and configuration from 4.42.0 work unchanged;
+there is no upgrade step.
 
 ### Fixed
 
@@ -20,6 +21,10 @@ unchanged; there is no upgrade step.
   are still case-insensitive everywhere else: `SET`, `SHOW timezone`, `SHOW TimeZone`
   and `current_setting('TimeZone')` behave as before. Every other name in the list is
   lower case, as in PostgreSQL.
+- **`SHOW` and `SHOW ALL` complete with the command tag `SHOW`**, as PostgreSQL sends.
+  4.42.0 sent `SELECT <rows>` on the simple-query protocol, and `OK 1` for a `SHOW
+  <name>` that the extended protocol ran through the engine. A client that checks the
+  tag before trusting the reply refused it.
 
 ### Changed
 
