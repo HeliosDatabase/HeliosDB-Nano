@@ -155,7 +155,9 @@ heliosdb-nano start --data-dir ./mydata \
 
 # Same-host / embedded mode — Unix sockets (no TCP)
 # (PostgreSQL UDS authenticates with the same credential; MySQL is trust-only,
-#  so --mysql / --mysql-socket are refused while a PostgreSQL credential is set)
+#  so --mysql / --mysql-socket are refused while a PostgreSQL credential is set.
+#  Both sockets are mode 0770 — the server's user and group; --pg-socket-mode /
+#  --mysql-socket-mode 0777 open them to every local user)
 heliosdb-nano start --memory \
   --pg-socket-dir /tmp \
   --mysql --mysql-socket /tmp/heliosdb-mysql.sock
@@ -661,6 +663,15 @@ on MySQL. Therefore:
   the same `Arc<AuthManager>` as the TCP listener, so missing / wrong / unknown-user
   credentials fail there exactly as they do on `127.0.0.1:5432`. With `--auth trust`
   it remains credential-free, as before.
+* Both sockets are created with mode **0770** (the server's user and group), not 0777;
+  `--pg-socket-mode` / `--mysql-socket-mode` (`[server] pg_socket_mode`,
+  `mysql_socket_mode`) change it.
+* Server control (`SWITCHOVER`, `pg_promote()`, `SET NODE ALIAS`) needs an
+  **administrator's session**: the server's admin socket (`<data-dir>/.s.hdb.admin`,
+  mode 0600, the server's own user as role `postgres` without a password), or TLS as a
+  superuser role that logged in with a password. Plain TCP, `trust`, the sockets above,
+  HTTP and MCP are refused with SQLSTATE 42501. See
+  [the admin socket and who may administer](docs/guides/authentication.md#the-admin-socket-and-who-may-administer).
 
 ## ORM & Driver Compatibility
 

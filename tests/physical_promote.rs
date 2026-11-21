@@ -576,7 +576,9 @@ async fn a_graceful_promotion_fences_the_primary_and_every_node_left_behind_reco
     assert_eq!(store_epoch(&c.s2_data), 1);
     // Spec P5.2 §2: `pg_promote` on a primary — the new one — is refused:
     // 55000, "this node is already the primary (epoch 2)".
-    let refused = s.simple_query("SELECT pg_promote(true, 5)").await.unwrap_err();
+    // Asked on the admin socket: promoting a node is an administrator's act.
+    let admin = connect_admin(&c.s_data).await;
+    let refused = admin.simple_query("SELECT pg_promote(true, 5)").await.unwrap_err();
     assert_eq!(sqlstate(&refused), "55000", "{refused}");
     assert!(
         message(&refused).contains("this node is already the primary (epoch 2)"),

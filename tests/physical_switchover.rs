@@ -377,7 +377,7 @@ impl Switchable {
 async fn switchover_check_answers_one_row_per_check_and_changes_nothing() {
     let pair = Switchable::new();
     let (primary, standby, target) = pair.start(20).await;
-    let p = connect(pair.pair.pg_p).await;
+    let p = connect_admin(&pair.p_data).await;
 
     let rows = check_rows(&p, &format!("SWITCHOVER CHECK TO '{target}'")).await;
     assert_check_rows(&rows);
@@ -419,29 +419,34 @@ async fn switchover_check_answers_one_row_per_check_and_changes_nothing() {
         unknown[8].2.contains(&target) && unknown[8].2.contains("recover --from-primary"),
         "{unknown:?}"
     );
-    // Review item 5: a role that is no superuser is refused, both forms.
-    let (analyst, analyst_connection) = tokio_postgres::connect(
-        &format!(
-            "host=127.0.0.1 port={} user=analyst dbname=postgres connect_timeout=5",
-            pair.pair.pg_p
-        ),
-        tokio_postgres::NoTls,
-    )
-    .await
-    .unwrap();
-    tokio::spawn(analyst_connection);
-    for sql in [
-        format!("SWITCHOVER CHECK TO '{target}'"),
-        format!("SWITCHOVER TO '{target}'"),
-    ] {
-        let refused = analyst.simple_query(&sql).await.unwrap_err();
-        assert_eq!(sqlstate(&refused), "42501", "{sql}: {refused}");
-        assert!(
-            message(&refused).contains("role \"analyst\" is not a superuser")
-                && message(&refused).contains("authenticates with trust"),
-            "{}",
-            message(&refused)
-        );
+    // A session that is not an administrator's is refused, both forms: on
+    // plain TCP under trust a role is only the name its client sent, the
+    // built-in superuser's included. (The rule itself: tests/admin_socket.rs.)
+    for user in ["analyst", "postgres"] {
+        let (session, connection) = tokio_postgres::connect(
+            &format!(
+                "host=127.0.0.1 port={} user={user} dbname=postgres connect_timeout=5",
+                pair.pair.pg_p
+            ),
+            tokio_postgres::NoTls,
+        )
+        .await
+        .unwrap();
+        tokio::spawn(connection);
+        for sql in [
+            format!("SWITCHOVER CHECK TO '{target}'"),
+            format!("SWITCHOVER TO '{target}'"),
+        ] {
+            let refused = session.simple_query(&sql).await.unwrap_err();
+            assert_eq!(sqlstate(&refused), "42501", "{user}: {sql}: {refused}");
+            assert!(
+                message(&refused).contains("permission denied to run SWITCHOVER")
+                    && message(&refused).contains("TCP connection without TLS")
+                    && message(&refused).contains("admin socket"),
+                "{user}: {}",
+                message(&refused)
+            );
+        }
     }
 
     // Nothing changed, on either node.
@@ -504,7 +509,7 @@ async fn a_switchover_swaps_the_roles_with_every_acknowledged_write_and_a_second
     tokio::time::sleep(Duration::from_millis(400)).await;
 
     let started = Instant::now();
-    let (caller, caller_connection) = connect_watched(pg_p).await;
+    let (caller, caller_connection) = connect_admin_watched(&pair.p_data).await;
     let answered = caller
         .simple_query(&format!("SWITCHOVER TO '{target}'"))
         .await
@@ -612,7 +617,7 @@ async fn a_switchover_swaps_the_roles_with_every_acknowledged_write_and_a_second
 
     // The switchover back restores the original roles, at epoch 3.
     let target_p = streaming_standby(http_s, &standby).await;
-    let (back, back_connection) = connect_watched(pg_s).await;
+    let (back, back_connection) = connect_admin_watched(&pair.s_data).await;
     let answered = back
         .simple_query(&format!("SWITCHOVER TO '{target_p}'"))
         .await
@@ -670,7 +675,7 @@ async fn a_switchover_swaps_the_roles_with_every_acknowledged_write_and_a_second
 async fn a_lagging_or_disconnected_target_is_refused_with_nothing_changed() {
     let pair = Switchable::new();
     let (primary, mut standby, target) = pair.start(10).await;
-    let p = connect(pair.pair.pg_p).await;
+    let p = connect_admin(&pair.p_data).await;
     let unchanged = |what: &'static str| {
         let data = pair.p_data.clone();
         async move {
@@ -743,7 +748,7 @@ async fn a_target_killed_after_it_fenced_the_primary_leaves_it_fenced_naming_wha
             vec![(RECEIVER_HOLD_DIR_ENV, text(&hold))],
         )
         .await;
-    let (caller, caller_connection) = connect_watched(pair.pair.pg_p).await;
+    let (caller, caller_connection) = connect_admin_watched(&pair.p_data).await;
     let sql = format!("SWITCHOVER TO '{target}'");
     let switching = tokio::spawn(async move {
         let outcome = caller.simple_query(&sql).await;
@@ -813,7 +818,7 @@ async fn a_target_whose_answer_is_lost_after_it_took_the_request_still_completes
             vec![(PROMOTE_ANSWER_DELAY_ENV, "12".to_string())],
         )
         .await;
-    let caller = connect(pair.pair.pg_p).await;
+    let caller = connect_admin(&pair.p_data).await;
     let answered = caller
         .simple_query(&format!("SWITCHOVER TO '{target}'"))
         .await
@@ -878,7 +883,7 @@ impl Drop for StopDaemon {
 async fn a_daemon_restart_after_a_switchover_forwards_the_recorded_role_to_its_child() {
     let pair = Switchable::new();
     let (mut primary, standby, target) = pair.start(10).await;
-    let caller = connect(pair.pair.pg_p).await;
+    let caller = connect_admin(&pair.p_data).await;
     caller
         .simple_query(&format!("SWITCHOVER TO '{target}'"))
         .await
@@ -955,7 +960,7 @@ async fn a_rewind_that_changed_nothing_reopens_the_old_primary_fenced_and_the_na
         Some(200),
         "the primary serves its full surface"
     );
-    let caller = connect(pair.pair.pg_p).await;
+    let caller = connect_admin(&pair.p_data).await;
     let failed = caller
         .simple_query(&format!("SWITCHOVER TO '{target}'"))
         .await
@@ -1145,7 +1150,7 @@ async fn a_switchover_over_tls_keeps_the_pair_on_tls() {
     wait_http(pair.pair.http_s, "/ready", 200, Duration::from_secs(120), &standby).await;
     assert_eq!(health(pair.pair.http_s).await["replication"]["tls"], true);
     let target = streaming_standby(pair.pair.http_p, &primary).await;
-    let caller = connect_to(P_HOST, pair.pair.pg_p).await;
+    let caller = connect_admin(&pair.p_data).await;
     let rows = check_rows(&caller, &format!("SWITCHOVER CHECK TO '{target}'")).await;
     assert!(rows.iter().all(|(_, ok, _)| *ok), "{rows:?}");
     assert!(rows[7].2.contains("over TLS"), "{rows:?}");

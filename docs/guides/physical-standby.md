@@ -1134,7 +1134,8 @@ epoch says which incarnation of the history a node is at).
 ### Online: `SELECT pg_promote(wait, wait_seconds)`
 
 ```sql
--- on the RUNNING standby's PostgreSQL port
+-- on the RUNNING standby, in an administrator's session: its admin socket,
+-- or TLS as a superuser role with a password (42501 otherwise)
 SELECT pg_promote(true, 60);   -- t once it serves as the primary
 SELECT pg_promote(false, 60);  -- t at once: the promotion was started
 SELECT pg_promote(true);       -- wait_seconds defaults to 60
@@ -1279,7 +1280,10 @@ replication_port`): it is the port it serves its standbys on once promoted.
 **HeliosDB Proxy.** Proxy promotes by sending exactly `SELECT pg_promote(true,
 N)` to the standby it chose and, right after the `t`, opening a fresh
 connection that must answer `pg_is_in_recovery() = f` (it polls every 500 ms
-within `N`). Point Proxy's promotion at it:
+within `N`). The session that sends it must be an administrator's: from another
+host that is a TLS connection as a superuser role with a password (the standby
+started with `--tls-cert` / `--tls-key` and `--auth scram-sha-256`); a `trust`
+or plaintext session is refused with 42501. Point Proxy's promotion at it:
 
 ```toml
 # HeliosDB Proxy
@@ -1295,11 +1299,12 @@ strictly highest `timeline_id`.
 
 ### SWITCHOVER: both roles in one command
 
-Oracle Data Guard's `SWITCHOVER`, run on the PRIMARY's PostgreSQL port, by a
-superuser session (the built-in `postgres` / `helios` roles, or a role created
-`SUPERUSER`; SQLSTATE 42501 otherwise — under `trust` authentication a
-session's role is the name its client sent, so only a password, md5 or
-scram-sha-256 listener makes this a boundary):
+Oracle Data Guard's `SWITCHOVER`, run on the PRIMARY by an administrator's
+session: on the server's admin socket (`<data-dir>/.s.hdb.admin`, the server's
+own operating-system user as role `postgres`, no password), or over TLS as a
+superuser role that logged in with SCRAM or a password. Any other session —
+plain TCP, `trust` — is refused with SQLSTATE 42501 (see
+[the admin socket and who may administer](authentication.md#the-admin-socket-and-who-may-administer)):
 
 ```sql
 -- on the primary
@@ -1766,8 +1771,8 @@ The test suites are listed in the [HA testing guide](ha_testing.md).
   cannot be rewound (`--replace` then swaps it in).
 - **`SWITCHOVER` is answered by the server's PostgreSQL session** on the
   primary, over the simple query protocol (not the embedded API or a
-  prepared statement), for a superuser session (42501 otherwise; under `trust`
-  authentication the session's role is its client's claim). The primary must
+  prepared statement), for an administrator's session (the admin socket, or
+  TLS as a superuser role with a password; 42501 otherwise). The primary must
   have no MySQL listener and no `--dump-on-shutdown` (a standby serves
   neither). The other standbys of the old primary are not re-pointed: each is
   rebuilt against the new primary (`recover --from-primary`, a fast-forward).

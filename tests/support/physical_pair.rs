@@ -1173,6 +1173,47 @@ pub async fn connect_watched(
     }
 }
 
+/// A session on the admin socket of the server that runs on the data
+/// directory `data`, as the built-in superuser — the peer check logs it in.
+/// Server control (`SWITCHOVER`, `pg_promote`) needs an administrator's
+/// session; a trust session on TCP is not one.
+pub async fn connect_admin(data: &Path) -> tokio_postgres::Client {
+    connect_admin_watched(data).await.0
+}
+
+/// [`connect_admin`], keeping the connection's own future ([`connect_watched`]).
+pub async fn connect_admin_watched(
+    data: &Path,
+) -> (
+    tokio_postgres::Client,
+    tokio::task::JoinHandle<Result<(), tokio_postgres::Error>>,
+) {
+    let socket = data.join(".s.hdb.admin");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let attempt = match tokio::net::UnixStream::connect(&socket).await {
+            Ok(stream) => {
+                let mut config = tokio_postgres::Config::new();
+                config
+                    .user("postgres")
+                    .dbname("postgres")
+                    .ssl_mode(tokio_postgres::config::SslMode::Disable);
+                config
+                    .connect_raw(stream, NoTls)
+                    .await
+                    .map(|(client, connection)| (client, tokio::spawn(connection)))
+                    .map_err(|error| error.to_string())
+            }
+            Err(error) => Err(error.to_string()),
+        };
+        match attempt {
+            Ok(session) => return session,
+            Err(error) if Instant::now() > deadline => panic!("no admin session on {}: {error}", socket.display()),
+            Err(_) => tokio::time::sleep(Duration::from_millis(300)).await,
+        }
+    }
+}
+
 /// The error a [`connect_watched`] connection ended with, within `budget`.
 pub async fn connection_end(
     connection: tokio::task::JoinHandle<Result<(), tokio_postgres::Error>>,

@@ -356,6 +356,20 @@ port = 5432
 # `Connection limit reached (N), rejecting <addr>` at WARN.
 max_connections = 100
 
+# The admin socket: the Unix socket through which the operating-system user
+# that runs the server administers it (mode 0600; that user logs in as role
+# "postgres" without a password, anyone else but root is disconnected).
+# Unset: ".s.hdb.admin" inside the data directory. A path puts it there
+# instead; "off" disables it. `--admin-socket` wins over this key.
+# admin_socket = "/run/heliosdb/admin.sock"
+
+# Permissions (octal) of the PostgreSQL Unix socket (--pg-socket-dir) and of
+# the MySQL Unix socket (--mysql-socket). Default "0770": the server's user
+# and group. "0777" lets every local user connect. The MySQL socket has no
+# login, so its mode decides who may use it.
+pg_socket_mode = "0770"
+mysql_socket_mode = "0770"
+
 # Log a WARN (once per crossing) when in-use connections on a listener reach
 # this percentage of max_connections. 0 disables; values above 100 are an error.
 max_connections_warn_percent = 80

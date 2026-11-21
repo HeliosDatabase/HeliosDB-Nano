@@ -392,6 +392,62 @@ behaves like `Require` (TLS required, no client cert checked). Treat this
 as a known gap on the PostgreSQL wire, not a redundant/alternate path to
 the MySQL mTLS support above.
 
+## The admin socket and who may administer
+
+A server with a data directory also listens on a Unix socket inside it,
+`<data-dir>/.s.hdb.admin`: the path this program's own tools use to manage the
+running server. It speaks the PostgreSQL wire protocol, so every statement
+works on it. `--admin-socket <path>` (`[server] admin_socket`) puts it
+somewhere else, `--admin-socket off` disables it; an in-memory server has one
+only when a path is given.
+
+- The file is created with mode 0600 and belongs to the user that runs the
+  server. Its directory must not be writable by others (anyone could put
+  another socket in its place): when it is, the socket is not started and the
+  log says so; the server itself runs.
+- The kernel tells the server who connected. A peer that is neither the
+  server's user nor root is disconnected before anything is answered.
+- A login on it is never `trust`. The server's own user logs in as the built-in
+  superuser `postgres` (or `helios`) **without a password** — the uid check is
+  the authentication, as with PostgreSQL's `peer` method. Any other role, and
+  root, log in with the server's password method; on a `trust` server such a
+  login is refused (SQLSTATE `28000`), because there is nothing to check a
+  password against.
+- A socket file left by a crashed server is replaced at the next start, after
+  checking that nothing listens on it; a clean shutdown removes it.
+
+**Who may administer.** One rule decides whether a session may run a
+server-control statement (`SWITCHOVER`, `SWITCHOVER CHECK`, `pg_promote()`,
+`SET NODE ALIAS`). A session is an administrator's when
+
+1. it arrived on the admin socket and logged in as a superuser role, or
+2. it arrived over TLS and logged in with SCRAM or a password — not `trust` —
+   as a superuser role (the built-in `postgres` / `helios`, or a role created
+   `SUPERUSER`).
+
+Every other session is refused with SQLSTATE `42501`, and the message says how
+to connect as an administrator: a TCP connection without TLS (whatever the
+role and the password), any `trust` session, the ordinary PostgreSQL Unix
+socket (`--pg-socket-dir`), the MySQL listeners, the HTTP API and MCP. Until
+5.0 the test was the role name alone, which under `trust` is whatever the
+client sent. An application that embeds the database in its own process is
+not restricted: it owns the process and the data directory.
+
+`pg_stat_activity` has two more columns, `listener` (`admin`, `unix`, `tcp`,
+`tls`, `mysql`) and `auth_method` (`peer`, `scram`, `password`, `md5`,
+`trust`), so an operator sees who is on the admin path:
+
+```sql
+SELECT pid, usename, listener, auth_method FROM pg_stat_activity;
+```
+
+**The ordinary sockets.** The PostgreSQL socket (`--pg-socket-dir`) and the
+MySQL socket (`--mysql-socket`) are created with mode 0770 — the server's user
+and group — instead of 0777. `--pg-socket-mode` and `--mysql-socket-mode`
+(`[server] pg_socket_mode`, `mysql_socket_mode`; octal) change that; `0777`
+restores the old behaviour. The MySQL socket has no login, so its mode is what
+decides who may use it.
+
 ## SQL session identity
 
 `current_user`, `session_user`, `current_role` (bare or as `current_role()`)

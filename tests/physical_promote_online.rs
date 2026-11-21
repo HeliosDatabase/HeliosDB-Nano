@@ -627,7 +627,7 @@ async fn a_running_standby_is_promoted_online_and_every_session_redials() {
     // --- the online promotion, P taking writes until it is fenced -------
     let during = Writer::start(pair.pg_p, 1000).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let caller = connect(pair.pg_s).await;
+    let caller = connect_admin(&s_data).await;
     let started = Instant::now();
     let (column, answer) = promote_answer(&caller, "SELECT pg_promote(true, 60)")
         .await
@@ -727,7 +727,7 @@ async fn a_running_standby_is_promoted_online_and_every_session_redials() {
         block["state"] == "needs_recovery"
     })
     .await;
-    let s2 = connect(pg_s2).await;
+    let s2 = connect_admin(&s2_data).await;
     let refused = s2.simple_query("SELECT pg_promote(true, 5)").await.unwrap_err();
     assert_eq!(sqlstate(&refused), "55000", "{refused}");
     assert!(
@@ -770,7 +770,7 @@ async fn a_running_standby_is_promoted_online_and_every_session_redials() {
 async fn the_exact_forms_proxy_sends_are_answered() {
     let c = promotable(10, ARCHIVE, Vec::new()).await;
     // On a primary: refused, naming its epoch.
-    let p = connect(c.pair.pg_p).await;
+    let p = connect_admin(&c.p_data).await;
     let refused = p.simple_query("SELECT pg_promote(true, 5)").await.unwrap_err();
     assert_eq!(sqlstate(&refused), "55000", "{refused}");
     assert!(
@@ -779,7 +779,7 @@ async fn the_exact_forms_proxy_sends_are_answered() {
         message(&refused)
     );
     // Out of range: 22023, nothing changed.
-    let s = connect(c.pair.pg_s).await;
+    let s = connect_admin(&c.s_data).await;
     let refused = s.simple_query("SELECT pg_promote(true, 0)").await.unwrap_err();
     assert_eq!(sqlstate(&refused), "22023", "{refused}");
     assert_eq!(
@@ -813,7 +813,7 @@ async fn the_exact_forms_proxy_sends_are_answered() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn wait_false_answers_at_once_and_the_promotion_completes() {
     let c = promotable(10, ARCHIVE, Vec::new()).await;
-    let s = connect(c.pair.pg_s).await;
+    let s = connect_admin(&c.s_data).await;
     let started = Instant::now();
     let (_, answer) = promote_answer(&s, "SELECT pg_promote(false, 60)").await.unwrap();
     assert_eq!(answer, "t");
@@ -846,13 +846,13 @@ async fn a_budget_too_short_answers_f_and_a_second_call_is_refused() {
     let pause = pause_dir.path().join("pause");
     std::fs::write(&pause, b"").unwrap();
     let c = promotable(10, ARCHIVE, vec![(PAUSE_ONLINE_PROMOTE_FILE_ENV, text(&pause))]).await;
-    let first = connect(c.pair.pg_s).await;
+    let first = connect_admin(&c.s_data).await;
     let started = Instant::now();
     let (_, answer) = promote_answer(&first, "SELECT pg_promote(true, 1)").await.unwrap();
     assert_eq!(answer, "f", "the budget ran out while the promotion runs");
     assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
     // Still under way (held): a second call is refused.
-    let second = connect(c.pair.pg_s).await;
+    let second = connect_admin(&c.s_data).await;
     let refused = second.simple_query("SELECT pg_promote(true, 5)").await.unwrap_err();
     assert_eq!(sqlstate(&refused), "55000", "{refused}");
     assert!(
@@ -911,7 +911,7 @@ async fn a_dead_primary_is_promoted_past_only_when_allowed() {
     let dir = c.pair.dir.path().to_path_buf();
     c.primary.kill();
     // `refuse`: 55000 naming the offline command; S stays a standby.
-    let s = connect(c.pair.pg_s).await;
+    let s = connect_admin(&c.s_data).await;
     let refused = s.simple_query("SELECT pg_promote(true, 20)").await.unwrap_err();
     assert_eq!(sqlstate(&refused), "55000", "{refused}");
     let text_of = message(&refused);
@@ -963,7 +963,7 @@ async fn a_dead_primary_is_promoted_past_only_when_allowed() {
     );
     wait_http(c.pair.http_s, "/ready", 200, Duration::from_secs(120), &standby).await;
     primary.kill();
-    let s = connect(c.pair.pg_s).await;
+    let s = connect_admin(&c.s_data).await;
     let (_, answer) = promote_answer(&s, "SELECT pg_promote(true, 30)")
         .await
         .unwrap_or_else(|error| panic!("pg_promote failed: {error}; log tail: {}", standby.tail(20)));
@@ -995,7 +995,7 @@ async fn a_failure_after_the_record_ends_the_process_and_promote_finishes_it() {
     ] {
         let mut c = promotable(10, ARCHIVE, vec![(env, step.to_string())]).await;
         let dir = c.pair.dir.path().to_path_buf();
-        let s = connect(c.pair.pg_s).await;
+        let s = connect_admin(&c.s_data).await;
         let answer = s.simple_query("SELECT pg_promote(true, 30)").await;
         assert!(
             answer.is_err(),
@@ -1151,7 +1151,7 @@ async fn a_long_statement_holds_the_promotion_and_the_primary_stays_unfenced() {
     let holder = connect(c.pair.pg_s).await;
     let held = tokio::spawn(async move { holder.simple_query("SELECT heliosdb_test_hold()").await });
     wait_log(&c.standby, "this statement holds while", 1, Duration::from_secs(30)).await;
-    let caller = connect(c.pair.pg_s).await;
+    let caller = connect_admin(&c.s_data).await;
     let refused = caller.simple_query("SELECT pg_promote(true, 3)").await.unwrap_err();
     assert_eq!(sqlstate(&refused), "55000", "{refused}");
     let text_of = message(&refused);
@@ -1190,7 +1190,7 @@ async fn a_long_statement_holds_the_promotion_and_the_primary_stays_unfenced() {
     let holder = connect(c.pair.pg_s).await;
     let held = tokio::spawn(async move { holder.simple_query("SELECT heliosdb_test_hold()").await });
     wait_log(&c.standby, "this statement holds while", 2, Duration::from_secs(30)).await;
-    let caller = connect(c.pair.pg_s).await;
+    let caller = connect_admin(&c.s_data).await;
     let promote = tokio::spawn(async move {
         promote_answer(&caller, "SELECT pg_promote(true, 60)")
             .await
@@ -1254,7 +1254,7 @@ async fn a_primary_that_dies_after_fenced_aborts_the_promotion_and_a_rerun_finis
     std::fs::write(&after, b"").unwrap();
     let mut c = promotable(10, ALLOW_UNFENCED, vec![(RECEIVER_HOLD_DIR_ENV, text(hold_dir.path()))]).await;
     let dir = c.pair.dir.path().to_path_buf();
-    let caller = connect(c.pair.pg_s).await;
+    let caller = connect_admin(&c.s_data).await;
     let promote = tokio::spawn(async move { caller.simple_query("SELECT pg_promote(true, 60)").await });
     wait_log(&c.standby, "holds at before-fence", 1, Duration::from_secs(60)).await;
     // The old primary still takes writes: the standby must catch up to them.
@@ -1302,7 +1302,7 @@ async fn a_primary_that_dies_after_fenced_aborts_the_promotion_and_a_rerun_finis
         block["state"] == "streaming"
     })
     .await;
-    let caller = connect(c.pair.pg_s).await;
+    let caller = connect_admin(&c.s_data).await;
     let (_, answer) = promote_answer(&caller, "SELECT pg_promote(true, 60)")
         .await
         .unwrap_or_else(|error| panic!("pg_promote failed: {error}; {}", c.standby.tail(20)));
@@ -1369,7 +1369,7 @@ async fn an_aborted_promotion_restores_the_receiver_and_the_cascading_port() {
     assert_eq!(health(pair.http_s).await["cascade"], true);
 
     primary.kill();
-    let s = connect(pair.pg_s).await;
+    let s = connect_admin(&dir.join("standby")).await;
     let refused = s.simple_query("SELECT pg_promote(true, 30)").await.unwrap_err();
     assert_eq!(sqlstate(&refused), "55000", "{refused}");
     let text_of = message(&refused);
@@ -1424,7 +1424,7 @@ async fn an_aborted_promotion_restores_the_receiver_and_the_cascading_port() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_extended_protocol_pg_promote_is_answered_then_the_session_ends() {
     let c = promotable(10, ARCHIVE, Vec::new()).await;
-    let (client, connection) = connect_watched(c.pair.pg_s).await;
+    let (client, connection) = connect_admin_watched(&c.s_data).await;
     let statement = client.prepare("SELECT pg_promote(true, 60)").await.unwrap();
     assert_eq!(statement.columns().len(), 1);
     assert_eq!(statement.columns()[0].name(), "pg_promote");
@@ -1485,7 +1485,7 @@ async fn a_cascading_standby_is_promoted_online_and_serves_its_port_as_the_prima
     assert_eq!(settle(pg_s3, &rows, Duration::from_secs(60)).await, Ok(rows.clone()));
     assert_eq!(health(pair.http_s).await["cascade"], true);
 
-    let caller = connect(pair.pg_s).await;
+    let caller = connect_admin(&s_data).await;
     let (_, answer) = promote_answer(&caller, "SELECT pg_promote(true, 60)")
         .await
         .unwrap_or_else(|error| panic!("pg_promote failed: {error}; {}", standby.tail(20)));
