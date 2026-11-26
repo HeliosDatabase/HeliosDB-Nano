@@ -5,6 +5,46 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.42.2] - 2026-11-26
+
+A transaction isolation fix. Data directories, standbys and configuration from 4.42.1
+work unchanged; there is no upgrade step and no change to the on-disk format.
+
+### Fixed
+
+- **A REPEATABLE READ snapshot could see rows committed after it.** A REPEATABLE READ
+  (or SERIALIZABLE) transaction that began while another client's write was being
+  committed could count a table without that write's rows and, later in the same
+  transaction, with them (for example `SELECT count(*)` returning 50, then 60). Three
+  kinds of commit took a commit timestamp without registering it as in progress, so a
+  snapshot taken after that timestamp did not wait for the write to land:
+  - an autocommit statement that changes rows without locking any, which committed at
+    its own snapshot's timestamp: an autocommit multi-row `INSERT … VALUES`,
+    `INSERT … SELECT`, and the other INSERT forms that no single-row fast path serves;
+  - `COPY … FROM STDIN` and batched parameterized INSERTs (`execute_many_params` on
+    the embedded API);
+  - a transaction whose only changes were INSERTs, such as `BEGIN; INSERT …; COMMIT`
+    on the embedded API.
+
+  Every commit that writes rows now takes a fresh commit timestamp, registered as in
+  progress before its rows are written and released after; a REPEATABLE READ or
+  SERIALIZABLE transaction that begins in between waits for it. Statements outside
+  such a transaction do not wait for INSERT-only commits, so concurrent INSERT and COPY
+  clients do not wait for each other. A transaction never saw part of a statement's
+  rows: the rows of one statement always appeared together. READ COMMITTED reads are
+  unchanged.
+
+### Tests
+
+- `rr_snapshot_stability`: pauses a writer between its commit timestamp and its write
+  (a test hook) and begins a REPEATABLE READ transaction in another session during the
+  pause, once for each commit form above: autocommit multi-row INSERT on a wire session
+  and on the embedded API, `INSERT … SELECT`, COPY on the PostgreSQL wire, a batched
+  parameterized INSERT, and INSERT-only transactions on a wire session and on the
+  embedded API. The transaction must count the table the same twice. Before the fix
+  every case except the wire-session transaction failed on every run. A short
+  PostgreSQL wire run with concurrent INSERT and COPY writers checks the same.
+
 ## [4.42.1] - 2026-11-21
 
 Two PostgreSQL wire compatibility fixes for clients that read session state from
