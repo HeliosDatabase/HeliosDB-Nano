@@ -68,6 +68,39 @@ pub fn debug_next_after_native_transaction_write(hook: impl FnOnce() + Send + 's
     NEXT_AFTER_NATIVE_TRANSACTION_WRITE.with(|next| *next.borrow_mut() = Some(Box::new(hook)));
 }
 
+/// `Transaction::announced`: the commit timestamp is not announced, announced in the
+/// conflict registry's ledger (write-set commits), or in its INSERT-only ledger.
+const ANNOUNCED_NONE: u8 = 0;
+const ANNOUNCED_WRITES: u8 = 1;
+const ANNOUNCED_INSERTS: u8 = 2;
+
+/// One-shot test hook that runs on the committing thread after a row-writing commit
+/// has taken its commit timestamp and before its write is applied. The argument names
+/// the funnel (`"transaction"`, `"fast_batch"`) and the timestamp. Process-wide: a
+/// caller arms it only while no other commit can run. Costs one relaxed load per
+/// commit while disarmed.
+type CommitStampHook = Box<dyn FnOnce(&'static str, u64) + Send>;
+static COMMIT_STAMP_HOOK_ARMED: AtomicBool = AtomicBool::new(false);
+static COMMIT_STAMP_HOOK: parking_lot::Mutex<Option<CommitStampHook>> = parking_lot::Mutex::new(None);
+
+#[doc(hidden)]
+pub fn debug_next_commit_stamped(hook: impl FnOnce(&'static str, u64) + Send + 'static) {
+    *COMMIT_STAMP_HOOK.lock() = Some(Box::new(hook));
+    COMMIT_STAMP_HOOK_ARMED.store(true, Ordering::Release);
+}
+
+#[inline]
+pub fn run_commit_stamp_hook(site: &'static str, commit_ts: u64) {
+    if !COMMIT_STAMP_HOOK_ARMED.load(Ordering::Relaxed) {
+        return;
+    }
+    let hook = COMMIT_STAMP_HOOK.lock().take();
+    COMMIT_STAMP_HOOK_ARMED.store(false, Ordering::Release);
+    if let Some(hook) = hook {
+        hook(site, commit_ts);
+    }
+}
+
 /// Reuse one callback queue and lock for success publication and cache fences.
 /// An attempted-write fence must also run when a failed write may have applied.
 enum AfterWriteHook {
@@ -147,6 +180,9 @@ pub struct Transaction {
     /// API and do not need per-row DashMap hashing. Updates/deletes still go to
     /// `write_set`; if both contain the same key, `write_set` is the final value.
     insert_log: Arc<RwLock<Vec<(Key, Vec<u8>)>>>,
+    /// Which in-flight ledger this transaction's commit timestamp was announced in
+    /// (`ANNOUNCED_*`), so that every exit of the commit retires it there.
+    announced: AtomicU8,
     /// Latest row-counter values staged by fast transactional inserts.
     ///
     /// Only the final counter value per table needs to be persisted at commit,
@@ -1065,6 +1101,7 @@ impl Transaction {
             snapshot_manager,
             write_set: Arc::new(DashMap::with_shard_amount(TXN_MAP_SHARDS)),
             insert_log: Arc::new(RwLock::new(Vec::new())),
+            announced: AtomicU8::new(ANNOUNCED_NONE),
             row_counter_stages: Arc::new(RwLock::new(std::collections::HashMap::new())),
             written_tables: TxnSet::new(),
             has_unattributed_writes: AtomicBool::new(false),
@@ -1535,22 +1572,76 @@ impl Transaction {
     /// `StorageEngine::next_commit_timestamp` announces one. An autocommit statement
     /// otherwise commits at its snapshot's timestamp, which may be below the commit of
     /// the transaction it waited for, and its version would sort under that one.
+    ///
+    /// A commit that stages a row write takes one too, even without row locks: at
+    /// its snapshot's timestamp it would be neither announced nor above snapshots
+    /// taken since, and a REPEATABLE READ reader that began in between would see its
+    /// rows appear.
     fn fresh_commit_timestamp(&self) -> Option<u64> {
         // Not for a transaction that cannot commit: `commit_with_timestamp` refuses it
         // before it would end an announcement made here.
-        if !self.is_active() || self.held_rows.lock().is_empty() {
+        if !self.is_active() || (self.held_rows.lock().is_empty() && !self.has_staged_row_writes()) {
             return None;
         }
         let set = self.row_locks.as_ref()?;
         let mut clock = set.clock.write();
         *clock += 1;
         let ts = *clock;
-        if self.has_tracked_writes() {
-            if let Some(registry) = &self.conflict_registry {
-                registry.begin_commit(ts);
-            }
+        if self.held_rows.lock().is_empty() {
+            self.announce_insert_commit(ts);
+        } else {
+            self.announce_commit(ts);
         }
         Some(ts)
+    }
+
+    /// Announce `commit_ts` in flight. The caller holds the engine clock's lock and
+    /// allocated `commit_ts` under it. A commit with write-set keys goes to the
+    /// conflict registry's ledger, which every new snapshot waits for; one that
+    /// stages only INSERT rows (`insert_log`) goes to its INSERT-only ledger, which
+    /// only a snapshot kept across statements waits for
+    /// (`WriteConflictRegistry::repeatable_snapshot_barrier`). Retired by
+    /// [`Self::retire_announcement`] on every exit of the commit.
+    pub(crate) fn announce_commit(&self, commit_ts: u64) {
+        let Some(registry) = &self.conflict_registry else {
+            return;
+        };
+        if !self.write_set.is_empty() {
+            registry.begin_commit(commit_ts);
+            self.announced.store(ANNOUNCED_WRITES, Ordering::Release);
+        } else if !self.insert_log.read().is_empty() {
+            registry.begin_insert_commit(commit_ts);
+            self.announced.store(ANNOUNCED_INSERTS, Ordering::Release);
+        }
+    }
+
+    /// Announce `commit_ts` of a commit that holds no row lock in the INSERT-only
+    /// ledger, whatever it staged (caller holds the clock's lock, as for
+    /// [`Self::announce_commit`]). Such a commit changes no existing row a reader
+    /// could have locked: an autocommit INSERT statement that is not served by a
+    /// fast path. Until 4.42.2 it committed at its snapshot timestamp unannounced;
+    /// only snapshots kept across statements need to wait for it, and per-statement
+    /// snapshots of concurrent INSERT statements must not.
+    fn announce_insert_commit(&self, commit_ts: u64) {
+        let Some(registry) = &self.conflict_registry else {
+            return;
+        };
+        if self.has_staged_row_writes() {
+            registry.begin_insert_commit(commit_ts);
+            self.announced.store(ANNOUNCED_INSERTS, Ordering::Release);
+        }
+    }
+
+    /// Retire the announcement [`Self::announce_commit`] made, if any. Idempotent.
+    fn retire_announcement(&self, commit_ts: u64) {
+        let Some(registry) = &self.conflict_registry else {
+            return;
+        };
+        match self.announced.swap(ANNOUNCED_NONE, Ordering::AcqRel) {
+            ANNOUNCED_WRITES => registry.end_commit(commit_ts),
+            ANNOUNCED_INSERTS => registry.end_insert_commit(commit_ts),
+            _ => {}
+        }
     }
 
     /// True once this transaction has staged a write and is therefore counted
@@ -1872,6 +1963,7 @@ impl Transaction {
             snapshot_manager,
             write_set: Arc::new(DashMap::with_shard_amount(TXN_MAP_SHARDS)),
             insert_log: Arc::new(RwLock::new(Vec::new())),
+            announced: AtomicU8::new(ANNOUNCED_NONE),
             row_counter_stages: Arc::new(RwLock::new(std::collections::HashMap::new())),
             written_tables: TxnSet::new(),
             has_unattributed_writes: AtomicBool::new(false),
@@ -2504,7 +2596,7 @@ impl Transaction {
         if let Err(error) = self.validate_parent_fk_checks() {
             // Low-level callers may already have announced this timestamp. The
             // refusal precedes every write, but must retire that announcement.
-            return Err(self.abort_partial_commit(self.has_tracked_writes(), commit_ts, error));
+            return Err(self.abort_partial_commit(commit_ts, error));
         }
         let commit_start = std::time::Instant::now();
         let insert_count = self.insert_log.read().len();
@@ -2531,6 +2623,8 @@ impl Transaction {
 
         if current.is_err() {
             warn!(txn_id = self.transaction_id, "Commit failed: transaction not active");
+            // The caller may have announced this timestamp; retire it (a no-op otherwise).
+            self.retire_announcement(commit_ts);
             return Err(Error::transaction("Transaction is not active"));
         }
 
@@ -2538,7 +2632,6 @@ impl Transaction {
         // newer than our snapshot and record ours — atomically w.r.t. other
         // committers. Runs before the batch is built; insert_log rows use
         // never-reused engine row ids and skip the registry by design.
-        let inflight = self.has_tracked_writes();
         if let Some(registry) = &self.conflict_registry {
             if let Err((key, committed_ts)) = registry.validate_and_record(
                 &self.write_set,
@@ -2546,9 +2639,7 @@ impl Transaction {
                 self.snapshot_ts.load(Ordering::Acquire),
                 commit_ts,
             ) {
-                if inflight {
-                    registry.end_commit(commit_ts);
-                }
+                self.retire_announcement(commit_ts);
                 self.acquired_locks.write().clear();
                 self.write_set.clear();
                 self.insert_log.write().clear();
@@ -2567,6 +2658,9 @@ impl Transaction {
                     self.snapshot_ts.load(Ordering::Acquire)
                 )));
             }
+        }
+        if write_count > 0 {
+            run_commit_stamp_hook("transaction", commit_ts);
         }
 
         let reverse_ts = u64::MAX - commit_ts;
@@ -2637,7 +2731,7 @@ impl Transaction {
                 }
                 if let Some(plan) = &mut vector_plan {
                     if let Err(error) = plan.stage(key, Some(val.as_slice()), pending_history, &mut batch) {
-                        return Err(self.abort_partial_commit(inflight, commit_ts, error));
+                        return Err(self.abort_partial_commit(commit_ts, error));
                     }
                 }
                 if let Err(e) = Self::put_versioned_batch(
@@ -2662,7 +2756,7 @@ impl Transaction {
                     // below for the same hazard). The `insert_log` read guard
                     // is released by this return; `abort_partial_commit`
                     // touches only the registry, the lock set and the state.
-                    return Err(self.abort_partial_commit(inflight, commit_ts, e));
+                    return Err(self.abort_partial_commit(commit_ts, e));
                 }
             }
         }
@@ -2697,7 +2791,7 @@ impl Transaction {
                                     .snapshot_manager
                                     .stage_row_pre_history(&mut batch, table, row_id, commit_ts)
                                 {
-                                    return Err(self.abort_partial_commit(inflight, commit_ts, error));
+                                    return Err(self.abort_partial_commit(commit_ts, error));
                                 }
                             }
                         }
@@ -2706,7 +2800,7 @@ impl Transaction {
             }
             if let Some(plan) = &mut vector_plan {
                 if let Err(error) = plan.stage(key, value.as_deref(), pending_history, &mut batch) {
-                    return Err(self.abort_partial_commit(inflight, commit_ts, error));
+                    return Err(self.abort_partial_commit(commit_ts, error));
                 }
             }
             match value {
@@ -2727,7 +2821,7 @@ impl Transaction {
                         &mut version_index_key_buf,
                     ) {
                         // See the insert_log loop: abort, never write in the clear.
-                        return Err(self.abort_partial_commit(inflight, commit_ts, e));
+                        return Err(self.abort_partial_commit(commit_ts, e));
                     }
                 }
                 None => {
@@ -2772,14 +2866,13 @@ impl Transaction {
                         Ok(durable) => durable.max(*staged),
                         Err(error) => {
                             return Err(self.abort_partial_commit(
-                                inflight,
                                 commit_ts,
                                 Error::storage(format!("invalid durable row counter: {error}")),
                             ))
                         }
                     },
                     Ok(None) => *staged,
-                    Err(error) => return Err(self.abort_partial_commit(inflight, commit_ts, error)),
+                    Err(error) => return Err(self.abort_partial_commit(commit_ts, error)),
                 },
             };
             *staged = current;
@@ -2794,7 +2887,7 @@ impl Transaction {
                 Ok(value) => value,
                 Err(e) => {
                     let e = Error::storage(format!("Failed to serialize counter: {}", e));
-                    return Err(self.abort_partial_commit(inflight, commit_ts, e));
+                    return Err(self.abort_partial_commit(commit_ts, e));
                 }
             };
             // `counter:` is a sealed keyspace (`put_internal` seals it on every
@@ -2802,7 +2895,7 @@ impl Transaction {
             // on-disk form depend on which route flushed the counter.
             let stored = match tde::seal(self.key_manager.as_deref(), &value) {
                 Ok(stored) => stored,
-                Err(e) => return Err(self.abort_partial_commit(inflight, commit_ts, e)),
+                Err(e) => return Err(self.abort_partial_commit(commit_ts, e)),
             };
             batch.put(key.as_bytes(), stored.as_ref());
         }
@@ -2878,7 +2971,7 @@ impl Transaction {
         for (key, proposed) in history_sidecars.iter().filter(|(key, _)| key.starts_with(b"dict:")) {
             if let Some(proposed) = proposed {
                 if let Err(error) = self.snapshot_manager.validate_staged_dictionary(key, proposed) {
-                    return Err(self.abort_partial_commit(inflight, commit_ts, error));
+                    return Err(self.abort_partial_commit(commit_ts, error));
                 }
             }
         }
@@ -2934,7 +3027,7 @@ impl Transaction {
                     &changes,
                     &pending_presence_keys,
                 ) {
-                    return Err(self.abort_partial_commit(inflight, commit_ts, error));
+                    return Err(self.abort_partial_commit(commit_ts, error));
                 }
             }
         }
@@ -2987,11 +3080,7 @@ impl Transaction {
                     Ok(None) => {}
                     Err(e) => {
                         drop(wal_guard);
-                        if inflight {
-                            if let Some(registry) = &self.conflict_registry {
-                                registry.end_commit(commit_ts);
-                            }
-                        }
+                        self.retire_announcement(commit_ts);
                         self.acquired_locks.write().clear();
                         self.state.store(TransactionState::Aborted.to_u8(), Ordering::Release);
                         warn!(
@@ -3020,7 +3109,7 @@ impl Transaction {
                     if let Some((wal, staged)) = staged_wal.take() {
                         wal.read().abandon_staged(staged);
                     }
-                    return Err(self.abort_partial_commit(inflight, commit_ts, e));
+                    return Err(self.abort_partial_commit(commit_ts, e));
                 }
             }
         };
@@ -3249,11 +3338,7 @@ impl Transaction {
 
         // The write is applied (or definitively failed): new snapshots may
         // proceed past this commit timestamp.
-        if inflight {
-            if let Some(registry) = &self.conflict_registry {
-                registry.end_commit(commit_ts);
-            }
-        }
+        self.retire_announcement(commit_ts);
 
         // Release all acquired locks
         #[cfg(feature = "internal-tests")]
@@ -3488,12 +3573,8 @@ impl Transaction {
     ///
     /// Deliberately does not touch `insert_log` / `write_set` /
     /// `row_counter_stages`: the callers hold guards on them.
-    fn abort_partial_commit(&self, inflight: bool, commit_ts: u64, err: Error) -> Error {
-        if inflight {
-            if let Some(registry) = &self.conflict_registry {
-                registry.end_commit(commit_ts);
-            }
-        }
+    fn abort_partial_commit(&self, commit_ts: u64, err: Error) -> Error {
+        self.retire_announcement(commit_ts);
         self.acquired_locks.write().clear();
         self.state.store(TransactionState::Aborted.to_u8(), Ordering::Release);
         err
@@ -3792,7 +3873,13 @@ impl Transaction {
     /// its reads would be stale while validating clean.
     pub fn set_conflict_registry(&mut self, registry: Arc<WriteConflictRegistry>, validate: bool) {
         let snapshot_ts = self.snapshot_ts.load(Ordering::Acquire);
-        registry.snapshot_barrier(snapshot_ts);
+        // A validating transaction keeps this snapshot across statements: it waits
+        // for INSERT-only commits too.
+        if validate {
+            registry.repeatable_snapshot_barrier(snapshot_ts);
+        } else {
+            registry.snapshot_barrier(snapshot_ts);
+        }
         if validate {
             registry.register_txn(self.transaction_id, snapshot_ts);
         }
@@ -3804,11 +3891,18 @@ impl Transaction {
         self.conflict_validation = validate;
     }
 
-    /// True when this commit must be announced in flight (it will record
-    /// write-set keys in the conflict registry). INSERT-only transactions
-    /// (`insert_log`) skip the registry by design.
+    /// True when this commit will record write-set keys in the conflict registry.
+    /// INSERT-only transactions (`insert_log`) skip the registry's keys by design;
+    /// their commit is still announced, in the INSERT-only ledger
+    /// ([`Self::announce_commit`]).
     pub fn has_tracked_writes(&self) -> bool {
         self.conflict_registry.is_some() && !self.write_set.is_empty()
+    }
+
+    /// True when the commit stages a row write (write set or `insert_log`) that a
+    /// snapshot must wait for: [`Self::announce_commit`] announces it.
+    fn has_staged_row_writes(&self) -> bool {
+        self.conflict_registry.is_some() && (!self.write_set.is_empty() || !self.insert_log.read().is_empty())
     }
 
     /// (table, row_id) pairs written through the write set, parsed from
@@ -3996,9 +4090,11 @@ impl Transaction {
     /// should see a fresh snapshot of the database.
     pub fn refresh_snapshot(&mut self, new_ts: u64) {
         if let Some(registry) = &self.conflict_registry {
-            registry.snapshot_barrier(new_ts);
             if self.conflict_validation {
+                registry.repeatable_snapshot_barrier(new_ts);
                 registry.refresh_txn(self.transaction_id, new_ts);
+            } else {
+                registry.snapshot_barrier(new_ts);
             }
         }
         self.snapshot_ts.store(new_ts, Ordering::Release);
@@ -4446,7 +4542,7 @@ mod tests {
         txn.defer_parent_fk_check(vec![1], ("c".into(), "fk".into()), |_, _| {
             Err(Error::constraint_violation("Foreign key deferred refusal"))
         });
-        let timestamp = engine.next_commit_timestamp(txn.has_tracked_writes());
+        let timestamp = engine.next_txn_commit_timestamp(&txn);
         assert!(matches!(
             txn.commit_with_timestamp(timestamp),
             Err(Error::ConstraintViolation(_))
@@ -4484,7 +4580,7 @@ mod tests {
         // This commit occurs AFTER the cold initialization was staged. A
         // snapshot-time backfill would omit its row from a complete manifest.
         let newer = engine.insert_tuple("p", Tuple::new(vec![Value::Int4(2)])).unwrap();
-        let timestamp = engine.next_commit_timestamp(txn.has_tracked_writes());
+        let timestamp = engine.next_txn_commit_timestamp(&txn);
         txn.commit_with_timestamp(timestamp).unwrap();
         assert!(ColumnarStore::presence_manifest_complete(&engine.db, "p"));
         let map = ColumnarStore::load_presence_map(&engine.db, "p").unwrap();

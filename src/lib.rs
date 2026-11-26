@@ -7074,7 +7074,7 @@ impl EmbeddedDatabase {
             } else {
                 txn.written_data_keys()
             };
-            let commit_ts = self.storage.next_commit_timestamp(txn.has_tracked_writes());
+            let commit_ts = self.storage.next_txn_commit_timestamp(&txn);
             let attempt = storage::write_outcome::WriteAttempt::default();
             let result = txn.commit_with_timestamp_settled(commit_ts, &attempt, |txn, outcome, succeeded| {
                 if self.commit_needs_index_undo(txn, outcome, succeeded) {
@@ -26934,7 +26934,7 @@ impl EmbeddedDatabase {
             } else {
                 txn.written_data_keys()
             };
-            let commit_ts = self.storage.next_commit_timestamp(txn.has_tracked_writes());
+            let commit_ts = self.storage.next_txn_commit_timestamp(&txn);
             // `commit_with_timestamp` CONSUMES the transaction, so its
             // uncommitted-write census slot is gone the moment it returns —
             // including when it returns an error, at which point this
@@ -27234,7 +27234,7 @@ impl EmbeddedDatabase {
                     } else {
                         txn.written_data_keys()
                     };
-                    let commit_ts = self.storage.next_commit_timestamp(txn.has_tracked_writes());
+                    let commit_ts = self.storage.next_txn_commit_timestamp(&txn);
                     let attempt = storage::write_outcome::WriteAttempt::default();
                     txn.commit_with_timestamp_settled(commit_ts, &attempt, |txn, outcome, succeeded| {
                         let undo = self.commit_needs_index_undo(txn, outcome, succeeded);
@@ -35476,7 +35476,7 @@ impl Transaction<'_> {
         } else {
             self.tx.written_data_keys()
         };
-        let commit_ts = self.db.storage.next_commit_timestamp(self.tx.has_tracked_writes());
+        let commit_ts = self.db.storage.next_txn_commit_timestamp(&self.tx);
         // Spec R5.1: nobody else in the table until the undo below has run.
         let _commit_locks = self.tx.table_locks_hold();
         let db = self.db;

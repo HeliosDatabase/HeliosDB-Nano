@@ -167,6 +167,8 @@ pub use row_shape::data_row_arity_refusals;
 pub use statistics::{ColumnStatistics, StatisticsAnalyzer, StatisticsCache, TableStatistics};
 pub use stats::{DatabaseStats, GlobalStatsCollector, ReplicationRole, StatsSnapshot};
 pub use time_travel::{GcConfig, Scn, SnapshotManager, SnapshotMetadata, TransactionId};
+#[doc(hidden)]
+pub use transaction::debug_next_commit_stamped;
 pub use transaction::{
     RowLockHold, Transaction, TransactionSavepointSnapshot, UncommittedWriteCensus, UncommittedWriteHold,
 };

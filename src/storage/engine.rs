@@ -6802,6 +6802,28 @@ impl StorageEngine {
         *ts
     }
 
+    /// Allocate `txn`'s commit timestamp and announce it in flight inside the
+    /// timestamp lock (`Transaction::announce_commit`): in the conflict registry's
+    /// ledger when it has write-set keys, in the INSERT-only ledger when it stages
+    /// only INSERT rows. The commit retires it.
+    pub fn next_txn_commit_timestamp(&self, txn: &super::Transaction) -> u64 {
+        let mut ts = self.timestamp.write();
+        *ts += 1;
+        txn.announce_commit(*ts);
+        *ts
+    }
+
+    /// Allocate a commit timestamp for a write that stages only INSERT rows outside
+    /// a transaction (the COPY / batch INSERT funnel), announced in the INSERT-only
+    /// ledger inside the timestamp lock. The caller retires it with
+    /// `WriteConflictRegistry::end_insert_commit`.
+    fn next_insert_commit_timestamp(&self) -> u64 {
+        let mut ts = self.timestamp.write();
+        *ts += 1;
+        self.conflict_registry.begin_insert_commit(*ts);
+        *ts
+    }
+
     /// THE pre-insert PK/UNIQUE gate. Every `insert_tuple*` arm calls this and
     /// nothing else: the non-versioned arm of [`Self::insert_tuple`], the
     /// versioned arm ([`Self::insert_tuple_versioned_with_schema`]) and the SQL
@@ -13686,7 +13708,7 @@ impl StorageEngine {
         };
         self.merge_failpoint_tick(MergeFailSite::TableClaimed)?;
 
-        let commit_ts = self.next_commit_timestamp(txn.has_tracked_writes());
+        let commit_ts = self.next_txn_commit_timestamp(&txn);
         let attempt = super::write_outcome::WriteAttempt::default();
         let mut claim = Some(claim);
         let mut applied = false;
@@ -17827,11 +17849,27 @@ impl StorageEngine {
             false
         };
 
-        let commit_ts = if self.config.storage.time_travel_enabled {
-            Some(self.next_timestamp())
-        } else {
-            None
-        };
+        // The commit timestamp is announced in flight, in the INSERT-only ledger,
+        // and retired once the batch is applied and published (or the write
+        // failed), so a REPEATABLE READ or SERIALIZABLE snapshot allocated after it
+        // waits (`repeatable_snapshot_barrier`) instead of reading the table before
+        // the batch lands and again after it. Only such a snapshot's BEGIN waits for
+        // this ledger, and it holds nothing yet, so the key-claim wait below cannot
+        // close a cycle with it.
+        struct Inflight<'a> {
+            registry: &'a super::conflict::WriteConflictRegistry,
+            timestamp: u64,
+        }
+        impl Drop for Inflight<'_> {
+            fn drop(&mut self) {
+                self.registry.end_insert_commit(self.timestamp);
+            }
+        }
+        let inflight = self.config.storage.time_travel_enabled.then(|| Inflight {
+            registry: &self.conflict_registry,
+            timestamp: self.next_insert_commit_timestamp(),
+        });
+        let commit_ts = inflight.as_ref().map(|inflight| inflight.timestamp);
         // W2.5: raise the committed-write watermark to this batch's commit
         // timestamp BEFORE the rows (and their `vmeta:` COPY marker / per-row
         // `v:` versions) become visible in the single WriteBatch below. This
@@ -17847,6 +17885,7 @@ impl StorageEngine {
         // gate (rows are visible to every snapshot), so no bump is needed.
         if let Some(ts) = commit_ts {
             self.note_committed_write(table_name, ts);
+            super::transaction::run_commit_stamp_hook("fast_batch", ts);
         }
         let reverse_ts = commit_ts.map(|ts| u64::MAX - ts);
         // W3.4: time the `data:`/`v:`/`vmeta:`/columnar WriteBatch build. Inert
@@ -18130,6 +18169,8 @@ impl StorageEngine {
                 self.snapshot_manager.record_copy_marker(table_name, first, last, ts);
             }
         }
+        // The batch is applied and published: REPEATABLE READ snapshots may proceed.
+        drop(inflight);
 
         // W3.4: HNSW maintenance — the phase W3.4 measures against total COPY
         // wall time.
@@ -21943,7 +21984,7 @@ impl StorageEngine {
                 hook();
             }
         }
-        let timestamp = self.next_commit_timestamp(txn.has_tracked_writes());
+        let timestamp = self.next_txn_commit_timestamp(&txn);
         let result = txn.commit_with_timestamp(timestamp);
         let (applied, settle_error, claim) = {
             let mut state = state.lock();

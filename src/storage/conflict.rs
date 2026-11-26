@@ -161,6 +161,17 @@ pub struct WriteConflictRegistry {
     gc_pins: DashMap<u64, u64>,
     /// Pin id allocator for `gc_pins`.
     next_gc_pin: AtomicU64,
+    /// In-flight ledger of commits that add rows without changing a row another
+    /// writer could have locked: an INSERT-only transaction, an autocommit
+    /// statement that holds no row lock, the COPY / batch INSERT funnel. Only a
+    /// snapshot that a transaction keeps
+    /// across statements (REPEATABLE READ, SERIALIZABLE, the embedded handle's
+    /// transaction) waits for them: [`Self::repeatable_snapshot_barrier`]. A
+    /// per-statement snapshot does not, which keeps concurrent INSERT statements
+    /// from waiting for each other. Same ring and contract as this registry's own
+    /// (`begin_insert_commit` runs inside the engine timestamp lock). `None` only
+    /// in the nested ledger itself.
+    insert_ledger: Option<Box<WriteConflictRegistry>>,
 }
 
 impl Default for WriteConflictRegistry {
@@ -171,6 +182,12 @@ impl Default for WriteConflictRegistry {
 
 impl WriteConflictRegistry {
     pub fn new() -> Self {
+        let mut registry = Self::ledger();
+        registry.insert_ledger = Some(Box::new(Self::ledger()));
+        registry
+    }
+
+    fn ledger() -> Self {
         let ring: Vec<AtomicU64> = (0..INFLIGHT_RING_SIZE).map(|_| AtomicU64::new(SLOT_EMPTY)).collect();
         Self {
             recent_writes: DashMap::new(),
@@ -187,6 +204,34 @@ impl WriteConflictRegistry {
             commit_count: AtomicU64::new(0),
             gc_pins: DashMap::new(),
             next_gc_pin: AtomicU64::new(0),
+            insert_ledger: None,
+        }
+    }
+
+    /// [`Self::begin_commit`] for a commit that stages only INSERT rows. Paired
+    /// with [`Self::end_insert_commit`]; same ordering rule (inside the engine
+    /// timestamp lock).
+    pub fn begin_insert_commit(&self, commit_ts: u64) {
+        if let Some(ledger) = &self.insert_ledger {
+            ledger.begin_commit(commit_ts);
+        }
+    }
+
+    /// [`Self::end_commit`] for [`Self::begin_insert_commit`].
+    pub fn end_insert_commit(&self, commit_ts: u64) {
+        if let Some(ledger) = &self.insert_ledger {
+            ledger.end_commit(commit_ts);
+        }
+    }
+
+    /// The barrier for a snapshot a transaction keeps across statements
+    /// (REPEATABLE READ, SERIALIZABLE): it waits for INSERT-only commits too, or
+    /// one that took its timestamp before the snapshot and applies after it
+    /// changes what the transaction reads.
+    pub fn repeatable_snapshot_barrier(&self, snapshot_ts: u64) {
+        self.snapshot_barrier(snapshot_ts);
+        if let Some(ledger) = &self.insert_ledger {
+            ledger.snapshot_barrier(snapshot_ts);
         }
     }
 
